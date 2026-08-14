@@ -1,0 +1,378 @@
+{
+  "generated_at": "2026-08-14T12:18:33.608978+00:00",
+  "snapshot_id": "20260814T121833608978Z",
+  "database": "soundstream",
+  "schema": "music",
+  "tables": {
+    "albums": {
+      "columns": [
+        {
+          "column": "id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "artist_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "title",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "release_year",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "duration_sec",
+          "data_type": "integer",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "inferred_primary_key": [
+        "id"
+      ],
+      "null_stats": {
+        "id": {
+          "total_rows": 25000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "artist_id": {
+          "total_rows": 25000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "title": {
+          "total_rows": 25000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "release_year": {
+          "total_rows": 25000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "duration_sec": {
+          "total_rows": 25000,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "artists": {
+      "columns": [
+        {
+          "column": "id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "name",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "genre",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "country",
+          "data_type": "text",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "inferred_primary_key": [
+        "id"
+      ],
+      "null_stats": {
+        "id": {
+          "total_rows": 8000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "name": {
+          "total_rows": 8000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "genre": {
+          "total_rows": 8000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "country": {
+          "total_rows": 8000,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "listeners": {
+      "columns": [
+        {
+          "column": "id",
+          "data_type": "bigint",
+          "nullable": false
+        },
+        {
+          "column": "name",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "plan",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "country",
+          "data_type": "text",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "inferred_primary_key": [
+        "id"
+      ],
+      "null_stats": {
+        "id": {
+          "total_rows": 100000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "name": {
+          "total_rows": 100000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "plan": {
+          "total_rows": 100000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "country": {
+          "total_rows": 100000,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "plays": {
+      "columns": [
+        {
+          "column": "id",
+          "data_type": "bigint",
+          "nullable": false
+        },
+        {
+          "column": "track_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "listener_id",
+          "data_type": "bigint",
+          "nullable": true
+        },
+        {
+          "column": "played_at",
+          "data_type": "date",
+          "nullable": true
+        },
+        {
+          "column": "seconds_listened",
+          "data_type": "integer",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "inferred_primary_key": [
+        "id"
+      ],
+      "null_stats": {
+        "id": {
+          "total_rows": 500000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "track_id": {
+          "total_rows": 500000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "listener_id": {
+          "total_rows": 500000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "played_at": {
+          "total_rows": 500000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "seconds_listened": {
+          "total_rows": 500000,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "tracks": {
+      "columns": [
+        {
+          "column": "id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "album_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "title",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "duration_sec",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "play_count",
+          "data_type": "bigint",
+          "nullable": true
+        },
+        {
+          "column": "explicit",
+          "data_type": "boolean",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "inferred_primary_key": [
+        "id"
+      ],
+      "null_stats": {
+        "id": {
+          "total_rows": 150000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "album_id": {
+          "total_rows": 150000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "title": {
+          "total_rows": 150000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "duration_sec": {
+          "total_rows": 150000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "play_count": {
+          "total_rows": 150000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "explicit": {
+          "total_rows": 150000,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    }
+  },
+  "declared_relationships": [],
+  "inferred_relationships": [
+    {
+      "table": "albums",
+      "column": "artist_id",
+      "references_table": "artists",
+      "references_column": "id",
+      "confidence": "heuristic-name-match",
+      "note": "No FK constraint declared in the database; relationship inferred from column naming convention."
+    },
+    {
+      "table": "plays",
+      "column": "track_id",
+      "references_table": "tracks",
+      "references_column": "id",
+      "confidence": "heuristic-name-match",
+      "note": "No FK constraint declared in the database; relationship inferred from column naming convention."
+    },
+    {
+      "table": "plays",
+      "column": "listener_id",
+      "references_table": "listeners",
+      "references_column": "id",
+      "confidence": "heuristic-name-match",
+      "note": "No FK constraint declared in the database; relationship inferred from column naming convention."
+    },
+    {
+      "table": "tracks",
+      "column": "album_id",
+      "references_table": "albums",
+      "references_column": "id",
+      "confidence": "heuristic-name-match",
+      "note": "No FK constraint declared in the database; relationship inferred from column naming convention."
+    }
+  ],
+  "relationship_edges": [
+    {
+      "source_table": "albums",
+      "source_column": "artist_id",
+      "target_table": "artists",
+      "target_column": "id",
+      "type": "inferred",
+      "confidence": "heuristic-name-match"
+    },
+    {
+      "source_table": "plays",
+      "source_column": "track_id",
+      "target_table": "tracks",
+      "target_column": "id",
+      "type": "inferred",
+      "confidence": "heuristic-name-match"
+    },
+    {
+      "source_table": "plays",
+      "source_column": "listener_id",
+      "target_table": "listeners",
+      "target_column": "id",
+      "type": "inferred",
+      "confidence": "heuristic-name-match"
+    },
+    {
+      "source_table": "tracks",
+      "source_column": "album_id",
+      "target_table": "albums",
+      "target_column": "id",
+      "type": "inferred",
+      "confidence": "heuristic-name-match"
+    }
+  ],
+  "semi_structured_sources": {}
+}

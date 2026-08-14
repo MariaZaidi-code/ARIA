@@ -1,0 +1,80 @@
+{
+  "generated_at": "2026-08-13T15:06:35.394886+00:00",
+  "snapshot_id": "20260813T150635394886Z",
+  "database": "scanned_report",
+  "schema": "file",
+  "tables": {
+    "scanned_report_20260813_200629_handwritten_1": {
+      "columns": [
+        {
+          "column": "region",
+          "data_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "column": "quarter",
+          "data_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "column": "product",
+          "data_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "column": "units",
+          "data_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "column": "revenue",
+          "data_type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "primary_key": [],
+      "inferred_primary_key": [],
+      "null_stats": {},
+      "source": "C:\\Users\\Go\\Desktop\\ARIA\\data\\uploads\\scanned_report_20260813_200629.pdf"
+    },
+    "scanned_report_20260813_200629_handwritten_2": {
+      "columns": [
+        {
+          "column": "name",
+          "data_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "column": "dept",
+          "data_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "column": "salary",
+          "data_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "column": "bonus",
+          "data_type": "TEXT",
+          "nullable": true
+        }
+      ],
+      "primary_key": [],
+      "inferred_primary_key": [],
+      "null_stats": {},
+      "source": "C:\\Users\\Go\\Desktop\\ARIA\\data\\uploads\\scanned_report_20260813_200629.pdf"
+    }
+  },
+  "declared_relationships": [],
+  "inferred_relationships": [],
+  "relationship_edges": [],
+  "semi_structured_sources": {
+    "C:\\Users\\Go\\Desktop\\ARIA\\data\\uploads\\scanned_report_20260813_200629.pdf": {
+      "tables": [
+        "scanned_report_20260813_200629_handwritten_1",
+        "scanned_report_20260813_200629_handwritten_2"
+      ]
+    }
+  }
+}

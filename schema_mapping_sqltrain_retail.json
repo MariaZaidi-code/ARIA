@@ -1,0 +1,311 @@
+{
+  "generated_at": "2026-08-13T20:50:46.718649+00:00",
+  "snapshot_id": "20260813T205046718649Z",
+  "database": "northwind",
+  "schema": "retail",
+  "tables": {
+    "customers": {
+      "columns": [
+        {
+          "column": "customer_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "name",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "email",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "country",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "city",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "signup_date",
+          "data_type": "date",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "customer_id"
+      ],
+      "inferred_primary_key": [
+        "customer_id"
+      ],
+      "null_stats": {
+        "customer_id": {
+          "total_rows": 60,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "name": {
+          "total_rows": 60,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "email": {
+          "total_rows": 60,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "country": {
+          "total_rows": 60,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "city": {
+          "total_rows": 60,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "signup_date": {
+          "total_rows": 60,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "order_items": {
+      "columns": [
+        {
+          "column": "item_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "order_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "product_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "quantity",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "unit_price",
+          "data_type": "numeric",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "item_id"
+      ],
+      "inferred_primary_key": [
+        "item_id"
+      ],
+      "null_stats": {
+        "item_id": {
+          "total_rows": 1500,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "order_id": {
+          "total_rows": 1500,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "product_id": {
+          "total_rows": 1500,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "quantity": {
+          "total_rows": 1500,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "unit_price": {
+          "total_rows": 1500,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "orders": {
+      "columns": [
+        {
+          "column": "order_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "customer_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "order_date",
+          "data_type": "date",
+          "nullable": true
+        },
+        {
+          "column": "status",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "region",
+          "data_type": "text",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "order_id"
+      ],
+      "inferred_primary_key": [
+        "order_id"
+      ],
+      "null_stats": {
+        "order_id": {
+          "total_rows": 500,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "customer_id": {
+          "total_rows": 500,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "order_date": {
+          "total_rows": 500,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "status": {
+          "total_rows": 500,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "region": {
+          "total_rows": 500,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "products": {
+      "columns": [
+        {
+          "column": "product_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "name",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "category",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "price",
+          "data_type": "numeric",
+          "nullable": true
+        },
+        {
+          "column": "cost",
+          "data_type": "numeric",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "product_id"
+      ],
+      "inferred_primary_key": [
+        "product_id"
+      ],
+      "null_stats": {
+        "product_id": {
+          "total_rows": 40,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "name": {
+          "total_rows": 40,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "category": {
+          "total_rows": 40,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "price": {
+          "total_rows": 40,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "cost": {
+          "total_rows": 40,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    }
+  },
+  "declared_relationships": [
+    {
+      "table_name": "orders",
+      "column_name": "customer_id",
+      "references_table": "customers",
+      "references_column": "customer_id"
+    },
+    {
+      "table_name": "order_items",
+      "column_name": "order_id",
+      "references_table": "orders",
+      "references_column": "order_id"
+    },
+    {
+      "table_name": "order_items",
+      "column_name": "product_id",
+      "references_table": "products",
+      "references_column": "product_id"
+    }
+  ],
+  "inferred_relationships": [],
+  "relationship_edges": [
+    {
+      "source_table": "orders",
+      "source_column": "customer_id",
+      "target_table": "customers",
+      "target_column": "customer_id",
+      "type": "declared"
+    },
+    {
+      "source_table": "order_items",
+      "source_column": "order_id",
+      "target_table": "orders",
+      "target_column": "order_id",
+      "type": "declared"
+    },
+    {
+      "source_table": "order_items",
+      "source_column": "product_id",
+      "target_table": "products",
+      "target_column": "product_id",
+      "type": "declared"
+    }
+  ],
+  "semi_structured_sources": {}
+}

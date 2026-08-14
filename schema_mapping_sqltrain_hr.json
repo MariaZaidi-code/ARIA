@@ -1,0 +1,281 @@
+{
+  "generated_at": "2026-08-13T20:50:47.182649+00:00",
+  "snapshot_id": "20260813T205047182649Z",
+  "database": "northwind",
+  "schema": "hr",
+  "tables": {
+    "assignments": {
+      "columns": [
+        {
+          "column": "assignment_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "employee_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "project_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "started_on",
+          "data_type": "date",
+          "nullable": true
+        },
+        {
+          "column": "hours",
+          "data_type": "integer",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "assignment_id"
+      ],
+      "inferred_primary_key": [
+        "assignment_id"
+      ],
+      "null_stats": {
+        "assignment_id": {
+          "total_rows": 400,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "employee_id": {
+          "total_rows": 400,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "project_id": {
+          "total_rows": 400,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "started_on": {
+          "total_rows": 400,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "hours": {
+          "total_rows": 400,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "departments": {
+      "columns": [
+        {
+          "column": "department_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "name",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "location",
+          "data_type": "text",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "department_id"
+      ],
+      "inferred_primary_key": [
+        "department_id"
+      ],
+      "null_stats": {
+        "department_id": {
+          "total_rows": 12,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "name": {
+          "total_rows": 12,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "location": {
+          "total_rows": 12,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "employees": {
+      "columns": [
+        {
+          "column": "employee_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "department_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "name",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "role",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "hire_date",
+          "data_type": "date",
+          "nullable": true
+        },
+        {
+          "column": "salary",
+          "data_type": "numeric",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "employee_id"
+      ],
+      "inferred_primary_key": [
+        "employee_id"
+      ],
+      "null_stats": {
+        "employee_id": {
+          "total_rows": 120,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "department_id": {
+          "total_rows": 120,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "name": {
+          "total_rows": 120,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "role": {
+          "total_rows": 120,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "hire_date": {
+          "total_rows": 120,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "salary": {
+          "total_rows": 120,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "projects": {
+      "columns": [
+        {
+          "column": "project_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "name",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "status",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "budget",
+          "data_type": "numeric",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "project_id"
+      ],
+      "inferred_primary_key": [
+        "project_id"
+      ],
+      "null_stats": {
+        "project_id": {
+          "total_rows": 30,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "name": {
+          "total_rows": 30,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "status": {
+          "total_rows": 30,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "budget": {
+          "total_rows": 30,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    }
+  },
+  "declared_relationships": [
+    {
+      "table_name": "employees",
+      "column_name": "department_id",
+      "references_table": "departments",
+      "references_column": "department_id"
+    },
+    {
+      "table_name": "assignments",
+      "column_name": "employee_id",
+      "references_table": "employees",
+      "references_column": "employee_id"
+    },
+    {
+      "table_name": "assignments",
+      "column_name": "project_id",
+      "references_table": "projects",
+      "references_column": "project_id"
+    }
+  ],
+  "inferred_relationships": [],
+  "relationship_edges": [
+    {
+      "source_table": "employees",
+      "source_column": "department_id",
+      "target_table": "departments",
+      "target_column": "department_id",
+      "type": "declared"
+    },
+    {
+      "source_table": "assignments",
+      "source_column": "employee_id",
+      "target_table": "employees",
+      "target_column": "employee_id",
+      "type": "declared"
+    },
+    {
+      "source_table": "assignments",
+      "source_column": "project_id",
+      "target_table": "projects",
+      "target_column": "project_id",
+      "type": "declared"
+    }
+  ],
+  "semi_structured_sources": {}
+}

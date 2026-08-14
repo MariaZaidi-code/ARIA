@@ -1,0 +1,301 @@
+{
+  "generated_at": "2026-08-14T12:18:08.035976+00:00",
+  "snapshot_id": "20260814T121808035976Z",
+  "database": "aria_fttest",
+  "schema": "hotel",
+  "tables": {
+    "bookings": {
+      "columns": [
+        {
+          "column": "booking_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "guest_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "room_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "check_in",
+          "data_type": "date",
+          "nullable": true
+        },
+        {
+          "column": "check_out",
+          "data_type": "date",
+          "nullable": true
+        },
+        {
+          "column": "total_amt",
+          "data_type": "numeric",
+          "nullable": true
+        },
+        {
+          "column": "status",
+          "data_type": "text",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "booking_id"
+      ],
+      "inferred_primary_key": [
+        "booking_id"
+      ],
+      "null_stats": {
+        "booking_id": {
+          "total_rows": 4000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "guest_id": {
+          "total_rows": 4000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "room_id": {
+          "total_rows": 4000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "check_in": {
+          "total_rows": 4000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "check_out": {
+          "total_rows": 4000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "total_amt": {
+          "total_rows": 4000,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "status": {
+          "total_rows": 4000,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "guests": {
+      "columns": [
+        {
+          "column": "guest_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "name",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "country",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "member_since",
+          "data_type": "date",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "guest_id"
+      ],
+      "inferred_primary_key": [
+        "guest_id"
+      ],
+      "null_stats": {
+        "guest_id": {
+          "total_rows": 300,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "name": {
+          "total_rows": 300,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "country": {
+          "total_rows": 300,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "member_since": {
+          "total_rows": 300,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "hotels": {
+      "columns": [
+        {
+          "column": "hotel_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "name",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "city",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "star_rating",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "chain",
+          "data_type": "text",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "hotel_id"
+      ],
+      "inferred_primary_key": [
+        "hotel_id"
+      ],
+      "null_stats": {
+        "hotel_id": {
+          "total_rows": 20,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "name": {
+          "total_rows": 20,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "city": {
+          "total_rows": 20,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "star_rating": {
+          "total_rows": 20,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "chain": {
+          "total_rows": 20,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    },
+    "rooms": {
+      "columns": [
+        {
+          "column": "room_id",
+          "data_type": "integer",
+          "nullable": false
+        },
+        {
+          "column": "hotel_id",
+          "data_type": "integer",
+          "nullable": true
+        },
+        {
+          "column": "room_type",
+          "data_type": "text",
+          "nullable": true
+        },
+        {
+          "column": "price_per_night",
+          "data_type": "numeric",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "room_id"
+      ],
+      "inferred_primary_key": [
+        "room_id"
+      ],
+      "null_stats": {
+        "room_id": {
+          "total_rows": 150,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "hotel_id": {
+          "total_rows": 150,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "room_type": {
+          "total_rows": 150,
+          "nulls": 0,
+          "null_pct": 0.0
+        },
+        "price_per_night": {
+          "total_rows": 150,
+          "nulls": 0,
+          "null_pct": 0.0
+        }
+      }
+    }
+  },
+  "declared_relationships": [
+    {
+      "table_name": "rooms",
+      "column_name": "hotel_id",
+      "references_table": "hotels",
+      "references_column": "hotel_id"
+    },
+    {
+      "table_name": "bookings",
+      "column_name": "guest_id",
+      "references_table": "guests",
+      "references_column": "guest_id"
+    },
+    {
+      "table_name": "bookings",
+      "column_name": "room_id",
+      "references_table": "rooms",
+      "references_column": "room_id"
+    }
+  ],
+  "inferred_relationships": [],
+  "relationship_edges": [
+    {
+      "source_table": "rooms",
+      "source_column": "hotel_id",
+      "target_table": "hotels",
+      "target_column": "hotel_id",
+      "type": "declared"
+    },
+    {
+      "source_table": "bookings",
+      "source_column": "guest_id",
+      "target_table": "guests",
+      "target_column": "guest_id",
+      "type": "declared"
+    },
+    {
+      "source_table": "bookings",
+      "source_column": "room_id",
+      "target_table": "rooms",
+      "target_column": "room_id",
+      "type": "declared"
+    }
+  ],
+  "semi_structured_sources": {}
+}

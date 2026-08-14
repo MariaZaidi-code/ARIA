@@ -1,0 +1,51 @@
+{
+  "generated_at": "2026-08-13T15:17:48.568527+00:00",
+  "snapshot_id": "20260813T151748568527Z",
+  "database": "retail_sales_20260813_201748",
+  "schema": "file",
+  "tables": {
+    "retail_sales_20260813_201748": {
+      "columns": [
+        {
+          "column": "order_date",
+          "data_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "column": "region",
+          "data_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "column": "product",
+          "data_type": "TEXT",
+          "nullable": true
+        },
+        {
+          "column": "quantity",
+          "data_type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "column": "revenue",
+          "data_type": "REAL",
+          "nullable": true
+        }
+      ],
+      "primary_key": [],
+      "inferred_primary_key": [],
+      "null_stats": {},
+      "source": "C:\\Users\\Go\\Desktop\\ARIA\\data\\uploads\\retail_sales_20260813_201748.csv"
+    }
+  },
+  "declared_relationships": [],
+  "inferred_relationships": [],
+  "relationship_edges": [],
+  "semi_structured_sources": {
+    "C:\\Users\\Go\\Desktop\\ARIA\\data\\uploads\\retail_sales_20260813_201748.csv": {
+      "tables": [
+        "retail_sales_20260813_201748"
+      ]
+    }
+  }
+}
