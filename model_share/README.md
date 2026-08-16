@@ -1,7 +1,9 @@
 # Sharing the aria-* local LLM models
 
 The three `aria-*` models are fine-tuned locally and are NOT on any registry, so
-your mates cannot `ollama pull` them. They must be given the model files.
+your mates cannot `ollama pull` them. They must be given the model files. The
+sharer runs `copy_models.ps1` and zips the folder as `model_share.zip`
+(~5.5 GB), then sends that single zip.
 
 ## For you (the sharer)
 
@@ -11,14 +13,23 @@ your mates cannot `ollama pull` them. They must be given the model files.
    - `base-4b.gguf`            (~4 GB, shared base for sql + story)
    - `sql-adapter.gguf`        (LoRA, ~100 MB)
    - `story-adapter.gguf`      (LoRA, ~100 MB)
-2. Zip this whole folder (the 3 `Modelfile-*` files + the 4 gguf files +
-   this README) and send it (Google Drive / WeTransfer / USB).
+2. Zip this whole folder so it can be transferred as one file:
+
+   ```
+   cd model_share
+   powershell -Command "Compress-Archive -Path * -DestinationPath model_share.zip"
+   ```
+
+   This produces `model_share.zip` (~5.5 GB) containing the 3 `Modelfile-*`
+   files, the 4 `.gguf` weight files and this README. Send that single zip
+   (Google Drive / WeTransfer / USB). It is the ONLY thing your mate needs
+   besides the repo itself.
 
 ## For your mate
 
 1. Install Ollama from https://ollama.com and make sure it is running
    (`ollama serve`).
-2. Unzip the folder. From inside it, create the models:
+2. Unzip `model_share.zip`. From inside the unzipped folder, create the models:
 
    ```
    ollama create aria-goal -f Modelfile-goal

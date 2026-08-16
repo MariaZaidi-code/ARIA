@@ -63,9 +63,10 @@ The `aria-*` models are **fine-tuned privately** and are NOT on any registry, so
 weights live in the model owner's Ollama store).
 
 1. Read `model_share/README.md` — it documents the packaging/transfer steps.
-2. Obtain the model package from the owner (they run `model_share/copy_models.ps1`
-   to export `aria-goal.gguf`, `base-4b.gguf` + two LoRA adapters, then share the zip).
-3. From inside the unzipped folder, build the models:
+2. Obtain `model_share.zip` from the owner (they run `model_share/copy_models.ps1`
+   to export `aria-goal.gguf`, `base-4b.gguf` + two LoRA adapters, then zip the
+   folder). The zip is the ONLY file you need besides this repo.
+3. Unzip it, and from inside the unzipped folder, build the models:
 
    ```bash
    ollama create aria-goal -f Modelfile-goal
