@@ -27,3 +27,5 @@ tmp_*.json
 *.sqlite
 # timestamped schema snapshots (keep the canonical *_latest.json)
 schema_mapping_*_20[0-9][0-9]*.json
+# exported local-LM model weights (huge; built by model_share/copy_models.ps1)
+model_share/*.gguf
