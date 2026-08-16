@@ -1,0 +1,15 @@
+psycopg2-binary
+pymysql
+python-dotenv
+langgraph
+pandas
+numpy
+sqlalchemy
+ollama
+groq
+httpx
+fastapi
+uvicorn
+python-multipart
+pdfplumber
+PyJWT
