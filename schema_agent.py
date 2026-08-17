@@ -1234,6 +1234,14 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                 # confirms them; a name match alone is not enough.
                 continue
 
+            # Negative evidence (txt item 7): a column whose most-specific
+            # table-name match is its OWN table is its identity, not a reference.
+            # e.g. orders.order_id matches both `orders` and `order_items` tokens;
+            # the shorter/most-specific name `orders` is the table itself, so the
+            # column must not be emitted as a name-only FK to `order_items`.
+            if not _is_reference_to_other_table(col_name, table_name, tables):
+                continue
+
             for candidate_table in sorted(candidate_tables):
                 ref_cols = table_pk.get(candidate_table) or [col_name]
                 for ref_col in ref_cols:
