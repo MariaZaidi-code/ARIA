@@ -76,6 +76,22 @@
   .history-detail h2 { margin-top: 14px; }
   .readonly-banner { border: 1px solid #fbbf24; background: #451a03; color: #fde68a;
           border-radius: 8px; padding: 8px 10px; font-size: 12px; margin: 10px 0; }
+  .badge.score-90 { background: #064e3b; color: #6ee7b7; }
+  .badge.score-75 { background: #1e3a8a; color: #93c5fd; }
+  .badge.score-50 { background: #78350f; color: #fcd34d; }
+  .badge.score-low { background: #7f1d1d; color: #fca5a5; }
+  .badge.flag { background: #7f1d1d; color: #fecaca; }
+  .badge.ambig { background: #78350f; color: #fde68a; }
+  .badge.ok { background: #064e3b; color: #6ee7b7; }
+  .drift-item { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+          padding: 8px 10px; margin: 6px 0; font-size: 12px; }
+  .drift-item .t { color: var(--accent); font-weight: 600; }
+  .drift-item .bad { color: #f87171; }
+  .drift-item .good { color: #34d399; }
+  .graph-node { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin: 6px 0; font-size: 12px; }
+  .graph-node .name { color: var(--accent); font-weight: 600; font-size: 13px; }
+  .graph-node .edge { color: var(--muted); margin: 1px 0; font-size: 11px; }
+  .graph-node .edge b { color: var(--text); font-weight: 500; }
 </style>
 </head>
 <body>
@@ -577,8 +593,41 @@ function renderSchemaReport(r) {
   } else { h += `(none)<br>`; }
   h += `<b>Inferred FKs (${r.inferred_relationships}):</b><br>`;
   if (r.inferred_fk_list && r.inferred_fk_list.length > 0) {
-    r.inferred_fk_list.forEach(fk => { h += `<span style="color:var(--muted)">${fk.from}</span> → <span style="color:var(--muted)">${fk.to}</span> <span style="color:var(--ok)">[${fk.confidence}]</span>${fk.note ? ' <span style="color:#888;font-size:11px">' + fk.note + '</span>' : ''}<br>`; });
+    r.inferred_fk_list.forEach(fk => {
+      const score = fk.confidence_score;
+      let scoreBadge = "";
+      if (score !== null && score !== undefined) {
+        const cls = score >= 80 ? "score-90" : score >= 60 ? "score-75" : score >= 40 ? "score-50" : "score-low";
+        scoreBadge = `<span class="badge ${cls}">${score}</span>`;
+      }
+      let flags = "";
+      if (fk.ambiguous) flags += `<span class="badge ambig" title="Two candidate tables had near-identical evidence">ambiguous</span>`;
+      if (fk.review_status === "flagged" || fk.review_status === "review") flags += `<span class="badge flag">${fk.review_status}</span>`;
+      if (fk.self_referencing) flags += `<span class="badge ambig">self-ref</span>`;
+      h += `<div style="margin:3px 0">`;
+      h += `<span style="color:var(--muted)">${fk.from}</span> → <span style="color:var(--muted)">${fk.to}</span> `;
+      h += `<span style="color:var(--ok)">[${fk.confidence}]</span> ${scoreBadge} ${flags}`;
+      if (fk.cardinality) h += `<span class="badge">${fk.cardinality}</span>`;
+      h += `<br>`;
+      if (fk.evidence && fk.evidence.length) h += `<span style="color:#888;font-size:11px">${fk.evidence.join(" · ")}</span>`;
+      if (fk.note) h += `<span style="color:#888;font-size:11px">${fk.note}</span>`;
+      h += `</div>`;
+    });
   } else { h += `(none)<br>`; }
+  if (r.drift) {
+    h += `<br><b style="color:#fbbf24">Schema Drift (vs previous run):</b><br>`;
+    if (r.drift.has_changes) {
+      if (r.drift.new_tables && r.drift.new_tables.length) h += `<span class="drift-item"><span class="t">NEW TABLES:</span> <span class="good">${r.drift.new_tables.join(", ")}</span></span>`;
+      if (r.drift.removed_tables && r.drift.removed_tables.length) h += `<span class="drift-item"><span class="t">REMOVED TABLES:</span> <span class="bad">${r.drift.removed_tables.join(", ")}</span></span>`;
+      if (r.drift.columns_added) Object.entries(r.drift.columns_added).forEach(([t, cols]) => { if (cols.length) h += `<span class="drift-item"><span class="t">${t} +cols:</span> <span class="good">${cols.join(", ")}</span></span>`; });
+      if (r.drift.columns_removed) Object.entries(r.drift.columns_removed).forEach(([t, cols]) => { if (cols.length) h += `<span class="drift-item"><span class="t">${t} -cols:</span> <span class="bad">${cols.join(", ")}</span></span>`; });
+      if (r.drift.datatypes_changed) Object.entries(r.drift.datatypes_changed).forEach(([t, chg]) => { if (Object.keys(chg).length) h += `<span class="drift-item"><span class="t">${t} type:</span> ${Object.entries(chg).map(([c, v]) => `${c} ${v.from}→${v.to}`).join(", ")}</span>`; });
+      if (r.drift.relationships_inferred_added && r.drift.relationships_inferred_added.length) h += `<span class="drift-item"><span class="t">+RELATIONS:</span> <span class="good">${r.drift.relationships_inferred_added.map(x => x.join(".")).join(", ")}</span></span>`;
+      if (r.drift.relationships_inferred_removed && r.drift.relationships_inferred_removed.length) h += `<span class="drift-item"><span class="t">-RELATIONS:</span> <span class="bad">${r.drift.relationships_inferred_removed.map(x => x.join(".")).join(", ")}</span></span>`;
+    } else {
+      h += `<span class="status ok">No changes since the previous run.</span>`;
+    }
+  }
   if (r.llm_reasoning) {
     const lr = r.llm_reasoning;
     h += `<br><b style="color:#c084fc">LLM Cross-Verification</b><br>`;
@@ -588,6 +637,7 @@ function renderSchemaReport(r) {
   h += `</div>`;
   el.innerHTML = h;
   el.className = "status ok";
+  loadSchema();
 }
 
 async function loadSchema() {
@@ -607,6 +657,24 @@ async function loadSchema() {
     edges.slice(0, 40).forEach(e => {
       html += `<div class="badge">${e.source_table}.${e.source_column} → ${e.target_table}.${e.target_column} [${e.type}]</div>`;
     });
+    if (s.relationship_graph) {
+      html += `<h2 style="margin-top:12px">Relationship Graph</h2>`;
+      Object.entries(s.relationship_graph).forEach(([t, node]) => {
+        html += `<div class="graph-node"><span class="name">${t}</span>`;
+        if (node.primary_key && node.primary_key.length) html += ` <span class="badge tb">PK: ${node.primary_key.join(", ")}</span>`;
+        (node.outgoing_relationships || []).forEach(e => {
+          const amb = e.ambiguous ? ` <span class="badge ambig">amb</span>` : "";
+          html += `<div class="edge">→ <b>${e.target_table}.${e.target_column}</b> <span class="badge">${e.cardinality || ""}</span><span class="badge">${e.confidence || ""}</span>${amb}</div>`;
+        });
+        (node.incoming_relationships || []).forEach(e => {
+          html += `<div class="edge">← <b>${e.source_table}.${e.source_column}</b> <span class="badge">${e.confidence || ""}</span></div>`;
+        });
+        if (node.many_to_many && node.many_to_many.length) {
+          html += `<div class="edge">M:N via <b>${node.many_to_many.map(j => j.junction_table).join(", ")}</b></div>`;
+        }
+        html += `</div>`;
+      });
+    }
     box.innerHTML = html || "No tables found.";
   } catch (e) { box.textContent = "No schema extracted yet."; }
 }

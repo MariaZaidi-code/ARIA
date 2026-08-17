@@ -1789,6 +1789,7 @@ def _build_relationship_graph(mapping):
                 "type": e.get("type"),
                 "confidence": e.get("confidence"),
                 "cardinality": e.get("cardinality"),
+                "ambiguous": e.get("ambiguous"),
             })
         for e in _in_edges(t):
             graph[t]["incoming_relationships"].append({
@@ -1798,6 +1799,7 @@ def _build_relationship_graph(mapping):
                 "type": e.get("type"),
                 "confidence": e.get("confidence"),
                 "cardinality": e.get("cardinality"),
+                "ambiguous": e.get("ambiguous"),
             })
 
     # Many-to-many via junction tables (composite PK, each PK column a FK).
@@ -2082,6 +2084,11 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
             "target_column": rel["references_column"],
             "type": "inferred",
             "confidence": rel.get("confidence", "heuristic"),
+            "confidence_score": rel.get("confidence_score"),
+            "review_status": rel.get("review_status"),
+            "ambiguous": rel.get("ambiguous"),
+            "self_referencing": rel.get("self_referencing"),
+            "cardinality": rel.get("cardinality"),
         })
 
     for table_name, columns in tables.items():

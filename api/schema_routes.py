@@ -157,6 +157,12 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
                 "from": f"{r['table']}.{r['column']}",
                 "to": f"{r['references_table']}.{r['references_column']}",
                 "confidence": r.get("confidence", "heuristic"),
+                "confidence_score": r.get("confidence_score"),
+                "review_status": r.get("review_status"),
+                "ambiguous": r.get("ambiguous"),
+                "self_referencing": r.get("self_referencing"),
+                "cardinality": r.get("cardinality"),
+                "evidence": r.get("evidence", []),
                 "note": r.get("note", ""),
             }
             for r in mapping["inferred_relationships"]
