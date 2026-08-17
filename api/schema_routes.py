@@ -159,10 +159,13 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
                 "confidence": r.get("confidence", "heuristic"),
                 "confidence_score": r.get("confidence_score"),
                 "review_status": r.get("review_status"),
+                "relationship_state": r.get("relationship_state"),
+                "relationship_type": r.get("relationship_type"),
                 "ambiguous": r.get("ambiguous"),
                 "self_referencing": r.get("self_referencing"),
                 "cardinality": r.get("cardinality"),
                 "evidence": r.get("evidence", []),
+                "evidence_detail": r.get("evidence_detail"),
                 "note": r.get("note", ""),
             }
             for r in mapping["inferred_relationships"]

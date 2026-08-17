@@ -4,6 +4,7 @@ Environment variables are loaded exactly once here (from the project root's
 ``.env``) so every other module reads them without calling load_dotenv itself.
 """
 
+import os
 import threading
 import time
 from copy import deepcopy
@@ -15,6 +16,18 @@ try:
     load_dotenv()
 except ImportError:
     pass
+
+# Secrets in .env may be stored DPAPI-encrypted (`enc1:<base64>`) so the file
+# is unreadable at rest. Decrypt them back into the environment now that dotenv
+# has loaded, before any module reads os.getenv for credentials.
+from core.secret_box import decrypt, PREFIX  # noqa: E402
+
+for _name, _value in list(os.environ.items()):
+    if isinstance(_value, str) and _value.startswith(PREFIX):
+        try:
+            os.environ[_name] = decrypt(_value)
+        except Exception:
+            pass
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"

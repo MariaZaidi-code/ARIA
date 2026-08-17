@@ -603,13 +603,18 @@ function renderSchemaReport(r) {
       let flags = "";
       if (fk.ambiguous) flags += `<span class="badge ambig" title="Two candidate tables had near-identical evidence">ambiguous</span>`;
       if (fk.review_status === "flagged" || fk.review_status === "review") flags += `<span class="badge flag">${fk.review_status}</span>`;
+      if (fk.relationship_state) flags += `<span class="badge ${fk.relationship_state === 'CONFIRMED' ? 'ok' : fk.relationship_state === 'PROBABLE' ? 'ambig' : 'flag'}">${fk.relationship_state}</span>`;
       if (fk.self_referencing) flags += `<span class="badge ambig">self-ref</span>`;
       h += `<div style="margin:3px 0">`;
       h += `<span style="color:var(--muted)">${fk.from}</span> → <span style="color:var(--muted)">${fk.to}</span> `;
       h += `<span style="color:var(--ok)">[${fk.confidence}]</span> ${scoreBadge} ${flags}`;
+      if (fk.relationship_type) h += `<span class="badge">${fk.relationship_type}</span>`;
       if (fk.cardinality) h += `<span class="badge">${fk.cardinality}</span>`;
       h += `<br>`;
-      if (fk.evidence && fk.evidence.length) h += `<span style="color:#888;font-size:11px">${fk.evidence.join(" · ")}</span>`;
+      if (fk.evidence_detail) {
+        const d = fk.evidence_detail;
+        h += `<span style="color:#888;font-size:11px">name:${d.name_match} · type:${d.datatype_match} · unique:${d.target_unique} · overlap:${d.value_overlap == null ? "n/a" : Math.round(d.value_overlap * 100) + "%"} · null:${d.null_rate == null ? "n/a" : Math.round(d.null_rate * 100) + "%"}</span>`;
+      } else if (fk.evidence && fk.evidence.length) h += `<span style="color:#888;font-size:11px">${fk.evidence.join(" · ")}</span>`;
       if (fk.note) h += `<span style="color:#888;font-size:11px">${fk.note}</span>`;
       h += `</div>`;
     });

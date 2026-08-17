@@ -1017,21 +1017,33 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
         # Item 1: explainable multi-factor confidence score.
         evidence = []
         score = 0.0
+        # Priority 2 (txt): structured evidence object alongside the readable list.
+        detail = {
+            "name_match": False,
+            "datatype_match": None,   # None when no data profiler available
+            "target_unique": False,
+            "value_overlap": overlap_ratio,
+            "null_rate": None,
+            "cardinality": rel.get("cardinality"),
+        }
 
         # name_match (item 1) — column base matches the target table name.
-        if name_hint:
-            score += 25
-            evidence.append("column name matches target table")
-        else:
+        name_hit = name_hint
+        if not name_hit:
             base = _singularize(col_name[:-3] if col_name.endswith("_id") else col_name)
             tgt_tokens = {_singularize(tok) for tok in _tokenize_words(candidate_table)}
             if base in tgt_tokens:
-                score += 25
-                evidence.append("column name matches target table")
+                name_hit = True
+        detail["name_match"] = name_hit
+        if name_hit:
+            score += 25
+            evidence.append("column name matches target table")
 
         # datatype_match (item 4).
         if profiler is not None and isinstance(col_name, str) and isinstance(ref_col, str):
-            if profiler.types_compatible(table_name, col_name, candidate_table, ref_col):
+            dt_ok = profiler.types_compatible(table_name, col_name, candidate_table, ref_col)
+            detail["datatype_match"] = bool(dt_ok)
+            if dt_ok:
                 score += 15
                 evidence.append("datatype compatible")
             else:
@@ -1039,6 +1051,7 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
 
         # overlap_ratio (item 5) — tiered value evidence.
         if overlap_ratio is not None:
+            detail["value_overlap"] = overlap_ratio
             if overlap_ratio >= 0.99:
                 score += 30
                 evidence.append("~100% values found in target PK")
@@ -1053,14 +1066,18 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
 
         # uniqueness: target column is a primary key.
         tgt_pk = set(table_pk.get(candidate_table, []))
+        target_unique = False
         if isinstance(ref_col, str) and ref_col in tgt_pk:
+            target_unique = True
             score += 20
             evidence.append("target is a primary key")
         elif not isinstance(ref_col, str):
             # Composite: referenced columns are key columns by construction.
             if all(c in tgt_pk for c in ref_col):
+                target_unique = True
                 score += 20
                 evidence.append("target is a composite primary key")
+        detail["target_unique"] = target_unique
 
         # cardinality: many-to-one / one-to-one favour a real FK over 1:1 sharing.
         if rel.get("cardinality") in ("many-to-one", "one-to-many"):
@@ -1073,6 +1090,7 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
             ns = null_stats.get(table_name, {}).get(col_name, {})
             null_pct = ns.get("null_pct") if isinstance(ns, dict) else None
             if null_pct is not None:
+                detail["null_rate"] = null_pct
                 if null_pct > 0.8:
                     score -= 25
                     evidence.append(f"high null rate ({null_pct:.0%}) — relationship optional")
@@ -1082,6 +1100,7 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
 
         rel["confidence_score"] = max(0, min(100, round(score)))
         rel["evidence"] = evidence
+        rel["evidence_detail"] = detail
 
         # Item 10: review tier.
         cs = rel["confidence_score"]
@@ -1091,11 +1110,29 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
             else "review"
         )
 
+        # Priority 5 (txt): CONFIRMED / PROBABLE / UNCERTAIN / REJECTED taxonomy.
+        # REJECTED candidates are never emitted, so emitted relationships use the
+        # three positive states; a null/empty/nullable-heavy hit that scores below
+        # the review floor would instead be surfaced as UNCERTAIN for a human.
+        rel["relationship_state"] = (
+            "CONFIRMED" if cs >= 80
+            else "PROBABLE" if cs >= 60
+            else "UNCERTAIN"
+        )
+
         # Item 2: self-referencing FK flag.
         rel["self_referencing"] = bool(
             isinstance(col_name, str) and table_name == candidate_table
             and col_name != ref_col
         )
+
+        # Priority 3 (txt): unified relationship type.
+        if rel.get("self_referencing"):
+            rel["relationship_type"] = "self-referencing"
+        elif rel.get("cardinality"):
+            rel["relationship_type"] = rel["cardinality"]
+        else:
+            rel["relationship_type"] = "foreign-key"
 
         inferred.append(rel)
 
