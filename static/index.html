@@ -524,6 +524,7 @@ async function connectDb() {
         setStatus("connect_status", `${r.provider} · ${r.source_type} routed to ${r.routed_to}. ${r.note}`, true);
       } else {
         setStatus("connect_status", `Connected to ${r.database} (schema ${r.schema}) · ${r.provider}`, true);
+        await extractSchema();
       }
     }
   } catch (e) {
