@@ -1,6 +1,7 @@
 """Schema Agent routes: schema extraction and retrieval."""
 
 import json
+import re
 import types
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -10,6 +11,10 @@ from core.config import SCHEMA_DIR, get_session
 from core.deps import get_current_user, require_data, require_writable
 
 router = APIRouter()
+
+
+def _safe_db(name):
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", str(name))[:64] or "db"
 
 
 def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresql") -> dict:
@@ -47,8 +52,19 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
     try:
         conn = schema_agent.get_connection(types.SimpleNamespace(**config))
         try:
+            # Item 5: seed drift detection from the previous run of this DB.
+            previous_mapping = None
+            try:
+                prev_latest = SCHEMA_DIR / f"user_{user['user_id']}" / (
+                    f"schema_mapping_{_safe_db(session['db_name'])}_latest.json"
+                )
+                if prev_latest.exists():
+                    previous_mapping = json.loads(prev_latest.read_text(encoding="utf-8"))
+            except Exception:
+                previous_mapping = None
             mapping = schema_agent.build_schema_mapping(
-                conn, schema_filter, db_type=db_type, llm=session.get("provider")
+                conn, schema_filter, db_type=db_type, llm=session.get("provider"),
+                previous_mapping=previous_mapping,
             )
             if not mapping.get("tables"):
                 hint = ""
@@ -148,6 +164,7 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
         "tables_with_pk": summary.get("tables_with_pk", []),
         "tables_without_pk": no_pk,
         "llm_reasoning": mapping.get("reasoning"),
+        "drift": mapping.get("drift"),
     }
 
 

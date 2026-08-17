@@ -563,7 +563,16 @@ class _ValueProfiler:
         if require_unambiguous and len(cands) >= 2 and cands[0][:3] == cands[1][:3]:
             return None
         ratio, _, _, table, pk_col, matched = cands[0]
-        return table, pk_col, ratio, matched
+        # Item 4 (ambiguous): a relationship is ambiguous when a runner-up
+        # candidate carries nearly identical data evidence (ratio within 3 pts
+        # and matched within a small absolute delta). We still return the best
+        # candidate, but flag it so the caller/downstream can defer to a human.
+        ambiguous = False
+        if len(cands) >= 2:
+            r2, m2 = cands[1][0], cands[1][5]
+            if (cands[0][0] - r2) < 0.03 and abs(matched - m2) <= max(2, int(0.05 * matched)):
+                ambiguous = True
+        return table, pk_col, ratio, matched, ambiguous
 
     def _distinct_raw(self, table, col, limit):
         """Raw (un-normalized) distinct values, for exact SQL containment checks."""
@@ -659,11 +668,19 @@ class _ValueProfiler:
             key_size = len(self._distinct(table, pk_col, self._pk_cache, self.MAX_PK_SAMPLE))
             cand = (ratio, matched, -key_size, boost, table, pk_col)
             if best is None or cand > best:
+                second = best
                 best = cand
+            elif second is None or cand > second:
+                second = cand
         if best is None:
             return None
         ratio, matched, _neg, _boost, table, pk_col = best
-        return table, pk_col, ratio, matched
+        # Item 4 (ambiguous): flag when the runner-up is within a hair of the
+        # winner on ratio (boost/key-size tiebreakers aside).
+        ambiguous = False
+        if second is not None and (ratio - second[0]) < 0.03:
+            ambiguous = True
+        return table, pk_col, ratio, matched, ambiguous
 
     def should_profile(self, col):
         """Only sample columns that could plausibly reference a key (bounds cost)."""
@@ -969,7 +986,7 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
         return sorted(set(names))
 
     def _emit(table_name, col_name, candidate_table, ref_col, confidence, note,
-              overlap_ratio=None, name_hint=False):
+              overlap_ratio=None, name_hint=False, ambiguous=False):
         rel = {
             "table": table_name,
             "column": col_name,
@@ -978,6 +995,11 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
             "confidence": confidence,
             "note": note,
         }
+        # Item 4 (ambiguous): a near-tie with a runner-up target means the data
+        # cannot distinguish the real reference; downstream agents should defer
+        # to the human rather than guess.
+        if ambiguous:
+            rel["ambiguous"] = True
         # Cardinality: source distinct values (data available) vs referenced key.
         # Distinct source < referenced rows means many source rows share one
         # target -> many-to-one; equal-ish counts -> one-to-one.
@@ -1198,7 +1220,7 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                         exclude=(table_name, col_name),
                     )
                 if hit is not None:
-                    target_table, target_col, ratio, matched = hit
+                    target_table, target_col, ratio, matched, ambiguous = hit
                     # Negative evidence (txt item 7) + common-value collisions
                     # (txt item 8): a code/label column (status, category, year,
                     # country_code, ...) whose values merely overlap a key is
@@ -1210,7 +1232,7 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                         if not name_hint:
                             hit = None
                     if hit is not None:
-                        target_table, target_col, ratio, matched = hit
+                        target_table, target_col, ratio, matched, ambiguous = hit
                         if target_table in candidate_tables:
                             confidence, note = "data-confirmed", (
                                 f"No FK constraint declared; confirmed by value overlap "
@@ -1226,7 +1248,8 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                             if table_name == target_table and col_name == ref_col:
                                 continue
                             _emit(table_name, col_name, target_table, ref_col, confidence, note,
-                                  overlap_ratio=ratio, name_hint=(target_table in candidate_tables))
+                                  overlap_ratio=ratio, name_hint=(target_table in candidate_tables),
+                                  ambiguous=ambiguous)
                         continue
 
             if is_composite_key_col:
@@ -1881,7 +1904,121 @@ def _drop_empty_key_columns(mapping, conn, schema, db_type):
     return mapping
 
 
-def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, database_name=None):
+def detect_schema_drift(previous, current):
+    """Compare two schema mappings (txt item 5) and report what changed.
+
+    Detects new/removed tables, added/removed columns, changed data types,
+    changed PK/FK structure, and newly inferred relationships. Used when the
+    agent runs repeatedly against a live database whose schema evolves.
+    """
+    prev_tables = previous.get("tables", {}) if previous else {}
+    curr_tables = current.get("tables", {}) if current else {}
+
+    def _norm(rel, source_side):
+        return {
+            "table": rel[source_side],
+            "column": rel["column"] if source_side == "table" else rel["column"],
+            "references_table": rel["references_table"],
+            "references_column": rel["references_column"],
+        }
+
+    def _edge_set(mapping, declared=True):
+        out = set()
+        for rel in mapping.get("declared_relationships", []):
+            if declared:
+                out.add((rel["table_name"], str(rel["column_name"]),
+                         rel["references_table"], str(rel["references_column"])))
+        return out
+
+    def _inferred_set(mapping):
+        out = set()
+        for rel in mapping.get("inferred_relationships", []):
+            col = rel.get("column")
+            if isinstance(col, list):
+                col = ",".join(col)
+            ref = rel.get("references_column")
+            if isinstance(ref, list):
+                ref = ",".join(ref)
+            out.add((rel.get("table"), str(col),
+                     rel.get("references_table"), str(ref)))
+        return out
+
+    drift = {"has_changes": False, "changed_tables": []}
+
+    new_tables = sorted(set(curr_tables) - set(prev_tables))
+    removed_tables = sorted(set(prev_tables) - set(curr_tables))
+    if new_tables:
+        drift["new_tables"] = new_tables
+        drift["has_changes"] = True
+    if removed_tables:
+        drift["removed_tables"] = removed_tables
+        drift["has_changes"] = True
+
+    added_columns = {}
+    removed_columns = {}
+    datatype_changed = {}
+    pk_changed = {}
+    for table in sorted(set(curr_tables) & set(prev_tables)):
+        prev_cols = {c["column"]: c for c in prev_tables[table].get("columns", [])}
+        curr_cols = {c["column"]: c for c in curr_tables[table].get("columns", [])}
+        new_cols = sorted(set(curr_cols) - set(prev_cols))
+        gone_cols = sorted(set(prev_cols) - set(curr_cols))
+        type_changes = {}
+        for col in sorted(set(curr_cols) & set(prev_cols)):
+            if str(prev_cols[col].get("data_type", "")).lower() != str(curr_cols[col].get("data_type", "")).lower():
+                type_changes[col] = {
+                    "from": prev_cols[col].get("data_type"),
+                    "to": curr_cols[col].get("data_type"),
+                }
+        prev_pk = sorted(prev_tables[table].get("primary_key", []) or [])
+        curr_pk = sorted(curr_tables[table].get("primary_key", []) or [])
+        table_changed = new_cols or gone_cols or type_changes or (prev_pk != curr_pk)
+        if table_changed:
+            added_columns[table] = new_cols
+            removed_columns[table] = gone_cols
+            datatype_changed[table] = type_changes
+            pk_changed[table] = {"from": prev_pk, "to": curr_pk}
+            drift["changed_tables"].append(table)
+            drift["has_changes"] = True
+
+    if added_columns:
+        drift["columns_added"] = added_columns
+    if removed_columns:
+        drift["columns_removed"] = removed_columns
+    if datatype_changed:
+        drift["datatypes_changed"] = datatype_changed
+    if pk_changed:
+        drift["primary_keys_changed"] = pk_changed
+
+    # FK structure: declared constraints added/removed.
+    prev_declared = _edge_set(previous)
+    curr_declared = _edge_set(current)
+    declared_added = sorted(prev_declared - curr_declared, key=str)
+    declared_removed = sorted(curr_declared - prev_declared, key=str)
+    if declared_added:
+        drift["declared_fk_removed"] = declared_added
+        drift["has_changes"] = True
+    if declared_removed:
+        drift["declared_fk_added"] = declared_removed
+        drift["has_changes"] = True
+
+    # Inferred relationships added/removed.
+    prev_inferred = _inferred_set(previous)
+    curr_inferred = _inferred_set(current)
+    inf_added = sorted(curr_inferred - prev_inferred, key=str)
+    inf_removed = sorted(prev_inferred - curr_inferred, key=str)
+    if inf_added:
+        drift["relationships_inferred_added"] = inf_added
+        drift["has_changes"] = True
+    if inf_removed:
+        drift["relationships_inferred_removed"] = inf_removed
+        drift["has_changes"] = True
+
+    return drift
+
+
+def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, database_name=None,
+                         previous_mapping=None):
     tables = get_tables_and_columns(conn, schema, db_type)
     primary_keys = get_primary_keys(conn, schema, db_type)
     unique_keys = get_unique_keys(conn, schema, db_type)
@@ -2046,6 +2183,10 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
     mapping["summary"]["review_list"] = review_list
     mapping["summary"]["review_count"] = len(review_list)
 
+    # Item 5: schema drift vs the previous run of this database (when supplied).
+    if previous_mapping:
+        mapping["drift"] = detect_schema_drift(previous_mapping, mapping)
+
     return mapping
 
 
@@ -2157,8 +2298,26 @@ def main():
             schema = find_schema_with_tables(conn)
             print(f"Auto-detected schema '{schema}'.")
         print(f"Connected ({args.db_type}). Extracting schema for '{schema}' schema...")
+
+        # Item 5: seed drift detection from the previous run of this database
+        # (the {stem}_latest.json alias), if one exists.
+        previous_mapping = None
+        try:
+            prev_base = Path(args.output)
+            prev_stem = prev_base.stem
+            if args.db:
+                safe_db = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(args.db))[:64] or "db"
+                prev_stem = f"{prev_stem}_{safe_db}"
+            prev_latest = prev_base.with_name(f"{prev_stem}_latest{prev_base.suffix or '.json'}")
+            if prev_latest.exists():
+                with open(prev_latest, encoding="utf-8") as fh:
+                    previous_mapping = json.load(fh)
+        except Exception as exc:
+            logger.debug("could not load previous schema for drift detection: %s", exc)
+
         mapping = build_schema_mapping(conn, schema, db_type=args.db_type, llm=llm,
-                                       database_name=args.db)
+                                       database_name=args.db,
+                                       previous_mapping=previous_mapping)
         if not mapping.get("tables"):
             sys.exit(
                 f"ERROR: no tables found in schema '{schema}' ({args.db_type}). "
@@ -2185,6 +2344,15 @@ def main():
     if mapping.get("llm_reasoning"):
         print(f"LLM-assisted reasoning applied via {mapping['llm_reasoning'].get('provider')} "
               f"(model {mapping['llm_reasoning'].get('model')}).")
+    drift = mapping.get("drift")
+    if drift:
+        if drift.get("has_changes"):
+            print(f"Schema drift detected: {len(drift.get('new_tables', []))} new table(s), "
+                  f"{len(drift.get('removed_tables', []))} removed, "
+                  f"{len(drift.get('columns_added', {}))} table(s) with column changes, "
+                  f"{len(drift.get('relationships_inferred_added', []))} new inferred relationship(s).")
+        else:
+            print("Schema drift: no changes since the previous run.")
     print(f"Written to {output_path}")
     print(f"Saved fresh snapshot to {timestamped_path}")
     print(f"Updated latest copy at {latest_path}")
