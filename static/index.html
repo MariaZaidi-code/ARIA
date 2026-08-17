@@ -549,7 +549,7 @@ async function extractSchema() {
   setStatus("schema_status", "Extracting schema...");
   try {
     const r = await api("/api/extract_schema", {});
-    let msg = `Schema extracted for ${r.database}.\n\n`;
+    let msg = r.short_summary + "\n\n";
     msg += `Tables in DB: ${r.total_db_tables} | Used: ${r.tables_used}`;
     if (r.tables_dropped_empty && r.tables_dropped_empty.length > 0) {
       msg += ` | Dropped (empty): ${r.tables_dropped_empty.join(", ")}`;

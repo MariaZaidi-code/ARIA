@@ -88,15 +88,46 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
 
     summary = mapping.get("summary", {})
 
+    # Build a short natural-language summary of the database.
+    db_name = session["db_name"]
+    n_used = summary.get("tables_used", len(mapping["tables"]))
+    n_total = summary.get("total_db_tables", len(mapping["tables"]))
+    dropped = summary.get("tables_dropped_empty", [])
+    n_declared = len(mapping["declared_relationships"])
+    n_inferred = len(mapping["inferred_relationships"])
+    descs = [
+        mapping["tables"][t].get("description", "")
+        for t in mapping["tables"]
+        if mapping["tables"][t].get("description")
+    ]
+
+    parts = [f'"{db_name}" contains {n_used} tables']
+    if dropped:
+        parts[0] += f' ({len(dropped)} empty table{"s" if len(dropped) > 1 else ""} dropped: {", ".join(dropped)})'
+    if descs:
+        parts.append("covering " + "; ".join(descs[:5]))
+    if n_declared:
+        fk_s = "s" if n_declared > 1 else ""
+        parts.append(f"{n_declared} declared foreign key{fk_s}")
+    if n_inferred:
+        fk_s = "s" if n_inferred > 1 else ""
+        parts.append(f"{n_inferred} inferred relationship{fk_s}")
+    no_pk = summary.get("tables_without_pk", [])
+    if no_pk:
+        parts.append(f"no primary key on {', '.join(no_pk)}")
+
+    short_summary = ". ".join(parts) + "."
+
     return {
         "ok": True,
         "provider": session["provider_name"],
         "snapshot_id": mapping["snapshot_id"],
         "database": session["db_name"],
+        "short_summary": short_summary,
         "tables_used": summary.get("tables_used", len(mapping["tables"])),
         "total_db_tables": summary.get("total_db_tables", len(mapping["tables"])),
         "tables_dropped_empty": summary.get("tables_dropped_empty", []),
-        "declared_relationships": len(mapping["declared_relationships"]),
+        "declared_relationships": n_declared,
         "declared_fk_list": [
             {
                 "from": f"{r['table_name']}.{r['column_name']}",
@@ -104,7 +135,7 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
             }
             for r in mapping["declared_relationships"]
         ],
-        "inferred_relationships": len(mapping["inferred_relationships"]),
+        "inferred_relationships": n_inferred,
         "inferred_fk_list": [
             {
                 "from": f"{r['table']}.{r['column']}",
@@ -115,7 +146,7 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
             for r in mapping["inferred_relationships"]
         ],
         "tables_with_pk": summary.get("tables_with_pk", []),
-        "tables_without_pk": summary.get("tables_without_pk", []),
+        "tables_without_pk": no_pk,
     }
 
 
