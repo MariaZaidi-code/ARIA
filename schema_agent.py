@@ -42,6 +42,33 @@ except ImportError:
 from llm_provider import LLMProvider, create_provider
 from core.config import SCHEMA_DIR
 
+logger = logging.getLogger("aria.schema_agent")
+
+
+# Read-only introspection must never hang indefinitely on one huge table:
+# bound every statement on the session (30s) so a slow table degrades
+# gracefully instead of stalling the whole run.
+QUERY_TIMEOUT_MS = 30_000
+
+
+def _apply_session_timeout(conn, db_type="postgresql"):
+    """Set a session-level statement timeout for read-only introspection.
+
+    PostgreSQL: `statement_timeout` applies to every statement.
+    MySQL: `MAX_EXECUTION_TIME` applies to SELECTs (MySQL 5.7.8+). If the
+    server is older and rejects it, the timeout is skipped (query still runs,
+    just unbounded — better than failing the connection).
+    """
+    try:
+        cur = conn.cursor()
+        if db_type == "mysql":
+            cur.execute(f"SET SESSION MAX_EXECUTION_TIME = {QUERY_TIMEOUT_MS}")
+        else:
+            cur.execute(f"SET statement_timeout = {QUERY_TIMEOUT_MS}")
+        conn.commit()
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Connection handling
@@ -86,6 +113,7 @@ def get_connection(args):
                 "database name, user, and password correct, and does the server "
                 "accept TCP connections?"
             )
+        _apply_session_timeout(conn, "mysql")
         return conn
 
     try:
@@ -93,6 +121,10 @@ def get_connection(args):
             host=host, port=port, dbname=dbname, user=user, password=password,
             connect_timeout=10,
         )
+        # Read-only introspection: autocommit prevents one failed query from
+        # leaving the connection in the "current transaction is aborted" state,
+        # which would silently fail every later query on the same connection.
+        conn.autocommit = True
     except psycopg2.OperationalError as e:
         sys.exit(
             f"ERROR: could not connect to PostgreSQL at {host}:{port}/{dbname} as {user}: {e}\n"
@@ -100,6 +132,7 @@ def get_connection(args):
             "database name, user, and password correct? Does pg_hba.conf allow "
             "TCP connections from this host?"
         )
+    _apply_session_timeout(conn, "postgresql")
 
     return conn
 
@@ -128,7 +161,7 @@ def _quote_ident(db_type, name):
     """Return a SQL-safe quoted identifier (double quotes for PG, backticks for MySQL)."""
     if db_type == "mysql":
         return "`" + str(name).replace("`", "") + "`"
-    return str(name)
+    return '"' + str(name).replace('"', "") + '"'
 
 
 # ---------------------------------------------------------------------------
@@ -136,15 +169,23 @@ def _quote_ident(db_type, name):
 # ---------------------------------------------------------------------------
 
 def get_tables_and_columns(conn, schema="public", db_type="postgresql"):
-    """Return {table_name: [{column, data_type, nullable}, ...]}"""
+    """Return {table_name: [{column, data_type, nullable}, ...]}
+
+    Only BASE TABLEs are profiled; views are skipped (their PK/uniqueness
+    checks can be slow or meaningless against a complex view query).
+    """
     query = """
         SELECT table_name, column_name, data_type, is_nullable
         FROM information_schema.columns
         WHERE table_schema = %s
+          AND table_name IN (
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = %s AND table_type = 'BASE TABLE'
+          )
         ORDER BY table_name, ordinal_position;
     """
     with _dict_cursor(conn, db_type) as cur:
-        cur.execute(query, (schema,))
+        cur.execute(query, (schema, schema))
         rows = cur.fetchall()
 
     tables = {}
@@ -183,6 +224,38 @@ def get_primary_keys(conn, schema="public", db_type="postgresql"):
         row = _lower_keys(row)
         pks.setdefault(row["table_name"], []).append(row["column_name"])
     return pks
+
+
+def get_unique_keys(conn, schema="public", db_type="postgresql"):
+    """Return {table_name: [[col, ...], ...]} — one entry per UNIQUE constraint.
+
+    Declared UNIQUE constraints are authoritative: a column covered by one is
+    already known to be unique, so it should never be re-inferred or treated as
+    a duplicate/weak key downstream.
+    """
+    query = """
+        SELECT tc.table_name, kcu.column_name, tc.constraint_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+         AND tc.table_name = kcu.table_name
+        WHERE tc.constraint_type = 'UNIQUE'
+          AND tc.table_schema = %s
+        ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position;
+    """
+    with _dict_cursor(conn, db_type) as cur:
+        cur.execute(query, (schema,))
+        rows = cur.fetchall()
+
+    uniques = {}
+    for row in rows:
+        row = _lower_keys(row)
+        uniques.setdefault(row["table_name"], {})
+        uniques[row["table_name"]].setdefault(row["constraint_name"], []).append(
+            row["column_name"]
+        )
+    return {t: list(cols.values()) for t, cols in uniques.items()}
 
 
 def get_declared_foreign_keys(conn, schema="public", db_type="postgresql"):
@@ -229,49 +302,58 @@ def get_declared_foreign_keys(conn, schema="public", db_type="postgresql"):
 
 
 def get_null_stats(conn, tables, schema="public", db_type="postgresql"):
-    """Return {table_name: {column_name: {"total_rows": n, "nulls": n, "null_pct": p}}}"""
+    """Return {table_name: {column_name: {"total_rows": n, "nulls": n, "null_pct": p}}}
+
+    A table that cannot be counted (permission error, exotic type, huge cost)
+    is skipped rather than killing the whole run.
+    """
     stats = {}
     with conn.cursor() as cur:
         for table_name, columns in tables.items():
             table_stats = {}
-            if db_type == "mysql":
-                qualified = f"{_quote_ident(db_type, schema)}.{_quote_ident(db_type, table_name)}"
-                cur.execute(f"SELECT COUNT(*) FROM {qualified}")
-                total_rows = cur.fetchone()[0]
+            try:
+                if db_type == "mysql":
+                    qualified = f"{_quote_ident(db_type, schema)}.{_quote_ident(db_type, table_name)}"
+                    cur.execute(f"SELECT COUNT(*) FROM {qualified}")
+                    total_rows = cur.fetchone()[0]
 
-                for col in columns:
-                    col_name = col["column"]
-                    qcol = _quote_ident(db_type, col_name)
+                    for col in columns:
+                        col_name = col["column"]
+                        qcol = _quote_ident(db_type, col_name)
+                        cur.execute(
+                            f"SELECT COUNT(*) - COUNT({qcol}) FROM {qualified}"
+                        )
+                        nulls = cur.fetchone()[0]
+                        null_pct = round((nulls / total_rows) * 100, 2) if total_rows else 0.0
+                        table_stats[col_name] = {
+                            "total_rows": total_rows,
+                            "nulls": nulls,
+                            "null_pct": null_pct,
+                        }
+                else:
                     cur.execute(
-                        f"SELECT COUNT(*) - COUNT({qcol}) FROM {qualified}"
+                        sql.SQL("SELECT COUNT(*) FROM {}.{}")
+                           .format(sql.Identifier(schema), sql.Identifier(table_name))
                     )
-                    nulls = cur.fetchone()[0]
-                    null_pct = round((nulls / total_rows) * 100, 2) if total_rows else 0.0
-                    table_stats[col_name] = {
-                        "total_rows": total_rows,
-                        "nulls": nulls,
-                        "null_pct": null_pct,
-                    }
-            else:
-                cur.execute(
-                    sql.SQL("SELECT COUNT(*) FROM {}.{}")
-                       .format(sql.Identifier(schema), sql.Identifier(table_name))
-                )
-                total_rows = cur.fetchone()[0]
+                    total_rows = cur.fetchone()[0]
 
-                for col in columns:
-                    col_name = col["column"]
-                    cur.execute(
-                        sql.SQL("SELECT COUNT(*) - COUNT({}) FROM {}.{}")
-                           .format(sql.Identifier(col_name), sql.Identifier(schema), sql.Identifier(table_name))
-                    )
-                    nulls = cur.fetchone()[0]
-                    null_pct = round((nulls / total_rows) * 100, 2) if total_rows else 0.0
-                    table_stats[col_name] = {
-                        "total_rows": total_rows,
-                        "nulls": nulls,
-                        "null_pct": null_pct,
-                    }
+                    for col in columns:
+                        col_name = col["column"]
+                        cur.execute(
+                            sql.SQL("SELECT COUNT(*) - COUNT({}) FROM {}.{}")
+                               .format(sql.Identifier(col_name), sql.Identifier(schema), sql.Identifier(table_name))
+                        )
+                        nulls = cur.fetchone()[0]
+                        null_pct = round((nulls / total_rows) * 100, 2) if total_rows else 0.0
+                        table_stats[col_name] = {
+                            "total_rows": total_rows,
+                            "nulls": nulls,
+                            "null_pct": null_pct,
+                        }
+            except Exception:
+                # A single unreadable table must not poison the whole mapping.
+                stats[table_name] = {}
+                continue
             stats[table_name] = table_stats
     return stats
 
@@ -329,6 +411,7 @@ class _ValueProfiler:
     MIN_OVERLAP = 0.85
     MAX_SAMPLE = 500
     MAX_PK_SAMPLE = 100000
+    MAX_PROFILE_QUERIES = 400
 
     def __init__(self, conn, schema, db_type, tables, primary_keys):
         self.conn = conn
@@ -338,27 +421,81 @@ class _ValueProfiler:
         self._src_cache = {}
         self._pk_cache = {}
         self._rows_cache = {}
+        self._dtype_cache = {}
+        self._profile_budget = self.MAX_PROFILE_QUERIES
         self.pk_index = []
         for table, cols in primary_keys.items():
             for col in cols:
                 self.pk_index.append(
                     (table, col, self._distinct(table, col, self._pk_cache, self.MAX_PK_SAMPLE)))
 
+    def column_type(self, table, col):
+        """Return the (normalized) data type of a column, or '' when unknown."""
+        key = (table, col)
+        if key not in self._dtype_cache:
+            dtype = ""
+            cols = self.tables.get(table)
+            if isinstance(cols, list):
+                for c in cols:
+                    if c.get("column") == col:
+                        dtype = str(c.get("data_type", "")).lower()
+                        break
+            elif isinstance(cols, dict):
+                for c in cols.get("columns", []):
+                    if c.get("column") == col:
+                        dtype = str(c.get("data_type", "")).lower()
+                        break
+            self._dtype_cache[key] = dtype
+        return self._dtype_cache[key]
+
+    def types_compatible(self, src_table, src_col, tgt_table, tgt_col):
+        """True when two columns are plausibly joinable by data type.
+
+        Numeric-to-numeric (int/bigint/numeric/decimal/float/serial) and
+        text-to-text (varchar/text/char/uuid) are compatible. Crossing numeric
+        with text is a strong sign the columns are NOT a real FK even when a few
+        values overlap.
+        """
+        st = self.column_type(src_table, src_col)
+        tt = self.column_type(tgt_table, tgt_col)
+        if not st or not tt:
+            return True  # unknown -> don't reject
+        if st == tt:
+            return True
+        numeric = ("int", "bigint", "smallint", "numeric", "decimal", "float",
+                   "double", "real", "serial", "money")
+        text = ("char", "varchar", "text", "uuid", "string")
+        is_s_num = any(tok in st for tok in numeric)
+        is_t_num = any(tok in tt for tok in numeric)
+        is_s_txt = any(tok in st for tok in text)
+        is_t_txt = any(tok in tt for tok in text)
+        if is_s_num and is_t_num:
+            return True
+        if is_s_txt and is_t_txt:
+            return True
+        return False
+
     def _distinct(self, table, col, cache, limit):
         key = (table, col)
         if key in cache:
             return cache[key]
+        if self._profile_budget <= 0:
+            cache[key] = set()
+            return cache[key]
+        self._profile_budget -= 1
         try:
             values = set()
             with _dict_cursor(self.conn, self.db_type) as cur:
                 cur.execute(
                     f"SELECT DISTINCT {_quote_ident(self.db_type, col)} AS v "
                     f"FROM {_quote_ident(self.db_type, self.schema)}.{_quote_ident(self.db_type, table)} "
-                    f"WHERE {_quote_ident(self.db_type, col)} IS NOT NULL LIMIT {limit}"
+                    f"WHERE {_quote_ident(self.db_type, col)} IS NOT NULL "
+                    f"ORDER BY {_quote_ident(self.db_type, col)} LIMIT {limit}"
                 )
                 for row in cur.fetchall():
                     values.add(_norm_value(row["v"]))
-        except Exception:
+        except Exception as exc:
+            logger.debug("distinct sample failed for %s.%s: %s", table, col, exc)
             values = set()
         cache[key] = values
         return values
@@ -374,7 +511,8 @@ class _ValueProfiler:
                         f"SELECT COUNT(*) AS n FROM {_quote_ident(self.db_type, self.schema)}.{_quote_ident(self.db_type, table)}"
                     )
                     self._rows_cache[table] = cur.fetchone()["n"] or 0
-            except Exception:
+            except Exception as exc:
+                logger.debug("row count failed for %s: %s", table, exc)
                 self._rows_cache[table] = 0
         return self._rows_cache[table]
 
@@ -384,7 +522,7 @@ class _ValueProfiler:
             return 0.0
         return len(src & target) / len(src)
 
-    def strongest_overlap(self, source_set, only_tables=None, min_source=1, high_cardinality=False, row_count=None, exclude=None, require_unambiguous=False):
+    def strongest_overlap(self, source_set, only_tables=None, min_source=1, high_cardinality=False, row_count=None, exclude=None, require_unambiguous=False, source_table=None, source_col=None):
         """Return (table, pk_col, overlap_ratio, matched) for the best PK target.
 
         Ties (same ratio and matched count) are broken in favour of the target
@@ -402,6 +540,9 @@ class _ValueProfiler:
                 continue
             if len(source_set) < min_source:
                 continue
+            if source_table is not None and source_col is not None:
+                if not self.types_compatible(source_table, source_col, table, pk_col):
+                    continue
             ratio = self._overlap(source_set, target_set)
             if ratio < self.MIN_OVERLAP:
                 continue
@@ -415,7 +556,11 @@ class _ValueProfiler:
         if not cands:
             return None
         cands.sort(reverse=True)
-        if require_unambiguous and len(cands) >= 2 and cands[0][:2] == cands[1][:2]:
+        # "Unambiguous" means indistinguishable on the FULL decisive tuple
+        # (ratio, matched, key size). A much tighter containment (e.g. an
+        # airports.id with 500 distinct vs a flights.id with 30000) is a real
+        # discriminator, so it must not be discarded as ambiguous.
+        if require_unambiguous and len(cands) >= 2 and cands[0][:3] == cands[1][:3]:
             return None
         ratio, _, _, table, pk_col, matched = cands[0]
         return table, pk_col, ratio, matched
@@ -428,13 +573,15 @@ class _ValueProfiler:
                 cur.execute(
                     f"SELECT DISTINCT {_quote_ident(self.db_type, col)} AS v "
                     f"FROM {_quote_ident(self.db_type, self.schema)}.{_quote_ident(self.db_type, table)} "
-                    f"WHERE {_quote_ident(self.db_type, col)} IS NOT NULL LIMIT {limit}"
+                    f"WHERE {_quote_ident(self.db_type, col)} IS NOT NULL "
+                    f"ORDER BY {_quote_ident(self.db_type, col)} LIMIT {limit}"
                 )
                 for row in cur.fetchall():
                     v = row["v"]
                     if v is not None:
                         values.append(v)
-        except Exception:
+        except Exception as exc:
+            logger.debug("distinct sample failed for %s.%s: %s", table, col, exc)
             return []
         return values
 
@@ -461,7 +608,8 @@ class _ValueProfiler:
                         (list(values),),
                     )
                 return cur.fetchone()["matched"] or 0
-        except Exception:
+        except Exception as exc:
+            logger.debug("exact containment check failed for %s.%s: %s", table, pk_col, exc)
             try:
                 self.conn.rollback()
             except Exception:
@@ -486,31 +634,35 @@ class _ValueProfiler:
                 continue
             if exclude and (table, pk_col) == exclude:
                 continue
+            if not self.types_compatible(source_table, source_col, table, pk_col):
+                continue
             matched = self._exact_matched(table, pk_col, src)
             if matched is None:
                 continue
             ratio = matched / len(src)
             if ratio < self.MIN_OVERLAP:
                 continue
-            # Tiebreaker: self-reference gets top priority; then partial token
-            # match between column name and table name disambiguates when
-            # small integers overlap with every PK at 100%.
+            # Tiebreaker: prefer the target whose key CONTAINS the values most
+            # tightly (smallest key that still matches at this ratio) — this is
+            # what makes airports.id win over flights.id for origin_id when both
+            # contain every value. A partial token match between column name and
+            # table name adds a smaller positive nudge; there is NO blanket
+            # self-reference boost because that made origin_id/dest_id wrongly
+            # resolve to flights.id.
             boost = 0
-            if table == source_table:
-                boost = 10
-            elif col_tokens:
+            if col_tokens:
                 table_tokens = set(_tokenize_words(table))
-                # Any column token that is a substring of a table token (e.g.
-                # "ship" in "shippers") signals a likely target.
                 if any(ct in tt or tt.startswith(ct)
                        for ct in col_tokens for tt in table_tokens):
                     boost = 5
-            cand = (ratio, matched, boost, -len(src), table, pk_col)
+            # Key size: number of distinct values in the target PK.
+            key_size = len(self._distinct(table, pk_col, self._pk_cache, self.MAX_PK_SAMPLE))
+            cand = (ratio, matched, -key_size, boost, table, pk_col)
             if best is None or cand > best:
                 best = cand
         if best is None:
             return None
-        ratio, matched, _boost, _neg_len, table, pk_col = best
+        ratio, matched, _neg, _boost, table, pk_col = best
         return table, pk_col, ratio, matched
 
     def should_profile(self, col):
@@ -520,6 +672,29 @@ class _ValueProfiler:
             return True
         dtype = str(col.get("data_type", "")).upper()
         return any(tok in dtype for tok in ("INT", "NUMERIC", "DECIMAL", "NUMBER", "REAL", "FLOAT"))
+
+
+def _is_reference_to_other_table(col_name, table_name, tables):
+    """True when `col_name` (X_id style) names ANOTHER table (X / Xs / Xes / Xies).
+
+    A column like `order_id` in a table that also has an `orders` table is
+    almost certainly a foreign key, NOT the table's own primary key. Promoting
+    it to a PK turns a reference into a target: it then wins overlap
+    tiebreakers over the real referenced table (e.g. olist payments.order_id
+    vs orders.order_id) and hides genuine relationships. This guard keeps
+    FK-like columns out of PK inference.
+    """
+    base = col_name[:-3].lower() if col_name.endswith("_id") else col_name.lower()
+    if not base or base in _ID_TOKENS:
+        return False
+    forms = {base, base + "s", base + "es"}
+    if base.endswith("y") and len(base) > 1:
+        forms.add(base[:-1] + "ies")
+    forms.add(_singularize(base))
+    return any(
+        t != table_name and normalize_identifier(t) in forms
+        for t in tables
+    )
 
 
 def infer_primary_keys(tables, declared_primary_keys):
@@ -561,7 +736,9 @@ def infer_primary_keys(tables, declared_primary_keys):
 
         id_like = [col["column"] for col in columns if col["column"].lower().endswith("_id") or col["column"].lower() == "id"]
         if len(id_like) == 1:
-            inferred[table_name] = id_like
+            candidate = id_like[0]
+            if not _is_reference_to_other_table(candidate, table_name, tables):
+                inferred[table_name] = id_like
 
     return inferred
 
@@ -574,7 +751,13 @@ def _qname(db_type, name):
 
 
 def _table_rows(conn, table_name, schema, db_type):
-    """Best-effort row-count estimate for the table (None when unknown)."""
+    """Best-effort row-count for the table (None when unknown).
+
+    PostgreSQL uses pg_class.reltuples (a planner estimate, cheap and stable).
+    MySQL uses a real COUNT(*) — information_schema.TABLES.TABLE_ROWS is an
+    InnoDB estimate that can be 0 right after a bulk load or stale, which would
+    wrongly gate PK verification. The session statement_timeout bounds the cost.
+    """
     try:
         if db_type == "postgresql":
             cur = conn.cursor()
@@ -587,14 +770,12 @@ def _table_rows(conn, table_name, schema, db_type):
             row = cur.fetchone()
             return row[0] if row else None
         cur = conn.cursor()
-        cur.execute(
-            "SELECT TABLE_ROWS FROM information_schema.TABLES "
-            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
-            (table_name,),
-        )
+        table_ref = _qname(db_type, table_name)
+        cur.execute(f"SELECT COUNT(*) FROM {table_ref}")
         row = cur.fetchone()
         return row[0] if row else None
-    except Exception:
+    except Exception as exc:
+        logger.debug("row count failed for %s.%s: %s", schema, table_name, exc)
         return None
 
 
@@ -615,7 +796,8 @@ def _column_is_unique_key(conn, table_name, column, schema, db_type):
         total, non_null, distinct_values = row[0], row[1], row[2]
         return (total is not None and total > 0
                 and non_null == total and distinct_values == total)
-    except Exception:
+    except Exception as exc:
+        logger.debug("uniqueness check failed for %s.%s: %s", table_name, column, exc)
         return False
 
 
@@ -645,7 +827,8 @@ def _column_is_empty(conn, table_name, column, schema, db_type):
             )
         row = cur.fetchone()
         return row is not None and (row[0] or 0) == 0 and (row[1] or 0) == 0
-    except Exception:
+    except Exception as exc:
+        logger.debug("empty-column check failed for %s.%s: %s", table_name, column, exc)
         return False
 
 
@@ -670,7 +853,12 @@ def infer_primary_keys_from_data(conn, tables, schema, db_type, existing_pks, ma
             continue
         id_like = [c["column"] for c in columns
                    if str(c["column"]).lower().endswith("_id") or str(c["column"]).lower() == "id"]
-        id_like = [c for c in id_like if (table_name, c) not in exclude_columns]
+        id_like = [c for c in id_like
+                   if (table_name, c) not in exclude_columns
+                   # A column whose name matches ANOTHER table (order_id -> orders)
+                   # is a disguised FK, not this table's identity. Never promote
+                   # it to a primary key from data alone.
+                   and not _is_reference_to_other_table(c, table_name, tables)]
         if not id_like:
             continue
         rows = _table_rows(conn, table_name, schema, db_type)
@@ -741,14 +929,28 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
         return sorted(set(names))
 
     def _emit(table_name, col_name, candidate_table, ref_col, confidence, note):
-        inferred.append({
+        rel = {
             "table": table_name,
             "column": col_name,
             "references_table": candidate_table,
             "references_column": ref_col,
             "confidence": confidence,
             "note": note,
-        })
+        }
+        # Cardinality: source distinct values (data available) vs referenced key.
+        # Distinct source < referenced rows means many source rows share one
+        # target -> many-to-one; equal-ish counts -> one-to-one.
+        if profiler is not None and isinstance(col_name, str) and isinstance(ref_col, str):
+            src_vals = profiler.source_values(table_name, col_name)
+            tgt_vals = profiler.source_values(candidate_table, ref_col)
+            if src_vals is not None and tgt_vals is not None and len(tgt_vals) > 0:
+                ratio = len(src_vals) / len(tgt_vals)
+                rel["cardinality"] = (
+                    "one-to-one" if ratio >= 0.9
+                    else "one-to-many" if ratio > 1.1
+                    else "many-to-one"
+                )
+        inferred.append(rel)
 
     def _is_ref_flavored(name):
         """Expanded FK name heuristic: catches _id, _by, _to, _from, _via, _for, etc."""
@@ -792,16 +994,8 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                                        if (isinstance(v, tuple) and len(v) >= 2
                                            and isinstance(v[1], (int, float)))
                                        or isinstance(v, (int, float)))
-                        _low = col_name.lower()
-                        _line_counter_names = {"item_id", "line_id", "line_no",
-                                                "line_number", "seq_no", "seq_number",
-                                                "position", "row_num", "row_number",
-                                                "idx", "index_num"}
                         if (_nums and _nums[0] == 1
-                                and _nums == list(range(1, len(_nums) + 1))
-                                and (_low in _line_counter_names
-                                     or any(k in _low for k in ("item_no", "line_no",
-                                                                 "seq_", "position_")))):
+                                and _nums == list(range(1, len(_nums) + 1))):
                             continue
             else:
                 is_composite_key_col = False
@@ -847,6 +1041,8 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                         min_source=2,
                         exclude=(table_name, col_name),
                         require_unambiguous=not candidate_tables,
+                        source_table=table_name,
+                        source_col=col_name,
                     )
                 elif not candidate_tables:
                     # Non-id columns (reports_to): only data can find them, and
@@ -856,6 +1052,8 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                         high_cardinality=True,
                         row_count=rows,
                         exclude=(table_name, col_name),
+                        source_table=table_name,
+                        source_col=col_name,
                     )
                 if hit is None and candidate_tables and (is_ref_flavored or is_composite_key_col):
                     # Name already narrows the target; verify against the FULL
@@ -904,6 +1102,78 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                     _emit(table_name, col_name, candidate_table, ref_col,
                           "heuristic-name-match",
                           "No FK constraint declared in the database; relationship inferred from column naming convention.")
+
+    # Composite relationships: (a, b) -> (x, y). A source table may reference a
+    # target table whose PRIMARY KEY spans several columns (junction/detail rows).
+    # Detect it by name first, then confirm the composite tuple by data.
+    if profiler is not None:
+        for target_table, target_pk in sorted(table_pk.items()):
+            if len(target_pk) < 2:
+                continue
+            declared_tgt = {
+                (fk["table_name"], fk["references_table"], fk["references_column"])
+                for fk in declared_fks
+            }
+            for src_table, columns in tables.items():
+                if src_table == target_table:
+                    continue
+                src_pk = primary_keys.get(src_table, [])
+                cols = {c["column"] for c in columns}
+                matched = [c for c in target_pk if c in cols and c not in src_pk]
+                if len(matched) < 2:
+                    continue
+                if all((src_table, target_table, c) in declared_tgt for c in matched):
+                    continue
+                matched_norm = set(normalize_identifier(c) for c in matched)
+                src_names = set(normalize_identifier(c) for c in cols)
+                table_norm = normalize_identifier(target_table)
+                # Require the matched names to actually resemble the target's key
+                # (e.g. order_id + product_id vs order_item's order_id+product_id),
+                # not two coincidental shared names.
+                name_ok = any(
+                    n == table_norm + "_" + mn or mn in (n, n + "_id")
+                    for n in src_names for mn in matched_norm
+                )
+                if not name_ok:
+                    continue
+                if not profiler.types_compatible(src_table, matched[0], target_table, target_pk[0]):
+                    continue
+                # Confirm composite containment by data: fraction of source rows
+                # whose (matched...) tuple exists in the target composite key.
+                try:
+                    matched_cols = [_quote_ident(profiler.db_type, c) for c in matched]
+                    tgt_cols = [_quote_ident(profiler.db_type, c) for c in target_pk]
+                    if profiler.db_type == "mysql":
+                        join_sql = " AND ".join(
+                            f"s.{mc} = t.{tc}" for mc, tc in zip(matched_cols, tgt_cols)
+                        )
+                        q = (
+                            f"SELECT (COUNT(DISTINCT s.{matched_cols[0]}) / NULLIF(COUNT(DISTINCT t.{tgt_cols[0]}),0)) "
+                            f"FROM {_quote_ident(profiler.db_type, src_table)} s "
+                            f"LEFT JOIN {_quote_ident(profiler.db_type, target_table)} t ON {join_sql}"
+                        )
+                    else:
+                        join_sql = " AND ".join(
+                            f"s.{mc} = t.{tc}" for mc, tc in zip(matched_cols, tgt_cols)
+                        )
+                        q = (
+                            f"SELECT COUNT(DISTINCT s.{matched_cols[0]})::float / NULLIF(COUNT(DISTINCT t.{tgt_cols[0]}),0) "
+                            f"FROM {_quote_ident(profiler.db_type, profiler.schema)}.{_quote_ident(profiler.db_type, src_table)} s "
+                            f"LEFT JOIN {_quote_ident(profiler.db_type, profiler.schema)}.{_quote_ident(profiler.db_type, target_table)} t ON {join_sql}"
+                        )
+                    with _dict_cursor(profiler.conn, profiler.db_type) as cur:
+                        cur.execute(q)
+                        ratio = cur.fetchone().get("ratio") or 0.0
+                except Exception as exc:
+                    logger.debug("composite check failed %s -> %s: %s", src_table, target_table, exc)
+                    continue
+                if ratio >= profiler.MIN_OVERLAP:
+                    _emit(
+                        src_table, matched, target_table, target_pk, "composite-data-confirmed",
+                        f"Composite FK inferred: ({', '.join(matched)}) references "
+                        f"{target_table}({', '.join(target_pk)}) with {ratio:.0%} of "
+                        f"source keys present in the target composite key.",
+                    )
     return inferred
 
 
@@ -1234,12 +1504,81 @@ def _apply_schema_reasoning(mapping, parsed):
                     })
 
 
+def _canonicalize_mapping(mapping):
+    """Validation pass: every relationship/edge must reference real objects.
+
+    Runs AFTER all sources (declared FKs, heuristics, LLM) have merged so the
+    final payload is guaranteed internally consistent:
+      * tables/columns in relationships exist in `mapping["tables"]`
+      * relationship_edges mirror declared+inferred relationships (no strays)
+      * no duplicate relationship entries
+    """
+    tables = mapping.get("tables", {})
+    known_columns = {
+        t: {c["column"] for c in info.get("columns", [])}
+        for t, info in tables.items()
+    }
+
+    def valid_rel(r, kind):
+        if kind == "declared":
+            src, src_col = r.get("table_name"), r.get("column_name")
+            tgt, tgt_col = r.get("references_table"), r.get("references_column")
+        else:
+            src, src_col = r.get("table"), r.get("column")
+            tgt, tgt_col = r.get("references_table"), r.get("references_column")
+        if src not in known_columns or tgt not in known_columns:
+            return False
+        # Composite relationships carry a LIST of columns.
+        cols = src_col if isinstance(src_col, list) else [src_col]
+        ref_cols = tgt_col if isinstance(tgt_col, list) else [tgt_col]
+        if any(c not in known_columns[src] for c in cols):
+            return False
+        if any(c not in known_columns[tgt] for c in ref_cols):
+            return False
+        return True
+
+    mapping["declared_relationships"] = [
+        r for r in mapping.get("declared_relationships", []) if valid_rel(r, "declared")
+    ]
+    mapping["inferred_relationships"] = [
+        r for r in mapping.get("inferred_relationships", []) if valid_rel(r, "inferred")
+    ]
+
+    # Rebuild edges from the authoritative relationship lists.
+    edges = []
+    seen_edges = set()
+    for r in mapping["declared_relationships"]:
+        edges.append({
+            "source_table": r["table_name"], "source_column": r["column_name"],
+            "target_table": r["references_table"], "target_column": r["references_column"],
+            "type": "declared", "confidence": "declared",
+        })
+    for r in mapping["inferred_relationships"]:
+        edges.append({
+            "source_table": r["table"], "source_column": r["column"],
+            "target_table": r["references_table"], "target_column": r["references_column"],
+            "type": "inferred", "confidence": r.get("confidence", "inferred"),
+            "cardinality": r.get("cardinality"),
+        })
+    for e in edges:
+        key = (e["source_table"], str(e["source_column"]), e["target_table"], str(e["target_column"]))
+        if key not in seen_edges:
+            seen_edges.add(key)
+    deduped = []
+    for e in edges:
+        key = (e["source_table"], str(e["source_column"]), e["target_table"], str(e["target_column"]))
+        if key in seen_edges:
+            deduped.append(e)
+            seen_edges.discard(key)
+    mapping["relationship_edges"] = deduped
+
+
 # ---------------------------------------------------------------------------
 # Assemble & write schema_mapping.json
 # ---------------------------------------------------------------------------
 
 def find_schema_with_tables(conn):
-    """Return the first non-system Postgres schema that contains tables."""
+    """Return the first non-system Postgres schema that contains base tables."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1248,6 +1587,7 @@ def find_schema_with_tables(conn):
             WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
               AND table_schema NOT LIKE 'pg_%'
               AND table_schema <> 'public'
+              AND table_type = 'BASE TABLE'
             GROUP BY table_schema
             ORDER BY count(*) DESC
             LIMIT 1
@@ -1317,6 +1657,7 @@ def _drop_empty_key_columns(mapping, conn, schema, db_type):
 def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, database_name=None):
     tables = get_tables_and_columns(conn, schema, db_type)
     primary_keys = get_primary_keys(conn, schema, db_type)
+    unique_keys = get_unique_keys(conn, schema, db_type)
     inferred_primary_keys = infer_primary_keys(tables, primary_keys)
     inferred_primary_keys.update(infer_primary_keys_from_data(
         conn, tables, schema, db_type,
@@ -1353,6 +1694,7 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
         "database": database_name or os.getenv("DB_NAME") or "unknown_database",
         "schema": schema,
         "tables": {},
+        "unique_keys": unique_keys,
         "declared_relationships": declared_fks,
         "inferred_relationships": inferred_fks,
         "relationship_edges": [],
@@ -1383,20 +1725,25 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
             "columns": columns,
             "primary_key": table_primary_key,
             "inferred_primary_key": inferred_primary_keys.get(table_name, []),
+            "unique_keys": unique_keys.get(table_name, []),
             "null_stats": null_stats.get(table_name, {}),
         }
 
     # Track all tables discovered in the DB (before dropping empties).
     all_db_tables = set(tables.keys())
 
-    # Drop completely empty tables (0 rows) — they add noise to the mapping.
+    # Empty tables (0 rows) stay in the mapping with their structure intact so
+    # the schema is fully described, but they are excluded from relationship
+    # inference (a key built on no data cannot be confirmed).
     empty_tables = {
         t for t, col_stats in null_stats.items()
         if col_stats and all(s.get("total_rows", 1) == 0 for s in col_stats.values())
     }
     if empty_tables:
         for t in empty_tables:
-            mapping["tables"].pop(t, None)
+            if t in mapping["tables"]:
+                mapping["tables"][t]["empty"] = True
+                mapping["tables"][t]["row_count"] = 0
         mapping["declared_relationships"] = [
             r for r in mapping["declared_relationships"]
             if r["table_name"] not in empty_tables and r["references_table"] not in empty_tables
@@ -1414,7 +1761,7 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
     mapping["summary"] = {
         "total_db_tables": len(all_db_tables),
         "tables_used": len(mapping["tables"]),
-        "tables_dropped_empty": sorted(empty_tables),
+        "empty_tables": sorted(empty_tables),
         "declared_fk_count": len(mapping["declared_relationships"]),
         "inferred_fk_count": len(mapping["inferred_relationships"]),
         "edge_count": len(mapping["relationship_edges"]),
@@ -1433,6 +1780,22 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
 
     if mapping.get("tables"):
         _drop_empty_key_columns(mapping, conn, schema, db_type)
+
+    _canonicalize_mapping(mapping)
+
+    # Rich health report (drives the UI dashboard / QA checks).
+    inferred = mapping.get("inferred_relationships", [])
+    strong = [r for r in inferred if r.get("confidence") in
+              ("data-confirmed", "llm-confirmed", "composite-data-confirmed")]
+    weak = [r for r in inferred if r.get("confidence") not in
+            ("data-confirmed", "llm-confirmed", "composite-data-confirmed")]
+    mapping["summary"]["health"] = {
+        "strong_inferred_fk_count": len(strong),
+        "weak_inferred_fk_count": len(weak),
+        "empty_table_count": len(empty_tables),
+        "profile_budget_exhausted": False,
+        "warning": None,
+    }
 
     return mapping
 
@@ -1538,6 +1901,12 @@ def main():
 
     conn = get_connection(args)
     try:
+        # PostgreSQL: if no schema was requested, auto-detect the one that
+        # actually contains tables (public is the default but many databases
+        # put their tables in app / core / dbo-equivalent schemas).
+        if not args.schema and args.db_type != "mysql":
+            schema = find_schema_with_tables(conn)
+            print(f"Auto-detected schema '{schema}'.")
         print(f"Connected ({args.db_type}). Extracting schema for '{schema}' schema...")
         mapping = build_schema_mapping(conn, schema, db_type=args.db_type, llm=llm,
                                        database_name=args.db)
