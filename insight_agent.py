@@ -187,6 +187,8 @@ class InsightAgent:
         trends = []
         for dt_col in datetime_cols[:1]:
             ts = pd.to_datetime(df[dt_col], errors="coerce")
+            if getattr(ts.dt, "tz", None) is not None:
+                ts = ts.dt.tz_localize(None)
             temp = df.copy()
             temp["_date"] = ts
             for num_col in numeric_cols:
@@ -419,6 +421,8 @@ class InsightAgent:
         # ---- 2) Datetime -> numeric (time series) ----
         if datetime_cols and measures_all:
             ts = pd.to_datetime(df[datetime_cols[0]], errors="coerce")
+            if getattr(ts.dt, "tz", None) is not None:
+                ts = ts.dt.tz_localize(None)
             temp = df.copy()
             temp["_date"] = ts
             temp = temp.dropna(subset=["_date"]).sort_values("_date")

@@ -32,12 +32,7 @@ from sqlalchemy import create_engine, text
 
 from llm_provider import LLMProvider, create_provider
 from core.validation import unknown_sql_tables, empty_sql_tables, unknown_sql_columns
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from core.config import SCHEMA_DIR, BASE_DIR
 
 try:
     from langgraph.graph import END, StateGraph
@@ -61,13 +56,26 @@ DEFAULT_DB_URI = (
 
 
 class GoalAgent:
-    def __init__(self, schema_json_path="schema_mapping_latest.json", db_uri=None,
+    def __init__(self, schema_json_path=None, db_uri=None,
                  provider=None, dialect="postgresql"):
-        schema_file = Path(schema_json_path)
+        if schema_json_path:
+            schema_file = Path(schema_json_path)
+        else:
+            # Absolute project-relative default so the process CWD never matters.
+            schema_file = SCHEMA_DIR / "schema_mapping_latest.json"
         if not schema_file.exists():
-            fallback = Path("schema_mapping.json")
+            # Absolute project-relative fallback so the process CWD never matters.
+            fallback = BASE_DIR / "schema_mapping.json"
             if fallback.exists():
                 schema_file = fallback
+        if not schema_file.exists():
+            available = sorted(p.name for p in SCHEMA_DIR.glob("schema_mapping_*.json"))
+            raise FileNotFoundError(
+                f"Schema mapping not found: {schema_file}. "
+                + (f"Available mappings: {', '.join(available)}."
+                   if available
+                   else "Run the schema extraction first (python schema_agent.py <database>).")
+            )
         with open(schema_file, "r", encoding="utf-8") as f:
             self.full_schema = json.load(f)
 
@@ -85,10 +93,21 @@ class GoalAgent:
     # ------------------------------------------------------------------
 
     def _normalize_schema(self, raw_schema):
+        raw_tables = raw_schema.get("tables", {})
+        if not isinstance(raw_tables, dict) or not raw_tables:
+            available = sorted(p.name for p in SCHEMA_DIR.glob("schema_mapping_*.json"))
+            raise ValueError(
+                "Schema mapping has no tables (stale or hand-edited JSON?). "
+                + (f"Available mappings: {', '.join(available)}."
+                   if available
+                   else "Re-run the schema extraction for this database.")
+            )
+
         tables = {}
         all_edges = raw_schema.get("relationship_edges", [])
         declared = raw_schema.get("declared_relationships", [])
         inferred = raw_schema.get("inferred_relationships", [])
+        known_tables = set(raw_tables)
 
         def add_fk(table_name, source_column, target_table, target_column, rel_type, confidence=None):
             tables.setdefault(table_name, {
@@ -139,6 +158,21 @@ class GoalAgent:
             add_fk(rel.get("table"), rel.get("column"),
                    rel.get("references_table"), rel.get("references_column"),
                    "inferred", rel.get("confidence"))
+
+        for table_name, info in tables.items():
+            for fk in info.get("foreign_keys", []):
+                target = fk["referenced_table"]
+                if target and target not in tables:
+                    logging.warning(
+                        "Schema mapping references unknown table '%s' from %s.%s "
+                        "(stale/manually-edited JSON?)",
+                        target, table_name, fk.get("column"),
+                    )
+                elif target and fk.get("referenced_column") not in tables[target]["columns"]:
+                    logging.warning(
+                        "Schema mapping references unknown column '%s.%s' from %s.%s",
+                        target, fk.get("referenced_column"), table_name, fk.get("column"),
+                    )
 
         return tables
 
@@ -231,18 +265,22 @@ class GoalAgent:
         return score
 
     def _expand_with_neighbors(self, selected, limit=4):
+        """Expand the selected tables through FK neighbors, depth-bounded so
+        unrelated tables further out in the graph never get pulled in."""
         expanded = set(selected)
-        queue = list(selected)
+        queue = [(t, 0) for t in selected]
         visited = set()
         while queue and len(expanded) < limit * 2:
-            current = queue.pop(0)
+            current, depth = queue.pop(0)
             if current in visited:
                 continue
             visited.add(current)
+            if depth >= 2:
+                continue
             for neighbor in self.relationship_graph.get(current, []):
-                if neighbor in self.tables:
+                if neighbor in self.tables and neighbor not in expanded:
                     expanded.add(neighbor)
-                    queue.append(neighbor)
+                    queue.append((neighbor, depth + 1))
         return list(expanded)
 
     def _get_relevant_tables(self, user_goal, max_tables=3):
@@ -368,10 +406,15 @@ class GoalAgent:
         # Small local models often ECHO the prompt's instruction sentences into
         # the answer ("with null values last. The final SQL statement is
         # provided without explanations or markdown; ..."). A real statement is
-        # SELECT, or a genuine CTE (WITH <name> AS). Plain English "with ..."
-        # must NOT be mistaken for a WITH clause (it silently corrupts the SQL).
+        # SELECT, or a genuine CTE (WITH <name> AS ( ... )). Plain English
+        # "with ..." must NOT be mistaken for a WITH clause (it silently
+        # corrupts the SQL), and the statement start must be the FIRST
+        # top-level keyword: taking the last SELECT would capture inner
+        # SELECTs from subqueries/CTEs and corrupt the query.
         stmt_pattern = re.compile(
-            r"\bWITH\s+[A-Za-z_]\w*\s+AS\b|\bSELECT\b", re.IGNORECASE
+            r"\bWITH\s+[A-Za-z_]\w*\s+AS\s*\(|\bSELECT\b|"
+            r"\bINSERT\s+INTO\b|\bUPDATE\b|\bDELETE\s+FROM\b",
+            re.IGNORECASE,
         )
         tail_pattern = re.compile(
             r"(?i)\b(the final sql statement|without explanations|no explanations|"
@@ -381,10 +424,10 @@ class GoalAgent:
         )
         statements = []
         for fragment in cleaned.split(";"):
-            matches = list(stmt_pattern.finditer(fragment))
-            if not matches:
+            match = stmt_pattern.search(fragment)
+            if not match:
                 continue
-            frag = fragment[matches[-1].start():].strip()
+            frag = fragment[match.start():].strip()
             cut = tail_pattern.search(frag)
             if cut:
                 frag = frag[:cut.start()].strip()
@@ -649,6 +692,168 @@ class GoalAgent:
         injection = " " + " ".join(joins)
         new_sql = sql[:inject_at] + injection + " " + sql[inject_at:]
         return new_sql, len(joins)
+
+    def _join_clauses(self, sql):
+        """Return (start, end, table, on_start, on_end) for every JOIN clause,
+        where on_start/on_end span the ON condition (None if no ON clause)."""
+        clauses = []
+        pos = 0
+        while True:
+            m = re.search(
+                r"\bJOIN\s+([\"'`]?)([A-Za-z_][A-Za-z0-9_]*)\1\b",
+                sql[pos:], re.IGNORECASE,
+            )
+            if not m:
+                break
+            start = pos + m.start()
+            table = m.group(2)
+            after = pos + m.end()
+            tail = sql[after:]
+            am = re.match(r"\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)\b", tail, re.IGNORECASE)
+            if not am:
+                am = re.match(r"\s+([A-Za-z_][A-Za-z0-9_]*)\b", tail, re.IGNORECASE)
+                if am and am.group(1).lower() in self._SQL_KEYWORDS:
+                    am = None
+            if am:
+                after += am.end()
+            om = re.search(r"\bON\b", sql[after:], re.IGNORECASE)
+            if not om:
+                end = self._clause_end(sql, after)
+                clauses.append((start, end, table, None, None))
+            else:
+                cond_start = after + om.end()
+                cond_end = self._clause_end(sql, cond_start)
+                clauses.append((start, cond_end, table, cond_start, cond_end))
+            pos = cond_end if om else end
+        return clauses
+
+    def _repair_unknown_columns(self, sql, columns_by_table, bad_columns):
+        """Deterministically fix hallucinated column references WITHOUT an LLM.
+
+        Handles two failure modes the LLM repair loop repeatedly fails on:
+          1. `tbl.col` where `col` actually lives on another table in the query's
+             schema -> rewrite the qualifier to the owning table (the missing-FROM
+             guard then injects the required FK join).
+          2. a JOIN whose ON condition uses an unresolvable column -> drop that
+             hallucinated JOIN entirely (only when the joined table is not used
+             anywhere else in the query).
+
+        JOIN ON predicates whose rewrite would self-compare the same table
+        (``rooms.room_id = rooms.room_id``) are refused and instead dropped or
+        left for the LLM. Returns (repaired_sql, changed).
+        """
+        if not bad_columns or not sql:
+            return sql, False
+        bad_set = {b.lower() for b in bad_columns}
+        table_cols_lc = {t: {c.lower() for c in cols} for t, cols in columns_by_table.items()}
+        col_owners = {}
+        for t, cols in table_cols_lc.items():
+            for c in cols:
+                col_owners.setdefault(c, []).append(t)
+        struct = self._sql_structure(sql)
+        in_from_lc = {t.lower() for t in struct["in_from"]}
+
+        def resolve_prefix(prefix):
+            p = prefix.lower()
+            if p in struct["alias_to_name"]:
+                return struct["alias_to_name"][p].lower()
+            if p in table_cols_lc:
+                return p
+            cands = [t for t in table_cols_lc if t.startswith(p)]
+            return cands[0].lower() if len(cands) == 1 else None
+
+        def near_match(table, col):
+            norm = re.sub(r"[^a-z0-9]", "", col.lower())
+            for c in table_cols_lc.get(table, ()):
+                if re.sub(r"[^a-z0-9]", "", c) == norm:
+                    return c
+            for c in table_cols_lc.get(table, ()):
+                if len(c) >= 4 and (norm.rstrip("s") == c.rstrip("s") or norm == c[:-1]):
+                    return c
+            return None
+
+        on_regions = [(s, e) for (_, _, _, s, e) in self._join_clauses(sql) if s is not None]
+
+        def other_side_table(pos, on_start, on_end):
+            """Resolve the table of the operand on the other side of the `=`
+            nearest to `pos` within an ON condition."""
+            seg = sql[on_start:on_end]
+            local = pos - on_start
+            eq = seg.rfind("=", 0, local)
+            eq2 = seg.find("=", local)
+            bounds = []
+            if eq != -1:
+                bounds.append((seg.rfind("=", 0, eq - 1), eq))
+            if eq2 != -1:
+                bounds.append((eq, seg.find("=", eq2 + 1)))
+            region = None
+            for lo, hi in bounds:
+                if lo <= local <= hi:
+                    region = seg[lo + 1:hi if hi != -1 else len(seg)]
+                    break
+            if not region:
+                return None
+            m = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\b", region)
+            return resolve_prefix(m.group(1)) if m else None
+
+        def in_on(pos):
+            return next(((s, e) for s, e in on_regions if s <= pos < e), None)
+
+        # --- pass 1: rewrite qualifiers to the column's real owner -------------
+        replacements = []
+        for m in re.finditer(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*|\*)\b", sql
+        ):
+            prefix, col = m.group(1), m.group(2)
+            if col == "*":
+                continue
+            tbl = resolve_prefix(prefix)
+            if tbl is None or f"{tbl}.{col}".lower() not in bad_set:
+                continue
+            real = near_match(tbl, col)
+            if real:
+                replacements.append((m.start(), m.end(), f"{prefix}.{real}"))
+                continue
+            owners = [t for t in col_owners.get(col.lower(), []) if t != tbl and t not in in_from_lc]
+            if len(owners) != 1:
+                continue
+            region = in_on(m.start())
+            if region:
+                other = other_side_table(m.start(), region[0], region[1])
+                if other == owners[0]:
+                    continue  # would become X.x = X.x (self-comparison); drop/LLM instead
+            replacements.append((m.start(), m.end(), f"{owners[0]}.{col}"))
+        if replacements:
+            out = sql
+            for start, end, repl in sorted(replacements, reverse=True):
+                out = out[:start] + repl + out[end:]
+            if not unknown_sql_columns(out, columns_by_table):
+                return out, True
+
+        # --- pass 2: drop hallucinated JOINs (unresolvable ON column) ----------
+        for (start, end, table, on_start, on_end) in self._join_clauses(sql):
+            if on_start is None:
+                continue
+            cond = sql[on_start:on_end]
+            used_elsewhere = False
+            alias = struct["alias_to_name"].get(table)
+            for token in {table, alias} - {None}:
+                remaining = sql[:start] + sql[end:]
+                if re.search(rf"\b{re.escape(token)}\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\b",
+                             remaining, re.IGNORECASE):
+                    used_elsewhere = True
+                    break
+            if used_elsewhere:
+                continue
+            cond_bad = [b for b in bad_set if re.search(
+                rf"\b{re.escape(b.split('.')[0])}\s*\.\s*{re.escape(b.split('.')[1])}\b",
+                cond, re.IGNORECASE)]
+            if not cond_bad:
+                continue
+            out = sql[:start] + sql[end:]
+            if not unknown_sql_columns(out, columns_by_table):
+                return out.strip(), True
+        return sql, False
 
     def _find_bare_select_star(self, sql):
         """Return a short description if `sql` is a bare `SELECT *` (no aggregate
@@ -921,6 +1126,16 @@ No explanations, no markdown.
             # on `order_details`). Deterministic + provider-agnostic.
             bad_columns = unknown_sql_columns(current_sql, columns_by_table)
             if bad_columns:
+                repaired, changed = self._repair_unknown_columns(
+                    current_sql, columns_by_table, bad_columns
+                )
+                if changed:
+                    logging.warning(
+                        f"SQL referenced unknown column(s) {bad_columns}; "
+                        f"repaired deterministically (no LLM)."
+                    )
+                    current_sql = repaired
+                    continue
                 if attempt >= retries:
                     raise RuntimeError(
                         f"Generated SQL referenced columns that do not exist "
@@ -1560,7 +1775,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     agent = GoalAgent(
-        schema_json_path="schema_mapping_latest.json",
+        schema_json_path=str(SCHEMA_DIR / "schema_mapping_latest.json"),
         db_uri=DEFAULT_DB_URI,
     )
 

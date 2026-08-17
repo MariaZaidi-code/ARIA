@@ -90,15 +90,26 @@ Rules:
     def _parse_actions(text, max_actions):
         actions = []
         for line in str(text).splitlines():
-            line = line.strip()
+            line = line.strip().replace("*", "").strip()
             if not line:
                 continue
-            m = re.match(r"^\s*(?:\d+[\.\)]|[-*]|\u2022)\s+(.*)$", line)
+            m = re.match(r"^\s*(?:\d+[\.\)]\s*[\.\)\:]?|[-*]\s*|\u2022\s*)\s*(.*)$", line)
             if m and m.group(1).strip():
                 actions.append(m.group(1).strip())
             if len(actions) >= max_actions:
                 break
-        return actions
+        if actions:
+            return actions[:max_actions]
+
+        # The model ignored the list format and returned prose. Split the text
+        # into sentences so each actionable instruction survives as its own item.
+        flat = re.sub(r"\s+", " ", str(text)).strip()
+        if not flat:
+            return []
+        sentences = [s.strip().rstrip(".") for s in re.split(r"(?<=[.!?])\s+", flat) if s.strip()]
+        if len(sentences) >= 2:
+            return sentences[:max_actions]
+        return [flat[:200]] if flat else []
 
     @staticmethod
     def _template_actions(kpis, trends, anomalies, hypotheses, predictions, max_actions):

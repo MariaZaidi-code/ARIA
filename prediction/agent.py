@@ -136,10 +136,17 @@ class PredictionAgent:
                 return low.endswith("_id") or low.endswith("_key") or low in ("id", "key", "code", "codeid")
 
             measure_cols = [c for c in numeric_cols if not _is_id_like(c)]
-            pool = measure_cols or numeric_cols
+            if not measure_cols:
+                # Only identifier-like numeric columns exist (e.g. an aggregate
+                # that only selected keys). Forecasting a synthetic key is
+                # meaningless, so degrade gracefully instead of guessing.
+                return self._empty(
+                    "no measure column to forecast (only id/key/code columns are numeric)",
+                    "not_applicable",
+                )
             numeric_col = next(
-                (c for c in pool if c.lower() in goal or goal in c.lower()),
-                pool[-1],  # measures usually come after id columns in SELECT order
+                (c for c in measure_cols if c.lower() in goal or goal in c.lower()),
+                measure_cols[-1],  # measures usually come after id columns in SELECT order
             )
         if numeric_col not in df.columns:
             return self._empty(f"numeric column '{numeric_col}' not found", "no_data")
@@ -150,6 +157,8 @@ class PredictionAgent:
 
         if datetime_col is not None:
             ts = pd.to_datetime(df[datetime_col], errors="coerce")
+            if getattr(ts.dt, "tz", None) is not None:
+                ts = ts.dt.tz_localize(None)
             mask = ts.notna()
             if mask.sum() >= 3:
                 temp = df[mask].copy()

@@ -5,7 +5,7 @@ import re
 from fastapi import Depends, Header, HTTPException, Request
 
 import auth
-from core.config import SESSION
+from core.config import get_session_for_request
 
 _MOBILE_RE = re.compile(
     r"Mobile|Android|iPhone|iPad|iPod|Windows Phone|BlackBerry|IEMobile|Opera Mini|Silk",
@@ -21,19 +21,23 @@ def is_mobile(request: Request) -> bool:
     return bool(_MOBILE_RE.search(request.headers.get("user-agent", "")))
 
 
-def require_provider():
-    """Fail unless an LLM provider is active in the session."""
-    if not SESSION["provider"]:
+def require_provider(request: Request):
+    """Fail unless an LLM provider is active in the request-scoped session."""
+    session = get_session_for_request(request)
+    if not session["provider"]:
         raise HTTPException(status_code=400, detail="Choose an LLM provider and connect a source first (POST /api/connect).")
-    return SESSION["provider"]
+    return session["provider"]
 
 
-def require_data():
+def require_data(request: Request):
     """Require a provider plus a usable source (relational DB or uploaded CSV/PDF)."""
-    provider = require_provider()
-    if SESSION["source_type"] == "relational" and not SESSION["db"]:
+    session = get_session_for_request(request)
+    provider = session["provider"]
+    if not provider:
+        raise HTTPException(status_code=400, detail="Choose an LLM provider and connect a source first (POST /api/connect).")
+    if session["source_type"] == "relational" and not session["db"]:
         raise HTTPException(status_code=400, detail="Connect to a relational database first (POST /api/connect).")
-    if SESSION["source_type"] == "semi-structured" and not SESSION["db_uri"]:
+    if session["source_type"] == "semi-structured" and not session["db_uri"]:
         raise HTTPException(status_code=400, detail="Upload a CSV or PDF file first (POST /api/connect_file).")
     return provider
 

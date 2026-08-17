@@ -49,6 +49,12 @@ def validate_goal_text(goal: str) -> str:
     if len(tokens) < 2:
         raise HTTPException(status_code=400, detail="Please write a fuller business question, e.g. 'Which product has the highest revenue?'")
 
+    # Single-letter tokens ("a b c d e f g", "x y") add no meaning: a real
+    # question needs at least a couple of proper words.
+    real_words = [t for t in tokens if len(t) >= 2]
+    if len(real_words) < 2:
+        raise HTTPException(status_code=400, detail="That doesn't look like a real question. Please type a meaningful business goal.")
+
     for token in tokens:
         if re.fullmatch(r"(.)\1{3,}", token):
             raise HTTPException(status_code=400, detail="That doesn't look like a real question. Please type a meaningful business goal.")
@@ -59,8 +65,8 @@ def validate_goal_text(goal: str) -> str:
         if token in _GIBSMASH:
             raise HTTPException(status_code=400, detail="That doesn't look like a real question. Please type a meaningful business goal.")
 
-    content_tokens = [t for t in tokens if t not in _GOAL_STOPWORDS]
-    if not content_tokens:
+    content_words = [t for t in real_words if t not in _GOAL_STOPWORDS]
+    if not content_words:
         raise HTTPException(status_code=400, detail="That doesn't look like a real question. Please type a meaningful business goal.")
 
     return cleaned
