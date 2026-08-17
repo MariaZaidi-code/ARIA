@@ -28,3 +28,4 @@ tmp_*.json
 # timestamped schema snapshots (keep the canonical *_latest.json)
 schema_mapping_*_20[0-9][0-9]*.json
 schema_mapping*.json
+.vscode/
