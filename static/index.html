@@ -553,44 +553,35 @@ async function extractSchema() {
   try {
     const r = await api("/api/extract_schema", {});
     lastExtract = r;
-    setStatus("schema_status", `Schema extracted for ${r.database}.`, true);
-    renderSchemaOverview(r);
+    renderSchemaReport(r);
     getSuggestions();
   } catch (e) { setStatus("schema_status", String(e.message), false); }
   enable("btn_schema");
 }
 
-function renderSchemaOverview(r) {
-  const box = $("schema_box");
-  let html = `<div style="margin-bottom:14px;font-size:13px;color:var(--text);line-height:1.6">`;
-  html += `<b style="color:var(--accent)">${r.database}</b><br>`;
-  html += `Tables in DB: <b>${r.total_db_tables}</b> &middot; Used: <b>${r.tables_used}</b>`;
+function renderSchemaReport(r) {
+  const el = $("schema_status");
+  let h = `<div style="font-size:12px;color:var(--text);line-height:1.7">`;
+  h += `<b style="color:var(--accent);font-size:13px">${r.database}</b><br>`;
+  h += `Tables in DB: <b>${r.total_db_tables}</b> &middot; Used: <b>${r.tables_used}</b>`;
   if (r.tables_dropped_empty && r.tables_dropped_empty.length > 0) {
-    html += ` &middot; Dropped (empty): <b style="color:#f87171">${r.tables_dropped_empty.join(", ")}</b>`;
+    h += `<br>Dropped (empty): <b style="color:#f87171">${r.tables_dropped_empty.join(", ")}</b>`;
   }
-  html += `<br>`;
-  html += `Primary Keys: <b>${r.tables_with_pk.length}</b> tables`;
+  h += `<br>Primary Keys: <b>${r.tables_with_pk.length}</b> tables have PK`;
   if (r.tables_without_pk && r.tables_without_pk.length > 0) {
-    html += ` &middot; No PK: <b style="color:#f87171">${r.tables_without_pk.join(", ")}</b>`;
+    h += `<br>No PK: <b style="color:#f87171">${r.tables_without_pk.join(", ")}</b>`;
   }
-  html += `</div>`;
-
-  html += `<div class="badge" style="background:#164e63;color:#7dd3fc;font-size:12px;padding:4px 10px;margin-bottom:6px">Declared FKs: ${r.declared_relationships}</div>`;
+  h += `<br><br><b>Declared FKs (${r.declared_relationships}):</b><br>`;
   if (r.declared_fk_list && r.declared_fk_list.length > 0) {
-    r.declared_fk_list.forEach(fk => {
-      html += `<div class="badge" style="font-size:11px">${fk.from} → ${fk.to}</div>`;
-    });
-  }
-  html += `<br>`;
-
-  html += `<div class="badge" style="background:#3b0764;color:#c084fc;font-size:12px;padding:4px 10px;margin:8px 0 6px">Inferred FKs: ${r.inferred_relationships}</div>`;
+    r.declared_fk_list.forEach(fk => { h += `<span style="color:var(--muted)">${fk.from}</span> → <span style="color:var(--muted)">${fk.to}</span><br>`; });
+  } else { h += `(none)<br>`; }
+  h += `<b>Inferred FKs (${r.inferred_relationships}):</b><br>`;
   if (r.inferred_fk_list && r.inferred_fk_list.length > 0) {
-    r.inferred_fk_list.forEach(fk => {
-      html += `<div class="badge" style="font-size:11px">${fk.from} → ${fk.to} <span style="color:var(--ok)">[${fk.confidence}]</span></div>`;
-    });
-  }
-
-  box.innerHTML = html;
+    r.inferred_fk_list.forEach(fk => { h += `<span style="color:var(--muted)">${fk.from}</span> → <span style="color:var(--muted)">${fk.to}</span> <span style="color:var(--ok)">[${fk.confidence}]</span><br>`; });
+  } else { h += `(none)<br>`; }
+  h += `</div>`;
+  el.innerHTML = h;
+  el.className = "status ok";
 }
 
 async function loadSchema() {
