@@ -462,6 +462,10 @@ class _ValueProfiler:
                     )
                 return cur.fetchone()["matched"] or 0
         except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             return None
 
     def strongest_exact_overlap(self, source_table, source_col, target_tables, exclude=None):
@@ -475,6 +479,7 @@ class _ValueProfiler:
         src = self._distinct_raw(source_table, source_col, self.MAX_SAMPLE)
         if len(src) < 2:
             return None
+        col_tokens = set(_tokenize_words(source_col))
         best = None
         for table, pk_col, _ in self.pk_index:
             if table not in target_tables:
@@ -487,12 +492,25 @@ class _ValueProfiler:
             ratio = matched / len(src)
             if ratio < self.MIN_OVERLAP:
                 continue
-            cand = (ratio, matched, table, pk_col)
+            # Tiebreaker: self-reference gets top priority; then partial token
+            # match between column name and table name disambiguates when
+            # small integers overlap with every PK at 100%.
+            boost = 0
+            if table == source_table:
+                boost = 10
+            elif col_tokens:
+                table_tokens = set(_tokenize_words(table))
+                # Any column token that is a substring of a table token (e.g.
+                # "ship" in "shippers") signals a likely target.
+                if any(ct in tt or tt.startswith(ct)
+                       for ct in col_tokens for tt in table_tokens):
+                    boost = 5
+            cand = (ratio, matched, boost, -len(src), table, pk_col)
             if best is None or cand > best:
                 best = cand
         if best is None:
             return None
-        ratio, matched, table, pk_col = best
+        ratio, matched, _boost, _neg_len, table, pk_col = best
         return table, pk_col, ratio, matched
 
     def should_profile(self, col):
@@ -732,6 +750,19 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
             "note": note,
         })
 
+    def _is_ref_flavored(name):
+        """Expanded FK name heuristic: catches _id, _by, _to, _from, _via, _for, etc."""
+        low = name.lower()
+        if low == "id":
+            return True
+        for suffix in ("_id", "_by", "_to", "_from", "_via", "_for", "_at",
+                        "_with", "_against", "_on", "_of", "_type"):
+            if low.endswith(suffix):
+                return True
+        if low.endswith("id") and len(low) > 2:
+            return True
+        return False
+
     inferred = []
     for table_name, columns in tables.items():
         for col in columns:
@@ -751,11 +782,10 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
             else:
                 is_composite_key_col = False
 
-            is_ref_flavored = (col_name.endswith("_id") or col_name.endswith("id")
-                               or col_name.lower() == "id")
+            is_ref_flavored = _is_ref_flavored(col_name)
             if not is_ref_flavored:
-                # Data-only candidates must still look plausibly reference-ish so
-                # we do not scan every text column of every table.
+                # When connected, allow numeric/UUID columns through — they may
+                # be FKs with non-standard names (reports_to, ship_via, …).
                 if not (profiler and profiler.should_profile(col)):
                     continue
 
@@ -811,11 +841,18 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                         table_name, col_name, candidate_tables,
                         exclude=(table_name, col_name),
                     )
+                if hit is None and not candidate_tables and is_ref_flavored:
+                    # Small integers (reports_to, ship_via, …) match every PK
+                    # in the sample. Use exact SQL containment against ALL tables
+                    # to find the real target via full-key containment ratio.
+                    all_tables = set(t for t, _, _ in profiler.pk_index)
+                    hit = profiler.strongest_exact_overlap(
+                        table_name, col_name, all_tables,
+                        exclude=(table_name, col_name),
+                    )
                 if hit is not None:
                     target_table, target_col, ratio, matched = hit
-                    if target_table == table_name:
-                        hit = None
-                    elif target_table in candidate_tables:
+                    if target_table in candidate_tables:
                         confidence, note = "data-confirmed", (
                             f"No FK constraint declared; confirmed by value overlap "
                             f"({matched}/{len(src_set)} sample values) with {target_table}.{target_col}.")
@@ -887,6 +924,10 @@ Rules:
 - "kind": "confirm" for a candidate relationship you believe is a real foreign key;
   "add" for a genuine FK-like link the candidates missed. Skip same-name columns
   that merely coincide (e.g. two unrelated "amount" columns).
+- CRITICAL: Look for foreign keys beyond X_id naming. Columns like reports_to,
+  ship_via, created_by, parent_id, managed_by, etc. may reference other tables.
+  A column referencing the same table (self-reference) is valid (e.g. reports_to
+  in employees referencing employee_id).
 - Use exact, case-sensitive table and column names.
 - When unsure, omit rather than guess. No markdown, no prose, JSON only.
 """
@@ -1102,34 +1143,54 @@ def _apply_schema_reasoning(mapping, parsed):
                 continue
             if ref_col not in {c["column"] for c in tables[ref_table].get("columns", [])}:
                 continue
-            # The source column must look like a reference (id-like name or an
-            # exact match to the target column): this stops the LLM from
-            # "confirming" a numeric measure (e.g. `total`) as a foreign key.
-            if not (normalize_identifier(column).endswith("id")
-                    or normalize_identifier(column) == normalize_identifier(ref_col)):
+            # The source column must look like a reference (id-like name, FK
+            # pattern like _by/_to/_via, or an exact match to the target column):
+            # this stops the LLM from "confirming" a numeric measure (e.g.
+            # `total`) as a foreign key.
+            col_norm = normalize_identifier(column)
+            ref_norm = normalize_identifier(ref_col)
+            col_dtype = _column_data_type(tables.get(table, {}), column).lower()
+            is_id_like = col_norm.endswith("id")
+            is_fk_pattern = column.lower().endswith(("_id", "_by", "_to", "_from", "_via", "_for", "_at", "_with", "_against", "_on", "_of", "_type"))
+            is_numeric_type = any(tok in col_dtype for tok in ("int", "numeric", "decimal", "serial"))
+            if not (is_id_like or is_fk_pattern or col_norm == ref_norm or is_numeric_type):
                 continue
             if (table, column) in declared_pairs:
                 continue  # already constrained; don't second-guess the DB
 
             new_pair = (table, column, ref_table, ref_col)
             if kind == "confirm":
-                # Replace any heuristic target for this column with the
-                # LLM-confirmed target (upgrades confidence, removes ambiguity).
-                inferred[:] = [r for r in inferred
-                               if not (r.get("table") == table and r.get("column") == column)]
-                edges[:] = [e for e in edges
-                            if not (e.get("source_table") == table and e.get("source_column") == column)]
-                inferred.append({
-                    "table": table, "column": column,
-                    "references_table": ref_table, "references_column": ref_col,
-                    "confidence": "llm-confirmed",
-                    "note": "Confirmed by LLM reasoning (no FK constraint declared in the database).",
-                })
-                edges.append({
-                    "source_table": table, "source_column": column,
-                    "target_table": ref_table, "target_column": ref_col,
-                    "type": "inferred", "confidence": "llm-confirmed",
-                })
+                existing = [r for r in inferred
+                            if r.get("table") == table and r.get("column") == column]
+                if existing:
+                    # Only upgrade confidence if LLM agrees with the existing
+                    # heuristic target. Never replace a heuristic target with
+                    # the LLM's guess — small LLMs often pick wrong targets.
+                    for r in existing:
+                        if (r.get("references_table") == ref_table
+                                and r.get("references_column") == ref_col):
+                            r["confidence"] = "llm-confirmed"
+                            r["note"] = ("Confirmed by LLM reasoning "
+                                         "(no FK constraint declared in the database).")
+                            # Also update the matching edge
+                            for e in edges:
+                                if (e.get("source_table") == table
+                                        and e.get("source_column") == column
+                                        and e.get("target_table") == ref_table):
+                                    e["confidence"] = "llm-confirmed"
+                else:
+                    # No existing heuristic — LLM is the only signal; add it.
+                    inferred.append({
+                        "table": table, "column": column,
+                        "references_table": ref_table, "references_column": ref_col,
+                        "confidence": "llm-confirmed",
+                        "note": "Confirmed by LLM reasoning (no FK constraint declared in the database).",
+                    })
+                    edges.append({
+                        "source_table": table, "source_column": column,
+                        "target_table": ref_table, "target_column": ref_col,
+                        "type": "inferred", "confidence": "llm-confirmed",
+                    })
             elif kind == "add" and new_pair not in {pair(r) for r in inferred}:
                 # Only add when this column has no inferred FK yet (no ambiguity).
                 if not any(r.get("table") == table and r.get("column") == column for r in inferred):

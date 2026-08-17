@@ -147,6 +147,7 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
         ],
         "tables_with_pk": summary.get("tables_with_pk", []),
         "tables_without_pk": no_pk,
+        "llm_reasoning": mapping.get("reasoning"),
     }
 
 

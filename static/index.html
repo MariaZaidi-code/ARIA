@@ -577,8 +577,14 @@ function renderSchemaReport(r) {
   } else { h += `(none)<br>`; }
   h += `<b>Inferred FKs (${r.inferred_relationships}):</b><br>`;
   if (r.inferred_fk_list && r.inferred_fk_list.length > 0) {
-    r.inferred_fk_list.forEach(fk => { h += `<span style="color:var(--muted)">${fk.from}</span> → <span style="color:var(--muted)">${fk.to}</span> <span style="color:var(--ok)">[${fk.confidence}]</span><br>`; });
+    r.inferred_fk_list.forEach(fk => { h += `<span style="color:var(--muted)">${fk.from}</span> → <span style="color:var(--muted)">${fk.to}</span> <span style="color:var(--ok)">[${fk.confidence}]</span>${fk.note ? ' <span style="color:#888;font-size:11px">' + fk.note + '</span>' : ''}<br>`; });
   } else { h += `(none)<br>`; }
+  if (r.llm_reasoning) {
+    const lr = r.llm_reasoning;
+    h += `<br><b style="color:#c084fc">LLM Cross-Verification</b><br>`;
+    h += `<span style="color:var(--muted)">Provider:</span> ${lr.provider || "?"} &middot; <span style="color:var(--muted)">Model:</span> ${lr.model || "?"}<br>`;
+    if (lr.generated_at) h += `<span style="color:var(--muted)">Generated:</span> ${lr.generated_at}<br>`;
+  }
   h += `</div>`;
   el.innerHTML = h;
   el.className = "status ok";
