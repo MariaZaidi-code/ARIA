@@ -1298,6 +1298,9 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
             "null_stats": null_stats.get(table_name, {}),
         }
 
+    # Track all tables discovered in the DB (before dropping empties).
+    all_db_tables = set(tables.keys())
+
     # Drop completely empty tables (0 rows) — they add noise to the mapping.
     empty_tables = {
         t for t, col_stats in null_stats.items()
@@ -1318,6 +1321,24 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
             e for e in mapping["relationship_edges"]
             if e["source_table"] not in empty_tables and e["target_table"] not in empty_tables
         ]
+
+    # Build summary metadata for the API response.
+    mapping["summary"] = {
+        "total_db_tables": len(all_db_tables),
+        "tables_used": len(mapping["tables"]),
+        "tables_dropped_empty": sorted(empty_tables),
+        "declared_fk_count": len(mapping["declared_relationships"]),
+        "inferred_fk_count": len(mapping["inferred_relationships"]),
+        "edge_count": len(mapping["relationship_edges"]),
+        "tables_with_pk": sorted(
+            t for t in mapping["tables"]
+            if mapping["tables"][t].get("primary_key")
+        ),
+        "tables_without_pk": sorted(
+            t for t in mapping["tables"]
+            if not mapping["tables"][t].get("primary_key")
+        ),
+    }
 
     if llm is not None:
         mapping = enrich_with_llm(mapping, llm)

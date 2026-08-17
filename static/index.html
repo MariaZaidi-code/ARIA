@@ -549,8 +549,28 @@ async function extractSchema() {
   setStatus("schema_status", "Extracting schema...");
   try {
     const r = await api("/api/extract_schema", {});
-    setStatus("schema_status",
-      `Done. ${r.tables} tables, ${r.declared_relationships} declared, ${r.inferred_relationships} inferred relationships.`, true);
+    let msg = `Schema extracted for ${r.database}.\n\n`;
+    msg += `Tables in DB: ${r.total_db_tables} | Used: ${r.tables_used}`;
+    if (r.tables_dropped_empty && r.tables_dropped_empty.length > 0) {
+      msg += ` | Dropped (empty): ${r.tables_dropped_empty.join(", ")}`;
+    }
+    msg += `\n\nPrimary Keys: ${r.tables_with_pk.length} tables have PK`;
+    if (r.tables_without_pk && r.tables_without_pk.length > 0) {
+      msg += ` | No PK: ${r.tables_without_pk.join(", ")}`;
+    }
+    msg += `\n\nDeclared FKs (${r.declared_relationships}):`;
+    if (r.declared_fk_list && r.declared_fk_list.length > 0) {
+      r.declared_fk_list.forEach(fk => { msg += `\n  ${fk.from} → ${fk.to}`; });
+    } else {
+      msg += `\n  (none)`;
+    }
+    msg += `\n\nInferred FKs (${r.inferred_relationships}):`;
+    if (r.inferred_fk_list && r.inferred_fk_list.length > 0) {
+      r.inferred_fk_list.forEach(fk => { msg += `\n  ${fk.from} → ${fk.to} [${fk.confidence}]`; });
+    } else {
+      msg += `\n  (none)`;
+    }
+    setStatus("schema_status", msg, true);
     await loadSchema();
     getSuggestions();
   } catch (e) { setStatus("schema_status", String(e.message), false); }

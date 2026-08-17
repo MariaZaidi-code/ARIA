@@ -86,13 +86,36 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
 
     session["schema_path"] = latest_path
 
+    summary = mapping.get("summary", {})
+
     return {
         "ok": True,
         "provider": session["provider_name"],
         "snapshot_id": mapping["snapshot_id"],
-        "tables": len(mapping["tables"]),
+        "database": session["db_name"],
+        "tables_used": summary.get("tables_used", len(mapping["tables"])),
+        "total_db_tables": summary.get("total_db_tables", len(mapping["tables"])),
+        "tables_dropped_empty": summary.get("tables_dropped_empty", []),
         "declared_relationships": len(mapping["declared_relationships"]),
+        "declared_fk_list": [
+            {
+                "from": f"{r['table_name']}.{r['column_name']}",
+                "to": f"{r['references_table']}.{r['references_column']}",
+            }
+            for r in mapping["declared_relationships"]
+        ],
         "inferred_relationships": len(mapping["inferred_relationships"]),
+        "inferred_fk_list": [
+            {
+                "from": f"{r['table']}.{r['column']}",
+                "to": f"{r['references_table']}.{r['references_column']}",
+                "confidence": r.get("confidence", "heuristic"),
+                "note": r.get("note", ""),
+            }
+            for r in mapping["inferred_relationships"]
+        ],
+        "tables_with_pk": summary.get("tables_with_pk", []),
+        "tables_without_pk": summary.get("tables_without_pk", []),
     }
 
 
