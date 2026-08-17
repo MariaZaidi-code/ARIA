@@ -683,18 +683,57 @@ def _is_reference_to_other_table(col_name, table_name, tables):
     tiebreakers over the real referenced table (e.g. olist payments.order_id
     vs orders.order_id) and hides genuine relationships. This guard keeps
     FK-like columns out of PK inference.
+
+    Matching is token-based (txt item 1: name-match evidence), so it works for
+    ANY naming convention — plain `orders`, prefixed `olist_orders_dataset`,
+    suffixed `tbl_order_items`, snake/camel — without per-database patches.
     """
     base = col_name[:-3].lower() if col_name.endswith("_id") else col_name.lower()
     if not base or base in _ID_TOKENS:
         return False
+    base = _singularize(base)
     forms = {base, base + "s", base + "es"}
     if base.endswith("y") and len(base) > 1:
         forms.add(base[:-1] + "ies")
     forms.add(_singularize(base))
-    return any(
-        t != table_name and normalize_identifier(t) in forms
-        for t in tables
-    )
+
+    def _matches(t):
+        """Does any word-token of table `t` (or its whole name) singularize to base?"""
+        if normalize_identifier(t) in forms:
+            return True
+        return any(_singularize(tok) in forms for tok in _tokenize_words(t))
+
+    # Find the MOST SPECIFIC table the base could name (shortest name that
+    # still contains the base as a token). `orders` names `olist_orders_dataset`
+    # but `order` inside `olist_order_payments_dataset` is just a qualifier —
+    # the shorter/simpler name wins. If that most-specific match is the table's
+    # OWN table, the column is its own identity; otherwise it is a reference.
+    best = None
+    for t in tables:
+        if not _matches(t):
+            continue
+        if best is None or len(t) < len(best):
+            best = t
+    return best is not None and best != table_name
+
+
+def _is_code_column(col_name):
+    """True for categorical label/code columns that collide with PKs by chance.
+
+    txt item 8: `status`, `country_code`, `category`, `year`, `department` etc.
+    often share values with primary keys (1..n) and must be penalized heavily
+    as FK candidates — they are almost never real references.
+    """
+    low = col_name.lower()
+    base = low[:-3] if low.endswith("_id") else low
+    tokens = set(_tokenize_words(base))
+    code_words = {
+        "status", "category", "subcategory", "country", "city", "state",
+        "region", "year", "month", "day", "week", "department", "gender",
+        "channel", "segment", "tier", "type", "flag", "currency", "language",
+        "color", "size", "brand", "name", "label", "grade", "level",
+    }
+    return any(t in code_words for t in tokens)
 
 
 def infer_primary_keys(tables, declared_primary_keys):
@@ -882,7 +921,7 @@ def infer_primary_keys_from_data(conn, tables, schema, db_type, existing_pks, ma
     return inferred
 
 
-def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="public", db_type="postgresql"):
+def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="public", db_type="postgresql", null_stats=None):
     """
     Infer relationships for columns that look like foreign keys but have NO
     declared constraint. Two general signals, in order of strength:
@@ -900,6 +939,7 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
       - "heuristic-name-match"  name match only (offline / no data)
     """
     declared_pairs = {(fk["table_name"], fk["column_name"]) for fk in declared_fks}
+    null_stats = null_stats or {}
 
     pk_owner = {}
     table_pk = {}
@@ -928,7 +968,8 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                         names.append(t)
         return sorted(set(names))
 
-    def _emit(table_name, col_name, candidate_table, ref_col, confidence, note):
+    def _emit(table_name, col_name, candidate_table, ref_col, confidence, note,
+              overlap_ratio=None, name_hint=False):
         rel = {
             "table": table_name,
             "column": col_name,
@@ -950,6 +991,90 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                     else "one-to-many" if ratio > 1.1
                     else "many-to-one"
                 )
+
+        # Item 1: explainable multi-factor confidence score.
+        evidence = []
+        score = 0.0
+
+        # name_match (item 1) — column base matches the target table name.
+        if name_hint:
+            score += 25
+            evidence.append("column name matches target table")
+        else:
+            base = _singularize(col_name[:-3] if col_name.endswith("_id") else col_name)
+            tgt_tokens = {_singularize(tok) for tok in _tokenize_words(candidate_table)}
+            if base in tgt_tokens:
+                score += 25
+                evidence.append("column name matches target table")
+
+        # datatype_match (item 4).
+        if profiler is not None and isinstance(col_name, str) and isinstance(ref_col, str):
+            if profiler.types_compatible(table_name, col_name, candidate_table, ref_col):
+                score += 15
+                evidence.append("datatype compatible")
+            else:
+                evidence.append("datatype mismatch")
+
+        # overlap_ratio (item 5) — tiered value evidence.
+        if overlap_ratio is not None:
+            if overlap_ratio >= 0.99:
+                score += 30
+                evidence.append("~100% values found in target PK")
+            elif overlap_ratio >= 0.95:
+                score += 25
+                evidence.append(">=95% values found in target PK")
+            elif overlap_ratio >= 0.80:
+                score += 18
+                evidence.append(">=80% values found in target PK")
+            else:
+                evidence.append("partial value overlap")
+
+        # uniqueness: target column is a primary key.
+        tgt_pk = set(table_pk.get(candidate_table, []))
+        if isinstance(ref_col, str) and ref_col in tgt_pk:
+            score += 20
+            evidence.append("target is a primary key")
+        elif not isinstance(ref_col, str):
+            # Composite: referenced columns are key columns by construction.
+            if all(c in tgt_pk for c in ref_col):
+                score += 20
+                evidence.append("target is a composite primary key")
+
+        # cardinality: many-to-one / one-to-one favour a real FK over 1:1 sharing.
+        if rel.get("cardinality") in ("many-to-one", "one-to-many"):
+            score += 10
+            evidence.append("many source rows map to one target row")
+
+        # Item 6: nullable FK intelligence. High null rate lowers confidence
+        # (sparse reference) but does NOT kill a name+datatype+overlap match.
+        if profiler is not None and isinstance(col_name, str):
+            ns = null_stats.get(table_name, {}).get(col_name, {})
+            null_pct = ns.get("null_pct") if isinstance(ns, dict) else None
+            if null_pct is not None:
+                if null_pct > 0.8:
+                    score -= 25
+                    evidence.append(f"high null rate ({null_pct:.0%}) — relationship optional")
+                elif null_pct > 0.5:
+                    score -= 10
+                    evidence.append(f"nullable ({null_pct:.0%})")
+
+        rel["confidence_score"] = max(0, min(100, round(score)))
+        rel["evidence"] = evidence
+
+        # Item 10: review tier.
+        cs = rel["confidence_score"]
+        rel["review_status"] = (
+            "auto-accept" if cs >= 80
+            else "flagged" if cs >= 60
+            else "review"
+        )
+
+        # Item 2: self-referencing FK flag.
+        rel["self_referencing"] = bool(
+            isinstance(col_name, str) and table_name == candidate_table
+            and col_name != ref_col
+        )
+
         inferred.append(rel)
 
     def _is_ref_flavored(name):
@@ -1074,21 +1199,34 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                     )
                 if hit is not None:
                     target_table, target_col, ratio, matched = hit
-                    if target_table in candidate_tables:
-                        confidence, note = "data-confirmed", (
-                            f"No FK constraint declared; confirmed by value overlap "
-                            f"({matched}/{len(src_set)} sample values) with {target_table}.{target_col}.")
-                    else:
-                        confidence, note = "data-inferred", (
-                            f"No FK constraint declared and no name match; inferred from "
-                            f"value overlap ({matched}/{len(src_set)} sample values) with {target_table}.{target_col}.")
+                    # Negative evidence (txt item 7) + common-value collisions
+                    # (txt item 8): a code/label column (status, category, year,
+                    # country_code, ...) whose values merely overlap a key is
+                    # NOT a real FK. Only accept it when the name itself points
+                    # at the target table (e.g. `order_status` -> status table)
+                    # — otherwise its "overlap" is coincidence.
+                    if _is_code_column(col_name):
+                        name_hint = target_table in candidate_tables
+                        if not name_hint:
+                            hit = None
+                    if hit is not None:
+                        target_table, target_col, ratio, matched = hit
+                        if target_table in candidate_tables:
+                            confidence, note = "data-confirmed", (
+                                f"No FK constraint declared; confirmed by value overlap "
+                                f"({matched}/{len(src_set)} sample values) with {target_table}.{target_col}.")
+                        else:
+                            confidence, note = "data-inferred", (
+                                f"No FK constraint declared and no name match; inferred from "
+                                f"value overlap ({matched}/{len(src_set)} sample values) with {target_table}.{target_col}.")
                     if hit is not None:
                         ref_cols = table_pk.get(target_table) or [target_col]
                         for ref_col in ref_cols:
                             # A column can never reference itself (same table + same column).
                             if table_name == target_table and col_name == ref_col:
                                 continue
-                            _emit(table_name, col_name, target_table, ref_col, confidence, note)
+                            _emit(table_name, col_name, target_table, ref_col, confidence, note,
+                                  overlap_ratio=ratio, name_hint=(target_table in candidate_tables))
                         continue
 
             if is_composite_key_col:
@@ -1101,7 +1239,8 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                 for ref_col in ref_cols:
                     _emit(table_name, col_name, candidate_table, ref_col,
                           "heuristic-name-match",
-                          "No FK constraint declared in the database; relationship inferred from column naming convention.")
+                          "No FK constraint declared in the database; relationship inferred from column naming convention.",
+                          name_hint=True)
 
     # Composite relationships: (a, b) -> (x, y). A source table may reference a
     # target table whose PRIMARY KEY spans several columns (junction/detail rows).
@@ -1173,6 +1312,7 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                         f"Composite FK inferred: ({', '.join(matched)}) references "
                         f"{target_table}({', '.join(target_pk)}) with {ratio:.0%} of "
                         f"source keys present in the target composite key.",
+                        overlap_ratio=ratio, name_hint=True,
                     )
     return inferred
 
@@ -1573,6 +1713,85 @@ def _canonicalize_mapping(mapping):
     mapping["relationship_edges"] = deduped
 
 
+def _build_relationship_graph(mapping):
+    """Build an explicit per-table relationship graph (txt item 9).
+
+    For every table: its primary key, columns, and separately its OUTGOING
+    (this table references others) and INCOMING (others reference this table)
+    relationships. Also detects MANY-TO-MANY (txt item 2) via junction tables:
+    a table whose composite primary key columns each reference another table is
+    a join table; the referenced tables get a many-to-many link through it.
+    """
+    tables = mapping.get("tables", {})
+    edges = mapping.get("relationship_edges", [])
+    graph = {}
+
+    # Normalize an edge to (table, column) -> (target, target_column).
+    def _out_edges(t):
+        out = []
+        for e in edges:
+            if e.get("source_table") == t:
+                out.append(e)
+        return out
+
+    def _in_edges(t):
+        incoming = []
+        for e in edges:
+            if e.get("target_table") == t:
+                incoming.append(e)
+        return incoming
+
+    for t, info in tables.items():
+        pks = info.get("primary_key") or info.get("inferred_primary_key") or []
+        graph[t] = {
+            "primary_key": pks,
+            "columns": [c["column"] for c in info.get("columns", [])],
+            "outgoing_relationships": [],
+            "incoming_relationships": [],
+            "many_to_many": [],
+        }
+        for e in _out_edges(t):
+            graph[t]["outgoing_relationships"].append({
+                "source_column": e.get("source_column"),
+                "target_table": e.get("target_table"),
+                "target_column": e.get("target_column"),
+                "type": e.get("type"),
+                "confidence": e.get("confidence"),
+                "cardinality": e.get("cardinality"),
+            })
+        for e in _in_edges(t):
+            graph[t]["incoming_relationships"].append({
+                "source_table": e.get("source_table"),
+                "source_column": e.get("source_column"),
+                "target_column": e.get("target_column"),
+                "type": e.get("type"),
+                "confidence": e.get("confidence"),
+                "cardinality": e.get("cardinality"),
+            })
+
+    # Many-to-many via junction tables (composite PK, each PK column a FK).
+    for t, info in tables.items():
+        pks = info.get("primary_key") or info.get("inferred_primary_key") or []
+        if len(pks) < 2:
+            continue
+        refs = {}
+        for e in _out_edges(t):
+            if e.get("source_column") in pks and e.get("target_table") != t:
+                refs[e["source_column"]] = e["target_table"]
+        if len(refs) >= 2:
+            # A junction: every PK column points at a different table.
+            involved = sorted(set(refs.values()))
+            if len(involved) >= 2:
+                junction = {
+                    "junction_table": t,
+                    "columns": list(refs.keys()),
+                    "tables": involved,
+                }
+                for parent in involved:
+                    graph[parent]["many_to_many"].append(junction)
+    return graph
+
+
 # ---------------------------------------------------------------------------
 # Assemble & write schema_mapping.json
 # ---------------------------------------------------------------------------
@@ -1668,7 +1887,8 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
 
     merged_primary_keys = {**primary_keys, **inferred_primary_keys}
     inferred_fks = infer_relationships(tables, merged_primary_keys, declared_fks,
-                                       conn=conn, schema=schema, db_type=db_type)
+                                       conn=conn, schema=schema, db_type=db_type,
+                                       null_stats=null_stats)
 
     # Refinement: a column confirmed (by data) to reference another table is a
     # foreign key, not the table's own identity. Ruling those out can resolve
@@ -1783,12 +2003,31 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
 
     _canonicalize_mapping(mapping)
 
+    # Item 9: build the explicit relationship graph (per-table outgoing and
+    # incoming relationships) ARIA can consume directly for SQL generation /
+    # RAG / query planning. Also detects many-to-many via junction tables
+    # (item 2).
+    mapping["relationship_graph"] = _build_relationship_graph(mapping)
+
     # Rich health report (drives the UI dashboard / QA checks).
     inferred = mapping.get("inferred_relationships", [])
     strong = [r for r in inferred if r.get("confidence") in
               ("data-confirmed", "llm-confirmed", "composite-data-confirmed")]
     weak = [r for r in inferred if r.get("confidence") not in
             ("data-confirmed", "llm-confirmed", "composite-data-confirmed")]
+    # Item 10: human-review list for uncertain relationships.
+    review_list = [
+        {
+            "table": r.get("table"),
+            "column": r.get("column"),
+            "references_table": r.get("references_table"),
+            "references_column": r.get("references_column"),
+            "confidence_score": r.get("confidence_score"),
+            "confidence": r.get("confidence"),
+            "evidence": r.get("evidence", []),
+        }
+        for r in inferred if r.get("review_status") in ("flagged", "review")
+    ]
     mapping["summary"]["health"] = {
         "strong_inferred_fk_count": len(strong),
         "weak_inferred_fk_count": len(weak),
@@ -1796,6 +2035,8 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
         "profile_budget_exhausted": False,
         "warning": None,
     }
+    mapping["summary"]["review_list"] = review_list
+    mapping["summary"]["review_count"] = len(review_list)
 
     return mapping
 
