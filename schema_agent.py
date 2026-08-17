@@ -1298,6 +1298,27 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
             "null_stats": null_stats.get(table_name, {}),
         }
 
+    # Drop completely empty tables (0 rows) — they add noise to the mapping.
+    empty_tables = {
+        t for t, col_stats in null_stats.items()
+        if col_stats and all(s.get("total_rows", 1) == 0 for s in col_stats.values())
+    }
+    if empty_tables:
+        for t in empty_tables:
+            mapping["tables"].pop(t, None)
+        mapping["declared_relationships"] = [
+            r for r in mapping["declared_relationships"]
+            if r["table_name"] not in empty_tables and r["references_table"] not in empty_tables
+        ]
+        mapping["inferred_relationships"] = [
+            r for r in mapping["inferred_relationships"]
+            if r.get("table") not in empty_tables and r.get("references_table") not in empty_tables
+        ]
+        mapping["relationship_edges"] = [
+            e for e in mapping["relationship_edges"]
+            if e["source_table"] not in empty_tables and e["target_table"] not in empty_tables
+        ]
+
     if llm is not None:
         mapping = enrich_with_llm(mapping, llm)
 
