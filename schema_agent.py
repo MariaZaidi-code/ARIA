@@ -779,6 +779,30 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                 if len(own_pk) == 1:
                     continue
                 is_composite_key_col = True
+                # Composite PK columns with very few distinct values that form
+                # a contiguous range starting from 1 are line counters or sort
+                # keys (e.g. item_id=1,2,3,4,5), not FKs. They overlap 100%
+                # with every small PK and create false positives.
+                if profiler is not None:
+                    _pk_vals = profiler.source_values(table_name, col_name)
+                    if _pk_vals is not None and len(_pk_vals) <= 6:
+                        # Extract numeric values from normalized tuples
+                        _nums = sorted(v[1] if isinstance(v, tuple) else v
+                                       for v in _pk_vals
+                                       if (isinstance(v, tuple) and len(v) >= 2
+                                           and isinstance(v[1], (int, float)))
+                                       or isinstance(v, (int, float)))
+                        _low = col_name.lower()
+                        _line_counter_names = {"item_id", "line_id", "line_no",
+                                                "line_number", "seq_no", "seq_number",
+                                                "position", "row_num", "row_number",
+                                                "idx", "index_num"}
+                        if (_nums and _nums[0] == 1
+                                and _nums == list(range(1, len(_nums) + 1))
+                                and (_low in _line_counter_names
+                                     or any(k in _low for k in ("item_no", "line_no",
+                                                                 "seq_", "position_")))):
+                            continue
             else:
                 is_composite_key_col = False
 
@@ -863,6 +887,9 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                     if hit is not None:
                         ref_cols = table_pk.get(target_table) or [target_col]
                         for ref_col in ref_cols:
+                            # A column can never reference itself (same table + same column).
+                            if table_name == target_table and col_name == ref_col:
+                                continue
                             _emit(table_name, col_name, target_table, ref_col, confidence, note)
                         continue
 
