@@ -52,6 +52,18 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
     try:
         conn = schema_agent.get_connection(types.SimpleNamespace(**config))
         try:
+            # Dynamic schema resolution (any PostgreSQL DB, not DB-specific):
+            # keep the configured schema when it has tables; otherwise fall back
+            # to the schema with the most tables (e.g. AdventureWorks ships data
+            # in non-public schemas, so 'public' alone maps nothing).
+            if db_type == "postgresql":
+                try:
+                    if not schema_agent.schema_has_tables(conn, schema_filter):
+                        alt = schema_agent.find_schema_with_tables(conn)
+                        if alt and alt != schema_filter:
+                            schema_filter = alt
+                except Exception:
+                    pass
             # Item 5: seed drift detection from the previous run of this DB.
             previous_mapping = None
             try:

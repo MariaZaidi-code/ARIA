@@ -1866,8 +1866,29 @@ def _build_relationship_graph(mapping):
 # Assemble & write schema_mapping.json
 # ---------------------------------------------------------------------------
 
+def schema_has_tables(conn, schema):
+    """Return True when the given Postgres schema contains at least one base table."""
+    if not schema:
+        return False
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = %s AND table_type = 'BASE TABLE'
+            )
+            """,
+            (schema,),
+        )
+        return bool(cur.fetchone()[0])
+
+
 def find_schema_with_tables(conn):
-    """Return the first non-system Postgres schema that contains base tables."""
+    """Return the largest non-system Postgres schema that contains base tables.
+
+    Prefers the schema with the most tables (best signal for relationship
+    inference). Falls back to 'public' when only it has tables.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -1875,10 +1896,9 @@ def find_schema_with_tables(conn):
             FROM information_schema.tables
             WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
               AND table_schema NOT LIKE 'pg_%'
-              AND table_schema <> 'public'
               AND table_type = 'BASE TABLE'
             GROUP BY table_schema
-            ORDER BY count(*) DESC
+            ORDER BY count(*) DESC, table_schema
             LIMIT 1
             """
         )
