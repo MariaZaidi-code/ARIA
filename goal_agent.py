@@ -1652,6 +1652,93 @@ Output a JSON array of strings only. No explanation, no markdown.
                 unique.append(suggestion)
         return unique[:limit]
 
+    def _detect_intent(self, user_goal):
+        """Heuristic intent classification (no LLM call) for the goal contract."""
+        g = str(user_goal).lower()
+        if any(k in g for k in ("top ", "best", "worst", "highest", "lowest",
+                                "most ", "least", "rank", "leader", "bottom")):
+            return "ranking"
+        if any(k in g for k in ("compare", "comparison", "versus", "difference",
+                                "among", "between")):
+            return "comparison"
+        if any(k in g for k in ("trend", "over time", "monthly", "daily",
+                                "weekly", "yearly", "growth", "decline",
+                                "increase", "decrease", "change")):
+            return "trend"
+        if any(k in g for k in ("distribution", "breakdown", "per ", "by ",
+                                "count")):
+            return "distribution"
+        return "summary"
+
+    def _detect_analysis_type(self, user_goal):
+        """Heuristic analysis-type classification for the goal contract."""
+        g = str(user_goal).lower()
+        if any(k in g for k in ("predict", "forecast", "future", "expected",
+                                "will ")):
+            return "predictive"
+        if any(k in g for k in ("why", "cause", "reason", "driver", "because")):
+            return "diagnostic"
+        if any(k in g for k in ("recommend", "should", "action", "improve",
+                                "optimize", "suggest")):
+            return "prescriptive"
+        return "descriptive"
+
+    def _parse_sql_plan(self, sql):
+        """Deterministically extract order_by and limit from the final SQL."""
+        order_by, limit = [], None
+        if not sql:
+            return order_by, limit
+        m = re.search(r"\bORDER\s+BY\s+(.+?)(?=\s+(LIMIT|GROUP\s+BY|HAVING|;)\s*|$)",
+                      sql, re.IGNORECASE | re.DOTALL)
+        if m:
+            order_by = [col.strip() for col in m.group(1).split(",") if col.strip()]
+        m = re.search(r"\bLIMIT\s+(\d+)", sql, re.IGNORECASE)
+        if m:
+            limit = int(m.group(1))
+        return order_by, limit
+
+    def _build_output_contract(self, user_goal, kpi_map, join_path, final_sql,
+                               cleaned_data, success=True, message=None):
+        """Enrich processed_data.json with the structured Goal-Agent contract
+        (goal intent, data selection, analysis plan) while keeping the existing
+        flat fields the Insight Agent and UI already consume."""
+        data_columns = list(cleaned_data[0].keys()) if cleaned_data else []
+        order_by, limit = self._parse_sql_plan(final_sql)
+
+        joins = []
+        for a, b in zip(join_path, join_path[1:]):
+            joins.append(f"{a} -> {b}")
+
+        return {
+            "goal": {
+                "original_question": user_goal,
+                "intent": self._detect_intent(user_goal),
+                "analysis_type": self._detect_analysis_type(user_goal),
+            },
+            "data_selection": {
+                "tables": list(join_path),
+                "columns": data_columns,
+                "filters": [],
+                "joins": joins,
+            },
+            "analysis_plan": {
+                "measures": [k["description"] for k in kpi_map.get("kpis", [])],
+                "dimensions": kpi_map.get("dimensions", []),
+                "aggregation": sorted({k["aggregate"] for k in kpi_map.get("kpis", [])}),
+                "group_by": kpi_map.get("dimensions", []),
+                "order_by": order_by,
+                "limit": limit,
+            },
+            "sql": final_sql,
+            "execution": {
+                "success": bool(success),
+                "row_count": len(cleaned_data),
+            },
+            "data": cleaned_data,
+            "suggested_questions": self._template_suggestions(3),
+            "message": message,
+        }
+
     def _graceful_failure(self, user_goal, output_path, exc):
         """Write a valid processed_data.json explaining WHY the goal could not
         be answered, so the endpoint never returns a 500 for a goal we could
@@ -1675,6 +1762,10 @@ Output a JSON array of strings only. No explanation, no markdown.
             "missing_values_handled": "filled (0 for numeric, '' for text)",
             "timestamp": datetime.now().isoformat(),
         }
+        output.update(self._build_output_contract(
+            user_goal, {"kpis": [], "dimensions": []}, [], None, [],
+            success=False, message=message,
+        ))
         Path(output_path).write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
         logging.error("Goal Agent graceful failure for %r: %s", user_goal, exc)
         return output_path
@@ -1715,6 +1806,10 @@ Output a JSON array of strings only. No explanation, no markdown.
             "missing_values_handled": "filled (0 for numeric, '' for text)",
             "timestamp": datetime.now().isoformat(),
         }
+        output.update(self._build_output_contract(
+            user_goal, kpi_map, join_path, final_sql, cleaned_data,
+            success=(note is None), message=output["message"],
+        ))
 
         out_path = Path(output_path)
         out_path.write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
@@ -1755,6 +1850,12 @@ Output a JSON array of strings only. No explanation, no markdown.
                 "missing_values_handled": "filled (0 for numeric, '' for text)",
                 "timestamp": datetime.now().isoformat(),
             }
+            output.update(self._build_output_contract(
+                state["user_goal"], state["kpi_map"], state["join_path"],
+                state["final_sql"], state["rows"],
+                success=(state.get("message") is None),
+                message=output["message"],
+            ))
             Path(output_path).write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
             state["result_path"] = output_path
             return state

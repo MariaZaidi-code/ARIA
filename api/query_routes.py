@@ -72,6 +72,11 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "message": processed.get("message"),
         "preprocessing": processed.get("preprocessing"),
         "data": processed.get("data", [])[:50],
+        "goal": processed.get("goal"),
+        "data_selection": processed.get("data_selection"),
+        "analysis_plan": processed.get("analysis_plan"),
+        "execution": processed.get("execution"),
+        "suggested_questions": processed.get("suggested_questions"),
         "history_id": session["pending_history_id"],
     }
 
