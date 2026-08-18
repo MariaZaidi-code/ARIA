@@ -10,13 +10,18 @@ against the original declared set:
     FPR       = wrong_inferred / total_inferred
     FNR       = missed_declared / total_declared
 
+Supported cases (txt table):
+  * single-schema databases (northwind, chinook, ...)
+  * multi-schema databases (adventureworks, aw_edit, ...) via build_schema_mapping_all
+  * messy naming: rename every child FK column to an opaque name (fk_c1, fk_c2, ...)
+    so inference must rely on DATA (value overlap + cardinality), not names.
+
 Run:
-    python benchmark_fk.py [--dbs northwind chinook ...]
+    python benchmark_fk.py [--dbs northwind adventureworks ...] [--messy]
 """
 
 import argparse
 import json
-import re
 import sys
 import time
 from pathlib import Path
@@ -27,7 +32,7 @@ import schema_agent
 
 ADMIN = "postgresql://postgres:12345@localhost:5432/postgres"
 
-DEFAULT_DBS = ["northwind", "chinook", "olist_ecommerce", "retail_fraud"]
+DEFAULT_DBS = ["northwind", "chinook", "olist_ecommerce", "retail_fraud", "adventureworks"]
 
 MAX_SOURCE_RATIO = 0.70  # keep at least 30% of the total inferred set
 
@@ -39,24 +44,48 @@ def make_cfg(db):
     }
 
 
-def list_fks(conn):
+def list_fks(conn, schema=None):
+    """Declared FKs, optionally restricted to one schema. Returns
+    (table, column, ftable, fcol, schema, fschema) tuples with the
+    schema-qualified table names for multi-schema databases."""
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT tc.table_name, kcu.column_name, ccu.table_name AS ftable,
-               ccu.column_name AS fcol
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-        JOIN information_schema.constraint_column_usage ccu
-          ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
-        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
-        """,
-    )
+    if schema:
+        cur.execute(
+            """
+            SELECT tc.table_name, kcu.column_name, ccu.table_name AS ftable,
+                   ccu.column_name AS fcol, tc.table_schema, ccu.table_schema AS fschema
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage ccu
+              ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+            WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = %s
+            """,
+            (schema,),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT tc.table_name, kcu.column_name, ccu.table_name AS ftable,
+                   ccu.column_name AS fcol, tc.table_schema, ccu.table_schema AS fschema
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage ccu
+              ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+            """,
+        )
     return cur.fetchall()
 
 
-def clone_and_strip(src):
+def clone_and_strip(src, messy=False):
+    """Clone src -> src_bench and drop every FK constraint.
+
+    When messy=True, also rename each child FK column to an opaque name so
+    name-based heuristics cannot fire; only data evidence remains. Returns
+    (dst, fks, col_renames) where col_renames maps (schema, table, old_col)
+    -> new_col for the messy case (empty otherwise)."""
     import psycopg2
     admin = psycopg2.connect(ADMIN)
     admin.autocommit = True
@@ -76,48 +105,116 @@ def clone_and_strip(src):
     conn.autocommit = True
     cur = conn.cursor()
     fks = list_fks(conn)
+
+    col_renames = {}
+    if messy and fks:
+        seen = set()
+        idx = 0
+        for t, col, ft, fc, sch, fsch in fks:
+            key = (sch, t, col)
+            if key in seen:
+                continue
+            seen.add(key)
+            idx += 1
+            new_col = f"fk_c{idx}"
+            # Avoid colliding with an existing column name in the table.
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema=%s AND table_name=%s AND column_name=%s",
+                (sch, t, new_col),
+            )
+            while cur.fetchone():
+                idx += 1
+                new_col = f"fk_c{idx}"
+            try:
+                cur.execute(
+                    f'ALTER TABLE "{sch}"."{t}" RENAME COLUMN "{col}" TO "{new_col}"'
+                )
+                col_renames[(sch, t, col)] = new_col
+            except Exception:
+                pass
+
     cur.execute(
         """
-        SELECT tc.table_name, tc.constraint_name
+        SELECT tc.table_schema, tc.table_name, tc.constraint_name
         FROM information_schema.table_constraints tc
-        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+        WHERE tc.constraint_type = 'FOREIGN KEY'
         """,
     )
-    for t, name in cur.fetchall():
+    for sch, t, name in cur.fetchall():
         try:
-            cur.execute(f'ALTER TABLE "{t}" DROP CONSTRAINT "{name}"')
+            cur.execute(f'ALTER TABLE "{sch}"."{t}" DROP CONSTRAINT "{name}"')
         except Exception:
             pass
     conn.close()
-    return dst, fks
+    return dst, fks, col_renames
 
 
-def edge_set(mapping):
+def edge_set(mapping, col_renames=None):
+    """Build the (source_table, column, target_table, ref_column) edge set,
+    translating messy-renamed columns back to their original names.
+
+    `col_renames` maps (schema, table, old_col) -> new_col; inferred edges carry
+    the new (opaque) column names, so we look up the reverse mapping."""
+    rev = {}
+    for (sch, t, old), new in (col_renames or {}).items():
+        rev[(sch, t, new)] = old
+        rev[(t, new)] = old  # single-schema inference uses unqualified names
     out = set()
     for r in mapping.get("inferred_relationships", []):
+        src = r.get("table")
         col = r.get("column")
-        if isinstance(col, list):
-            col = ",".join(col)
+        tgt = r.get("references_table")
         ref = r.get("references_column")
-        if isinstance(ref, list):
-            ref = ",".join(ref)
-        out.add((r.get("table"), str(col), r.get("references_table"), str(ref)))
+        if rev and isinstance(col, str):
+            parts = str(src).split(".")
+            if len(parts) == 2:
+                col = rev.get((parts[0], parts[1], col), col)
+            else:
+                col = rev.get(("public", parts[0], col), col)
+        out.add((src, str(col), tgt, str(ref)))
     return out
 
 
-def run(db):
+def run(db, col_renames=None):
     cfg = make_cfg(db)
     conn = schema_agent.get_connection(type("C", (), cfg)())
     try:
-        mapping = schema_agent.build_schema_mapping(conn, "public", db_type="postgresql")
+        mode = schema_agent.detect_schema_mode(conn)
+        multi = mode["mode"] == "multi"
+        if multi:
+            mapping = schema_agent.build_schema_mapping_all(
+                conn, db_type="postgresql", llm=None, database_name=db,
+            )
+        else:
+            mapping = schema_agent.build_schema_mapping(
+                conn, "public", db_type="postgresql",
+            )
     finally:
         conn.close()
-    return mapping
+    return mapping, multi
+
+
+def declared_edges(fks, multi):
+    """Declared edges as (qualified_source, col, qualified_target, ref_col).
+
+    For single-schema databases the inference emits unqualified table names
+    (the same as the declared sets they are compared against), so the schema
+    prefix is dropped; multi-schema sets are always schema-qualified."""
+    out = set()
+    for t, c, ft, fc, sch, fsch in fks:
+        if multi:
+            out.add((f"{sch}.{t}", str(c), f"{fsch}.{ft}", str(fc)))
+        else:
+            out.add((t, str(c), ft, str(fc)))
+    return out
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dbs", nargs="*", default=DEFAULT_DBS)
+    ap.add_argument("--messy", action="store_true",
+                    help="rename child FK columns to opaque names to force data-only inference")
     args = ap.parse_args()
 
     rows = []
@@ -125,22 +222,22 @@ def main():
 
     for db in args.dbs:
         print("=" * 74)
-        print(f"DB: {db}", flush=True)
-        result = clone_and_strip(db)
+        print(f"DB: {db} {'[MESSY-NAMING]' if args.messy else ''}", flush=True)
+        result = clone_and_strip(db, messy=args.messy)
         if result is None:
             print("  skipped (not found)")
             continue
-        dst, declared = result
-        declared_set = {(t, str(c), ft, str(fc)) for t, c, ft, fc in declared}
+        dst, declared, col_renames = result
         t0 = time.time()
         try:
-            stripped_map = run(dst)
+            stripped_map, multi = run(dst, col_renames)
         except Exception as exc:
             print(f"  ERROR: {exc}")
             continue
         elapsed = time.time() - t0
+        declared_set = declared_edges(declared, multi)
 
-        inferred = edge_set(stripped_map)
+        inferred = edge_set(stripped_map, col_renames)
         correct = declared_set & inferred
         wrong = inferred - declared_set
         missed = declared_set - inferred
@@ -166,12 +263,16 @@ def main():
                 print(f"    {'.'.join([e[0], e[1]])} -> {'.'.join([e[2], e[3]])}")
         if wrong:
             print("  FALSE POSITIVES:")
-            for e in sorted(wrong, key=str):
+            for e in sorted(wrong, key=str)[:20]:
                 print(f"    {'.'.join([e[0], e[1]])} -> {'.'.join([e[2], e[3]])}")
+            if len(wrong) > 20:
+                print(f"    ... and {len(wrong) - 20} more")
         if missed:
             print("  FALSE NEGATIVES (missed):")
-            for e in sorted(missed, key=str):
+            for e in sorted(missed, key=str)[:20]:
                 print(f"    {'.'.join([e[0], e[1]])} -> {'.'.join([e[2], e[3]])}")
+            if len(missed) > 20:
+                print(f"    ... and {len(missed) - 20} more")
         rows.append({
             "db": db, "declared": len(declared_set), "inferred": len(inferred),
             "correct": tp, "false_positives": fp, "missed": fn,

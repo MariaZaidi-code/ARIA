@@ -95,7 +95,9 @@ _REFUSAL_RE = [
 ]
 
 _SQL_TABLE_RE = re.compile(
-    r"\b(?:FROM|JOIN|UPDATE|INTO|DELETE\s+FROM|TABLE)\s+[\"`\[]?([A-Za-z_][\w$]*)", re.IGNORECASE
+    r"\b(?:FROM|JOIN|UPDATE|INTO|DELETE\s+FROM|TABLE)\s+"
+    r"[\"`\[]?([A-Za-z_][\w$]*)[\]\"`]?(?:\s*\.\s*[\"`\[]?([A-Za-z_][\w$]*)[\]\"`]?)?",
+    re.IGNORECASE,
 )
 
 
@@ -167,11 +169,17 @@ def parse_llm_json(raw):
 
 
 def sql_table_names(sql):
-    """Return the set of table identifiers referenced by a SQL statement."""
+    """Return the set of table identifiers referenced by a SQL statement.
+
+    Supports bare (`orders`) and schema-qualified (`sales.orders`) names,
+    returning the fully-qualified name when a schema prefix is present.
+    """
     names = set()
     for m in _SQL_TABLE_RE.finditer(sql or ""):
-        name = m.group(1)
-        if name.lower() not in ("dual",):
+        first = m.group(1)
+        second = m.group(2)
+        name = f"{first}.{second}" if second else first
+        if name.lower() not in ("dual", "public"):
             names.add(name)
     return names
 

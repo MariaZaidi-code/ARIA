@@ -81,16 +81,26 @@ class GoalAgent:
 
         self.tables = self._normalize_schema(self.full_schema)
         self.relationship_graph = self._build_relationship_graph()
-        self.engine = create_engine(db_uri or DEFAULT_DB_URI)
+        self.dialect = dialect
+        self.schema = (self.full_schema.get("schema") or "public").strip()
+        self.engine = self._build_engine(db_uri)
         self.llm = provider or create_provider()
         self.kpi_index = self._build_kpi_index()
-        self.dialect = dialect
         self._row_counts_cache = None
         self.preprocessing_report = None
 
     # ------------------------------------------------------------------
     # Schema mapping normalization
     # ------------------------------------------------------------------
+
+    def _build_engine(self, db_uri):
+        """Build the SQLAlchemy engine. For non-public PostgreSQL schemas the
+        search_path is applied via connect_args (survives pool resets), so bare
+        table names from the schema mapping resolve correctly."""
+        uri = db_uri or DEFAULT_DB_URI
+        if self.dialect == "postgresql" and self.schema and self.schema != "public":
+            return create_engine(uri, connect_args={"options": f"-csearch_path={self.schema}"})
+        return create_engine(uri)
 
     def _normalize_schema(self, raw_schema):
         raw_tables = raw_schema.get("tables", {})

@@ -53,12 +53,18 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
         conn = schema_agent.get_connection(types.SimpleNamespace(**config))
         try:
             # Dynamic schema resolution (any PostgreSQL DB, not DB-specific):
-            # keep the configured schema when it has tables; otherwise fall back
-            # to the schema with the most tables (e.g. AdventureWorks ships data
-            # in non-public schemas, so 'public' alone maps nothing).
+            # - single-schema DBs (northwind): keep the configured schema when it
+            #   has tables; otherwise fall back to the schema with the most tables.
+            # - multi-schema DBs (AdventureWorks): map ALL populated schemas with
+            #   schema-qualified table names so goals can span schemas.
+            multi_schema = False
             if db_type == "postgresql":
                 try:
-                    if not schema_agent.schema_has_tables(conn, schema_filter):
+                    mode = schema_agent.detect_schema_mode(conn)
+                    multi_schema = mode["mode"] == "multi"
+                    if multi_schema:
+                        schema_filter = "*"
+                    elif not schema_agent.schema_has_tables(conn, schema_filter):
                         alt = schema_agent.find_schema_with_tables(conn)
                         if alt and alt != schema_filter:
                             schema_filter = alt
@@ -74,10 +80,16 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
                     previous_mapping = json.loads(prev_latest.read_text(encoding="utf-8"))
             except Exception:
                 previous_mapping = None
-            mapping = schema_agent.build_schema_mapping(
-                conn, schema_filter, db_type=db_type, llm=session.get("provider"),
-                previous_mapping=previous_mapping,
-            )
+            if multi_schema:
+                mapping = schema_agent.build_schema_mapping_all(
+                    conn, db_type=db_type, llm=session.get("provider"),
+                    previous_mapping=previous_mapping,
+                )
+            else:
+                mapping = schema_agent.build_schema_mapping(
+                    conn, schema_filter, db_type=db_type, llm=session.get("provider"),
+                    previous_mapping=previous_mapping,
+                )
             if not mapping.get("tables"):
                 hint = ""
                 if db_type == "postgresql":
@@ -170,6 +182,7 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
                 "to": f"{r['references_table']}.{r['references_column']}",
                 "confidence": r.get("confidence", "heuristic"),
                 "confidence_score": r.get("confidence_score"),
+                "confidence_band": r.get("confidence_band"),
                 "review_status": r.get("review_status"),
                 "relationship_state": r.get("relationship_state"),
                 "relationship_type": r.get("relationship_type"),

@@ -995,6 +995,13 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
             "confidence": confidence,
             "note": note,
         }
+        # Multi-schema (txt): schema is a first-class identifier on the
+        # relationship record itself, so downstream agents never collapse
+        # Sales.Customer and Marketing.Customer into one entity.
+        if isinstance(table_name, str) and "." in table_name:
+            rel["schema"] = table_name.split(".", 1)[0]
+        if isinstance(candidate_table, str) and "." in candidate_table:
+            rel["references_schema"] = candidate_table.split(".", 1)[0]
         # Item 4 (ambiguous): a near-tie with a runner-up target means the data
         # cannot distinguish the real reference; downstream agents should defer
         # to the human rather than guess.
@@ -1025,7 +1032,27 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
             "value_overlap": overlap_ratio,
             "null_rate": None,
             "cardinality": rel.get("cardinality"),
+            "same_schema": None,      # schema compatibility (supporting signal)
         }
+
+        # Multi-schema (txt): schema compatibility is a SUPPORTING signal, never
+        # a hard rule. Same-schema edges are usually easier to confirm, so they
+        # earn a small bonus; cross-schema edges are NOT penalized (a cross-schema
+        # FK is still a real relationship, e.g. Sales.SalesOrderDetail -> Production.Product).
+        def _table_schema(name):
+            if isinstance(name, str) and "." in name:
+                return name.split(".", 1)[0]
+            return schema
+
+        src_schema = _table_schema(table_name)
+        tgt_schema = _table_schema(candidate_table)
+        same_schema = bool(src_schema and tgt_schema and src_schema == tgt_schema)
+        detail["same_schema"] = same_schema
+        if same_schema:
+            score += 5
+            evidence.append("intra-schema relationship (supporting)")
+        else:
+            evidence.append("cross-schema relationship (not penalized)")
 
         # name_match (item 1) — column base matches the target table name.
         name_hit = name_hint
@@ -1118,6 +1145,16 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
             "CONFIRMED" if cs >= 80
             else "PROBABLE" if cs >= 60
             else "UNCERTAIN"
+        )
+
+        # Item 8 (txt): confidence band aligned to the documented taxonomy.
+        # REJECTED candidates are never emitted, so the sub-60 band is surfaced
+        # as Low (UNCERTAIN) rather than dropped.
+        rel["confidence_band"] = (
+            "High" if cs >= 90
+            else "Medium" if cs >= 75
+            else "Possible" if cs >= 60
+            else "Low"
         )
 
         # Item 2: self-referencing FK flag.
@@ -1883,6 +1920,39 @@ def schema_has_tables(conn, schema):
         return bool(cur.fetchone()[0])
 
 
+def list_schemas_with_tables(conn):
+    """Return non-system schemas that contain at least one base table (Postgres)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT table_schema
+            FROM information_schema.tables
+            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+              AND table_schema NOT LIKE 'pg_%'
+              AND table_type = 'BASE TABLE'
+            GROUP BY table_schema
+            ORDER BY count(*) DESC, table_schema
+            """
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def detect_schema_mode(conn):
+    """Classify a database as single-schema or multi-schema.
+
+    Returns {"mode": "single"|"multi", "schemas": [...], "count": n}.
+    Databases like northwind use only 'public' (single); AdventureWorks-style
+    databases spread tables across several schemas (multi). The caller picks
+    the matching extraction path so the single-schema flow is untouched.
+    """
+    schemas = list_schemas_with_tables(conn)
+    return {
+        "mode": "multi" if len(schemas) > 1 else "single",
+        "schemas": schemas,
+        "count": len(schemas),
+    }
+
+
 def find_schema_with_tables(conn):
     """Return the largest non-system Postgres schema that contains base tables.
 
@@ -2254,6 +2324,221 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
     return mapping
 
 
+def _all_schemas_foreign_keys(conn, schemas):
+    """Declared FKs across every mapped schema, with schema-qualified names.
+
+    Runs once for the merged multi-schema mapping so cross-schema foreign keys
+    (e.g. purchasing.productvendor -> production.product) survive qualification
+    and join paths can span schemas.
+    """
+    query = """
+        SELECT
+            refn.nspname AS table_schema,
+            refcon.relname AS table_name,
+            refatt.attname AS column_name,
+            conn.nspname AS references_schema,
+            conrel.relname AS references_table,
+            conatt.attname AS references_column
+        FROM pg_constraint c
+        JOIN pg_namespace refn ON refn.oid = c.connamespace
+        JOIN pg_class refcon ON refcon.oid = c.conrelid
+        JOIN pg_namespace conn ON conn.oid = (SELECT relnamespace FROM pg_class WHERE oid = c.confrelid)
+        JOIN pg_class conrel ON conrel.oid = c.confrelid
+        JOIN unnest(c.conkey) WITH ORDINALITY AS srckeys(attnum, ord) ON TRUE
+        JOIN unnest(c.confkey) WITH ORDINALITY AS tgtkeys(attnum, ord) ON srckeys.ord = tgtkeys.ord
+        JOIN pg_attribute refatt ON refatt.attrelid = c.conrelid AND refatt.attnum = srckeys.attnum
+        JOIN pg_attribute conatt ON conatt.attrelid = c.confrelid AND conatt.attnum = tgtkeys.attnum
+        WHERE c.contype = 'f'
+          AND refn.nspname = ANY(%s)
+        ORDER BY refn.nspname, refcon.relname, srckeys.ord;
+    """
+    with _dict_cursor(conn) as cur:
+        cur.execute(query, (list(schemas),))
+        rows = cur.fetchall()
+        rels = []
+        for r in rows:
+            rel = {
+                "table_name": f"{r['table_schema']}.{r['table_name']}",
+                "column_name": r["column_name"],
+                "references_table": f"{r['references_schema']}.{r['references_table']}",
+                "references_column": r["references_column"],
+                "schema": r["table_schema"],
+                "references_schema": r["references_schema"],
+            }
+            rel["same_schema"] = bool(r["table_schema"] == r["references_schema"])
+            rels.append(rel)
+        return rels
+
+
+def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name=None,
+                             previous_mapping=None):
+    """Build a merged mapping across every populated schema in a database.
+
+    Used only when `detect_schema_mode` reports more than one schema (e.g.
+    AdventureWorks). Each schema is extracted with the existing single-schema
+    pipeline, then merged with schema-qualified table names
+    (`sales.salesorderheader`) so the Goal Agent can answer questions that span
+    schemas. Single-schema databases never hit this path.
+    """
+    schemas = list_schemas_with_tables(conn)
+    mapping = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "snapshot_id": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),
+        "database": database_name or os.getenv("DB_NAME") or "unknown_database",
+        "schema": "*",
+        "schemas": schemas,
+        "tables": {},
+        "unique_keys": {},
+        "declared_relationships": [],
+        "inferred_relationships": [],
+        "relationship_edges": [],
+    }
+
+    for schema in schemas:
+        sub = build_schema_mapping(
+            conn, schema, db_type=db_type, llm=None,
+            database_name=database_name, previous_mapping=None,
+        )
+        for table_name, info in sub.get("tables", {}).items():
+            qualified = f"{schema}.{table_name}"
+            mapping["tables"][qualified] = info
+            mapping["unique_keys"].update(
+                {f"{schema}.{t}": v for t, v in sub.get("unique_keys", {}).items()}
+            )
+        for rel in sub.get("declared_relationships", []):
+            mapping["declared_relationships"].append({
+                "table_name": f"{schema}.{rel['table_name']}",
+                "column_name": rel["column_name"],
+                "references_table": f"{schema}.{rel['references_table']}",
+                "references_column": rel["references_column"],
+            })
+        for rel in sub.get("inferred_relationships", []):
+            mapping["inferred_relationships"].append({
+                "table": f"{schema}.{rel['table']}",
+                "column": rel["column"],
+                "references_table": f"{schema}.{rel['references_table']}",
+                "references_column": rel["references_column"],
+                "confidence": rel.get("confidence", "heuristic"),
+                "confidence_score": rel.get("confidence_score"),
+                "confidence_band": rel.get("confidence_band"),
+                "relationship_state": rel.get("relationship_state"),
+                "review_status": rel.get("review_status"),
+                "ambiguous": rel.get("ambiguous"),
+                "self_referencing": rel.get("self_referencing"),
+                "cardinality": rel.get("cardinality"),
+                "evidence": rel.get("evidence", []),
+                "evidence_detail": rel.get("evidence_detail"),
+                "note": rel.get("note", ""),
+                "schema": schema,
+                "references_schema": schema,
+                "same_schema": True,
+            })
+
+    # Cross-schema declared FKs replace the per-schema (same-schema-only) list,
+    # so join paths can span schemas and qualification is consistent.
+    mapping["declared_relationships"] = _all_schemas_foreign_keys(conn, schemas)
+
+    for rel in mapping["declared_relationships"]:
+        mapping["relationship_edges"].append({
+            "source_table": rel["table_name"],
+            "source_column": rel["column_name"],
+            "target_table": rel["references_table"],
+            "target_column": rel["references_column"],
+            "type": "declared",
+        })
+    for rel in mapping["inferred_relationships"]:
+        mapping["relationship_edges"].append({
+            "source_table": rel["table"],
+            "source_column": rel["column"],
+            "target_table": rel["references_table"],
+            "target_column": rel["references_column"],
+            "type": "inferred",
+            "confidence": rel.get("confidence", "heuristic"),
+            "confidence_score": rel.get("confidence_score"),
+            "confidence_band": rel.get("confidence_band"),
+            "relationship_state": rel.get("relationship_state"),
+            "review_status": rel.get("review_status"),
+            "ambiguous": rel.get("ambiguous"),
+            "self_referencing": rel.get("self_referencing"),
+            "cardinality": rel.get("cardinality"),
+        })
+
+    empty_tables = {
+        t for t, info in mapping["tables"].items()
+        if info.get("empty")
+    }
+    for t in empty_tables:
+        if t in mapping["tables"]:
+            mapping["tables"][t]["empty"] = True
+            mapping["tables"][t]["row_count"] = 0
+    mapping["declared_relationships"] = [
+        r for r in mapping["declared_relationships"]
+        if r["table_name"] not in empty_tables and r["references_table"] not in empty_tables
+    ]
+    mapping["inferred_relationships"] = [
+        r for r in mapping["inferred_relationships"]
+        if r.get("table") not in empty_tables and r.get("references_table") not in empty_tables
+    ]
+    mapping["relationship_edges"] = [
+        e for e in mapping["relationship_edges"]
+        if e["source_table"] not in empty_tables and e["target_table"] not in empty_tables
+    ]
+
+    _canonicalize_mapping(mapping)
+    mapping["relationship_graph"] = _build_relationship_graph(mapping)
+
+    inferred = mapping.get("inferred_relationships", [])
+    strong = [r for r in inferred if r.get("confidence") in
+              ("data-confirmed", "llm-confirmed", "composite-data-confirmed")]
+    weak = [r for r in inferred if r.get("confidence") not in
+            ("data-confirmed", "llm-confirmed", "composite-data-confirmed")]
+    review_list = [
+        {
+            "table": r.get("table"),
+            "column": r.get("column"),
+            "references_table": r.get("references_table"),
+            "references_column": r.get("references_column"),
+            "confidence_score": r.get("confidence_score"),
+            "confidence": r.get("confidence"),
+            "evidence": r.get("evidence", []),
+        }
+        for r in inferred if r.get("review_status") in ("flagged", "review")
+    ]
+    mapping["summary"] = {
+        "total_db_tables": len(mapping["tables"]),
+        "tables_used": len(mapping["tables"]),
+        "empty_tables": sorted(empty_tables),
+        "declared_fk_count": len(mapping["declared_relationships"]),
+        "inferred_fk_count": len(inferred),
+        "edge_count": len(mapping["relationship_edges"]),
+        "tables_with_pk": sorted(
+            t for t in mapping["tables"]
+            if mapping["tables"][t].get("primary_key")
+        ),
+        "tables_without_pk": sorted(
+            t for t in mapping["tables"]
+            if not mapping["tables"][t].get("primary_key")
+        ),
+        "health": {
+            "strong_inferred_fk_count": len(strong),
+            "weak_inferred_fk_count": len(weak),
+            "empty_table_count": len(empty_tables),
+            "profile_budget_exhausted": False,
+            "warning": None,
+        },
+        "review_list": review_list,
+        "review_count": len(review_list),
+    }
+
+    if llm is not None:
+        mapping = enrich_with_llm(mapping, llm)
+
+    if previous_mapping:
+        mapping["drift"] = detect_schema_drift(previous_mapping, mapping)
+
+    return mapping
+
+
 SNAPSHOT_KEEP = 20  # max snapshot files retained per (user, database) file set
 
 
@@ -2357,10 +2642,19 @@ def main():
     try:
         # PostgreSQL: if no schema was requested, auto-detect the one that
         # actually contains tables (public is the default but many databases
-        # put their tables in app / core / dbo-equivalent schemas).
+        # put their tables in app / core / dbo-equivalent schemas). When the
+        # database spans several populated schemas, map all of them with
+        # schema-qualified table names instead of picking just the largest.
+        multi_schema = False
         if not args.schema and args.db_type != "mysql":
-            schema = find_schema_with_tables(conn)
-            print(f"Auto-detected schema '{schema}'.")
+            mode = detect_schema_mode(conn)
+            multi_schema = mode["mode"] == "multi"
+            if multi_schema:
+                schema = "*"
+            else:
+                schema = mode["schemas"][0] if mode["schemas"] else "public"
+            print(f"Detected schema mode '{mode['mode']}' "
+                  f"({len(mode['schemas'])} schema(s): {', '.join(mode['schemas']) or 'none'}).")
         print(f"Connected ({args.db_type}). Extracting schema for '{schema}' schema...")
 
         # Item 5: seed drift detection from the previous run of this database
@@ -2379,9 +2673,14 @@ def main():
         except Exception as exc:
             logger.debug("could not load previous schema for drift detection: %s", exc)
 
-        mapping = build_schema_mapping(conn, schema, db_type=args.db_type, llm=llm,
-                                       database_name=args.db,
-                                       previous_mapping=previous_mapping)
+        if multi_schema:
+            mapping = build_schema_mapping_all(conn, db_type=args.db_type, llm=llm,
+                                               database_name=args.db,
+                                               previous_mapping=previous_mapping)
+        else:
+            mapping = build_schema_mapping(conn, schema, db_type=args.db_type, llm=llm,
+                                           database_name=args.db,
+                                           previous_mapping=previous_mapping)
         if not mapping.get("tables"):
             sys.exit(
                 f"ERROR: no tables found in schema '{schema}' ({args.db_type}). "
