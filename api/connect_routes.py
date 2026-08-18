@@ -19,6 +19,7 @@ router = APIRouter()
 class ProviderSwitchRequest(BaseModel):
     provider: str = "local"
     api_key: str | None = None      # optional key override for hosted providers
+    base_url: str | None = None     # optional endpoint override for hosted providers
 
 
 @router.post("/api/provider/switch")
