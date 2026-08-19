@@ -304,54 +304,54 @@ def get_declared_foreign_keys(conn, schema="public", db_type="postgresql"):
 def get_null_stats(conn, tables, schema="public", db_type="postgresql"):
     """Return {table_name: {column_name: {"total_rows": n, "nulls": n, "null_pct": p}}}
 
-    A table that cannot be counted (permission error, exotic type, huge cost)
-    is skipped rather than killing the whole run.
+    ONE aggregate query per table computes every column's null count (PART 9):
+    the old per-column COUNT pattern is an N+1 anti-pattern that issued
+    len(columns)+1 round trips per table. A table that cannot be counted
+    (permission error, exotic type, huge cost) reports UNKNOWN for every column
+    rather than zeros and never kills the run (missing != negative).
     """
     stats = {}
     with conn.cursor() as cur:
         for table_name, columns in tables.items():
+            if not columns:
+                continue
             table_stats = {}
             try:
+                col_names = [c["column"] for c in columns]
                 if db_type == "mysql":
                     qualified = f"{_quote_ident(db_type, schema)}.{_quote_ident(db_type, table_name)}"
-                    cur.execute(f"SELECT COUNT(*) FROM {qualified}")
-                    total_rows = cur.fetchone()[0]
-
-                    for col in columns:
-                        col_name = col["column"]
-                        qcol = _quote_ident(db_type, col_name)
-                        cur.execute(
-                            f"SELECT COUNT(*) - COUNT({qcol}) FROM {qualified}"
-                        )
-                        nulls = cur.fetchone()[0]
-                        null_pct = round((nulls / total_rows) * 100, 2) if total_rows else 0.0
-                        table_stats[col_name] = {
-                            "total_rows": total_rows,
-                            "nulls": nulls,
-                            "null_pct": null_pct,
-                        }
-                else:
-                    cur.execute(
-                        sql.SQL("SELECT COUNT(*) FROM {}.{}")
-                           .format(sql.Identifier(schema), sql.Identifier(table_name))
+                    select_parts = ", ".join(
+                        f"COUNT({_quote_ident(db_type, c)}) AS c{i}" for i, c in enumerate(col_names)
                     )
-                    total_rows = cur.fetchone()[0]
-
-                    for col in columns:
-                        col_name = col["column"]
-                        cur.execute(
-                            sql.SQL("SELECT COUNT(*) - COUNT({}) FROM {}.{}")
-                               .format(sql.Identifier(col_name), sql.Identifier(schema), sql.Identifier(table_name))
+                    cur.execute(f"SELECT COUNT(*) AS total, {select_parts} FROM {qualified}")
+                    row = cur.fetchone()
+                else:
+                    select_parts = ", ".join(
+                        f"COUNT({_quote_ident(db_type, c)}) AS c{i}" for i, c in enumerate(col_names)
+                    )
+                    cur.execute(
+                        sql.SQL("SELECT COUNT(*) AS total, {} FROM {}.{}").format(
+                            sql.SQL(select_parts),
+                            sql.Identifier(schema),
+                            sql.Identifier(table_name),
                         )
-                        nulls = cur.fetchone()[0]
-                        null_pct = round((nulls / total_rows) * 100, 2) if total_rows else 0.0
+                    )
+                    row = cur.fetchone()
+                if row:
+                    total = row[0]
+                    for i, col_name in enumerate(col_names):
+                        non_null = row[i + 1]
+                        nulls = total - (non_null or 0)
+                        null_pct = round((nulls / total) * 100, 2) if total else 0.0
                         table_stats[col_name] = {
-                            "total_rows": total_rows,
+                            "total_rows": total,
                             "nulls": nulls,
                             "null_pct": null_pct,
                         }
             except Exception:
-                # A single unreadable table must not poison the whole mapping.
+                # A single unreadable table must not poison the whole mapping;
+                # every column reports UNKNOWN (missing evidence, not zero).
+                logger.debug("null stats failed for table %s", table_name, exc_info=True)
                 stats[table_name] = {}
                 continue
             stats[table_name] = table_stats
@@ -380,22 +380,6 @@ def _singularize(name):
 _ID_TOKENS = {"id", "no", "num", "number", "code", "key", "fk", "ref", "uuid", "sk", "nk"}
 
 
-def _is_ref_flavored(name):
-    """Expanded FK name heuristic: catches _id, _by, _to, _from, _via, _for, etc."""
-    if not isinstance(name, str):
-        return False
-    low = name.lower()
-    if low == "id":
-        return True
-    for suffix in ("_id", "_by", "_to", "_from", "_via", "_for", "_at",
-                    "_with", "_against", "_on", "_of", "_type"):
-        if low.endswith(suffix):
-            return True
-    if low.endswith("id") and len(low) > 2:
-        return True
-    return False
-
-
 def _tokenize_words(name):
     """Split an identifier into lowercase word tokens (snake_case, camelCase, acronyms).
 
@@ -405,418 +389,6 @@ def _tokenize_words(name):
     s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(name))
     s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)
     return [w for w in re.split(r"[^a-zA-Z0-9]+", s.lower()) if w]
-
-
-def _norm_value(v):
-    """Normalize a sampled value for cross-column comparison (numeric-aware)."""
-    if isinstance(v, bool):
-        return ("bool", v)
-    if isinstance(v, (int, float)):
-        return ("num", float(v))
-    return ("str", str(v))
-
-
-class _ValueProfiler:
-    """Samples distinct column values so relationships can be confirmed from DATA.
-
-    This is what makes inference work for ANY database: a column whose values
-    overlap a primary key's values is a de-facto foreign key, regardless of how
-    it is named (e.g. support_rep_id -> employee, reports_to -> employee).
-    """
-
-    MIN_OVERLAP = 0.85
-    MAX_SAMPLE = 500
-    MAX_PK_SAMPLE = 100000
-    MAX_PROFILE_QUERIES = 400
-
-    def __init__(self, conn, schema, db_type, tables, primary_keys):
-        self.conn = conn
-        self.schema = schema
-        self.db_type = db_type
-        self.tables = tables
-        self._src_cache = {}
-        self._pk_cache = {}
-        self._rows_cache = {}
-        self._dtype_cache = {}
-        self._profile_budget = self.MAX_PROFILE_QUERIES
-        self.pk_index = []
-        for table, cols in primary_keys.items():
-            for col in cols:
-                self.pk_index.append(
-                    (table, col, self._distinct(table, col, self._pk_cache, self.MAX_PK_SAMPLE)))
-
-    def rel_table(self, table):
-        """Return a SQL-safe qualified table reference.
-
-        Table names may arrive bare (`product`) for a single-schema pass or
-        already schema-qualified (`production.product`) for the global
-        cross-schema pass. Bare names are qualified with self.schema; qualified
-        names are used as-is. MySQL has no separate schema namespace here.
-        """
-        if self.db_type == "mysql":
-            return _quote_ident(self.db_type, table)
-        if isinstance(table, str) and "." in table:
-            parts = table.split(".", 1)
-            return (
-                f"{_quote_ident(self.db_type, parts[0])}."
-                f"{_quote_ident(self.db_type, parts[1])}"
-            )
-        return (
-            f"{_quote_ident(self.db_type, self.schema)}."
-            f"{_quote_ident(self.db_type, table)}"
-        )
-
-    def column_type(self, table, col):
-        """Return the (normalized) data type of a column, or '' when unknown."""
-        key = (table, col)
-        if key not in self._dtype_cache:
-            dtype = ""
-            cols = self.tables.get(table)
-            if isinstance(cols, list):
-                for c in cols:
-                    if c.get("column") == col:
-                        dtype = str(c.get("data_type", "")).lower()
-                        break
-            elif isinstance(cols, dict):
-                for c in cols.get("columns", []):
-                    if c.get("column") == col:
-                        dtype = str(c.get("data_type", "")).lower()
-                        break
-            self._dtype_cache[key] = dtype
-        return self._dtype_cache[key]
-
-    def types_compatible(self, src_table, src_col, tgt_table, tgt_col):
-        """True when two columns are plausibly joinable by data type.
-
-        Numeric-to-numeric (int/bigint/numeric/decimal/float/serial) and
-        text-to-text (varchar/text/char/uuid) are compatible. Crossing numeric
-        with text is a strong sign the columns are NOT a real FK even when a few
-        values overlap.
-        """
-        st = self.column_type(src_table, src_col)
-        tt = self.column_type(tgt_table, tgt_col)
-        if not st or not tt:
-            return True  # unknown -> don't reject
-        if st == tt:
-            return True
-        numeric = ("int", "bigint", "smallint", "numeric", "decimal", "float",
-                   "double", "real", "serial", "money")
-        text = ("char", "varchar", "text", "uuid", "string")
-        is_s_num = any(tok in st for tok in numeric)
-        is_t_num = any(tok in tt for tok in numeric)
-        is_s_txt = any(tok in st for tok in text)
-        is_t_txt = any(tok in tt for tok in text)
-        if is_s_num and is_t_num:
-            return True
-        if is_s_txt and is_t_txt:
-            return True
-        return False
-
-    def _distinct(self, table, col, cache, limit):
-        key = (table, col)
-        if key in cache:
-            return cache[key]
-        if self._profile_budget <= 0:
-            cache[key] = set()
-            return cache[key]
-        self._profile_budget -= 1
-        try:
-            values = set()
-            with _dict_cursor(self.conn, self.db_type) as cur:
-                cur.execute(
-                    f"SELECT DISTINCT {_quote_ident(self.db_type, col)} AS v "
-                    f"FROM {self.rel_table(table)} "
-                    f"WHERE {_quote_ident(self.db_type, col)} IS NOT NULL "
-                    f"ORDER BY {_quote_ident(self.db_type, col)} LIMIT {limit}"
-                )
-                for row in cur.fetchall():
-                    values.add(_norm_value(row["v"]))
-        except Exception as exc:
-            logger.debug("distinct sample failed for %s.%s: %s", table, col, exc)
-            values = set()
-        cache[key] = values
-        return values
-
-    def source_values(self, table, col):
-        return self._distinct(table, col, self._src_cache, self.MAX_SAMPLE)
-
-    def row_count(self, table):
-        if table not in self._rows_cache:
-            try:
-                with _dict_cursor(self.conn, self.db_type) as cur:
-                    cur.execute(
-                        f"SELECT COUNT(*) AS n FROM {self.rel_table(table)}"
-                    )
-                    self._rows_cache[table] = cur.fetchone()["n"] or 0
-            except Exception as exc:
-                logger.debug("row count failed for %s: %s", table, exc)
-                self._rows_cache[table] = 0
-        return self._rows_cache[table]
-
-    @staticmethod
-    def _overlap(src, target):
-        if not src:
-            return 0.0
-        return len(src & target) / len(src)
-
-    def strongest_overlap(self, source_set, only_tables=None, min_source=1, high_cardinality=False, row_count=None, exclude=None, require_unambiguous=False, source_table=None, source_col=None):
-        """Return (table, pk_col, overlap_ratio, matched) for the best PK target.
-
-        Ties (same ratio and matched count) are broken in favour of the target
-        whose primary key set is the smallest that still contains the values —
-        the tightest containment is the more likely real reference. When
-        `require_unambiguous` is set and the top two targets are indistinguishable
-        on (ratio, matched), no target is returned: with opaque names and no name
-        evidence a wrong guess is worse than none.
-        """
-        cands = []
-        src_tokens = set()
-        if source_col:
-            for tok in _tokenize_words(source_col):
-                if tok in _ID_TOKENS:
-                    continue
-                src_tokens.add(_singularize(tok))
-                # All-lowercase concatenated names (productmodelid) do not split,
-                # so also add the base with a trailing id stripped.
-                if tok.endswith("id") and len(tok) > 2:
-                    src_tokens.add(_singularize(tok[:-2]))
-        # Most-specific name target: the SHORTEST table whose name tokens match
-        # the source column's base (mirrors _is_reference_to_other_table). Only
-        # that table gets a name boost; longer tables that merely CONTAIN the
-        # token (productmodelproductdescriptionculture vs productmodelid) must
-        # not outrank the real target on a substring accident. Schema prefixes
-        # (production.product) are ignored as name tokens so a column never
-        # matches a table just because its schema name is a substring.
-        most_specific = None
-        if src_tokens:
-            for table, _, _ in self.pk_index:
-                name_part = table.rsplit(".", 1)[-1]
-                table_tokens = {_singularize(tok) for tok in _tokenize_words(name_part)}
-                if not table_tokens:
-                    continue
-                if table_tokens & src_tokens:
-                    if most_specific is None or len(table) < len(most_specific):
-                        most_specific = table
-        for table, pk_col, target_set in self.pk_index:
-            if only_tables and table not in only_tables:
-                continue
-            if exclude and (table, pk_col) == exclude:
-                continue
-            if len(source_set) < min_source:
-                continue
-            if source_table is not None and source_col is not None:
-                if not self.types_compatible(source_table, source_col, table, pk_col):
-                    continue
-            ratio = self._overlap(source_set, target_set)
-            if ratio < self.MIN_OVERLAP:
-                continue
-            if high_cardinality:
-                if len(source_set) < 10:
-                    continue
-                if row_count and len(source_set) < 0.05 * row_count:
-                    continue
-            # Name-match nudge (same tie-break as strongest_exact_overlap): when
-            # two targets overlap the source values equally (e.g. productmodelid
-            # vs both `productmodel` and `productmodelproductdescriptionculture`),
-            # the MOST SPECIFIC table name the column actually matches should win.
-            # It outranks key size: a shared key (productid) appears in many
-            # tables, and the smallest key is often the wrong parent.
-            boost = 10 if (most_specific and table == most_specific) else 0
-            cands.append((ratio, len(source_set & target_set), boost,
-                          -len(target_set), table, pk_col, len(source_set & target_set)))
-        if not cands:
-            return None
-        cands.sort(reverse=True)
-        # "Unambiguous" means indistinguishable on the FULL decisive tuple
-        # (ratio, matched, name boost, key size). A much tighter containment
-        # (e.g. an airports.id with 500 distinct vs a flights.id with 30000) is
-        # a real discriminator, so it must not be discarded as ambiguous.
-        if require_unambiguous and len(cands) >= 2 and cands[0][:4] == cands[1][:4]:
-            return None
-        ratio, _, _boost, _ksize, table, pk_col, matched = cands[0]
-        # Item 4 (ambiguous): a relationship is ambiguous when a runner-up
-        # candidate carries nearly identical DATA evidence (ratio within 3 pts
-        # and matched within a small absolute delta). A decisive NAME advantage
-        # (the winner's table is the most-specific name target and the runner-up
-        # is not) resolves the tie, so it is NOT ambiguous. We still return the
-        # best candidate, but flag it so the caller/downstream can defer to a
-        # human when the data alone cannot decide.
-        ambiguous = False
-        if len(cands) >= 2:
-            r2, m2, boost2 = cands[1][0], cands[1][6], cands[1][2]
-            data_tie = (cands[0][0] - r2) < 0.03 and abs(matched - m2) <= max(2, int(0.05 * matched))
-            # A MUCH tighter containment is a real discriminator: e.g.
-            # purchaseorderid with 4012 distinct matching purchaseorderheader's
-            # 4012-key PK is clearly the reference, even though a 40k-key
-            # workorder PK also contains every value.
-            winner_tighter = (-cands[0][3]) < 0.5 * (-cands[1][3])
-            # Conversely, when the RUNNER-UP is much tighter than the winner
-            # (businessentity's 20k-key PK vs employee's 290-key PK), the
-            # name-selected winner is a loose HUB the source values merely
-            # fall inside — the data actually favours the tighter runner-up,
-            # so the relationship is ambiguous and goes to review.
-            runner_tighter = (-cands[1][3]) < 0.5 * (-cands[0][3])
-            name_decides = (_boost > boost2 and most_specific is not None
-                            and table == most_specific and not runner_tighter)
-            if data_tie and not name_decides and not winner_tighter:
-                ambiguous = True
-        # Evidence conflict (txt item 5): the data points at one table but the
-        # column NAME names a different table (e.g. productmodelid overlapping
-        # productmodelproductdescriptionculture while the name says productmodel).
-        # Emitting the data winner as a confident FK would contradict the name
-        # evidence, so the relationship is flagged ambiguous and routed to review.
-        if most_specific is not None and most_specific != table and not ambiguous:
-            ambiguous = True
-        # Containment-density guard (txt item 7/8): a source column whose
-        # distinct values are a TINY fraction of the target's key size (e.g. bin
-        # with 62 distinct against a 127-key PK, or onorderqty with 26 distinct
-        # against an 8845-key PK) is almost certainly an attribute/code column
-        # that happens to fall inside the key range — not a real reference.
-        # A decisive name match (productid -> product) overrides, because the
-        # name itself points at the parent table. Without a name, sparse
-        # containment is routed to review rather than emitted.
-        if not ambiguous and _boost == 0 and len(source_set) < self.MAX_SAMPLE \
-                and len(source_set) < 0.6 * len(self._pk_values(table)):
-            # A sparse containment is suspicious when the source values look
-            # like a SEQUENCE/COUNTER (a contiguous integer range, e.g. bin
-            # 0..61, territoryid 1..10, referenceorderlineid 0..71) — those
-            # collide with every small PK. A sparse subset WITH GAPS (e.g.
-            # employee.reports_to = {1,2,6} against an 8-row employee table,
-            # or addresstypeid = {2,3,5} against a 6-row lookup) is exactly
-            # what a real partial FK looks like and must NOT be flagged. For
-            # NON id-flavored columns (bin, onorderqty) any sparse containment
-            # is a coincidence — a quantity/label column matching a huge PK.
-            vals = sorted(
-                v[1] for v in source_set
-                if isinstance(v, tuple) and len(v) == 2 and v[0] in ("num", "int")
-            )
-            contiguous = bool(vals) and (vals[-1] - vals[0] + 1) <= len(vals) * 1.5
-            ref_flavored = source_col and _is_ref_flavored(source_col)
-            if contiguous or not ref_flavored:
-                ambiguous = True
-        return table, pk_col, ratio, matched, ambiguous
-
-    def _pk_values(self, table):
-        for t, _pk, tset in self.pk_index:
-            if t == table:
-                return tset
-        return set()
-
-    def _distinct_raw(self, table, col, limit):
-        """Raw (un-normalized) distinct values, for exact SQL containment checks."""
-        values = []
-        try:
-            with _dict_cursor(self.conn, self.db_type) as cur:
-                cur.execute(
-                    f"SELECT DISTINCT {_quote_ident(self.db_type, col)} AS v "
-                    f"FROM {self.rel_table(table)} "
-                    f"WHERE {_quote_ident(self.db_type, col)} IS NOT NULL "
-                    f"ORDER BY {_quote_ident(self.db_type, col)} LIMIT {limit}"
-                )
-                for row in cur.fetchall():
-                    v = row["v"]
-                    if v is not None:
-                        values.append(v)
-        except Exception as exc:
-            logger.debug("distinct sample failed for %s.%s: %s", table, col, exc)
-            return []
-        return values
-
-    def _exact_matched(self, table, pk_col, values):
-        """Count how many of `values` actually occur in the FULL target key column."""
-        if not values:
-            return None
-        ident = _quote_ident(self.db_type, pk_col)
-        try:
-            with _dict_cursor(self.conn, self.db_type) as cur:
-                if self.db_type == "mysql":
-                    marks = ", ".join(["%s"] * len(values))
-                    cur.execute(
-                        f"SELECT count(DISTINCT {ident}) AS matched "
-                        f"FROM {_quote_ident(self.db_type, table)} "
-                        f"WHERE {ident} IN ({marks})",
-                        tuple(values),
-                    )
-                else:
-                    cur.execute(
-                        f"SELECT count(DISTINCT {ident}) AS matched "
-                        f"FROM {self.rel_table(table)} "
-                        f"WHERE {ident} = ANY(%s)",
-                        (list(values),),
-                    )
-                return cur.fetchone()["matched"] or 0
-        except Exception as exc:
-            logger.debug("exact containment check failed for %s.%s: %s", table, pk_col, exc)
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-            return None
-
-    def strongest_exact_overlap(self, source_table, source_col, target_tables, exclude=None):
-        """Like strongest_overlap but verifies against the FULL target key column.
-
-        Sampling both sides dilutes containment when the target table is huge
-        (e.g. a 1M-row sales key vs a 30k-row warranty that references it),
-        hiding real relationships. When the column name already points at a
-        concrete target, an exact SQL containment count is cheap and accurate.
-        """
-        src = self._distinct_raw(source_table, source_col, self.MAX_SAMPLE)
-        if len(src) < 2:
-            return None
-        col_tokens = set(_tokenize_words(source_col))
-        best = None
-        for table, pk_col, _ in self.pk_index:
-            if table not in target_tables:
-                continue
-            if exclude and (table, pk_col) == exclude:
-                continue
-            if not self.types_compatible(source_table, source_col, table, pk_col):
-                continue
-            matched = self._exact_matched(table, pk_col, src)
-            if matched is None:
-                continue
-            ratio = matched / len(src)
-            if ratio < self.MIN_OVERLAP:
-                continue
-            # Tiebreaker: prefer the target whose key CONTAINS the values most
-            # tightly (smallest key that still matches at this ratio) — this is
-            # what makes airports.id win over flights.id for origin_id when both
-            # contain every value. A partial token match between column name and
-            # table name adds a smaller positive nudge; there is NO blanket
-            # self-reference boost because that made origin_id/dest_id wrongly
-            # resolve to flights.id.
-            boost = 0
-            if col_tokens:
-                table_tokens = set(_tokenize_words(table))
-                if any(ct in tt or tt.startswith(ct)
-                       for ct in col_tokens for tt in table_tokens):
-                    boost = 5
-            # Key size: number of distinct values in the target PK.
-            key_size = len(self._distinct(table, pk_col, self._pk_cache, self.MAX_PK_SAMPLE))
-            cand = (ratio, matched, -key_size, boost, table, pk_col)
-            if best is None or cand > best:
-                second = best
-                best = cand
-            elif second is None or cand > second:
-                second = cand
-        if best is None:
-            return None
-        ratio, matched, _neg, _boost, table, pk_col = best
-        # Item 4 (ambiguous): flag when the runner-up is within a hair of the
-        # winner on ratio (boost/key-size tiebreakers aside).
-        ambiguous = False
-        if second is not None and (ratio - second[0]) < 0.03:
-            ambiguous = True
-        return table, pk_col, ratio, matched, ambiguous
-
-    def should_profile(self, col):
-        """Only sample columns that could plausibly reference a key (bounds cost)."""
-        name = str(col["column"]).lower()
-        if name.endswith(("_id", "_code", "id", "_no", "_num", "_number", "_key", "_uuid")):
-            return True
-        dtype = str(col.get("data_type", "")).upper()
-        return any(tok in dtype for tok in ("INT", "NUMERIC", "DECIMAL", "NUMBER", "REAL", "FLOAT"))
 
 
 def _is_reference_to_other_table(col_name, table_name, tables):
@@ -860,25 +432,6 @@ def _is_reference_to_other_table(col_name, table_name, tables):
         if best is None or len(t) < len(best):
             best = t
     return best is not None and best != table_name
-
-
-def _is_code_column(col_name):
-    """True for categorical label/code columns that collide with PKs by chance.
-
-    txt item 8: `status`, `country_code`, `category`, `year`, `department` etc.
-    often share values with primary keys (1..n) and must be penalized heavily
-    as FK candidates — they are almost never real references.
-    """
-    low = col_name.lower()
-    base = low[:-3] if low.endswith("_id") else low
-    tokens = set(_tokenize_words(base))
-    code_words = {
-        "status", "category", "subcategory", "country", "city", "state",
-        "region", "year", "month", "day", "week", "department", "gender",
-        "channel", "segment", "tier", "type", "flag", "currency", "language",
-        "color", "size", "brand", "name", "label", "grade", "level",
-    }
-    return any(t in code_words for t in tokens)
 
 
 def infer_primary_keys(tables, declared_primary_keys):
@@ -1067,506 +620,19 @@ def infer_primary_keys_from_data(conn, tables, schema, db_type, existing_pks, ma
 
 
 def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="public", db_type="postgresql", null_stats=None):
+    """Infer relationships for columns with no declared FK constraint.
+
+    Phase C: delegates to the schema_engine pipeline (candidates -> evidence
+    -> classifier -> acceptance policy -> registry), the single acceptance
+    authority (RULE 6). Returns (inferred, ambiguous) legacy-shaped dicts.
     """
-    Infer relationships for columns that look like foreign keys but have NO
-    declared constraint. Two general signals, in order of strength:
+    from schema_engine.relationships import infer_relationships as _pipeline
 
-      1. DATA: when `conn` is given, sample distinct column values and confirm a
-         relationship by value overlap with another table's primary key. This
-         works for ANY naming convention (support_rep_id -> employee, reports_to
-         -> employee, ...) because it relies on the values, not the names.
-      2. NAME: tokenized word matching (snake_case / camelCase / plurals), which
-         is a generic convention rule, not a per-database patch.
-
-    Confidence levels:
-      - "data-confirmed"     value overlap PLUS a name hint (strongest)
-      - "data-inferred"      value overlap only (e.g. opaque names)
-      - "heuristic-name-match"  name match only (offline / no data)
-    """
-    declared_pairs = {(fk["table_name"], fk["column_name"]) for fk in declared_fks}
-    null_stats = null_stats or {}
-
-    pk_owner = {}
-    table_pk = {}
-    for table_name, pk_cols in primary_keys.items():
-        table_pk[table_name] = pk_cols
-        for pk_col in pk_cols:
-            pk_owner.setdefault(pk_col, []).append(table_name)
-
-    profiler = _ValueProfiler(conn, schema, db_type, tables, primary_keys) if conn is not None else None
-
-    def table_name_candidates(col_name):
-        """For 'X_id', return tables whose name (singular or plural) is X."""
-        base = col_name[:-3].lower() if col_name.endswith("_id") else col_name.lower()
-        forms = {base, base + "s", base + "es"}
-        if base.endswith("y") and len(base) > 1:
-            forms.add(base[:-1] + "ies")
-        forms.add(_singularize(base))
-        names = [t for t in tables if t.lower() in forms]
-        if not names:
-            # Generalized token match: any naming style, not just X_id.
-            col_tokens = {_singularize(tok) for tok in _tokenize_words(col_name) if tok not in _ID_TOKENS}
-            if col_tokens:
-                for t in tables:
-                    t_tokens = {_singularize(tok) for tok in _tokenize_words(t)}
-                    if col_tokens <= t_tokens:
-                        names.append(t)
-        return sorted(set(names))
-
-    def _emit(table_name, col_name, candidate_table, ref_col, confidence, note,
-              overlap_ratio=None, name_hint=False, ambiguous=False):
-        rel = {
-            "table": table_name,
-            "column": col_name,
-            "references_table": candidate_table,
-            "references_column": ref_col,
-            "confidence": confidence,
-            "note": note,
-        }
-        # Multi-schema (txt): schema is a first-class identifier on the
-        # relationship record itself, so downstream agents never collapse
-        # Sales.Customer and Marketing.Customer into one entity.
-        if isinstance(table_name, str) and "." in table_name:
-            rel["schema"] = table_name.split(".", 1)[0]
-        if isinstance(candidate_table, str) and "." in candidate_table:
-            rel["references_schema"] = candidate_table.split(".", 1)[0]
-        # Item 4 (ambiguous): a near-tie with a runner-up target means the data
-        # cannot distinguish the real reference; downstream agents should defer
-        # to the human rather than guess.
-        if ambiguous:
-            rel["ambiguous"] = True
-        # Cardinality: source distinct values (data available) vs referenced key.
-        # Distinct source < referenced rows means many source rows share one
-        # target -> many-to-one; equal-ish counts -> one-to-one.
-        if profiler is not None and isinstance(col_name, str) and isinstance(ref_col, str):
-            src_vals = profiler.source_values(table_name, col_name)
-            tgt_vals = profiler.source_values(candidate_table, ref_col)
-            if src_vals is not None and tgt_vals is not None and len(tgt_vals) > 0:
-                ratio = len(src_vals) / len(tgt_vals)
-                rel["cardinality"] = (
-                    "one-to-one" if ratio >= 0.9
-                    else "one-to-many" if ratio > 1.1
-                    else "many-to-one"
-                )
-
-        # Item 1: explainable multi-factor confidence score.
-        evidence = []
-        score = 0.0
-        # Priority 2 (txt): structured evidence object alongside the readable list.
-        detail = {
-            "name_match": False,
-            "datatype_match": None,   # None when no data profiler available
-            "target_unique": False,
-            "value_overlap": overlap_ratio,
-            "null_rate": None,
-            "cardinality": rel.get("cardinality"),
-            "same_schema": None,      # schema compatibility (supporting signal)
-        }
-
-        # Multi-schema (txt): schema compatibility is a SUPPORTING signal, never
-        # a hard rule. Same-schema edges are usually easier to confirm, so they
-        # earn a small bonus; cross-schema edges are NOT penalized (a cross-schema
-        # FK is still a real relationship, e.g. Sales.SalesOrderDetail -> Production.Product).
-        def _table_schema(name):
-            if isinstance(name, str) and "." in name:
-                return name.split(".", 1)[0]
-            return schema
-
-        src_schema = _table_schema(table_name)
-        tgt_schema = _table_schema(candidate_table)
-        same_schema = bool(src_schema and tgt_schema and src_schema == tgt_schema)
-        detail["same_schema"] = same_schema
-        if same_schema:
-            score += 5
-            evidence.append("intra-schema relationship (supporting)")
-        else:
-            evidence.append("cross-schema relationship (not penalized)")
-
-        # name_match (item 1) — column base matches the target table name.
-        name_hit = name_hint
-        if not name_hit:
-            base = _singularize(col_name[:-3] if col_name.endswith("_id") else col_name)
-            tgt_tokens = {_singularize(tok) for tok in _tokenize_words(candidate_table)}
-            if base in tgt_tokens:
-                name_hit = True
-        detail["name_match"] = name_hit
-        if name_hit:
-            score += 25
-            evidence.append("column name matches target table")
-
-        # datatype_match (item 4).
-        if profiler is not None and isinstance(col_name, str) and isinstance(ref_col, str):
-            dt_ok = profiler.types_compatible(table_name, col_name, candidate_table, ref_col)
-            detail["datatype_match"] = bool(dt_ok)
-            if dt_ok:
-                score += 15
-                evidence.append("datatype compatible")
-            else:
-                evidence.append("datatype mismatch")
-
-        # overlap_ratio (item 5) — tiered value evidence.
-        if overlap_ratio is not None:
-            detail["value_overlap"] = overlap_ratio
-            if overlap_ratio >= 0.99:
-                score += 30
-                evidence.append("~100% values found in target PK")
-            elif overlap_ratio >= 0.95:
-                score += 25
-                evidence.append(">=95% values found in target PK")
-            elif overlap_ratio >= 0.80:
-                score += 18
-                evidence.append(">=80% values found in target PK")
-            else:
-                evidence.append("partial value overlap")
-
-        # uniqueness: target column is a primary key.
-        tgt_pk = set(table_pk.get(candidate_table, []))
-        target_unique = False
-        if isinstance(ref_col, str) and ref_col in tgt_pk:
-            target_unique = True
-            score += 20
-            evidence.append("target is a primary key")
-        elif not isinstance(ref_col, str):
-            # Composite: referenced columns are key columns by construction.
-            if all(c in tgt_pk for c in ref_col):
-                target_unique = True
-                score += 20
-                evidence.append("target is a composite primary key")
-        detail["target_unique"] = target_unique
-
-        # cardinality: many-to-one / one-to-one favour a real FK over 1:1 sharing.
-        if rel.get("cardinality") in ("many-to-one", "one-to-many"):
-            score += 10
-            evidence.append("many source rows map to one target row")
-
-        # Item 6: nullable FK intelligence. High null rate lowers confidence
-        # (sparse reference) but does NOT kill a name+datatype+overlap match.
-        if profiler is not None and isinstance(col_name, str):
-            ns = null_stats.get(table_name, {}).get(col_name, {})
-            null_pct = ns.get("null_pct") if isinstance(ns, dict) else None
-            if null_pct is not None:
-                detail["null_rate"] = null_pct
-                if null_pct > 0.8:
-                    score -= 25
-                    evidence.append(f"high null rate ({null_pct:.0%}) — relationship optional")
-                elif null_pct > 0.5:
-                    score -= 10
-                    evidence.append(f"nullable ({null_pct:.0%})")
-
-        rel["confidence_score"] = max(0, min(100, round(score)))
-        rel["evidence"] = evidence
-        rel["evidence_detail"] = detail
-
-        # Item 10: review tier.
-        cs = rel["confidence_score"]
-        rel["review_status"] = (
-            "auto-accept" if cs >= 80
-            else "flagged" if cs >= 60
-            else "review"
-        )
-
-        # Priority 5 (txt): CONFIRMED / PROBABLE / UNCERTAIN / REJECTED taxonomy.
-        # REJECTED candidates are never emitted, so emitted relationships use the
-        # three positive states; a null/empty/nullable-heavy hit that scores below
-        # the review floor would instead be surfaced as UNCERTAIN for a human.
-        rel["relationship_state"] = (
-            "CONFIRMED" if cs >= 80
-            else "PROBABLE" if cs >= 60
-            else "UNCERTAIN"
-        )
-
-        # Item 8 (txt): confidence band aligned to the documented taxonomy.
-        # REJECTED candidates are never emitted, so the sub-60 band is surfaced
-        # as Low (UNCERTAIN) rather than dropped.
-        rel["confidence_band"] = (
-            "High" if cs >= 90
-            else "Medium" if cs >= 75
-            else "Possible" if cs >= 60
-            else "Low"
-        )
-
-        # Item 2: self-referencing FK flag.
-        rel["self_referencing"] = bool(
-            isinstance(col_name, str) and table_name == candidate_table
-            and col_name != ref_col
-        )
-
-        # Priority 3 (txt): unified relationship type.
-        if rel.get("self_referencing"):
-            rel["relationship_type"] = "self-referencing"
-        elif rel.get("cardinality"):
-            rel["relationship_type"] = rel["cardinality"]
-        else:
-            rel["relationship_type"] = "foreign-key"
-
-        # Item 4 (txt item 5): an AMBIGUOUS relationship means the data cannot
-        # distinguish the real reference from a runner-up candidate (e.g. a
-        # shared businessentityid present in many tables). Emitting it as a
-        # confirmed edge would hallucinate an FK, so it is routed to review
-        # instead: downstream agents see only unambiguous, data-supported edges
-        # and the human is asked to arbitrate the tie.
-        if ambiguous:
-            rel["review_status"] = "review"
-            rel["relationship_state"] = "UNCERTAIN"
-            if "ambiguous candidate - data cannot distinguish best target" not in evidence:
-                evidence.append("ambiguous candidate - data cannot distinguish best target")
-                rel["evidence"] = evidence
-            ambiguous_list.append(rel)
-            return
-
-        inferred.append(rel)
-
-    inferred = []
-    ambiguous_list = []
-    for table_name, columns in tables.items():
-        for col in columns:
-            col_name = col["column"]
-
-            if (table_name, col_name) in declared_pairs:
-                continue
-
-            own_pk = primary_keys.get(table_name, [])
-            if col_name in own_pk:
-                # A sole primary key is the table's own identity, never a FK.
-                # A column of a COMPOSITE key may also reference another table
-                # (junction tables), so it stays eligible but only via DATA.
-                if len(own_pk) == 1:
-                    continue
-                is_composite_key_col = True
-                # Composite PK columns with very few distinct values that form
-                # a contiguous range starting from 1 are line counters or sort
-                # keys (e.g. item_id=1,2,3,4,5), not FKs. They overlap 100%
-                # with every small PK and create false positives.
-                if profiler is not None:
-                    _pk_vals = profiler.source_values(table_name, col_name)
-                    if _pk_vals is not None and len(_pk_vals) <= 6:
-                        # Extract numeric values from normalized tuples
-                        _nums = sorted(v[1] if isinstance(v, tuple) else v
-                                       for v in _pk_vals
-                                       if (isinstance(v, tuple) and len(v) >= 2
-                                           and isinstance(v[1], (int, float)))
-                                       or isinstance(v, (int, float)))
-                        if (_nums and _nums[0] == 1
-                                and _nums == list(range(1, len(_nums) + 1))):
-                            continue
-            else:
-                is_composite_key_col = False
-
-            is_ref_flavored = _is_ref_flavored(col_name)
-            if not is_ref_flavored:
-                # When connected, allow numeric/UUID columns through — they may
-                # be FKs with non-standard names (reports_to, ship_via, …).
-                if not (profiler and profiler.should_profile(col)):
-                    continue
-
-            candidate_tables = set(pk_owner.get(col_name, []))
-            table_cands = set(table_name_candidates(col_name))
-            if not table_cands:
-                # Fallback: a column that shares its name with ANOTHER table's
-                # primary key (only when that name is meaningful). A same-named
-                # non-key column is a coincidental attribute, not a relationship.
-                same_name = [
-                    other_table
-                    for other_table in tables
-                    if other_table != table_name
-                    and col_name in table_pk.get(other_table, [])
-                    and len(normalize_identifier(col_name)) >= 3
-                ]
-                if len(same_name) == 1:
-                    candidate_tables.update(same_name)
-            candidate_tables.update(table_cands)
-            candidate_tables.discard(table_name)
-
-            if profiler is not None:
-                src_set = profiler.source_values(table_name, col_name)
-                rows = profiler.row_count(table_name)
-                hit = None
-                if is_ref_flavored or is_composite_key_col:
-                    # id-suffixed columns: the name is already a strong signal,
-                    # so data only needs a modest overlap to confirm. When the
-                    # name gives NO target at all (opaque support_rep_id), let
-                    # the data speak against every primary key — but only pick a
-                    # target it can identify unambiguously.
-                    hit = profiler.strongest_overlap(
-                        src_set,
-                        only_tables=candidate_tables or None,
-                        min_source=2,
-                        exclude=(table_name, col_name),
-                        require_unambiguous=not candidate_tables,
-                        source_table=table_name,
-                        source_col=col_name,
-                    )
-                elif not candidate_tables:
-                    # Non-id columns (reports_to): only data can find them, and
-                    # only when high-cardinality enough to not be a code/status.
-                    hit = profiler.strongest_overlap(
-                        src_set,
-                        high_cardinality=True,
-                        row_count=rows,
-                        exclude=(table_name, col_name),
-                        source_table=table_name,
-                        source_col=col_name,
-                    )
-                if hit is None and candidate_tables and (is_ref_flavored or is_composite_key_col):
-                    # Name already narrows the target; verify against the FULL
-                    # target key (exact containment) so huge key tables are not
-                    # diluted by sampling (e.g. warranty -> 1M-row sales).
-                    hit = profiler.strongest_exact_overlap(
-                        table_name, col_name, candidate_tables,
-                        exclude=(table_name, col_name),
-                    )
-                if hit is None and not candidate_tables and is_ref_flavored:
-                    # Small integers (reports_to, ship_via, …) match every PK
-                    # in the sample. Use exact SQL containment against ALL tables
-                    # to find the real target via full-key containment ratio.
-                    all_tables = set(t for t, _, _ in profiler.pk_index)
-                    hit = profiler.strongest_exact_overlap(
-                        table_name, col_name, all_tables,
-                        exclude=(table_name, col_name),
-                    )
-                if hit is not None:
-                    target_table, target_col, ratio, matched, ambiguous = hit
-                    # Negative evidence (txt item 7) + common-value collisions
-                    # (txt item 8): a code/label column (status, category, year,
-                    # country_code, ...) whose values merely overlap a key is
-                    # NOT a real FK. Only accept it when the name itself points
-                    # at the target table (e.g. `order_status` -> status table)
-                    # — otherwise its "overlap" is coincidence.
-                    if _is_code_column(col_name):
-                        name_hint = target_table in candidate_tables
-                        if not name_hint:
-                            hit = None
-                    if hit is not None:
-                        target_table, target_col, ratio, matched, ambiguous = hit
-                        if target_table in candidate_tables:
-                            confidence, note = "data-confirmed", (
-                                f"No FK constraint declared; confirmed by value overlap "
-                                f"({matched}/{len(src_set)} sample values) with {target_table}.{target_col}.")
-                        else:
-                            confidence, note = "data-inferred", (
-                                f"No FK constraint declared and no name match; inferred from "
-                                f"value overlap ({matched}/{len(src_set)} sample values) with {target_table}.{target_col}.")
-                    if hit is not None:
-                        # The value overlap was confirmed against ONE target
-                        # column (target_col). If the target's PK is composite,
-                        # fanning out to every member would claim the other
-                        # members' values overlap too — they were never checked
-                        # (e.g. product.productmodelid matching
-                        # productmodelproductdescriptionculture.{productmodelid,
-                        # productdescriptionid, cultureid}). Only the actually
-                        # matched column is emitted; full composite references
-                        # are handled by the composite-data pass below.
-                        tgt_pk = table_pk.get(target_table) or []
-                        ref_cols = [target_col] if len(tgt_pk) > 1 else (tgt_pk or [target_col])
-                        for ref_col in ref_cols:
-                            # A column can never reference itself (same table + same column).
-                            if table_name == target_table and col_name == ref_col:
-                                continue
-                            _emit(table_name, col_name, target_table, ref_col, confidence, note,
-                                  overlap_ratio=ratio, name_hint=(target_table in candidate_tables),
-                                  ambiguous=ambiguous)
-                        continue
-
-            if is_composite_key_col:
-                # Composite-key columns only produce relationships when the data
-                # confirms them; a name match alone is not enough.
-                continue
-
-            # Negative evidence (txt item 7): a column whose most-specific
-            # table-name match is its OWN table is its identity, not a reference.
-            # e.g. orders.order_id matches both `orders` and `order_items` tokens;
-            # the shorter/most-specific name `orders` is the table itself, so the
-            # column must not be emitted as a name-only FK to `order_items`.
-            if not _is_reference_to_other_table(col_name, table_name, tables):
-                continue
-
-            for candidate_table in sorted(candidate_tables):
-                # A name match targets ONE column; when the candidate's PK is
-                # composite, emitting every member would fabricate relationships
-                # the name never supported (e.g. productmodelid -> cultureid).
-                # Composite references are only emitted when the data confirms
-                # them (composite pass below).
-                cand_pk = table_pk.get(candidate_table) or []
-                ref_cols = [col_name] if len(cand_pk) > 1 else (cand_pk or [col_name])
-                for ref_col in ref_cols:
-                    _emit(table_name, col_name, candidate_table, ref_col,
-                          "heuristic-name-match",
-                          "No FK constraint declared in the database; relationship inferred from column naming convention.",
-                          name_hint=True)
-
-    # Composite relationships: (a, b) -> (x, y). A source table may reference a
-    # target table whose PRIMARY KEY spans several columns (junction/detail rows).
-    # Detect it by name first, then confirm the composite tuple by data.
-    if profiler is not None:
-        for target_table, target_pk in sorted(table_pk.items()):
-            if len(target_pk) < 2:
-                continue
-            declared_tgt = {
-                (fk["table_name"], fk["references_table"], fk["references_column"])
-                for fk in declared_fks
-            }
-            for src_table, columns in tables.items():
-                if src_table == target_table:
-                    continue
-                src_pk = primary_keys.get(src_table, [])
-                cols = {c["column"] for c in columns}
-                matched = [c for c in target_pk if c in cols and c not in src_pk]
-                if len(matched) < 2:
-                    continue
-                if all((src_table, target_table, c) in declared_tgt for c in matched):
-                    continue
-                matched_norm = set(normalize_identifier(c) for c in matched)
-                src_names = set(normalize_identifier(c) for c in cols)
-                table_norm = normalize_identifier(target_table)
-                # Require the matched names to actually resemble the target's key
-                # (e.g. order_id + product_id vs order_item's order_id+product_id),
-                # not two coincidental shared names.
-                name_ok = any(
-                    n == table_norm + "_" + mn or mn in (n, n + "_id")
-                    for n in src_names for mn in matched_norm
-                )
-                if not name_ok:
-                    continue
-                if not profiler.types_compatible(src_table, matched[0], target_table, target_pk[0]):
-                    continue
-                # Confirm composite containment by data: fraction of source rows
-                # whose (matched...) tuple exists in the target composite key.
-                try:
-                    matched_cols = [_quote_ident(profiler.db_type, c) for c in matched]
-                    tgt_cols = [_quote_ident(profiler.db_type, c) for c in target_pk]
-                    if profiler.db_type == "mysql":
-                        join_sql = " AND ".join(
-                            f"s.{mc} = t.{tc}" for mc, tc in zip(matched_cols, tgt_cols)
-                        )
-                        q = (
-                            f"SELECT (COUNT(DISTINCT s.{matched_cols[0]}) / NULLIF(COUNT(DISTINCT t.{tgt_cols[0]}),0)) "
-                            f"FROM {_quote_ident(profiler.db_type, src_table)} s "
-                            f"LEFT JOIN {_quote_ident(profiler.db_type, target_table)} t ON {join_sql}"
-                        )
-                    else:
-                        join_sql = " AND ".join(
-                            f"s.{mc} = t.{tc}" for mc, tc in zip(matched_cols, tgt_cols)
-                        )
-                        q = (
-                            f"SELECT COUNT(DISTINCT s.{matched_cols[0]})::float / NULLIF(COUNT(DISTINCT t.{tgt_cols[0]}),0) "
-                            f"FROM {_quote_ident(profiler.db_type, profiler.schema)}.{_quote_ident(profiler.db_type, src_table)} s "
-                            f"LEFT JOIN {_quote_ident(profiler.db_type, profiler.schema)}.{_quote_ident(profiler.db_type, target_table)} t ON {join_sql}"
-                        )
-                    with _dict_cursor(profiler.conn, profiler.db_type) as cur:
-                        cur.execute(q)
-                        ratio = cur.fetchone().get("ratio") or 0.0
-                except Exception as exc:
-                    logger.debug("composite check failed %s -> %s: %s", src_table, target_table, exc)
-                    continue
-                if ratio >= profiler.MIN_OVERLAP:
-                    _emit(
-                        src_table, matched, target_table, target_pk, "composite-data-confirmed",
-                        f"Composite FK inferred: ({', '.join(matched)}) references "
-                        f"{target_table}({', '.join(target_pk)}) with {ratio:.0%} of "
-                        f"source keys present in the target composite key.",
-                        overlap_ratio=ratio, name_hint=True,
-                    )
-    return inferred, ambiguous_list
+    inferred, ambiguous, _registry = _pipeline(
+        tables, primary_keys, declared_fks,
+        conn=conn, schema=schema, db_type=db_type, null_stats=null_stats,
+    )
+    return inferred, ambiguous
 
 
 # ---------------------------------------------------------------------------
@@ -1625,7 +691,7 @@ Rules:
 _SCHEMA_REASONING_PROMPT_TAIL = "\nSchema:\n"
 
 
-def enrich_with_llm(mapping, llm):
+def enrich_with_llm(mapping, llm, schema=None):
     """Optional LLM-assisted reasoning pass over a built schema mapping.
 
     Works identically for every provider (Ollama 'local' or Groq 'cloud').
@@ -1635,7 +701,7 @@ def enrich_with_llm(mapping, llm):
     if llm is None:
         return mapping
 
-    summary = _condense_schema(mapping)
+    summary = _build_reasoning_brief(mapping)
     if not summary.strip():
         return mapping
 
@@ -1667,52 +733,82 @@ def enrich_with_llm(mapping, llm):
         "model": model,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _apply_schema_reasoning(mapping, parsed)
+    _apply_schema_reasoning(mapping, parsed, schema=schema)
     return mapping
 
 
-def _condense_schema(mapping, max_tables=60, max_chars=12000):
-    """Compact text summary of the mapping for the reasoning LLM."""
+def _build_reasoning_brief(mapping, max_candidates=40):
+    """Focused briefing for the reasoning LLM (PART 16).
+
+    Deterministic candidate generation and evidence collection have already
+    happened before this point. The LLM is only asked for SEMANTIC evidence on
+    the genuinely ambiguous/high-value candidates plus descriptions / PK
+    suggestions for tables that lack a key. This is NOT a lossy whole-schema
+    dump: the payload is bounded by the number of candidates under review, so
+    the LLM is never treated as an oracle over the entire database. Everything
+    it returns is still routed through the deterministic classifier + policy
+    (RULE 5).
+    """
     tables = mapping.get("tables", {})
     if not tables:
         return ""
     lines = [f"Database: {mapping.get('database', 'unknown')} "
              f"(schema: {mapping.get('schema', '?')})"]
 
-    for idx, (table_name, info) in enumerate(tables.items()):
-        if idx >= max_tables:
-            lines.append("... (additional tables omitted)")
-            break
+    def _pk(table_name):
+        info = tables.get(table_name, {}) or {}
         pk = info.get("primary_key") or info.get("inferred_primary_key") or []
-        pk_str = ", ".join(pk) if isinstance(pk, (list, tuple)) and pk else "none declared/inferred"
-        lines.append(f"TABLE {table_name} (PK: {pk_str})")
-        for col in info.get("columns", []):
-            npct = info.get("null_stats", {}).get(col["column"], {}).get("null_pct")
-            null_info = "NULL" if col.get("nullable") else "NOT NULL"
-            if npct is not None:
-                null_info += f" ({npct}% null)"
-            lines.append(f"  {col['column']} {col.get('data_type', '?')} {null_info}")
-        lines.append("")
+        return ", ".join(pk) if isinstance(pk, (list, tuple)) and pk else "none"
 
-    declared = mapping.get("declared_relationships", [])
+    lines.append("TABLES:")
+    for table_name in tables:
+        lines.append(f"  {table_name} (PK: {_pk(table_name)})")
+
+    missing_pk = sorted(t for t in tables if _pk(t) == "none")
+    declared = mapping.get("declared_relationships", []) or []
+    inferred = mapping.get("inferred_relationships", []) or []
+    ambiguous = mapping.get("ambiguous_relationships", []) or []
+    candidates = inferred + ambiguous
+
+    review_tables = set()
+    for r in candidates:
+        review_tables.add(r.get("table"))
+        review_tables.add(r.get("references_table"))
+
+    detail_tables = sorted((set(missing_pk) | review_tables) & set(tables))
+    if detail_tables:
+        lines.append("COLUMN CONTEXT (tables under review / lacking a key):")
+        for t in detail_tables:
+            cols = ", ".join(c["column"] for c in tables[t].get("columns", []))
+            lines.append(f"  {t}: {cols}")
+
     if declared:
-        lines.append("DECLARED FOREIGN KEYS:")
+        lines.append("DECLARED FOREIGN KEYS (authoritative - do not second-guess):")
         for d in declared:
             lines.append(f"  {d['table_name']}.{d['column_name']} -> "
                          f"{d['references_table']}.{d['references_column']}")
-        lines.append("")
 
-    inferred = mapping.get("inferred_relationships", [])
-    if inferred:
-        lines.append("CANDIDATE RELATIONSHIPS (unverified, from naming heuristics):")
-        for r in inferred:
-            lines.append(f"  {r['table']}.{r['column']} -> "
-                         f"{r['references_table']}.{r['references_column']}")
+    if candidates:
+        lines.append(f"CANDIDATES FOR SEMANTIC REVIEW ({len(candidates)}):")
+        for r in candidates[:max_candidates]:
+            src = r.get("table", r.get("table_name"))
+            col = r.get("column", r.get("column_name"))
+            tgt_t = r.get("references_table")
+            tgt_c = r.get("references_column")
+            extra = ""
+            state = r.get("relationship_state")
+            if state:
+                extra += f" state={state}"
+            if r.get("confidence"):
+                extra += f" confidence={r.get('confidence')}"
+            score = r.get("confidence_score")
+            if score is not None:
+                extra += f" score={score}"
+            lines.append(f"  {src}.{col} -> {tgt_t}.{tgt_c}{extra}")
+        if len(candidates) > max_candidates:
+            lines.append(f"... ({len(candidates) - max_candidates} more candidates omitted)")
 
-    summary = "\n".join(lines)
-    if len(summary) > max_chars:
-        summary = summary[:max_chars] + "\n... (truncated)"
-    return summary
+    return "\n".join(lines)
 
 
 def _parse_schema_reasoning(content):
@@ -1769,7 +865,7 @@ def _column_data_type(table_info, col_name):
     return ""
 
 
-def _apply_schema_reasoning(mapping, parsed):
+def _apply_schema_reasoning(mapping, parsed, schema=None):
     """Merge validated LLM suggestions into the mapping (never invents names)."""
     tables = mapping.setdefault("tables", {})
     declared = mapping.get("declared_relationships", [])
@@ -1816,6 +912,14 @@ def _apply_schema_reasoning(mapping, parsed):
     # -- relationship confirm / add ----------------------------------------
     llm_rels = parsed.get("relationships") or []
     if isinstance(llm_rels, list):
+        from schema_engine.classifier import classify
+        from schema_engine.policy import AcceptancePolicy
+
+        policy = AcceptancePolicy()
+        table_pk = {t: list(info.get("primary_key") or []) for t, info in tables.items()}
+        null_stats = {t: (info.get("null_stats") or {}) for t, info in tables.items()}
+        review_stash = mapping.setdefault("_llm_review", [])
+
         for rel in llm_rels:
             if not isinstance(rel, dict):
                 continue
@@ -1861,39 +965,65 @@ def _apply_schema_reasoning(mapping, parsed):
                             r["confidence"] = "llm-confirmed"
                             r["note"] = ("Confirmed by LLM reasoning "
                                          "(no FK constraint declared in the database).")
-                            # Also update the matching edge
+                            policy.corroborate(r, 20, "LLM reasoning corroborates this target")
                             for e in edges:
                                 if (e.get("source_table") == table
                                         and e.get("source_column") == column
                                         and e.get("target_table") == ref_table):
                                     e["confidence"] = "llm-confirmed"
+                                    e["confidence_score"] = r.get("confidence_score")
+                                    e["confidence_band"] = r.get("confidence_band")
+                                    e["relationship_state"] = r.get("relationship_state")
+                                    e["review_status"] = r.get("review_status")
                 else:
-                    # No existing heuristic — LLM is the only signal; add it.
-                    inferred.append({
-                        "table": table, "column": column,
-                        "references_table": ref_table, "references_column": ref_col,
-                        "confidence": "llm-confirmed",
-                        "note": "Confirmed by LLM reasoning (no FK constraint declared in the database).",
-                    })
-                    edges.append({
-                        "source_table": table, "source_column": column,
-                        "target_table": ref_table, "target_column": ref_col,
-                        "type": "inferred", "confidence": "llm-confirmed",
-                    })
+                    # No existing heuristic — LLM is the only signal; the
+                    # policy decides whether it is strong enough to emit.
+                    new_rel, _amb = classify(
+                        None, table_pk, null_stats, schema,
+                        table, column, ref_table, ref_col,
+                        "llm-confirmed",
+                        "Confirmed by LLM reasoning (no FK constraint declared in the database).",
+                        name_hint=False, llm_signal="confirm",
+                    )
+                    if new_rel["relationship_state"] == "UNCERTAIN":
+                        new_rel["review_status"] = "review"
+                        review_stash.append(new_rel)
+                    else:
+                        inferred.append(new_rel)
+                        edges.append({
+                            "source_table": table, "source_column": column,
+                            "target_table": ref_table, "target_column": ref_col,
+                            "type": "inferred", "confidence": "llm-confirmed",
+                            "confidence_score": new_rel.get("confidence_score"),
+                            "confidence_band": new_rel.get("confidence_band"),
+                            "relationship_state": new_rel.get("relationship_state"),
+                            "review_status": new_rel.get("review_status"),
+                        })
             elif kind == "add" and new_pair not in {pair(r) for r in inferred}:
-                # Only add when this column has no inferred FK yet (no ambiguity).
+                # Only add when this column has no inferred FK yet (no ambiguity);
+                # the policy decides the state from LLM + name + PK evidence.
                 if not any(r.get("table") == table and r.get("column") == column for r in inferred):
-                    inferred.append({
-                        "table": table, "column": column,
-                        "references_table": ref_table, "references_column": ref_col,
-                        "confidence": "llm-reasoned",
-                        "note": "Proposed by LLM reasoning (no FK constraint declared in the database).",
-                    })
-                    edges.append({
-                        "source_table": table, "source_column": column,
-                        "target_table": ref_table, "target_column": ref_col,
-                        "type": "inferred", "confidence": "llm-reasoned",
-                    })
+                    new_rel, _amb = classify(
+                        None, table_pk, null_stats, schema,
+                        table, column, ref_table, ref_col,
+                        "llm-reasoned",
+                        "Proposed by LLM reasoning (no FK constraint declared in the database).",
+                        name_hint=False, llm_signal="add",
+                    )
+                    if new_rel["relationship_state"] == "UNCERTAIN":
+                        new_rel["review_status"] = "review"
+                        review_stash.append(new_rel)
+                    else:
+                        inferred.append(new_rel)
+                        edges.append({
+                            "source_table": table, "source_column": column,
+                            "target_table": ref_table, "target_column": ref_col,
+                            "type": "inferred", "confidence": "llm-reasoned",
+                            "confidence_score": new_rel.get("confidence_score"),
+                            "confidence_band": new_rel.get("confidence_band"),
+                            "relationship_state": new_rel.get("relationship_state"),
+                            "review_status": new_rel.get("review_status"),
+                        })
 
 
 def _canonicalize_mapping(mapping):
@@ -2159,7 +1289,7 @@ def _drop_empty_key_columns(mapping, conn, schema, db_type):
         for rel in rel_list:
             table_name, col_name = source_pair(rel, declared)
             col_names = {c["column"] for c in tables.get(table_name, {}).get("columns", [])}
-            if (table_name in tables and col_name in col_names
+            if isinstance(col_name, str) and (table_name in tables and col_name in col_names
                     and _column_is_empty(conn, table_name, col_name, schema, db_type)):
                 removed_fk_pairs.add((table_name, col_name))
                 removed_fks.append((table_name, col_name, declared))
@@ -2306,8 +1436,10 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
     declared_fks = get_declared_foreign_keys(conn, schema, db_type)
     null_stats = get_null_stats(conn, tables, schema, db_type)
 
+    from schema_engine.relationships import infer_relationships as _pipeline
+
     merged_primary_keys = {**primary_keys, **inferred_primary_keys}
-    inferred_fks, ambiguous_fks = infer_relationships(
+    inferred_fks, ambiguous_fks, registry = _pipeline(
         tables, merged_primary_keys, declared_fks,
         conn=conn, schema=schema, db_type=db_type,
         null_stats=null_stats,
@@ -2328,7 +1460,7 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
         if refined:
             inferred_primary_keys.update(refined)
             merged_primary_keys = {**primary_keys, **inferred_primary_keys}
-            inferred_fks, ambiguous_fks = infer_relationships(
+            inferred_fks, ambiguous_fks, registry = _pipeline(
                 tables, merged_primary_keys, declared_fks,
                 conn=conn, schema=schema, db_type=db_type,
             )
@@ -2441,11 +1573,13 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
     mapping["relationship_graph"] = _build_relationship_graph(mapping)
 
     # Rich health report (drives the UI dashboard / QA checks).
+    # Strong vs weak uses the STRUCTURED state (PART 12); the legacy confidence
+    # strings remain only as provenance on each record.
     inferred = mapping.get("inferred_relationships", [])
-    strong = [r for r in inferred if r.get("confidence") in
-              ("data-confirmed", "llm-confirmed", "composite-data-confirmed")]
-    weak = [r for r in inferred if r.get("confidence") not in
-            ("data-confirmed", "llm-confirmed", "composite-data-confirmed")]
+    strong = [r for r in inferred
+              if r.get("relationship_state") in ("CONFIRMED", "PROBABLE")]
+    weak = [r for r in inferred
+            if r.get("relationship_state") not in ("CONFIRMED", "PROBABLE")]
     # Item 10: human-review list for uncertain relationships.
     review_list = [
         {
@@ -2455,6 +1589,8 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
             "references_column": r.get("references_column"),
             "confidence_score": r.get("confidence_score"),
             "confidence": r.get("confidence"),
+            "confidence_level": r.get("confidence_level"),
+            "relationship_state": r.get("relationship_state"),
             "evidence": r.get("evidence", []),
         }
         for r in inferred if r.get("review_status") in ("flagged", "review")
@@ -2469,18 +1605,31 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
             "references_column": r.get("references_column"),
             "confidence_score": r.get("confidence_score"),
             "confidence": r.get("confidence"),
+            "confidence_level": r.get("confidence_level"),
+            "relationship_state": r.get("relationship_state"),
             "evidence": r.get("evidence", []),
         })
     review_list.sort(key=lambda x: (x.get("table") or "", x.get("column") or ""))
-    mapping["summary"]["health"] = {
+
+    # Truthful profiling budget (PART 8) - never hardcoded.
+    budget_summary = registry.summary() if registry is not None else {}
+    health = {
         "strong_inferred_fk_count": len(strong),
         "weak_inferred_fk_count": len(weak),
         "empty_table_count": len(empty_tables),
-        "profile_budget_exhausted": False,
+        "profile_budget_exhausted": budget_summary.get("profile_budget_exhausted", False),
+        "profiling_status": budget_summary.get("profiling_status", "unknown"),
+        "queries_used": budget_summary.get("queries_used"),
+        "queries_remaining": budget_summary.get("queries_remaining"),
         "warning": None,
     }
+    mapping["summary"]["health"] = health
     mapping["summary"]["review_list"] = review_list
     mapping["summary"]["review_count"] = len(review_list)
+    # PART 14: rejected candidates are retained internally for debugging and
+    # benchmarking even though they never enter the relationship lists.
+    from schema_engine.serializer import serialize_rejected
+    mapping["rejected_candidates"] = serialize_rejected(registry) if registry is not None else []
 
     # Item 5: schema drift vs the previous run of this database (when supplied).
     if previous_mapping:
@@ -2568,7 +1717,8 @@ def _infer_cross_schema_relationships(mapping, conn, db_type="postgresql"):
         for qualified, info in mapping.get("tables", {}).items()
     }
     declared = mapping.get("declared_relationships", [])
-    cross, cross_ambiguous = infer_relationships(
+    from schema_engine.relationships import infer_relationships as _xs_pipeline
+    cross, cross_ambiguous, cross_registry = _xs_pipeline(
         tables, primary_keys, declared,
         conn=conn, schema="", db_type=db_type,
     )
@@ -2582,6 +1732,10 @@ def _infer_cross_schema_relationships(mapping, conn, db_type="postgresql"):
         for r in declared
     }
 
+    # Cross-schema candidates use the SAME pipeline and the SAME acceptance
+    # state as intra-schema ones (PART 15): there is no separate cross-schema
+    # acceptance rule. Only the structured relationship_state decides whether
+    # an edge is emitted; everything else is surfaced for human review.
     added = []
     for r in cross:
         src_schema = r.get("schema")
@@ -2591,42 +1745,8 @@ def _infer_cross_schema_relationships(mapping, conn, db_type="postgresql"):
         key = (r.get("table"), r.get("column"), r.get("references_table"))
         if key in existing:
             continue
-        # Cross-schema edges are ONLY accepted on strong, unambiguous data
-        # evidence. Value overlap alone is not enough across schemas (low-
-        # cardinality codes like quantity/sickleavehours overlap every small
-        # key), so weak/ambiguous candidates become `review` instead of being
-        # emitted as relationships (txt: "do not improve recall by creating
-        # excessive false positives"; "return uncertain/review").
-        score = r.get("confidence_score")
-        band = r.get("confidence_band")
-        # Names are hints, not requirements (txt item 8) — but a cross-schema
-        # edge still needs SOME genuine name evidence to confirm WHICH table the
-        # column references. Without it the data cannot distinguish a real FK
-        # from a coincidental value overlap (e.g. customer.personid overlapping
-        # businessentitycontact.personid only because personid is a composite-PK
-        # member there). The pk_owner name hint used by single-schema inference
-        # is too permissive for cross-schema edges, so re-derive the name match
-        # from the column's tokens vs the target table's tokens, or from an
-        # exact match against the target's SOLE primary-key column (a composite
-        # member is a junction/child key, not a parent reference).
-        col_name = r.get("column", "")
-        tgt_table = r.get("references_table", "")
-        base = _singularize(col_name[:-3] if col_name.endswith("_id") else col_name)
-        tgt_tokens = {_singularize(tok) for tok in _tokenize_words(tgt_table)}
-        sole_pk = primary_keys.get(tgt_table, [])
-        genuine_name = bool(
-            (base and base in tgt_tokens)
-            or (len(sole_pk) == 1 and col_name == sole_pk[0])
-        )
-        strong = (
-            r.get("confidence") in ("data-confirmed", "composite-data-confirmed")
-            and genuine_name
-            and not r.get("ambiguous")
-            and score is not None and score >= 90
-            and band == "High"
-        )
-        if not strong:
-            r["relationship_state"] = "uncertain"
+        if r.get("relationship_state") not in ("CONFIRMED", "PROBABLE"):
+            r["relationship_state"] = "UNCERTAIN"
             r["review_status"] = "review"
             mapping.setdefault("_cross_schema_review", []).append(r)
             continue
@@ -2636,32 +1756,36 @@ def _infer_cross_schema_relationships(mapping, conn, db_type="postgresql"):
         )
         added.append(r)
 
-    if not added:
-        return
-    mapping["inferred_relationships"].extend(added)
-    for rel in added:
-        mapping["relationship_edges"].append({
-            "source_table": rel["table"],
-            "source_column": rel["column"],
-            "target_table": rel["references_table"],
-            "target_column": rel["references_column"],
-            "type": "inferred",
-            "confidence": rel.get("confidence", "heuristic"),
-            "confidence_score": rel.get("confidence_score"),
-            "confidence_band": rel.get("confidence_band"),
-            "relationship_state": rel.get("relationship_state"),
-            "review_status": rel.get("review_status"),
-            "ambiguous": rel.get("ambiguous"),
-            "self_referencing": rel.get("self_referencing"),
-            "cardinality": rel.get("cardinality"),
-        })
+    if added:
+        mapping["inferred_relationships"].extend(added)
+        for rel in added:
+            mapping["relationship_edges"].append({
+                "source_table": rel["table"],
+                "source_column": rel["column"],
+                "target_table": rel["references_table"],
+                "target_column": rel["references_column"],
+                "type": "inferred",
+                "confidence": rel.get("confidence", "heuristic"),
+                "confidence_score": rel.get("confidence_score"),
+                "confidence_band": rel.get("confidence_band"),
+                "relationship_state": rel.get("relationship_state"),
+                "review_status": rel.get("review_status"),
+                "ambiguous": rel.get("ambiguous"),
+                "self_referencing": rel.get("self_referencing"),
+                "cardinality": rel.get("cardinality"),
+            })
 
     # Ambiguous cross-schema candidates: keep them visible for human review
-    # even though they are never accepted as edges.
+    # even though they are never accepted as edges (same pipeline, same rule).
     for r in cross_ambiguous:
-        r["relationship_state"] = "uncertain"
+        r["relationship_state"] = "UNCERTAIN"
         r["review_status"] = "review"
         mapping.setdefault("_cross_schema_review", []).append(r)
+    # Rejected cross-schema candidates are also retained (PART 14) rather than
+    # disappearing, so benchmarks/debugging can explain every non-edge.
+    if cross_registry is not None and cross_registry.rejected:
+        mapping.setdefault("_cross_schema_rejected", []).extend(
+            cross_registry.rejected)
 
 
 def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name=None,
@@ -2675,6 +1799,7 @@ def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name
     schemas. Single-schema databases never hit this path.
     """
     schemas = list_schemas_with_tables(conn)
+    schema_health = []
     mapping = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "snapshot_id": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),
@@ -2693,6 +1818,9 @@ def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name
             conn, schema, db_type=db_type, llm=None,
             database_name=database_name, previous_mapping=None,
         )
+        # Aggregate truthful profiling budget per schema (PART 8).
+        _h = (sub.get("summary") or {}).get("health") or {}
+        schema_health.append(_h)
         for table_name, info in sub.get("tables", {}).items():
             qualified = f"{schema}.{table_name}"
             mapping["tables"][qualified] = info
@@ -2855,7 +1983,15 @@ def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name
             "strong_inferred_fk_count": len(strong),
             "weak_inferred_fk_count": len(weak),
             "empty_table_count": len(empty_tables),
-            "profile_budget_exhausted": False,
+            "profile_budget_exhausted": bool(
+                any(h.get("profile_budget_exhausted") for h in schema_health)
+            ),
+            "profiling_status": (
+                "exhausted" if any(h.get("profile_budget_exhausted") for h in schema_health)
+                else "active" if schema_health else "unknown"
+            ),
+            "queries_used": sum(h.get("queries_used") or 0 for h in schema_health),
+            "queries_remaining": sum(h.get("queries_remaining") or 0 for h in schema_health),
             "warning": None,
         },
         "review_list": review_list,
