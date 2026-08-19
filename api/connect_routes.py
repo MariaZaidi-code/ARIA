@@ -84,6 +84,8 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     session["schema_path"] = SCHEMA_DIR / uid_dir / "schema_mapping_latest.json"
     session["processed_path"] = PROCESSED_DIR / uid_dir / "processed_data.json"
     session["insights_path"] = INSIGHTS_DIR / uid_dir / "insights.json"
+    session["processed_path"].parent.mkdir(parents=True, exist_ok=True)
+    session["insights_path"].parent.mkdir(parents=True, exist_ok=True)
 
     if not (request.db and request.user and request.password is not None):
         raise HTTPException(status_code=400, detail="Relational source requires db, user, and password.")
@@ -125,6 +127,8 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     session["schema_path"] = SCHEMA_DIR / uid_dir / "schema_mapping_latest.json"
     session["processed_path"] = PROCESSED_DIR / uid_dir / f"processed_data_{safe}.json"
     session["insights_path"] = INSIGHTS_DIR / uid_dir / f"insights_{safe}.json"
+    session["processed_path"].parent.mkdir(parents=True, exist_ok=True)
+    session["insights_path"].parent.mkdir(parents=True, exist_ok=True)
 
     return {
         "ok": True,

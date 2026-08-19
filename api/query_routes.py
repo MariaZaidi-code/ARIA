@@ -63,6 +63,8 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     return {
         "ok": True,
         "provider": session["provider_name"],
+        "status": processed.get("status", "success"),
+        "question": processed.get("question"),
         "user_goal": processed.get("user_goal"),
         "kpi_alignment": processed.get("kpi_alignment"),
         "join_path": processed.get("join_path"),
@@ -76,6 +78,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "data_selection": processed.get("data_selection"),
         "analysis_plan": processed.get("analysis_plan"),
         "execution": processed.get("execution"),
+        "warnings": processed.get("warnings"),
         "suggested_questions": processed.get("suggested_questions"),
         "history_id": session["pending_history_id"],
     }

@@ -179,15 +179,6 @@
       <button onclick="extractSchema()" id="btn_schema">Run Schema Agent</button>
       <div class="status" id="schema_status"></div>
     </section>
-
-    <section class="panel">
-      <h2>5 · Suggested Searches</h2>
-      <p style="font-size:12px;color:var(--muted);margin:0 0 8px">
-        The LLM analyses your tables and suggests what you can search for.
-      </p>
-      <button onclick="getSuggestions()" id="btn_suggest">Get Suggestions</button>
-      <div id="suggestions_box" style="margin-top:10px"></div>
-    </section>
   </div>
 
   <!-- Right column -->
@@ -200,9 +191,12 @@
     <section class="panel">
       <h2>6 · Ask a Goal (Natural Language)</h2>
       <div class="flex">
-        <input id="goal_input" placeholder="e.g. Show total sales by customer" onkeydown="if(event.key==='Enter')askGoal()" />
+        <input id="goal_input" placeholder="e.g. Show total sales by customer"
+               onkeydown="if(event.key==='Enter')askGoal()"
+               onfocus="openSuggestions()" onclick="openSuggestions()" />
         <button onclick="askGoal()" id="btn_ask" style="white-space:nowrap">Ask</button>
       </div>
+      <div id="suggestions_box" style="margin-top:10px"></div>
       <div class="status" id="ask_status"></div>
       <div id="ask_box" class="hidden" style="margin-top:10px">
         <h2 style="margin-top:14px">Processed Data</h2>
@@ -309,7 +303,7 @@ function logout() {
   showLogin();
 }
 function applyMobileMode() {
-  ["btn_connect", "btn_schema", "btn_suggest", "btn_ask", "btn_insight"].forEach(id => {
+  ["btn_connect", "btn_schema", "btn_ask", "btn_insight"].forEach(id => {
     const el = $(id); if (el) el.disabled = true;
   });
   const banner = document.createElement("div");
@@ -570,7 +564,9 @@ async function extractSchema() {
     const r = await api("/api/extract_schema", {});
     lastExtract = r;
     renderSchemaReport(r);
-    getSuggestions();
+    SUGGESTIONS_CACHE = null;
+    SUGGESTIONS_LOADING = false;
+    $("suggestions_box").innerHTML = "";
   } catch (e) { setStatus("schema_status", String(e.message), false); }
   enable("btn_schema");
 }
@@ -684,18 +680,32 @@ async function loadSchema() {
   } catch (e) { box.textContent = "No schema extracted yet."; }
 }
 
-async function getSuggestions() {
+let SUGGESTIONS_CACHE = null;
+let SUGGESTIONS_LOADING = false;
+
+async function openSuggestions() {
   const box = $("suggestions_box");
-  box.innerHTML = '<div class="status">Generating suggestions with Mistral...</div>';
+  if (SUGGESTIONS_CACHE) { renderSuggestions(SUGGESTIONS_CACHE); return; }
+  if (SUGGESTIONS_LOADING) return;
+  SUGGESTIONS_LOADING = true;
+  box.innerHTML = '<div class="status">Generating suggestions...</div>';
   try {
     const r = await api("/api/suggestions", { limit: 8 });
-    box.innerHTML = r.suggestions.map(s =>
-      `<div class="suggestion" onclick="useSuggestion(this)">${s}</div>`).join("");
+    SUGGESTIONS_CACHE = r.suggestions || [];
+    renderSuggestions(SUGGESTIONS_CACHE);
   } catch (e) {
     box.innerHTML = `<div class="status err">${e.message}</div>`;
+  } finally {
+    SUGGESTIONS_LOADING = false;
   }
 }
-function useSuggestion(el) { $("goal_input").value = el.textContent; }
+function renderSuggestions(list) {
+  const box = $("suggestions_box");
+  if (!list || !list.length) { box.innerHTML = ""; return; }
+  box.innerHTML = `<div style="font-size:12px;color:var(--muted);margin-bottom:6px">Try asking:</div>` +
+    list.map(s => `<div class="suggestion" onclick="useSuggestion(this)">${s}</div>`).join("");
+}
+function useSuggestion(el) { $("goal_input").value = el.textContent; $("goal_input").focus(); }
 
 const questionSuggestions = [
   "Show total sales by category",
@@ -757,7 +767,7 @@ async function askGoal() {
       $("ask_meta").appendChild(warn);
       setStatus("ask_status", r.message, false);
     }
-    if (r.preprocessing && (r.preprocessing.nulls_filled || r.preprocessing.dropped_empty_columns.length || r.preprocessing.dropped_empty_rows)) {
+    if (r.preprocessing && (r.preprocessing.nulls_preserved || r.preprocessing.dropped_empty_columns.length || r.preprocessing.dropped_empty_rows)) {
       const note = document.createElement("div");
       note.className = "status ok";
       note.textContent = (r.preprocessing.notes || []).join(" ");

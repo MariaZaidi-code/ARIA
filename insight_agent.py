@@ -893,6 +893,7 @@ Rules:
         }
 
         out_path = Path(output_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(
             json.dumps(sanitize_json(insights), indent=2, default=str), encoding="utf-8"
         )
