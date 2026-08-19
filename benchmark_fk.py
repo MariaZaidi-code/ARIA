@@ -171,6 +171,12 @@ def edge_set(mapping, col_renames=None):
                 col = rev.get((parts[0], parts[1], col), col)
             else:
                 col = rev.get(("public", parts[0], col), col)
+        if rev and isinstance(ref, str):
+            parts = str(tgt).split(".")
+            if len(parts) == 2:
+                ref = rev.get((parts[0], parts[1], ref), ref)
+            else:
+                ref = rev.get(("public", parts[0], ref), ref)
         out.add((src, str(col), tgt, str(ref)))
     return out
 

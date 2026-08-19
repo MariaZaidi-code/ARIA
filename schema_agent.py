@@ -380,6 +380,22 @@ def _singularize(name):
 _ID_TOKENS = {"id", "no", "num", "number", "code", "key", "fk", "ref", "uuid", "sk", "nk"}
 
 
+def _is_ref_flavored(name):
+    """Expanded FK name heuristic: catches _id, _by, _to, _from, _via, _for, etc."""
+    if not isinstance(name, str):
+        return False
+    low = name.lower()
+    if low == "id":
+        return True
+    for suffix in ("_id", "_by", "_to", "_from", "_via", "_for", "_at",
+                    "_with", "_against", "_on", "_of", "_type"):
+        if low.endswith(suffix):
+            return True
+    if low.endswith("id") and len(low) > 2:
+        return True
+    return False
+
+
 def _tokenize_words(name):
     """Split an identifier into lowercase word tokens (snake_case, camelCase, acronyms).
 
@@ -554,6 +570,33 @@ class _ValueProfiler:
         evidence a wrong guess is worse than none.
         """
         cands = []
+        src_tokens = set()
+        if source_col:
+            for tok in _tokenize_words(source_col):
+                if tok in _ID_TOKENS:
+                    continue
+                src_tokens.add(_singularize(tok))
+                # All-lowercase concatenated names (productmodelid) do not split,
+                # so also add the base with a trailing id stripped.
+                if tok.endswith("id") and len(tok) > 2:
+                    src_tokens.add(_singularize(tok[:-2]))
+        # Most-specific name target: the SHORTEST table whose name tokens match
+        # the source column's base (mirrors _is_reference_to_other_table). Only
+        # that table gets a name boost; longer tables that merely CONTAIN the
+        # token (productmodelproductdescriptionculture vs productmodelid) must
+        # not outrank the real target on a substring accident. Schema prefixes
+        # (production.product) are ignored as name tokens so a column never
+        # matches a table just because its schema name is a substring.
+        most_specific = None
+        if src_tokens:
+            for table, _, _ in self.pk_index:
+                name_part = table.rsplit(".", 1)[-1]
+                table_tokens = {_singularize(tok) for tok in _tokenize_words(name_part)}
+                if not table_tokens:
+                    continue
+                if table_tokens & src_tokens:
+                    if most_specific is None or len(table) < len(most_specific):
+                        most_specific = table
         for table, pk_col, target_set in self.pk_index:
             if only_tables and table not in only_tables:
                 continue
@@ -572,28 +615,92 @@ class _ValueProfiler:
                     continue
                 if row_count and len(source_set) < 0.05 * row_count:
                     continue
-            cands.append((ratio, len(source_set & target_set), -len(target_set),
-                          table, pk_col, len(source_set & target_set)))
+            # Name-match nudge (same tie-break as strongest_exact_overlap): when
+            # two targets overlap the source values equally (e.g. productmodelid
+            # vs both `productmodel` and `productmodelproductdescriptionculture`),
+            # the MOST SPECIFIC table name the column actually matches should win.
+            # It outranks key size: a shared key (productid) appears in many
+            # tables, and the smallest key is often the wrong parent.
+            boost = 10 if (most_specific and table == most_specific) else 0
+            cands.append((ratio, len(source_set & target_set), boost,
+                          -len(target_set), table, pk_col, len(source_set & target_set)))
         if not cands:
             return None
         cands.sort(reverse=True)
         # "Unambiguous" means indistinguishable on the FULL decisive tuple
-        # (ratio, matched, key size). A much tighter containment (e.g. an
-        # airports.id with 500 distinct vs a flights.id with 30000) is a real
-        # discriminator, so it must not be discarded as ambiguous.
-        if require_unambiguous and len(cands) >= 2 and cands[0][:3] == cands[1][:3]:
+        # (ratio, matched, name boost, key size). A much tighter containment
+        # (e.g. an airports.id with 500 distinct vs a flights.id with 30000) is
+        # a real discriminator, so it must not be discarded as ambiguous.
+        if require_unambiguous and len(cands) >= 2 and cands[0][:4] == cands[1][:4]:
             return None
-        ratio, _, _, table, pk_col, matched = cands[0]
+        ratio, _, _boost, _ksize, table, pk_col, matched = cands[0]
         # Item 4 (ambiguous): a relationship is ambiguous when a runner-up
-        # candidate carries nearly identical data evidence (ratio within 3 pts
-        # and matched within a small absolute delta). We still return the best
-        # candidate, but flag it so the caller/downstream can defer to a human.
+        # candidate carries nearly identical DATA evidence (ratio within 3 pts
+        # and matched within a small absolute delta). A decisive NAME advantage
+        # (the winner's table is the most-specific name target and the runner-up
+        # is not) resolves the tie, so it is NOT ambiguous. We still return the
+        # best candidate, but flag it so the caller/downstream can defer to a
+        # human when the data alone cannot decide.
         ambiguous = False
         if len(cands) >= 2:
-            r2, m2 = cands[1][0], cands[1][5]
-            if (cands[0][0] - r2) < 0.03 and abs(matched - m2) <= max(2, int(0.05 * matched)):
+            r2, m2, boost2 = cands[1][0], cands[1][6], cands[1][2]
+            data_tie = (cands[0][0] - r2) < 0.03 and abs(matched - m2) <= max(2, int(0.05 * matched))
+            # A MUCH tighter containment is a real discriminator: e.g.
+            # purchaseorderid with 4012 distinct matching purchaseorderheader's
+            # 4012-key PK is clearly the reference, even though a 40k-key
+            # workorder PK also contains every value.
+            winner_tighter = (-cands[0][3]) < 0.5 * (-cands[1][3])
+            # Conversely, when the RUNNER-UP is much tighter than the winner
+            # (businessentity's 20k-key PK vs employee's 290-key PK), the
+            # name-selected winner is a loose HUB the source values merely
+            # fall inside — the data actually favours the tighter runner-up,
+            # so the relationship is ambiguous and goes to review.
+            runner_tighter = (-cands[1][3]) < 0.5 * (-cands[0][3])
+            name_decides = (_boost > boost2 and most_specific is not None
+                            and table == most_specific and not runner_tighter)
+            if data_tie and not name_decides and not winner_tighter:
+                ambiguous = True
+        # Evidence conflict (txt item 5): the data points at one table but the
+        # column NAME names a different table (e.g. productmodelid overlapping
+        # productmodelproductdescriptionculture while the name says productmodel).
+        # Emitting the data winner as a confident FK would contradict the name
+        # evidence, so the relationship is flagged ambiguous and routed to review.
+        if most_specific is not None and most_specific != table and not ambiguous:
+            ambiguous = True
+        # Containment-density guard (txt item 7/8): a source column whose
+        # distinct values are a TINY fraction of the target's key size (e.g. bin
+        # with 62 distinct against a 127-key PK, or onorderqty with 26 distinct
+        # against an 8845-key PK) is almost certainly an attribute/code column
+        # that happens to fall inside the key range — not a real reference.
+        # A decisive name match (productid -> product) overrides, because the
+        # name itself points at the parent table. Without a name, sparse
+        # containment is routed to review rather than emitted.
+        if not ambiguous and _boost == 0 and len(source_set) < self.MAX_SAMPLE \
+                and len(source_set) < 0.6 * len(self._pk_values(table)):
+            # A sparse containment is suspicious when the source values look
+            # like a SEQUENCE/COUNTER (a contiguous integer range, e.g. bin
+            # 0..61, territoryid 1..10, referenceorderlineid 0..71) — those
+            # collide with every small PK. A sparse subset WITH GAPS (e.g.
+            # employee.reports_to = {1,2,6} against an 8-row employee table,
+            # or addresstypeid = {2,3,5} against a 6-row lookup) is exactly
+            # what a real partial FK looks like and must NOT be flagged. For
+            # NON id-flavored columns (bin, onorderqty) any sparse containment
+            # is a coincidence — a quantity/label column matching a huge PK.
+            vals = sorted(
+                v[1] for v in source_set
+                if isinstance(v, tuple) and len(v) == 2 and v[0] in ("num", "int")
+            )
+            contiguous = bool(vals) and (vals[-1] - vals[0] + 1) <= len(vals) * 1.5
+            ref_flavored = source_col and _is_ref_flavored(source_col)
+            if contiguous or not ref_flavored:
                 ambiguous = True
         return table, pk_col, ratio, matched, ambiguous
+
+    def _pk_values(self, table):
+        for t, _pk, tset in self.pk_index:
+            if t == table:
+                return tset
+        return set()
 
     def _distinct_raw(self, table, col, limit):
         """Raw (un-normalized) distinct values, for exact SQL containment checks."""
@@ -1192,22 +1299,25 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
         else:
             rel["relationship_type"] = "foreign-key"
 
+        # Item 4 (txt item 5): an AMBIGUOUS relationship means the data cannot
+        # distinguish the real reference from a runner-up candidate (e.g. a
+        # shared businessentityid present in many tables). Emitting it as a
+        # confirmed edge would hallucinate an FK, so it is routed to review
+        # instead: downstream agents see only unambiguous, data-supported edges
+        # and the human is asked to arbitrate the tie.
+        if ambiguous:
+            rel["review_status"] = "review"
+            rel["relationship_state"] = "UNCERTAIN"
+            if "ambiguous candidate - data cannot distinguish best target" not in evidence:
+                evidence.append("ambiguous candidate - data cannot distinguish best target")
+                rel["evidence"] = evidence
+            ambiguous_list.append(rel)
+            return
+
         inferred.append(rel)
 
-    def _is_ref_flavored(name):
-        """Expanded FK name heuristic: catches _id, _by, _to, _from, _via, _for, etc."""
-        low = name.lower()
-        if low == "id":
-            return True
-        for suffix in ("_id", "_by", "_to", "_from", "_via", "_for", "_at",
-                        "_with", "_against", "_on", "_of", "_type"):
-            if low.endswith(suffix):
-                return True
-        if low.endswith("id") and len(low) > 2:
-            return True
-        return False
-
     inferred = []
+    ambiguous_list = []
     for table_name, columns in tables.items():
         for col in columns:
             col_name = col["column"]
@@ -1337,7 +1447,17 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                                 f"No FK constraint declared and no name match; inferred from "
                                 f"value overlap ({matched}/{len(src_set)} sample values) with {target_table}.{target_col}.")
                     if hit is not None:
-                        ref_cols = table_pk.get(target_table) or [target_col]
+                        # The value overlap was confirmed against ONE target
+                        # column (target_col). If the target's PK is composite,
+                        # fanning out to every member would claim the other
+                        # members' values overlap too — they were never checked
+                        # (e.g. product.productmodelid matching
+                        # productmodelproductdescriptionculture.{productmodelid,
+                        # productdescriptionid, cultureid}). Only the actually
+                        # matched column is emitted; full composite references
+                        # are handled by the composite-data pass below.
+                        tgt_pk = table_pk.get(target_table) or []
+                        ref_cols = [target_col] if len(tgt_pk) > 1 else (tgt_pk or [target_col])
                         for ref_col in ref_cols:
                             # A column can never reference itself (same table + same column).
                             if table_name == target_table and col_name == ref_col:
@@ -1361,7 +1481,13 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                 continue
 
             for candidate_table in sorted(candidate_tables):
-                ref_cols = table_pk.get(candidate_table) or [col_name]
+                # A name match targets ONE column; when the candidate's PK is
+                # composite, emitting every member would fabricate relationships
+                # the name never supported (e.g. productmodelid -> cultureid).
+                # Composite references are only emitted when the data confirms
+                # them (composite pass below).
+                cand_pk = table_pk.get(candidate_table) or []
+                ref_cols = [col_name] if len(cand_pk) > 1 else (cand_pk or [col_name])
                 for ref_col in ref_cols:
                     _emit(table_name, col_name, candidate_table, ref_col,
                           "heuristic-name-match",
@@ -1440,7 +1566,7 @@ def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="p
                         f"source keys present in the target composite key.",
                         overlap_ratio=ratio, name_hint=True,
                     )
-    return inferred
+    return inferred, ambiguous_list
 
 
 # ---------------------------------------------------------------------------
@@ -2181,9 +2307,11 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
     null_stats = get_null_stats(conn, tables, schema, db_type)
 
     merged_primary_keys = {**primary_keys, **inferred_primary_keys}
-    inferred_fks = infer_relationships(tables, merged_primary_keys, declared_fks,
-                                       conn=conn, schema=schema, db_type=db_type,
-                                       null_stats=null_stats)
+    inferred_fks, ambiguous_fks = infer_relationships(
+        tables, merged_primary_keys, declared_fks,
+        conn=conn, schema=schema, db_type=db_type,
+        null_stats=null_stats,
+    )
 
     # Refinement: a column confirmed (by data) to reference another table is a
     # foreign key, not the table's own identity. Ruling those out can resolve
@@ -2200,8 +2328,10 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
         if refined:
             inferred_primary_keys.update(refined)
             merged_primary_keys = {**primary_keys, **inferred_primary_keys}
-            inferred_fks = infer_relationships(tables, merged_primary_keys, declared_fks,
-                                               conn=conn, schema=schema, db_type=db_type)
+            inferred_fks, ambiguous_fks = infer_relationships(
+                tables, merged_primary_keys, declared_fks,
+                conn=conn, schema=schema, db_type=db_type,
+            )
 
     mapping = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -2212,6 +2342,7 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
         "unique_keys": unique_keys,
         "declared_relationships": declared_fks,
         "inferred_relationships": inferred_fks,
+        "ambiguous_relationships": ambiguous_fks,
         "relationship_edges": [],
     }
 
@@ -2328,6 +2459,19 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
         }
         for r in inferred if r.get("review_status") in ("flagged", "review")
     ]
+    # Ambiguous candidates (data cannot distinguish the real target) also go to
+    # review so a human can arbitrate, but they never enter the accepted set.
+    for r in mapping.get("ambiguous_relationships", []):
+        review_list.append({
+            "table": r.get("table"),
+            "column": r.get("column"),
+            "references_table": r.get("references_table"),
+            "references_column": r.get("references_column"),
+            "confidence_score": r.get("confidence_score"),
+            "confidence": r.get("confidence"),
+            "evidence": r.get("evidence", []),
+        })
+    review_list.sort(key=lambda x: (x.get("table") or "", x.get("column") or ""))
     mapping["summary"]["health"] = {
         "strong_inferred_fk_count": len(strong),
         "weak_inferred_fk_count": len(weak),
@@ -2424,7 +2568,7 @@ def _infer_cross_schema_relationships(mapping, conn, db_type="postgresql"):
         for qualified, info in mapping.get("tables", {}).items()
     }
     declared = mapping.get("declared_relationships", [])
-    cross = infer_relationships(
+    cross, cross_ambiguous = infer_relationships(
         tables, primary_keys, declared,
         conn=conn, schema="", db_type=db_type,
     )
@@ -2512,6 +2656,13 @@ def _infer_cross_schema_relationships(mapping, conn, db_type="postgresql"):
             "cardinality": rel.get("cardinality"),
         })
 
+    # Ambiguous cross-schema candidates: keep them visible for human review
+    # even though they are never accepted as edges.
+    for r in cross_ambiguous:
+        r["relationship_state"] = "uncertain"
+        r["review_status"] = "review"
+        mapping.setdefault("_cross_schema_review", []).append(r)
+
 
 def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name=None,
                              previous_mapping=None):
@@ -2575,6 +2726,23 @@ def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name
                 "schema": schema,
                 "references_schema": schema,
                 "same_schema": True,
+            })
+        for rel in sub.get("ambiguous_relationships", []):
+            mapping.setdefault("_cross_schema_review", []).append({
+                "table": f"{schema}.{rel['table']}",
+                "column": rel["column"],
+                "references_table": f"{schema}.{rel['references_table']}",
+                "references_column": rel["references_column"],
+                "confidence": rel.get("confidence", "heuristic"),
+                "confidence_score": rel.get("confidence_score"),
+                "confidence_band": rel.get("confidence_band"),
+                "relationship_state": "uncertain",
+                "review_status": "review",
+                "ambiguous": rel.get("ambiguous"),
+                "evidence": rel.get("evidence", []),
+                "note": "Ambiguous candidate - data cannot distinguish best target.",
+                "schema": schema,
+                "references_schema": schema,
             })
 
     # Cross-schema declared FKs replace the per-schema (same-schema-only) list,
