@@ -47,35 +47,34 @@ def make_cfg(db):
 def list_fks(conn, schema=None):
     """Declared FKs, optionally restricted to one schema. Returns
     (table, column, ftable, fcol, schema, fschema) tuples with the
-    schema-qualified table names for multi-schema databases."""
+    schema-qualified table names for multi-schema databases.
+
+    Uses pg_constraint (not the information_schema *column_usage* views,
+    whose table_schema join silently drops cross-schema foreign keys)."""
+    query = """
+        SELECT
+            refcon.relname AS table_name,
+            refatt.attname AS column_name,
+            conrel.relname AS ftable,
+            conatt.attname AS fcol,
+            refn.nspname AS table_schema,
+            conn.nspname AS fschema
+        FROM pg_constraint c
+        JOIN pg_namespace refn ON refn.oid = c.connamespace
+        JOIN pg_class refcon ON refcon.oid = c.conrelid
+        JOIN pg_namespace conn ON conn.oid = (SELECT relnamespace FROM pg_class WHERE oid = c.confrelid)
+        JOIN pg_class conrel ON conrel.oid = c.confrelid
+        JOIN unnest(c.conkey) WITH ORDINALITY AS srckeys(attnum, ord) ON TRUE
+        JOIN unnest(c.confkey) WITH ORDINALITY AS tgtkeys(attnum, ord) ON srckeys.ord = tgtkeys.ord
+        JOIN pg_attribute refatt ON refatt.attrelid = c.conrelid AND refatt.attnum = srckeys.attnum
+        JOIN pg_attribute conatt ON conatt.attrelid = c.confrelid AND conatt.attnum = tgtkeys.attnum
+        WHERE c.contype = 'f'
+    """
     cur = conn.cursor()
     if schema:
-        cur.execute(
-            """
-            SELECT tc.table_name, kcu.column_name, ccu.table_name AS ftable,
-                   ccu.column_name AS fcol, tc.table_schema, ccu.table_schema AS fschema
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-            JOIN information_schema.constraint_column_usage ccu
-              ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
-            WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = %s
-            """,
-            (schema,),
-        )
+        cur.execute(query + " AND refn.nspname = %s ORDER BY 5, 1, srckeys.ord", (schema,))
     else:
-        cur.execute(
-            """
-            SELECT tc.table_name, kcu.column_name, ccu.table_name AS ftable,
-                   ccu.column_name AS fcol, tc.table_schema, ccu.table_schema AS fschema
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-            JOIN information_schema.constraint_column_usage ccu
-              ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
-            WHERE tc.constraint_type = 'FOREIGN KEY'
-            """,
-        )
+        cur.execute(query + " ORDER BY 5, 1, srckeys.ord")
     return cur.fetchall()
 
 

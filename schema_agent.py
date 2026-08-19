@@ -429,6 +429,27 @@ class _ValueProfiler:
                 self.pk_index.append(
                     (table, col, self._distinct(table, col, self._pk_cache, self.MAX_PK_SAMPLE)))
 
+    def rel_table(self, table):
+        """Return a SQL-safe qualified table reference.
+
+        Table names may arrive bare (`product`) for a single-schema pass or
+        already schema-qualified (`production.product`) for the global
+        cross-schema pass. Bare names are qualified with self.schema; qualified
+        names are used as-is. MySQL has no separate schema namespace here.
+        """
+        if self.db_type == "mysql":
+            return _quote_ident(self.db_type, table)
+        if isinstance(table, str) and "." in table:
+            parts = table.split(".", 1)
+            return (
+                f"{_quote_ident(self.db_type, parts[0])}."
+                f"{_quote_ident(self.db_type, parts[1])}"
+            )
+        return (
+            f"{_quote_ident(self.db_type, self.schema)}."
+            f"{_quote_ident(self.db_type, table)}"
+        )
+
     def column_type(self, table, col):
         """Return the (normalized) data type of a column, or '' when unknown."""
         key = (table, col)
@@ -488,7 +509,7 @@ class _ValueProfiler:
             with _dict_cursor(self.conn, self.db_type) as cur:
                 cur.execute(
                     f"SELECT DISTINCT {_quote_ident(self.db_type, col)} AS v "
-                    f"FROM {_quote_ident(self.db_type, self.schema)}.{_quote_ident(self.db_type, table)} "
+                    f"FROM {self.rel_table(table)} "
                     f"WHERE {_quote_ident(self.db_type, col)} IS NOT NULL "
                     f"ORDER BY {_quote_ident(self.db_type, col)} LIMIT {limit}"
                 )
@@ -508,7 +529,7 @@ class _ValueProfiler:
             try:
                 with _dict_cursor(self.conn, self.db_type) as cur:
                     cur.execute(
-                        f"SELECT COUNT(*) AS n FROM {_quote_ident(self.db_type, self.schema)}.{_quote_ident(self.db_type, table)}"
+                        f"SELECT COUNT(*) AS n FROM {self.rel_table(table)}"
                     )
                     self._rows_cache[table] = cur.fetchone()["n"] or 0
             except Exception as exc:
@@ -581,7 +602,7 @@ class _ValueProfiler:
             with _dict_cursor(self.conn, self.db_type) as cur:
                 cur.execute(
                     f"SELECT DISTINCT {_quote_ident(self.db_type, col)} AS v "
-                    f"FROM {_quote_ident(self.db_type, self.schema)}.{_quote_ident(self.db_type, table)} "
+                    f"FROM {self.rel_table(table)} "
                     f"WHERE {_quote_ident(self.db_type, col)} IS NOT NULL "
                     f"ORDER BY {_quote_ident(self.db_type, col)} LIMIT {limit}"
                 )
@@ -612,7 +633,7 @@ class _ValueProfiler:
                 else:
                     cur.execute(
                         f"SELECT count(DISTINCT {ident}) AS matched "
-                        f"FROM {_quote_ident(self.db_type, self.schema)}.{_quote_ident(self.db_type, table)} "
+                        f"FROM {self.rel_table(table)} "
                         f"WHERE {ident} = ANY(%s)",
                         (list(values),),
                     )
@@ -2370,6 +2391,128 @@ def _all_schemas_foreign_keys(conn, schemas):
         return rels
 
 
+def _infer_cross_schema_relationships(mapping, conn, db_type="postgresql"):
+    """Global relationship inference across ALL schemas after the per-schema merge.
+
+    Each schema's own pass already found intra-schema relationships. This pass
+    searches for cross-schema edges (e.g. purchasing.productvendor.productid ->
+    production.product.productid) that no single-schema pass could see, using the
+    SAME generic evidence as normal inference (datatype compatibility, value
+    overlap, uniqueness/PK-likeness, cardinality, null patterns, name and
+    semantic similarity) on fully-qualified `schema.table.column` names.
+
+    Only edges whose source and target schemas DIFFER are added, so intra-schema
+    results are not duplicated. Edges already declared or already inferred are
+    never re-emitted. Requires the mapping's tables to be schema-qualified and
+    the connection to be available (no-op otherwise).
+    """
+    if conn is None:
+        return
+    tables = {
+        qualified: info.get("columns", [])
+        for qualified, info in mapping.get("tables", {}).items()
+        if not info.get("empty")
+    }
+    if not tables:
+        return
+    schemas = {t.split(".", 1)[0] for t in tables if "." in t}
+    if len(schemas) < 2:
+        return  # single schema -> nothing cross-schema to find
+
+    primary_keys = {
+        qualified: list(info.get("primary_key", []) or [])
+        for qualified, info in mapping.get("tables", {}).items()
+    }
+    declared = mapping.get("declared_relationships", [])
+    cross = infer_relationships(
+        tables, primary_keys, declared,
+        conn=conn, schema="", db_type=db_type,
+    )
+
+    existing = {
+        (r.get("table"), r.get("column"), r.get("references_table"))
+        for r in mapping.get("inferred_relationships", [])
+    }
+    existing |= {
+        (r.get("table_name"), r.get("column_name"), r.get("references_table"))
+        for r in declared
+    }
+
+    added = []
+    for r in cross:
+        src_schema = r.get("schema")
+        tgt_schema = r.get("references_schema")
+        if src_schema and tgt_schema and src_schema == tgt_schema:
+            continue  # intra-schema; already found by the per-schema pass
+        key = (r.get("table"), r.get("column"), r.get("references_table"))
+        if key in existing:
+            continue
+        # Cross-schema edges are ONLY accepted on strong, unambiguous data
+        # evidence. Value overlap alone is not enough across schemas (low-
+        # cardinality codes like quantity/sickleavehours overlap every small
+        # key), so weak/ambiguous candidates become `review` instead of being
+        # emitted as relationships (txt: "do not improve recall by creating
+        # excessive false positives"; "return uncertain/review").
+        score = r.get("confidence_score")
+        band = r.get("confidence_band")
+        # Names are hints, not requirements (txt item 8) — but a cross-schema
+        # edge still needs SOME genuine name evidence to confirm WHICH table the
+        # column references. Without it the data cannot distinguish a real FK
+        # from a coincidental value overlap (e.g. customer.personid overlapping
+        # businessentitycontact.personid only because personid is a composite-PK
+        # member there). The pk_owner name hint used by single-schema inference
+        # is too permissive for cross-schema edges, so re-derive the name match
+        # from the column's tokens vs the target table's tokens, or from an
+        # exact match against the target's SOLE primary-key column (a composite
+        # member is a junction/child key, not a parent reference).
+        col_name = r.get("column", "")
+        tgt_table = r.get("references_table", "")
+        base = _singularize(col_name[:-3] if col_name.endswith("_id") else col_name)
+        tgt_tokens = {_singularize(tok) for tok in _tokenize_words(tgt_table)}
+        sole_pk = primary_keys.get(tgt_table, [])
+        genuine_name = bool(
+            (base and base in tgt_tokens)
+            or (len(sole_pk) == 1 and col_name == sole_pk[0])
+        )
+        strong = (
+            r.get("confidence") in ("data-confirmed", "composite-data-confirmed")
+            and genuine_name
+            and not r.get("ambiguous")
+            and score is not None and score >= 90
+            and band == "High"
+        )
+        if not strong:
+            r["relationship_state"] = "uncertain"
+            r["review_status"] = "review"
+            mapping.setdefault("_cross_schema_review", []).append(r)
+            continue
+        r["same_schema"] = False
+        r["note"] = (r.get("note") or "") + (
+            " Detected by the global cross-schema inference pass."
+        )
+        added.append(r)
+
+    if not added:
+        return
+    mapping["inferred_relationships"].extend(added)
+    for rel in added:
+        mapping["relationship_edges"].append({
+            "source_table": rel["table"],
+            "source_column": rel["column"],
+            "target_table": rel["references_table"],
+            "target_column": rel["references_column"],
+            "type": "inferred",
+            "confidence": rel.get("confidence", "heuristic"),
+            "confidence_score": rel.get("confidence_score"),
+            "confidence_band": rel.get("confidence_band"),
+            "relationship_state": rel.get("relationship_state"),
+            "review_status": rel.get("review_status"),
+            "ambiguous": rel.get("ambiguous"),
+            "self_referencing": rel.get("self_referencing"),
+            "cardinality": rel.get("cardinality"),
+        })
+
+
 def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name=None,
                              previous_mapping=None):
     """Build a merged mapping across every populated schema in a database.
@@ -2484,6 +2627,12 @@ def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name
         if e["source_table"] not in empty_tables and e["target_table"] not in empty_tables
     ]
 
+    # Global cross-schema inference (txt): after per-schema extraction and
+    # merge, search across ALL schemas for edges no single-schema pass can see
+    # (e.g. purchasing.productvendor -> production.product). Uses the same
+    # generic evidence as normal inference on schema-qualified names.
+    _infer_cross_schema_relationships(mapping, conn, db_type)
+
     _canonicalize_mapping(mapping)
     mapping["relationship_graph"] = _build_relationship_graph(mapping)
 
@@ -2504,6 +2653,21 @@ def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name
         }
         for r in inferred if r.get("review_status") in ("flagged", "review")
     ]
+    # Cross-schema candidates that lacked strong evidence are surfaced as
+    # review items too, so a human can confirm genuine cross-schema FKs without
+    # the engine auto-declaring weak value-overlap edges.
+    for r in mapping.get("_cross_schema_review", []):
+        review_list.append({
+            "table": r.get("table"),
+            "column": r.get("column"),
+            "references_table": r.get("references_table"),
+            "references_column": r.get("references_column"),
+            "confidence_score": r.get("confidence_score"),
+            "confidence": r.get("confidence"),
+            "evidence": r.get("evidence", []),
+            "note": r.get("note"),
+        })
+    review_list.sort(key=lambda x: (x.get("table") or "", x.get("column") or ""))
     mapping["summary"] = {
         "total_db_tables": len(mapping["tables"]),
         "tables_used": len(mapping["tables"]),
@@ -2536,6 +2700,7 @@ def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name
     if previous_mapping:
         mapping["drift"] = detect_schema_drift(previous_mapping, mapping)
 
+    mapping.pop("_cross_schema_review", None)
     return mapping
 
 
