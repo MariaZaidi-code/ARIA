@@ -26,6 +26,7 @@ except ImportError:
     END = None
     StateGraph = None
 
+logger = logging.getLogger(__name__)
 
 class SchemaMixin:
     # ---- _normalize_schema (_normalize_schema) ----
@@ -109,13 +110,13 @@ class SchemaMixin:
             for fk in info.get("foreign_keys", []):
                 target = fk["referenced_table"]
                 if target and target not in tables:
-                    logging.warning(
+                    logger.warning(
                         "Schema mapping references unknown table '%s' from %s.%s "
                         "(stale/manually-edited JSON?)",
                         target, table_name, fk.get("column"),
                     )
                 elif target and fk.get("referenced_column") not in tables[target]["columns"]:
-                    logging.warning(
+                    logger.warning(
                         "Schema mapping references unknown column '%s.%s' from %s.%s",
                         target, fk.get("referenced_column"), table_name, fk.get("column"),
                     )
@@ -245,7 +246,7 @@ class SchemaMixin:
         are always listed first and marked as preferred.
         """
         relevant = [t for t in join_path if t in self.tables]
-        logging.info(f"Relevant tables (join path): {relevant}")
+        logger.info("Relevant tables (join path): %s", relevant)
 
         tables = list(relevant)
         if full:

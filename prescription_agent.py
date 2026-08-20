@@ -115,18 +115,19 @@ Rules:
     def _template_actions(kpis, trends, anomalies, hypotheses, predictions, max_actions):
         actions = []
         if hypotheses:
-            actions.append(f"Validate the leading hypothesis: {hypotheses[0]['hypothesis']}")
+            actions.append(f"Validate the leading hypothesis: {hypotheses[0].get('hypothesis', 'N/A')}")
         if trends:
             t = trends[0]
             actions.append(
-                f"Review the {t['direction']} trend in {', '.join(t['columns'])} "
-                f"(change {t['pct_change']}%)."
+                f"Review the {t.get('direction', 'unknown')} trend in "
+                f"{', '.join(t.get('columns', []))} "
+                f"(change {t.get('pct_change', 'N/A')}%)."
             )
         if anomalies:
             a = anomalies[0]
             actions.append(
-                f"Investigate the anomaly in {a['column']} "
-                f"(value {a['value']}, z-score {a['z_score']})."
+                f"Investigate the anomaly in {a.get('column', 'unknown')} "
+                f"(value {a.get('value', 'N/A')}, z-score {a.get('z_score', 'N/A')})."
             )
         if predictions and predictions.get("valid") and predictions.get("points"):
             period_word = predictions.get("period") or "periods"

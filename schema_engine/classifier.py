@@ -60,8 +60,8 @@ def classify(profiler: Optional[ValueProfiler],
     # Cardinality: source distinct values (data available) vs referenced key.
     if profiler is not None and isinstance(col_name, str) and isinstance(ref_col, str):
         src_vals = profiler.source_values(table_name, col_name)
-        tgt_vals = profiler.source_values(candidate_table, ref_col)
-        if src_vals is not None and tgt_vals is not None and len(tgt_vals) > 0:
+        tgt_vals = profiler._pk_values(candidate_table)
+        if src_vals is not None and len(tgt_vals) > 0:
             ratio = len(src_vals) / len(tgt_vals)
             rel["cardinality"] = (
                 "one-to-one" if ratio >= 0.9

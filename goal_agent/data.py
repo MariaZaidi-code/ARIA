@@ -26,6 +26,7 @@ except ImportError:
     END = None
     StateGraph = None
 
+logger = logging.getLogger(__name__)
 
 class DataMixin:
     # ---- _execute_with_retry (_execute_with_retry) ----
@@ -69,7 +70,7 @@ class DataMixin:
                         f"Generated SQL referenced tables that do not exist "
                         f"({', '.join(bad_tables)}) and could not be repaired."
                     )
-                logging.warning(
+                logger.warning(
                     f"SQL references unknown table(s) {bad_tables} on attempt {attempt + 1}. "
                     f"Asking LLM to repair."
                 )
@@ -108,7 +109,7 @@ No explanations, no markdown.
                     current_sql, columns_by_table, bad_columns
                 )
                 if changed:
-                    logging.warning(
+                    logger.warning(
                         f"SQL referenced unknown column(s) {bad_columns}; "
                         f"repaired deterministically (no LLM)."
                     )
@@ -119,7 +120,7 @@ No explanations, no markdown.
                         f"Generated SQL referenced columns that do not exist "
                         f"({', '.join(bad_columns)}) and could not be repaired."
                     )
-                logging.warning(
+                logger.warning(
                     f"SQL references unknown column(s) {bad_columns} on attempt {attempt + 1}. "
                     f"Asking LLM to repair."
                 )
@@ -158,7 +159,7 @@ No explanations, no markdown.
             if missing:
                 auto_sql, injected = self._inject_missing_joins(current_sql, missing)
                 if injected:
-                    logging.warning(
+                    logger.warning(
                         f"SQL referenced {missing} without a FROM clause; injected "
                         f"{injected} deterministic FK JOIN(s)."
                     )
@@ -169,7 +170,7 @@ No explanations, no markdown.
                         f"Generated SQL referenced table(s) {missing} without including "
                         f"them in FROM/JOIN and could not be repaired."
                     )
-                logging.warning(
+                logger.warning(
                     f"SQL references {missing} without a FROM clause on attempt {attempt + 1}. "
                     f"Asking LLM to repair."
                 )
@@ -211,7 +212,7 @@ Return only the corrected SQL query. No explanations, no markdown.
                         f"Generated SQL nested aggregate function(s) "
                         f"({', '.join(nested)}) and could not be repaired."
                     )
-                logging.warning(
+                logger.warning(
                     f"SQL nests aggregate function(s) {nested} on attempt {attempt + 1}. "
                     f"Asking LLM to repair."
                 )
@@ -256,7 +257,7 @@ Return only the corrected SQL query. No explanations, no markdown.
                         f"Generated SQL joins unrelated tables "
                         f"({', '.join(bad_joins)}) and could not be repaired."
                     )
-                logging.warning(
+                logger.warning(
                     f"SQL joins unrelated tables {bad_joins} on attempt {attempt + 1}. "
                     f"Asking LLM to repair."
                 )
@@ -297,7 +298,7 @@ Return only the corrected SQL query using real FK relationships. No explanations
                         "Generated SQL is a plain `SELECT *` that does not aggregate the "
                         "data the goal asks for, and could not be repaired."
                     )
-                logging.warning(
+                logger.warning(
                     f"SQL is a bare SELECT * for an aggregating goal on attempt {attempt + 1}. "
                     f"Asking LLM to repair."
                 )
@@ -342,7 +343,7 @@ Return only the corrected SQL query. No explanations, no markdown.
                 sem_issues, sem_warnings = self._semantic_validate_sql(
                     ir, current_sql, join_path, join_plan
                 )
-                self._last_semantic_warnings = sem_warnings
+                self._last_semantic_warnings = list(sem_warnings)
                 if sem_issues:
                     if attempt >= retries:
                         raise RuntimeError(
@@ -350,7 +351,7 @@ Return only the corrected SQL query. No explanations, no markdown.
                             + "; ".join(sem_issues)
                             + " and could not be repaired."
                         )
-                    logging.warning(
+                    logger.warning(
                         f"SQL violates the semantic plan on attempt {attempt + 1}: "
                         f"{sem_issues}. Asking LLM to repair."
                     )
@@ -473,14 +474,14 @@ No explanations, no markdown.
                                     "requested. Please rephrase or try the other model provider."
                                 )
                             }
-                        logging.warning(f"LLM SQL exhausted retries ({exc}); returning safe fallback.")
+                        logger.warning(f"LLM SQL exhausted retries ({exc}); returning safe fallback.")
                         return df.to_dict(orient="records"), safe_sql, None
                     except Exception as safe_exc:
                         raise RuntimeError(
                             f"Could not build a working query for this goal after retrying "
                             f"({exc}). Last fallback also failed: {safe_exc}"
                         ) from exc
-                logging.warning(f"SQL failed on attempt {attempt + 1}: {exc}. Asking LLM to repair.")
+                logger.warning(f"SQL failed on attempt {attempt + 1}: {exc}. Asking LLM to repair.")
                 fix_prompt = f"""
 The SQL below failed with error:
 {exc}
@@ -500,7 +501,7 @@ Fix it and return only the corrected SQL query. No explanations, no markdown.
                     raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500)
                     current_sql = self._clean_sql(raw)
                 except Exception:
-                    break
+                    continue
 
         return [], current_sql, {
             "message": "Could not produce a working query for this goal after retrying."

@@ -40,17 +40,21 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     session = get_session(user["user_id"])
     provider = require_data(request)
     goal = validate_goal_text(req.goal)
+    agent = None
     try:
         agent = GoalAgent(schema_json_path=str(session["schema_path"]), db_uri=session["db_uri"], provider=provider, dialect=session["dialect"])
         agent.process_goal(goal, output_path=str(session["processed_path"]))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Goal Agent failed: {exc}")
     finally:
-        try:
-            agent.engine.dispose()
-        except Exception:
-            pass
+        if agent and getattr(agent, "engine", None):
+            try:
+                agent.engine.dispose()
+            except Exception:
+                pass
 
+    if not session["processed_path"].exists():
+        raise HTTPException(status_code=400, detail="Goal Agent did not produce output. Please try rephrasing.")
     processed = json.loads(session["processed_path"].read_text(encoding="utf-8"))
     processed = sanitize_json(processed)
     columns = list(processed.get("data", [{}])[0].keys()) if processed.get("data") else []
@@ -121,6 +125,7 @@ def insight(request: Request, user: dict = Depends(require_writable)):
 
     if session["pending_history_id"]:
         auth.set_history_insights(session["pending_history_id"], user["user_id"], insights)
+        session["pending_history_id"] = None
 
     return {
         "ok": True,

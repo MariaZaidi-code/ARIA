@@ -288,12 +288,12 @@ class SqlContractMixin:
         not answer (provider outage, unfixable SQL, database hiccup)."""
         exc_str = str(exc)
         # Sanitize: strip internal paths, connection strings, hostnames.
-        import re as _re
-        sanitized = _re.sub(r"(?:/[^/\s:]+){2,}", "[path]", exc_str)
-        sanitized = _re.sub(r"postgresql://[^\s]+", "[connection-string]", sanitized)
-        sanitized = _re.sub(r"mysql://[^\s]+", "[connection-string]", sanitized)
-        sanitized = _re.sub(r"sqlite:///[^\s]+", "[connection-string]", sanitized)
-        sanitized = _re.sub(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", "[host]", sanitized)
+        
+        sanitized = re.sub(r"(?:/[^/\s:]+){2,}", "[path]", exc_str)
+        sanitized = re.sub(r"postgresql://[^\s]+", "[connection-string]", sanitized)
+        sanitized = re.sub(r"mysql://[^\s]+", "[connection-string]", sanitized)
+        sanitized = re.sub(r"sqlite:///[^\s]+", "[connection-string]", sanitized)
+        sanitized = re.sub(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", "[host]", sanitized)
 
         if self._llm_unavailable(exc) or "429" in exc_str:
             message = (

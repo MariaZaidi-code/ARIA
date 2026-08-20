@@ -230,26 +230,25 @@ def _column_is_empty(conn, table_name, column, schema, db_type):
     a real key.
     """
     try:
-        cur = conn.cursor()
-        table_ref = (f"{_qname(db_type, schema)}.{_qname(db_type, table_name)}"
-                     if db_type == "postgresql" else _qname(db_type, table_name))
-        col_ref = _qname(db_type, column)
-        if db_type == "mysql":
-            cur.execute(
-                f"SELECT COUNT({col_ref}) AS non_null, "
-                f"COUNT(NULLIF(TRIM(CAST({col_ref} AS CHAR)), '')) AS non_blank "
-                f"FROM {table_ref}"
-            )
-        else:
-            cur.execute(
-                f"SELECT COUNT({col_ref}) AS non_null, "
-                f"COUNT(NULLIF(TRIM(CAST({col_ref} AS TEXT)), '')) AS non_blank "
-                f"FROM {table_ref}"
-            )
-        row = cur.fetchone()
-        return row is not None and (row[0] or 0) == 0 and (row[1] or 0) == 0
+        with conn.cursor() as cur:
+            table_ref = (f"{_qname(db_type, schema)}.{_qname(db_type, table_name)}"
+                         if db_type == "postgresql" else _qname(db_type, table_name))
+            col_ref = _qname(db_type, column)
+            if db_type == "mysql":
+                cur.execute(
+                    f"SELECT COUNT({col_ref}) AS non_null, "
+                    f"COUNT(NULLIF(TRIM(CAST({col_ref} AS CHAR)), '')) AS non_blank "
+                    f"FROM {table_ref}"
+                )
+            else:
+                cur.execute(
+                    f"SELECT COUNT({col_ref}), COUNT(NULLIF(TRIM({col_ref}::text), '')) "
+                    f"FROM {table_ref}"
+                )
+            row = cur.fetchone()
+            return row is not None and (row[0] or 0) == 0 and (row[1] or 0) == 0
     except Exception as exc:
-        logger.debug("empty-column check failed for %s.%s: %s", table_name, column, exc)
+        logger.warning("empty-column check failed for %s.%s: %s", table_name, column, exc)
         return False
 
 # ---- infer_primary_keys_from_data (572-619) ----

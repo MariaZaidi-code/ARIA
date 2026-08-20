@@ -56,14 +56,6 @@ def detect_schema_drift(previous, current):
     prev_tables = previous.get("tables", {}) if previous else {}
     curr_tables = current.get("tables", {}) if current else {}
 
-    def _norm(rel, source_side):
-        return {
-            "table": rel[source_side],
-            "column": rel["column"] if source_side == "table" else rel["column"],
-            "references_table": rel["references_table"],
-            "references_column": rel["references_column"],
-        }
-
     def _edge_set(mapping, declared=True):
         out = set()
         for rel in mapping.get("declared_relationships", []):
@@ -135,13 +127,13 @@ def detect_schema_drift(previous, current):
     # FK structure: declared constraints added/removed.
     prev_declared = _edge_set(previous)
     curr_declared = _edge_set(current)
-    declared_added = sorted(prev_declared - curr_declared, key=str)
-    declared_removed = sorted(curr_declared - prev_declared, key=str)
+    declared_added = sorted(curr_declared - prev_declared, key=str)
+    declared_removed = sorted(prev_declared - curr_declared, key=str)
     if declared_added:
-        drift["declared_fk_removed"] = declared_added
+        drift["declared_fk_added"] = declared_added
         drift["has_changes"] = True
     if declared_removed:
-        drift["declared_fk_added"] = declared_removed
+        drift["declared_fk_removed"] = declared_removed
         drift["has_changes"] = True
 
     # Inferred relationships added/removed.

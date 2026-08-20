@@ -26,6 +26,7 @@ except ImportError:
     END = None
     StateGraph = None
 
+logger = logging.getLogger(__name__)
 
 class IntentMixin:
     # ---- _needs_clarification (_needs_clarification) ----
@@ -256,7 +257,7 @@ class IntentMixin:
         Path(output_path).write_text(
             json.dumps(output, indent=2, default=str), encoding="utf-8"
         )
-        print(f"Goal Agent overview done! Saved to {output_path}")
+        logger.info("Goal Agent overview done! Saved to %s", output_path)
         return output_path
 
     # ---- map_goal_to_kpi (map_goal_to_kpi) ----
@@ -408,16 +409,20 @@ class IntentMixin:
         agg = self._detect_aggregation(goal)
         if agg:
             ir["aggregation"] = agg
+        seen_metrics = set()
         for keyword, (aggregate, description) in self.kpi_index.items():
             if re.search(r"\b" + re.escape(keyword) + r"\b", goal_l):
-                ir["metrics"].append({
-                    "concept": description,
-                    "aggregation": None if keyword == "growth" else aggregate,
-                    "expression": None,
-                    "resolved_expression": None,
-                    "resolved_table": None,
-                    "resolved_column": None,
-                })
+                metric_key = (description, aggregate)
+                if metric_key not in seen_metrics:
+                    seen_metrics.add(metric_key)
+                    ir["metrics"].append({
+                        "concept": description,
+                        "aggregation": None if keyword == "growth" else aggregate,
+                        "expression": None,
+                        "resolved_expression": None,
+                        "resolved_table": None,
+                        "resolved_column": None,
+                    })
         if any(k in goal_l for k in ("growth", "trend", "over time", "increase",
                                      "decrease", "change")):
             ir["intent"] = "trend"

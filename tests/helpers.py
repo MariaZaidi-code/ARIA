@@ -39,6 +39,12 @@ def fake_profiler(src=None, rows=100, hit=None, exact_hit=None,
         def source_values(self, table, col):
             return src.get((table, col))
 
+        def _pk_values(self, table):
+            for t, _pk, tset in self.pk_index:
+                if t == table:
+                    return tset
+            return set()
+
         def row_count(self, table):
             return rows
 

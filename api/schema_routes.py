@@ -47,7 +47,10 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
                    f"Re-connect via /api/connect/{db_type} first.",
         )
 
-    config = session["db"]
+    config = dict(session["db"])
+    if "password" in config and config["password"] is not None:
+        from core.secret_box import decrypt as _decrypt_secret
+        config["password"] = _decrypt_secret(config["password"])
     schema_filter = config["db"] if db_type == "mysql" else config["db_schema"]
     try:
         conn = schema_agent.get_connection(types.SimpleNamespace(**config))
@@ -229,4 +232,4 @@ def get_schema(request: Request, user: dict = Depends(get_current_user)):
     path = session["schema_path"]
     if not path.exists():
         raise HTTPException(status_code=404, detail="No schema extracted yet. Call POST /api/extract_schema first.")
-    return json.loads(path.read_text(encoding="utf-8"))
+    return {"ok": True, "schema": json.loads(path.read_text(encoding="utf-8"))}

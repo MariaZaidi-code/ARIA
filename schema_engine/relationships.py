@@ -198,13 +198,15 @@ def _composite_containment(profiler, src_table, matched, target_table, target_pk
         )
         if profiler.db_type == "mysql":
             q = (
-                f"SELECT COUNT(DISTINCT s.{matched_cols[0]}) / NULLIF(COUNT(DISTINCT t.{tgt_cols[0]}),0) "
+                f"SELECT COUNT(DISTINCT CASE WHEN t.{tgt_cols[0]} IS NOT NULL THEN s.{matched_cols[0]} END) "
+                f"/ NULLIF(COUNT(DISTINCT s.{matched_cols[0]}),0) AS ratio "
                 f"FROM {profiler.quote(src_table)} s "
                 f"LEFT JOIN {profiler.quote(target_table)} t ON {join_sql}"
             )
         else:
             q = (
-                f"SELECT COUNT(DISTINCT s.{matched_cols[0]})::float / NULLIF(COUNT(DISTINCT t.{tgt_cols[0]}),0) "
+                f"SELECT COUNT(DISTINCT CASE WHEN t.{tgt_cols[0]} IS NOT NULL THEN s.{matched_cols[0]} END)::float "
+                f"/ NULLIF(COUNT(DISTINCT s.{matched_cols[0]}),0) AS ratio "
                 f"FROM {profiler.quote(profiler.schema)}.{profiler.quote(src_table)} s "
                 f"LEFT JOIN {profiler.quote(profiler.schema)}.{profiler.quote(target_table)} t ON {join_sql}"
             )

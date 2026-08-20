@@ -68,6 +68,10 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     if request.source_type == "relational" and db_type not in DB_TYPES:
         raise HTTPException(status_code=400, detail=f"Unknown database type '{db_type}'. Choose from {sorted(DB_TYPES)}.")
 
+    if request.source_type == "relational":
+        if not (request.db and request.user and request.password):
+            raise HTTPException(status_code=400, detail="Relational source requires db, user, and password.")
+
     try:
         llm = create_provider(provider=request.provider)
     except Exception as exc:
@@ -87,13 +91,11 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     session["processed_path"].parent.mkdir(parents=True, exist_ok=True)
     session["insights_path"].parent.mkdir(parents=True, exist_ok=True)
 
-    if not (request.db and request.user and request.password is not None):
-        raise HTTPException(status_code=400, detail="Relational source requires db, user, and password.")
-
     config = request.model_dump()
     config["db_type"] = db_type
-    config["port"] = int(config["port"])
+    conn = None
     try:
+        config["port"] = int(config["port"])
         conn = schema_agent.get_connection(types.SimpleNamespace(**config))
         with conn.cursor() as cur:
             if db_type == "mysql":
@@ -103,9 +105,10 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
             else:
                 cur.execute("SELECT current_database(), current_schema();")
                 db_name, current_db_schema = cur.fetchone()
-        conn.close()
     except SystemExit as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid port number.")
     except Exception as exc:
         detail = f"Connection failed: {exc}"
         if db_type == "mysql":
@@ -115,8 +118,18 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
             detail += (" Hint: is the PostgreSQL service running on that host/port? "
                        "Verify the database name, user, and password are correct.")
         raise HTTPException(status_code=400, detail=detail)
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-    session["db"] = config
+    from core.secret_box import encrypt as _encrypt_secret
+    safe_config = dict(config)
+    if "password" in safe_config and safe_config["password"] is not None:
+        safe_config["password"] = _encrypt_secret(str(safe_config["password"]))
+    session["db"] = safe_config
     session["db_type"] = db_type
     session["db_uri"] = build_db_uri(config, db_type)
     session["db_name"] = db_name

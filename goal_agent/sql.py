@@ -26,15 +26,17 @@ except ImportError:
     END = None
     StateGraph = None
 
+logger = logging.getLogger(__name__)
 
 class SqlMixin:
     # ---- _is_read_only_sql (_is_read_only_sql) ----
 
     def _is_read_only_sql(self, sql):
         """True only for read-only SQL (SELECT / CTE-WITH). Deterministically
-        rejects INSERT/UPDATE/DELETE/DDL/DCL/DML before the DB round-trip."""
+        rejects INSERT/UPDATE/DELETE/DDL/DCL/DML before the DB round-trip.
+        Returns False for empty/None SQL (not a valid statement)."""
         if not sql:
-            return True
+            return False
         stripped = self._STRIP_STRINGS_RE.sub(" ", sql or "")
         return self._DESTRUCTIVE_RE.search(stripped) is None
 
@@ -120,7 +122,7 @@ class SqlMixin:
             return statements[-1].rstrip(";") + ";"
         # No real statement found: return the raw text so the validation layer /
         # repair loop sees it as broken and asks the model to fix it.
-        return str(raw_sql).strip().replace('"', "") + ";"
+        return str(raw_sql).strip() + ";"
 
     # ---- _find_nested_aggregates (_find_nested_aggregates) ----
 
@@ -129,11 +131,12 @@ class SqlMixin:
 
         Matches an aggregate keyword directly wrapping another aggregate keyword.
         """
-        return re.findall(
+        matches = re.findall(
             r"\b(AVG|SUM|COUNT|MIN|MAX)\s*\(\s*(?:DISTINCT\s+)?(AVG|SUM|COUNT|MIN|MAX)\s*\(",
             sql,
             re.IGNORECASE,
         )
+        return [f"{a}({b}" for a, b in matches]
 
     # ---- _goal_asks_for_aggregation (_goal_asks_for_aggregation) ----
 
@@ -178,7 +181,7 @@ class SqlMixin:
             flags=re.IGNORECASE,
         )
         if n:
-            logging.warning(
+            logger.warning(
                 "Extremes goal detected; stripped trailing LIMIT so both the "
                 "highest and lowest appear in the result set."
             )
@@ -781,7 +784,7 @@ Rules:
             raw = self.llm.complete("sql", prompt, temperature=0.1, num_predict=500)
             return self._clean_sql(raw)
         except Exception as exc:
-            logging.warning(f"LLM SQL generation failed: {exc}.")
+            logger.warning(f"LLM SQL generation failed: {exc}.")
             if self._llm_unavailable(exc):
                 # Provider down/exhausted: do NOT fall back to a bare SELECT *
                 # (that would only trigger pointless repair loops). Signal the

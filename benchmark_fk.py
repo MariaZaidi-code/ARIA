@@ -30,7 +30,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import schema_agent
 
-ADMIN = "postgresql://postgres:12345@localhost:5432/postgres"
+ADMIN = "postgresql://{user}:{password}@{host}:{port}/{dbname}".format(
+    user=os.getenv("DB_USER", "postgres"),
+    password=os.getenv("DB_PASSWORD", "postgres"),
+    host=os.getenv("DB_HOST", "localhost"),
+    port=os.getenv("DB_PORT", "5432"),
+    dbname=os.getenv("DB_NAME", "postgres"),
+)
 
 DEFAULT_DBS = ["northwind", "chinook", "olist_ecommerce", "retail_fraud", "adventureworks"]
 
@@ -39,8 +45,13 @@ MAX_SOURCE_RATIO = 0.70  # keep at least 30% of the total inferred set
 
 def make_cfg(db):
     return {
-        "host": "localhost", "port": 5432, "db": db, "user": "postgres",
-        "password": "12345", "db_type": "postgresql", "db_schema": "public",
+        "host": os.getenv("DB_HOST", "localhost"),
+        "port": int(os.getenv("DB_PORT", "5432")),
+        "db": db,
+        "user": os.getenv("DB_USER", "postgres"),
+        "password": os.getenv("DB_PASSWORD", "postgres"),
+        "db_type": "postgresql",
+        "db_schema": os.getenv("DB_SCHEMA", "public"),
     }
 
 

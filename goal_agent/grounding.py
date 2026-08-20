@@ -53,9 +53,6 @@ class GroundingMixin:
                 elif tok.endswith("s") and tok[:-1] in col_tokens:
                     score += 6
         score += len(info.get("foreign_keys", [])) * 2
-        # Penalty for junction/lookup tables that match only via FK columns.
-        if name_hit:
-            score += 0
         return score
 
     # ---- _expand_with_neighbors (_expand_with_neighbors) ----

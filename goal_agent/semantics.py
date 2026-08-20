@@ -30,9 +30,9 @@ except ImportError:
 class SemanticMixin:
     # ---- _normalize_tokens (_normalize_tokens) ----
 
-    def _normalize_tokens(self, text):
+    def _normalize_tokens(self, raw_text):
         tokens = set()
-        for word in re.findall(r"[a-zA-Z0-9_]+", str(text)):
+        for word in re.findall(r"[a-zA-Z0-9_]+", str(raw_text)):
             tokens.add(word.lower())
             tokens.update(part for part in word.split("_") if part)
         return {t for t in tokens if t}

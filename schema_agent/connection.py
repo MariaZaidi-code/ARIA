@@ -42,6 +42,7 @@ logger = logging.getLogger("aria.schema_agent")
 
 JSON_INDENT = 2
 K = 2
+QUERY_TIMEOUT_MS = 30_000
 
 
 # ---- _apply_session_timeout (54-70) ----
@@ -55,12 +56,11 @@ def _apply_session_timeout(conn, db_type="postgresql"):
     just unbounded — better than failing the connection).
     """
     try:
-        cur = conn.cursor()
-        if db_type == "mysql":
-            cur.execute(f"SET SESSION MAX_EXECUTION_TIME = {QUERY_TIMEOUT_MS}")
-        else:
-            cur.execute(f"SET statement_timeout = {QUERY_TIMEOUT_MS}")
-        conn.commit()
+        with conn.cursor() as cur:
+            if db_type == "mysql":
+                cur.execute(f"SET SESSION MAX_EXECUTION_TIME = {QUERY_TIMEOUT_MS}")
+            else:
+                cur.execute(f"SET statement_timeout = {QUERY_TIMEOUT_MS}")
     except Exception:
         pass
 
@@ -100,7 +100,7 @@ def get_connection(args):
             )
         except pymysql.MySQLError as e:
             sys.exit(
-                f"ERROR: could not connect to MySQL at {host}:{port}/{dbname} as {user}: {e}\n"
+                f"ERROR: could not connect to MySQL at {host}:{port}/{dbname}: {e}\n"
                 "Check: is the MySQL server running on that host/port? Are the "
                 "database name, user, and password correct, and does the server "
                 "accept TCP connections?"
@@ -119,7 +119,7 @@ def get_connection(args):
         conn.autocommit = True
     except psycopg2.OperationalError as e:
         sys.exit(
-            f"ERROR: could not connect to PostgreSQL at {host}:{port}/{dbname} as {user}: {e}\n"
+            f"ERROR: could not connect to PostgreSQL at {host}:{port}/{dbname}: {e}\n"
             "Check: is the PostgreSQL service running on that host/port? Are the "
             "database name, user, and password correct? Does pg_hba.conf allow "
             "TCP connections from this host?"
@@ -158,10 +158,6 @@ def _quote_ident(db_type, name):
         return "`" + str(name).replace("`", "") + "`"
     return '"' + str(name).replace('"', "") + '"'
 
-# ---- _qname (483-487) ----
+# ---- _qname (alias for _quote_ident, kept for backward compatibility) ----
 
-def _qname(db_type, name):
-    """SQL-safe quoted identifier (double quotes for PG, backticks for MySQL)."""
-    if db_type == "mysql":
-        return "`" + str(name).replace("`", "") + "`"
-    return '"' + str(name).replace('"', "") + '"'
+_qname = _quote_ident

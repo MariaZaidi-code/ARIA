@@ -10,7 +10,7 @@ as evidence availability (never as evidence weight).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from schema_engine.lexical import (
     ID_TOKENS, is_ref_flavored, normalize_identifier, singularize,

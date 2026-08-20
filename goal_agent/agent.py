@@ -2,6 +2,7 @@
 
 import difflib
 import json
+import os
 import re
 import logging
 import sys
@@ -43,11 +44,11 @@ from .data import DataMixin
 DEFAULT_DB_URI = (
     "postgresql://{user}:{password}@{host}:{port}/{dbname}"
 ).format(
-    user=__import__("os").getenv("DB_USER", "postgres"),
-    password=__import__("os").getenv("DB_PASSWORD", "postgres"),
-    host=__import__("os").getenv("DB_HOST", "localhost"),
-    port=__import__("os").getenv("DB_PORT", "5432"),
-    dbname=__import__("os").getenv("DB_NAME", "postgres"),
+    user=os.getenv("DB_USER", "postgres"),
+    password=os.getenv("DB_PASSWORD", "postgres"),
+    host=os.getenv("DB_HOST", "localhost"),
+    port=os.getenv("DB_PORT", "5432"),
+    dbname=os.getenv("DB_NAME", "postgres"),
 )
 
 class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
@@ -125,7 +126,7 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
             ]
             entity = self._detect_metrics_overview(corrected_goal)
             if entity is not None:
-                logging.info(
+                logger.info(
                     "Open-ended metrics goal -> deterministic overview for '%s'.",
                     entity,
                 )
@@ -137,7 +138,7 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
                 if corrections:
                     suggestions = ", ".join(f"'{suggestion}'" for _, suggestion in corrections)
                     question += f" Did you mean: {suggestions}?"
-                logging.info("Goal is ambiguous; returning needs_clarification.")
+                logger.info("Goal is ambiguous; returning needs_clarification.")
                 return self._clarify(user_goal, question, output_path)
             if LANGGRAPH_AVAILABLE and StateGraph is not None and END is not None:
                 return self._process_goal_langgraph(corrected_goal, output_path)
@@ -151,10 +152,10 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
     # ---- _process_goal_linear (_process_goal_linear) ----
 
     def _process_goal_linear(self, user_goal, output_path="processed_data.json"):
-        print(f"Goal Agent: '{user_goal}'")
+        logger.info("Goal Agent: '%s'", user_goal)
 
         kpi_map = self.map_goal_to_kpi(user_goal)
-        print(f"Aligned KPIs: {kpi_map['kpis']} | dimensions: {kpi_map['dimensions']}")
+        logger.info("Aligned KPIs: %s | dimensions: %s", kpi_map['kpis'], kpi_map['dimensions'])
 
         ir = self._build_goal_ir(user_goal)
         relevant_tables = self._get_relevant_tables(user_goal)
@@ -165,10 +166,10 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
         if join_plan["edges"]:
             join_path = join_plan["nodes"]
         ir["join_plan"] = join_plan["edges"]
-        print(f"Join path: {join_path}")
+        logger.info("Join path: %s", join_path)
 
         raw_sql = self._generate_sql(user_goal, join_path, kpi_map, ir=ir, join_plan=join_plan)
-        print(f"Generated SQL: {raw_sql}")
+        logger.info("Generated SQL: %s", raw_sql)
 
         data_rows, final_sql, note = self._execute_with_retry(
             user_goal, join_path, kpi_map, raw_sql, ir=ir, join_plan=join_plan
@@ -198,7 +199,7 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
 
         out_path = Path(output_path)
         out_path.write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
-        print(f"Goal Agent done! Saved to {output_path}")
+        logger.info("Goal Agent done! Saved to %s", output_path)
         return output_path
 
     # ---- _process_goal_langgraph (_process_goal_langgraph) ----
@@ -300,6 +301,6 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
             "user_goal": user_goal, "kpi_map": {}, "relevant_tables": [],
             "join_path": [], "raw_sql": "", "rows": [], "final_sql": "",
         })
-        print(f"Goal Agent done! Saved to {result['result_path']}")
+        logger.info("Goal Agent done! Saved to %s", result['result_path'])
         return result["result_path"]
 

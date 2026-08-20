@@ -296,6 +296,8 @@ class ValueProfiler:
         return set()
 
     def _distinct_raw(self, table, col, limit: int) -> list:
+        if self.budget is not None and not self.budget.spend():
+            return []
         values = []
         try:
             with self._dict_cursor() as cur:

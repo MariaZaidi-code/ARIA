@@ -49,7 +49,7 @@ def logout(user: dict = Depends(get_current_user)):
 @router.get("/api/history")
 def history(request: Request, user: dict = Depends(get_current_user), limit: int = 200):
     """List the current user's saved analyses (metadata only, newest first)."""
-    items = auth.list_history(user["user_id"], limit=min(limit, 500))
+    items = auth.list_history(user["user_id"], limit=max(1, min(limit, 500)))
     return {
         "ok": True,
         "mode": "read-only" if is_mobile(request) else "full",

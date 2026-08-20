@@ -157,18 +157,18 @@ class PostgreSQLAdapter(DatabaseAdapter):
         """pg_class.reltuples estimates (cheap; matches legacy behavior)."""
         out: Dict[Tuple[str, str], Optional[int]] = {}
         try:
-            cur = self.conn.cursor()
-            cur.execute(
-                """
-                SELECT n.nspname AS schema, c.relname AS table, c.reltuples::bigint AS rows
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = ANY(%s) AND c.relkind = 'r'
-                """,
-                (list({s for s, _ in tables}),),
-            )
-            for row in cur.fetchall():
-                out[(row[0], row[1])] = row[2]
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT n.nspname AS schema, c.relname AS table, c.reltuples::bigint AS rows
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = ANY(%s) AND c.reltuples IS NOT NULL AND c.relkind = 'r'
+                    """,
+                    (list({s for s, _ in tables}),),
+                )
+                for row in cur.fetchall():
+                    out[(row[0], row[1])] = row[2]
         except Exception as exc:
             logger.debug("row-count query failed: %s", exc)
         return out
@@ -193,21 +193,21 @@ class PostgreSQLAdapter(DatabaseAdapter):
                 sql.Identifier(table.schema),
                 sql.Identifier(table.name),
             )
-            cur = self.conn.cursor()
-            cur.execute(q)
-            row = cur.fetchone()
-            if row:
-                total = row[0]
-                for i, col in enumerate(table.columns):
-                    non_null = row[i + 1]
-                    nulls = total - (non_null or 0)
-                    null_pct = round((nulls / total) * 100, 2) if total else 0.0
-                    stats[col.name] = ColumnStatistics(
-                        status="MEASURED",
-                        total_rows=total,
-                        nulls=nulls,
-                        null_pct=null_pct,
-                    )
+            with self.conn.cursor() as cur:
+                cur.execute(q)
+                row = cur.fetchone()
+                if row:
+                    total = row[0]
+                    for i, col in enumerate(table.columns):
+                        non_null = row[i + 1]
+                        nulls = total - (non_null or 0)
+                        null_pct = round((nulls / total) * 100, 2) if total else 0.0
+                        stats[col.name] = ColumnStatistics(
+                            status="MEASURED",
+                            total_rows=total,
+                            nulls=nulls,
+                            null_pct=null_pct,
+                        )
         except Exception as exc:
             logger.debug("null stats failed for %s: %s", table.qualified_name, exc)
             for col in table.columns:
