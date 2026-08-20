@@ -18,6 +18,9 @@ from core.validation import unknown_sql_tables, empty_sql_tables, unknown_sql_co
 from core.config import SCHEMA_DIR, BASE_DIR
 from schema_engine.lexical import singularize
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 try:
     from langgraph.graph import END, StateGraph
     LANGGRAPH_AVAILABLE = True
@@ -26,7 +29,6 @@ except ImportError:
     END = None
     StateGraph = None
 
-logging.basicConfig(level=logging.INFO)
 
 from .constants import ConstantsMixin
 from .semantics import SemanticMixin
@@ -141,6 +143,9 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
                 return self._process_goal_langgraph(corrected_goal, output_path)
             return self._process_goal_linear(corrected_goal, output_path)
         except Exception as exc:
+            if isinstance(exc, (MemoryError, RecursionError, OverflowError)):
+                logger.critical("Fatal exception in process_goal: %s", exc, exc_info=True)
+                raise
             return self._graceful_failure(user_goal, output_path, exc)
 
     # ---- _process_goal_linear (_process_goal_linear) ----

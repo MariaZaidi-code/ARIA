@@ -26,7 +26,6 @@ except ImportError:
     END = None
     StateGraph = None
 
-logging.basicConfig(level=logging.INFO)
 
 class GroundingMixin:
     # ---- _table_keyword_score (_table_keyword_score) ----

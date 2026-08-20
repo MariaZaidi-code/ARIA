@@ -45,6 +45,11 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         agent.process_goal(goal, output_path=str(session["processed_path"]))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Goal Agent failed: {exc}")
+    finally:
+        try:
+            agent.engine.dispose()
+        except Exception:
+            pass
 
     processed = json.loads(session["processed_path"].read_text(encoding="utf-8"))
     processed = sanitize_json(processed)

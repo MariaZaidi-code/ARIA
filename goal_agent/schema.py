@@ -26,7 +26,6 @@ except ImportError:
     END = None
     StateGraph = None
 
-logging.basicConfig(level=logging.INFO)
 
 class SchemaMixin:
     # ---- _normalize_schema (_normalize_schema) ----
@@ -269,14 +268,14 @@ class SchemaMixin:
                 data_type = col_info.get("data_type", "TEXT")
                 is_pk = column_name in info.get("primary_key", []) or col_info.get("is_primary_key")
                 suffix = " PRIMARY KEY" if is_pk else ""
-                col_defs.append(f"    {column_name} {data_type}{suffix}")
+                col_defs.append(f'    "{column_name}" {data_type}{suffix}')
             fk_lines = []
             for fk in info.get("foreign_keys", []):
                 fk_lines.append(
-                    f"    FOREIGN KEY ({fk['column']}) REFERENCES {fk['referenced_table']}({fk['referenced_column']})"
+                    f'    FOREIGN KEY ("{fk["column"]}") REFERENCES "{fk["referenced_table"]}"("{fk["referenced_column"]}")'
                 )
             all_defs = ",\n".join(col_defs + fk_lines)
-            ddl_parts.append(f"CREATE TABLE {table_name} (\n{all_defs}\n);")
+            ddl_parts.append(f'CREATE TABLE "{table_name}" (\n{all_defs}\n);')
         return "\n\n".join(ddl_parts)
 
     # ---- _fk_edges (_fk_edges) ----

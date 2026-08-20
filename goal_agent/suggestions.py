@@ -26,7 +26,6 @@ except ImportError:
     END = None
     StateGraph = None
 
-logging.basicConfig(level=logging.INFO)
 
 class SuggestionsMixin:
     # ---- _schema_summary_text (_schema_summary_text) ----

@@ -26,7 +26,6 @@ except ImportError:
     END = None
     StateGraph = None
 
-logging.basicConfig(level=logging.INFO)
 
 class ConstantsMixin:
     # ---- UNCERTAIN_STATES (UNCERTAIN_STATES) ----

@@ -26,7 +26,6 @@ except ImportError:
     END = None
     StateGraph = None
 
-logging.basicConfig(level=logging.INFO)
 
 class SemanticMixin:
     # ---- _normalize_tokens (_normalize_tokens) ----
@@ -168,6 +167,11 @@ class SemanticMixin:
         protected = self._PROTECTED_GOAL_WORDS
         corrected = user_goal
         seen = set()
+        # Pre-index vocab by first 2 chars for O(bucket_size) lookups.
+        _vocab_index = defaultdict(set)
+        for v in vocab:
+            if len(v) >= 2:
+                _vocab_index[v[:2]].add(v)
         for word in re.findall(r"[a-zA-Z0-9_]+", user_goal):
             low = word.lower()
             if low in seen or not low.isalpha():
@@ -177,8 +181,10 @@ class SemanticMixin:
                 continue
             if low in vocab or (low + "s") in vocab or (low.endswith("s") and low[:-1] in vocab):
                 continue
+            prefix = low[:2] if len(low) >= 2 else low
+            candidates = _vocab_index.get(prefix, vocab)
             best, score = None, 0.0
-            for cand in vocab:
+            for cand in candidates:
                 ratio = difflib.SequenceMatcher(None, low, cand).ratio()
                 if ratio > score:
                     best, score = cand, ratio

@@ -26,7 +26,6 @@ except ImportError:
     END = None
     StateGraph = None
 
-logging.basicConfig(level=logging.INFO)
 
 class IntentMixin:
     # ---- _needs_clarification (_needs_clarification) ----
@@ -44,7 +43,10 @@ class IntentMixin:
         """
         tokens = self._normalize_tokens(user_goal)
         if not tokens:
-            return False, None
+            return True, (
+                "Please provide a business question, for example "
+                "'total sales by month' or 'top customers'."
+            )
 
         goal_l = str(user_goal).lower()
 
@@ -467,18 +469,13 @@ class IntentMixin:
     def _detect_intent(self, user_goal):
         """Heuristic intent classification (no LLM call) for the goal contract."""
         g = str(user_goal).lower()
-        if any(k in g for k in ("top ", "best", "worst", "highest", "lowest",
-                                "most ", "least", "rank", "leader", "bottom")):
+        if re.search(r"\b(top\b|best\b|worst\b|highest\b|lowest\b|most\b|least\b|rank\b|leader\b|bottom\b)", g):
             return "ranking"
-        if any(k in g for k in ("compare", "comparison", "versus", "difference",
-                                "among", "between")):
+        if re.search(r"\b(compare|comparison|versus|difference|among|between)\b", g):
             return "comparison"
-        if any(k in g for k in ("trend", "over time", "monthly", "daily",
-                                "weekly", "yearly", "growth", "decline",
-                                "increase", "decrease", "change")):
+        if re.search(r"\b(trend|over\s+time|monthly|daily|weekly|yearly|growth|decline|increase|decrease|change)\b", g):
             return "trend"
-        if any(k in g for k in ("distribution", "breakdown", "per ", "by ",
-                                "count")):
+        if re.search(r"\b(distribution|breakdown|per\b|by\b|count)\b", g):
             return "distribution"
         return "summary"
 

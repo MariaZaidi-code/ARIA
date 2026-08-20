@@ -26,7 +26,6 @@ except ImportError:
     END = None
     StateGraph = None
 
-logging.basicConfig(level=logging.INFO)
 
 class DataMixin:
     # ---- _execute_with_retry (_execute_with_retry) ----
@@ -393,9 +392,18 @@ No explanations, no markdown.
 
             try:
                 _t0 = time.monotonic()
+                _MAX_ROWS = 10_000
+                _STMT_TIMEOUT_MS = 30_000
                 with self.engine.connect() as conn:
+                    if self.dialect == "postgresql":
+                        conn.execute(text(f"SET statement_timeout = '{_STMT_TIMEOUT_MS}'"))
+                    elif self.dialect == "mysql":
+                        conn.execute(text(f"SET SESSION max_execution_time = {_STMT_TIMEOUT_MS}"))
                     result = conn.execute(text(current_sql))
-                    rows = result.fetchall()
+                    rows = result.fetchmany(_MAX_ROWS + 1)
+                    truncated = len(rows) > _MAX_ROWS
+                    if truncated:
+                        rows = rows[:_MAX_ROWS]
                     cols = list(result.keys())
                 self._last_execution_ms = int((time.monotonic() - _t0) * 1000)
                 df = pd.DataFrame(rows, columns=cols)
@@ -426,7 +434,17 @@ No explanations, no markdown.
                     df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
                 for col in df.select_dtypes(include=['float64', 'int64']).columns:
                     df[col] = df[col].astype(float)
-                return df.to_dict(orient="records"), current_sql, None
+                records = df.to_dict(orient="records")
+                note = None
+                if truncated:
+                    note = {
+                        "message": (
+                            f"Results were truncated to {_MAX_ROWS:,} rows "
+                            f"(the query returned more). Add filters or a LIMIT to "
+                            f"narrow the result set."
+                        )
+                    }
+                return records, current_sql, note
             except Exception as exc:
                 if attempt >= retries:
                     # Give up on the LLM SQL, but never fail the request: try a

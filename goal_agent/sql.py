@@ -26,7 +26,6 @@ except ImportError:
     END = None
     StateGraph = None
 
-logging.basicConfig(level=logging.INFO)
 
 class SqlMixin:
     # ---- _is_read_only_sql (_is_read_only_sql) ----
@@ -81,7 +80,12 @@ class SqlMixin:
         cleaned = str(raw_sql).strip()
         cleaned = re.sub(r"```(?:sql)?\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"```\s*", "", cleaned)
-        cleaned = cleaned.replace('"', "")
+        # Only strip double-quotes that wrap the ENTIRE statement (the LLM
+        # sometimes wraps its answer in quotes).  Never strip quotes around
+        # individual identifiers — they protect reserved words and
+        # case-sensitive names (e.g. SELECT "order" FROM "order").
+        if cleaned.startswith('"') and cleaned.endswith('"') and cleaned.count('"') == 2:
+            cleaned = cleaned[1:-1]
         # Small local models often ECHO the prompt's instruction sentences into
         # the answer ("with null values last. The final SQL statement is
         # provided without explanations or markdown; ..."). A real statement is
@@ -189,13 +193,14 @@ class SqlMixin:
           - in_from:    set of table names present in FROM/JOIN clauses
           - alias_to_name, name_to_alias: alias mappings
           - first_ref:  reference token (alias or bare name) of the FIRST
-                        FROM table â€” the only table guaranteed visible at the
+                        FROM table — the only table guaranteed visible at the
                         point right after the FROM clause.
           - intro:      table name -> byte position just after the clause that
                         introduces it (end of the FROM/JOIN block).
 
-        Implemented as a positional scan so a JOIN/ON keyword right after a
-        table name is never mistaken for an alias.
+        Implemented as a positional scan that skips parenthesized subqueries
+        so a JOIN/ON keyword inside a subquery is never mistaken for a
+        top-level clause.
         """
         out = {
             "in_from": set(),
@@ -206,7 +211,20 @@ class SqlMixin:
         }
         pos = 0
         first = True
-        while True:
+        depth = 0
+        while pos < len(sql):
+            ch = sql[pos]
+            if ch == "(":
+                depth += 1
+                pos += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                pos += 1
+                continue
+            if depth > 0:
+                pos += 1
+                continue
             m = re.search(
                 r"\b(?:FROM|JOIN)\s+([\"'`]?)([A-Za-z_][A-Za-z0-9_]*)\1\b",
                 sql[pos:], re.IGNORECASE,
@@ -557,7 +575,7 @@ class SqlMixin:
         # Resolve aliases to table names: FROM x [AS] a, JOIN y [AS] b.
         alias_to_table = {}
         for m in re.finditer(
-            r"\b(FROM|JOIN)\s+([\"']?)(\w+)\2\s+(?:AS\s+)?([a-zA-Z_]\w*)",
+            r"\b(FROM|JOIN)\s+([\"'`]?)(\w+)\2\s+(?:AS\s+)?([a-zA-Z_]\w*)",
             sql,
             re.IGNORECASE,
         ):
@@ -569,7 +587,7 @@ class SqlMixin:
         suspects = []
         # Capture each ON clause and the equality conditions inside it.
         for on_m in re.finditer(
-            r"\bJOIN\s+([\"']?)(\w+)\1\s+(?:AS\s+)?([a-zA-Z_]\w*)\s+ON\s+(.*?)(?=\s+(?:JOIN|WHERE|GROUP|ORDER|LIMIT|;)|$)",
+            r"\bJOIN\s+([\"'`]?)(\w+)\1\s+(?:AS\s+)?([a-zA-Z_]\w*)\s+ON\s+(.*?)(?=\s+(?:JOIN|WHERE|GROUP|ORDER|LIMIT|;)|$)",
             sql,
             re.IGNORECASE,
         ):
@@ -602,7 +620,7 @@ class SqlMixin:
 
         alias_to_table = {}
         for m in re.finditer(
-            r"\b(FROM|JOIN)\s+([\"']?)(\w+)\2\s+(?:AS\s+)?([a-zA-Z_]\w*)",
+            r"\b(FROM|JOIN)\s+([\"'`]?)(\w+)\2\s+(?:AS\s+)?([a-zA-Z_]\w*)",
             sql,
             re.IGNORECASE,
         ):
@@ -613,7 +631,7 @@ class SqlMixin:
 
         suspects = []
         for on_m in re.finditer(
-            r"\bJOIN\s+([\"']?)(\w+)\1\s+(?:AS\s+)?([a-zA-Z_]\w*)\s+ON\s+(.*?)(?=\s+(?:JOIN|WHERE|GROUP|ORDER|LIMIT|;)|$)",
+            r"\bJOIN\s+([\"'`]?)(\w+)\1\s+(?:AS\s+)?([a-zA-Z_]\w*)\s+ON\s+(.*?)(?=\s+(?:JOIN|WHERE|GROUP|ORDER|LIMIT|;)|$)",
             sql,
             re.IGNORECASE,
         ):
@@ -966,8 +984,10 @@ Rules:
     def _fallback_sql(self, join_path):
         relevant = [t for t in join_path if t in self.tables]
         if not relevant:
-            return "SELECT * FROM information_schema.tables LIMIT 10;"
-        return f"SELECT * FROM {relevant[0]} LIMIT 50;"
+            if self.dialect == "sqlite":
+                return "SELECT name FROM sqlite_master WHERE type='table' LIMIT 10;"
+            return "SELECT table_name FROM information_schema.tables LIMIT 10;"
+        return f'SELECT * FROM "{relevant[0]}" LIMIT 50;'
 
     # ---- _row_counts (_row_counts) ----
 
