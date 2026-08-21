@@ -152,6 +152,8 @@ def classify(profiler: Optional[ValueProfiler],
     if profiler is not None and isinstance(col_name, str):
         ns = null_stats.get(table_name, {}).get(col_name, {})
         null_pct = ns.get("null_pct") if isinstance(ns, dict) else None
+        if null_pct is not None and null_pct > 1:
+            null_pct = null_pct / 100.0
         if null_pct is not None:
             detail["null_rate"] = null_pct
             if null_pct > 0.8:

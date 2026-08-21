@@ -37,6 +37,7 @@ except ImportError:
     _se_relationships = None
 
 from core.config import SCHEMA_DIR
+from .connection import _qname
 
 logger = logging.getLogger("aria.schema_agent")
 

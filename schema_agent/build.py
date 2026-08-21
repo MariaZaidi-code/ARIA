@@ -44,6 +44,17 @@ JSON_INDENT = 2
 K = 2
 
 from .snapshots import _prune_snapshots, get_output_paths
+from .introspection import (
+    get_tables_and_columns, get_primary_keys, get_unique_keys,
+    get_declared_foreign_keys, get_null_stats,
+)
+from .inference import (
+    infer_primary_keys, infer_primary_keys_from_data, _column_is_empty,
+)
+from .graph import _canonicalize_mapping, _build_relationship_graph
+from .llm import enrich_with_llm
+from .drift import detect_schema_drift
+from .connection import _dict_cursor
 
 
 # ---- schema_has_tables (1183-1197) ----

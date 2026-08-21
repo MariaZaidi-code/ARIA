@@ -81,7 +81,11 @@ class SchemaMixin:
                 if key in col_map:
                     col_map[key]["is_primary_key"] = True
 
-            tables[table_name] = {"columns": col_map, "primary_key": pk, "foreign_keys": []}
+            tables[table_name] = {
+                "columns": col_map, "primary_key": pk, "foreign_keys": [],
+                "empty": bool(info.get("empty")),
+                "row_count": info.get("row_count"),
+            }
 
         for edge in all_edges:
             add_fk(

@@ -176,6 +176,7 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
         )
         cleaned_data = self._clean_data(data_rows)
 
+        failed = bool(note and note.get("failed"))
         output = {
             "user_goal": self._active_original_goal or user_goal,
             "kpi_alignment": kpi_map,
@@ -190,8 +191,8 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
         }
         output.update(self._build_output_contract(
             user_goal, kpi_map, join_path, final_sql, cleaned_data,
-            success=(note is None), message=output["message"],
-            status="success",
+            success=(not failed), message=output["message"],
+            status="query_failed" if failed else "success",
             warnings=self._typo_warnings + self._warnings_for_sql(final_sql)
                     + self._last_semantic_warnings,
             execution_time_ms=self._last_execution_ms,
@@ -247,11 +248,13 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
             )
             state["rows"] = self._clean_data(rows)
             state["final_sql"] = final_sql
+            state["_failed"] = bool(note and note.get("failed"))
             state["message"] = (note or {}).get("message") if note else None
             state["preprocessing"] = self.preprocessing_report
             return state
 
         def finalize(state):
+            failed = bool(state.get("message") and state.get("_failed"))
             output = {
                 "user_goal": self._active_original_goal or state["user_goal"],
                 "kpi_alignment": state["kpi_map"],
@@ -268,9 +271,9 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
             output.update(self._build_output_contract(
                 state["user_goal"], state["kpi_map"], state["join_path"],
                 state["final_sql"], state["rows"],
-                success=(state.get("message") is None),
+                success=(not failed),
                 message=output["message"],
-                status="success",
+                status="query_failed" if failed else "success",
                 warnings=self._typo_warnings + self._warnings_for_sql(state["final_sql"])
                 + self._last_semantic_warnings,
                 execution_time_ms=self._last_execution_ms,

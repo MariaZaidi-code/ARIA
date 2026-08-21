@@ -9,14 +9,36 @@ representation when a query could not run.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("aria.schema_engine.profiling")
 
 NUMERIC_TYPES = ("int", "bigint", "smallint", "numeric", "decimal", "float",
                  "double", "real", "serial", "money")
 TEXT_TYPES = ("char", "varchar", "text", "uuid", "string")
+
+
+def _token_prefix_match(src_tokens: set, table_tokens: set) -> bool:
+    """True when a source-token is a prefix of (or is prefixed by) a table token.
+
+    Generalizes name corroboration beyond exact token equality so that a column
+    like `ship_via` (token `ship`) still resolves to `shippers` (token `shipper`)
+    and `customer_id`/`customer_type_id` reach `customers` even when no exact
+    token coincides. Only tokens >= 3 chars participate to avoid short-token
+    noise.
+    """
+    if not src_tokens or not table_tokens:
+        return False
+    for s in src_tokens:
+        if len(s) < 3:
+            continue
+        for t in table_tokens:
+            if len(t) < 3:
+                continue
+            if s.startswith(t) or t.startswith(s):
+                return True
+    return False
 
 
 def norm_value(v):
@@ -181,6 +203,26 @@ class ValueProfiler:
             return 0.0
         return len(src & target) / len(src)
 
+    @staticmethod
+    def _is_selfref_column(col_name: str) -> bool:
+        """Ref-flavored column names that conventionally self-reference their own table.
+
+        `reports_to`, `parent_id`, `parent_category_id`, `manager_id`, `managed_by`
+        etc. point at the same table's PK (employee.manager -> employee). We only
+        use this as a tie-breaker when data also confirms full containment, so a
+        genuine cross-table `_to`/`_by` reference (target != source table) is never
+        forced to self-reference.
+        """
+        if not isinstance(col_name, str) or not col_name:
+            return False
+        low = col_name.lower()
+        return (
+            low.endswith("_to")
+            or low.endswith("_parent")
+            or low.endswith("_managed")
+            or low.endswith("_manager")
+        )
+
     # ------------------------------------------------------------------ #
     # Target ranking (ported verbatim for Phase C parity).
     # ------------------------------------------------------------------ #
@@ -213,7 +255,7 @@ class ValueProfiler:
                 table_tokens = {singularize(tok) for tok in tokenize_words(name_part)}
                 if not table_tokens:
                     continue
-                if table_tokens & src_tokens:
+                if table_tokens & src_tokens or _token_prefix_match(src_tokens, table_tokens):
                     if most_specific is None or len(str(table)) < len(str(most_specific)):
                         most_specific = table
         for table, pk_col, target_set in self.pk_index:
@@ -235,11 +277,26 @@ class ValueProfiler:
                 if row_count and len(source_set) < 0.05 * row_count:
                     continue
             boost = 10 if (most_specific and table == most_specific) else 0
+            # Self-FK preference (PART 5): a ref-flavored column ending in a
+            # self-reference convention (`_to`, `_by`, `_parent`, `_managed`)
+            # whose sampled values are FULLY contained in the same table's own
+            # primary key is a self-hierarchy reference (e.g.
+            # employees.reports_to -> employees.employee_id). Data overlap alone
+            # cannot distinguish this from a coincidental small-key match (shippers
+            # also contains the manager ids), so prefer the self target.
+            if boost == 0 and source_col and self._is_selfref_column(source_col) \
+                    and source_table == table and source_set \
+                    and len(source_set & target_set) == len(source_set):
+                boost = 9
             cands.append((ratio, len(source_set & target_set), boost,
                           -len(target_set), table, pk_col, len(source_set & target_set)))
         if not cands:
             return None
         cands.sort(reverse=True)
+        # Index winning target's value set for the self-FK containment check
+        # (the loop variable `target_set` is stale after sorting).
+        pk_sets = { (t, c): s for t, c, s in self.pk_index }
+        winner_set = pk_sets.get((cands[0][4], cands[0][5]))
         if require_unambiguous and len(cands) >= 2 and cands[0][:4] == cands[1][:4]:
             # A concrete name match can break an otherwise unresolvable tie
             # (e.g. `payments.order_id` vs `order_items.order_id` -> the header).
@@ -271,8 +328,19 @@ class ValueProfiler:
             runner_tighter = (-cands[1][3]) < 0.5 * (-cands[0][3])
             name_decides = (_boost > boost2 and most_specific is not None
                             and table == most_specific and not runner_tighter)
-            if (data_tie and not name_decides and not winner_tighter) \
-                    or same_key_ties >= 3:
+            # A self-FK winner (ref-flavored column whose values are fully
+            # contained in its OWN primary key) is definitive evidence of a
+            # self-hierarchy reference, not a shared-key domain coincidence: the
+            # data-tie / shared-key veto must not override it.
+            is_self_ref_win = (
+                _boost >= 9
+                and source_table is not None
+                and table == source_table
+                and winner_set is not None
+                and len(source_set & winner_set) == len(source_set)
+            )
+            if (data_tie and not name_decides and not winner_tighter
+                    and not is_self_ref_win) or same_key_ties >= 3:
                 ambiguous = True
         if most_specific is not None and most_specific != table and not ambiguous:
             ambiguous = True

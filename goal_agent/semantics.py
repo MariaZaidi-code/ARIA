@@ -93,6 +93,8 @@ class SemanticMixin:
             return []
         scored = []
         for table in self.tables:
+            if self.tables[table].get("empty"):
+                continue
             parts = set(table.lower().split("_"))
             score = 0
             for tok in goal_tokens:

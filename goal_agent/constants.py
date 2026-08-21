@@ -82,6 +82,7 @@ class ConstantsMixin:
         "sale": {"order", "transaction", "purchase", "invoice", "deal"},
         "employee": {"staff", "person", "worker", "associate", "user", "member"},
         "store": {"branch", "outlet", "shop", "location", "site", "warehouse"},
+        "shipper": {"shipping", "carrier", "courier", "delivery", "freight", "logistics"},
         "brand": {"make", "manufacturer", "vendor", "label", "supplier"},
         "category": {"group", "department", "segment", "class", "type", "division"},
         "quantity": {"qty", "units", "volume", "amount"},

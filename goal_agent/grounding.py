@@ -31,50 +31,87 @@ class GroundingMixin:
     # ---- _table_keyword_score (_table_keyword_score) ----
 
     def _table_keyword_score(self, table_name, info, user_goal_tokens):
-        # Token-overlap scoring with singular/plural awareness.
-        name_tokens = self._normalize_tokens(table_name)
-        score = 0
+        """Score how strongly a table matches the goal words.
+
+        Name matches dominate (synonym/plural-aware). Column matches are only a
+        small bonus ON TOP of a name hit; a bare column match (e.g. the generic
+        word 'company' hitting `company_name` on every table) must never outrank
+        a table whose name actually matches the subject.
+        """
+        name_parts = set(self._normalize_tokens(table_name))
         name_hit = False
         for tok in user_goal_tokens:
-            if tok in name_tokens:
-                score += 40
-                name_hit = True
-            elif tok.endswith("s") and tok[:-1] in name_tokens:
-                score += 32
-                name_hit = True
-            elif name_tokens and (tok + "s") in name_tokens:
-                score += 32
-                name_hit = True
-        for column_name in info.get("columns", {}).keys():
-            col_tokens = self._normalize_tokens(column_name)
+            for part in name_parts:
+                if self._schema_token_matches_goal(part, tok):
+                    name_hit = True
+                    break
+            if name_hit:
+                break
+        score = 0
+        if name_hit:
+            # Strong: the table's name means something mentioned in the goal.
+            # An EXACT name token outranks a partial/synonym match so "orders"
+            # picks `orders`, not `order_details` (which only matches because
+            # "order" is a prefix of "order_detail").
             for tok in user_goal_tokens:
-                if tok in col_tokens:
-                    score += 10 if name_hit else 14
-                elif tok.endswith("s") and tok[:-1] in col_tokens:
-                    score += 6
-        score += len(info.get("foreign_keys", [])) * 2
+                matched = False
+                for part in name_parts:
+                    if tok == part or (tok.endswith("s") and tok[:-1] == part):
+                        score += 55
+                        matched = True
+                        break
+                if matched:
+                    continue
+                for part in name_parts:
+                    if self._schema_token_matches_goal(part, tok):
+                        score += 40
+                        break
+        for column_name in info.get("columns", {}).keys():
+            col_parts = set(self._normalize_tokens(column_name))
+            for tok in user_goal_tokens:
+                for part in col_parts:
+                    if self._schema_token_matches_goal(part, tok):
+                        # Column matches are a bonus only on a name-matched
+                        # table; otherwise they are a weak hint that must not
+                        # outrank a subject-table name match.
+                        score += 8 if name_hit else 3
+                        break
         return score
 
     # ---- _expand_with_neighbors (_expand_with_neighbors) ----
 
     def _expand_with_neighbors(self, selected, limit=4):
         """Expand the selected tables through FK neighbors, depth-bounded so
-        unrelated tables further out in the graph never get pulled in."""
+        unrelated tables further out in the graph never get pulled in.
+        Deterministic: neighbors are ordered by FK connectivity (more central
+        tables first) then alphabetically, never by set/dict insertion order.
+        Only fills up to `limit` tables so a small relevant set is not drowned
+        by the whole graph."""
         expanded = set(selected)
         queue = [(t, 0) for t in selected]
         visited = set()
-        while queue and len(expanded) < limit * 2:
+        while queue and len(expanded) < limit:
             current, depth = queue.pop(0)
             if current in visited:
                 continue
             visited.add(current)
             if depth >= 2:
                 continue
-            for neighbor in self.relationship_graph.get(current, []):
+            neighbors = self.relationship_graph.get(current, [])
+            neighbors = sorted(
+                set(neighbors),
+                key=lambda n: (-len(self.tables[n].get("foreign_keys", [])) if n in self.tables else 0, n),
+            )
+            for neighbor in neighbors:
+                if len(expanded) >= limit:
+                    break
                 if neighbor in self.tables and neighbor not in expanded:
                     expanded.add(neighbor)
                     queue.append((neighbor, depth + 1))
-        return list(expanded)
+        return sorted(
+            list(expanded),
+            key=lambda n: (-len(self.tables[n].get("foreign_keys", [])) if n in self.tables else 0, n),
+        )
 
     # ---- _get_relevant_tables (_get_relevant_tables) ----
 
@@ -85,13 +122,23 @@ class GroundingMixin:
 
         ranked = []
         for table_name, info in self.tables.items():
+            if info.get("empty"):
+                # An empty table (0 rows) can never contribute data to an
+                # answer; selecting it as relevant forces an unsatisfiable
+                # join into the semantic plan and degrades every goal that
+                # mentions its name.
+                continue
             score = self._table_keyword_score(table_name, info, goal_tokens)
             ranked.append((table_name, score))
-        ranked.sort(key=lambda x: x[1], reverse=True)
+        # Deterministic ordering: ties resolved by FK connectivity (more central
+        # tables win) then alphabetically, never by dict insertion order.
+        ranked.sort(key=lambda x: (-x[1], -len(self.tables[x[0]].get("foreign_keys", [])), x[0]))
         selected = [name for name, _ in ranked if _ > 0][:max_tables]
 
         if not selected:
-            selected = [list(self.tables.keys())[0]] if self.tables else []
+            fallback = [name for name, _ in self.tables.items() if not self.tables[name].get("empty")]
+            fallback.sort(key=lambda x: (-len(self.tables[x].get("foreign_keys", [])), x))
+            selected = fallback[:max_tables] if fallback else []
 
         if len(selected) < max_tables:
             selected = self._expand_with_neighbors(selected, max_tables)
@@ -230,12 +277,27 @@ class GroundingMixin:
         """Columns of `table` that the goal means AND that are legitimate
         breakdown columns (excludes PK / FK / *_id and pure-measure numeric
         columns). Used for dimension grounding and for choosing the fact table
-        of an inferred COUNT."""
+        of an inferred COUNT.
+
+        Metric/analytical concept words ('sales', 'value', 'average', ...) are
+        stripped BEFORE column matching: in 'average order value per customer'
+        the word 'value' (or 'sales' -> synonym 'order') must not bind
+        order_date / ship_name as a dimension and make the SQL over-group."""
         info = self.tables.get(table, {})
         fk_cols = {fk.get("column") for fk in info.get("foreign_keys", [])}
         pk = set(info.get("primary_key", []) or [])
+        goal_tokens = self._normalize_tokens(goal_l)
+        # Don't bind metric words, analytical words, or (when the goal carries
+        # a metric) bare count/fact nouns like "order"/"sales" — "average ORDER
+        # value per customer" must not group by order_date, and "by ORDER STATUS"
+        # should bind the status column, not order_date.
+        metric_present = bool(goal_tokens & self._METRIC_CONCEPT_WORDS)
+        skip = set(self._ANALYTICAL_GOAL_WORDS) | set(self._METRIC_CONCEPT_WORDS)
+        if metric_present:
+            skip |= self._COUNT_OBJECT_TOKENS
+        filtered = " ".join(t for t in goal_tokens if t not in skip)
         out = []
-        for score, col in self._match_columns(goal_l, table):
+        for score, col in self._match_columns(filtered or goal_l, table):
             low = col.lower()
             if col in fk_cols or col in pk or low == "id" or low.endswith("_id"):
                 continue
@@ -253,6 +315,9 @@ class GroundingMixin:
         Rules (generic, schema-driven):
           - if the SUBJECT itself carries the requested dimension columns,
             count the subject ("how many customers");
+          - else if the goal EXPLICITLY names a child table (word in the goal
+            matches the child's table name: "shipping company with most
+            ORDERS" -> count orders, not order_details), prefer that child;
           - else if a CHILD table that references the subject carries the
             requested dimension columns, count there ("top brands by model
             year" -> count products, because model_year lives in products);
@@ -262,6 +327,7 @@ class GroundingMixin:
             return relevant[0] if relevant else None
         if self._match_dimension_columns(goal_l, subject):
             return subject
+        goal_tokens = self._normalize_tokens(goal_l)
         best_child = None
         for t in relevant:
             if t == subject:
@@ -273,6 +339,14 @@ class GroundingMixin:
             )
             if not child_of_subject:
                 continue
+            name_parts = set(self._normalize_tokens(t))
+            named_in_goal = any(
+                any(tok == part or (tok.endswith("s") and tok[:-1] == part)
+                    for part in name_parts)
+                for tok in goal_tokens
+            )
+            if named_in_goal:
+                return t
             if self._match_dimension_columns(goal_l, t):
                 best_child = t
                 break
@@ -301,7 +375,94 @@ class GroundingMixin:
                     }
         return None
 
-    # ---- _resolve_semantics (_resolve_semantics) ----
+    # ---- _is_pure_fact_table (_is_pure_fact_table) ----
+
+    def _is_pure_fact_table(self, table):
+        """True for a line-item/fact table: every non-key column is a measure
+        (order_details, transaction_items, ...). Such tables are measures, never
+        a breakdown subject, and must not contribute label dimensions."""
+        info = self.tables.get(table, {})
+        cols = [c for c in info.get("columns", {})
+                if not (c.lower().endswith("_id") or c.lower() == "id")]
+        if not cols:
+            return True
+        return all(self._is_measure_column(table, c) for c in cols)
+
+    # ---- _pick_subject (_pick_subject) ----
+
+    _COUNT_OBJECT_TOKENS = frozenset({
+        "order", "orders", "sale", "sales", "transaction", "transactions",
+        "quantity", "qty", "units", "unit", "amount", "price", "cost",
+        "revenue", "income", "turnover", "profit", "margin",
+    })
+
+    _QUANTITY_COL_TOKENS = frozenset({
+        "quantity", "qty", "units", "unit", "count", "num",
+    })
+
+    # Column-name preference tiers for measure resolution. When match scores
+    # tie, higher-tier (KPI total) columns win so "overall sales" binds the
+    # sales.amount total column rather than a per-line quantity/price column.
+    _MONETARY_TOTAL_COLS = frozenset({
+        "amount", "total", "revenue", "sales",
+    })
+    _MONETARY_LINE_COLS = frozenset({
+        "price", "cost", "value", "margin", "income",
+    })
+
+    def _pick_subject(self, matched_tables, goal_tokens, entity_tokens):
+        """Choose the subject (entity) table and the ordered list of entity
+        (subject) tables from the matched tables.
+
+        Entity tables are those whose NAME matches an entity token
+        (non-metric, non-analytical; minus count/fact nouns when a metric is
+        present). Pure-fact tables (order_details, ...) are never subjects.
+        Falls back to non-fact matched tables, then the strongest name match."""
+        def name_matches_entity(table):
+            parts = set(self._normalize_tokens(table))
+            return any(
+                self._schema_token_matches_goal(part, tok)
+                for tok in entity_tokens for part in parts
+            )
+        subject_tables = [
+            mt for mt in matched_tables
+            if not self._is_pure_fact_table(mt[1]) and name_matches_entity(mt[1])
+        ]
+        if not subject_tables:
+            subject_tables = [
+                mt for mt in matched_tables if not self._is_pure_fact_table(mt[1])
+            ]
+        if not subject_tables:
+            subject_tables = matched_tables
+        def key(mt):
+            t = mt[1]
+            return (
+                self._table_keyword_score(t, self.tables[t], goal_tokens),
+                -len(self.tables[t].get("foreign_keys", [])),
+                t,
+            )
+        best = max(subject_tables, key=key)
+        return best[1], subject_tables
+
+    def _explicit_breakdown_tokens(self, goal_l):
+        """Goal tokens that name an explicit breakdown dimension via a
+        'by X / per X / for each X' phrase. Empty when the goal has no explicit
+        breakdown (so only the subject label becomes a dimension)."""
+        goal_l = str(goal_l).lower()
+        tokens = self._normalize_tokens(goal_l)
+        breakdown = set()
+        for m in re.finditer(r"\b(?:by|per)\s+([a-z][a-z0-9_\s]+)", goal_l):
+            for w in m.group(1).split():
+                breakdown.add(w.rstrip("s") if w.endswith("s") else w)
+        if re.search(r"\bfor each\b|\bfor every\b", goal_l):
+            # tokens after "for each" up to a punctuation/keyword
+            for m in re.finditer(r"for each\s+([a-z][a-z0-9_\s]+)", goal_l):
+                for w in m.group(1).split():
+                    breakdown.add(w.rstrip("s") if w.endswith("s") else w)
+        # Intersect with what the goal actually contains so we never invent words.
+        return breakdown & tokens
+
+# ---- _resolve_semantics (_resolve_semantics) ----
 
     def _resolve_semantics(self, goal, ir, join_path):
         """Bind the Goal IR concepts to real schema columns/tables (spec §3).
@@ -341,11 +502,31 @@ class GroundingMixin:
 
         # -- 1) SUBJECT grounding (synonym-aware table matching) -------------
         matched_tables = self._match_tables(goal_l)
-        subject = matched_tables[0][1] if matched_tables else None
+        goal_tokens = self._normalize_tokens(goal_l)
+        metric_present = bool(goal_tokens & self._METRIC_CONCEPT_WORDS)
+        entity_tokens = {
+            t for t in goal_tokens
+            if t not in self._ANALYTICAL_GOAL_WORDS and t not in self._METRIC_CONCEPT_WORDS
+        }
+        if metric_present:
+            # When the goal states a metric ("average order VALUE per customer")
+            # bare count/fact nouns ("order", "sales", "quantity") belong to the
+            # measure, not the breakdown entity.
+            entity_tokens -= self._COUNT_OBJECT_TOKENS
+        if matched_tables:
+            subject, subject_tables = self._pick_subject(
+                matched_tables, goal_tokens, entity_tokens
+            )
+        else:
+            subject, subject_tables = None, []
 
         # -- 2) DIMENSION grounding -----------------------------------------
         dims = []
-        for _score, table in matched_tables:
+        # Label dimensions are bound to the entity (subject) tables the goal
+        # actually names — never to pure-fact tables that only appear because a
+        # generic word matched their name. This keeps "average order value per
+        # customer" from dragging orders.ship_name / order_date into GROUP BY.
+        for _score, table in subject_tables:
             label_col = self._pick_label_column(table)
             dims.append({
                 "concept": table,
@@ -354,15 +535,27 @@ class GroundingMixin:
                 "confidence": 0.9,
                 "reason": "subject table named (or meant) in the question",
             })
-        for table in relevant:
-            for _score, col in self._match_dimension_columns(goal_l, table):
-                dims.append({
-                    "concept": col,
-                    "resolved_table": table,
-                    "resolved_column": col,
-                    "confidence": 0.85,
-                    "reason": "dimension/breakdown column meant in the question",
-                })
+        # Explicit breakdown columns ("by X", "per X", "for each X") are bound
+        # across the join path from tables whose column names the breakdown
+        # tokens resolve to ("by model year" -> products.model_year,
+        # "by order status" -> transactions.status). Only from columns that are
+        # legitimate dimensions (excludes PK/FK/*_id and pure measures).
+        breakdown_tokens = self._explicit_breakdown_tokens(goal_l)
+        if breakdown_tokens:
+            breakdown_str = " ".join(sorted(breakdown_tokens))
+            for table in relevant:
+                cols = self._match_dimension_columns(breakdown_str, table)
+                if cols:
+                    label_col = self._pick_label_column(table)
+                    for _score, col in cols:
+                        if col != label_col:
+                            dims.append({
+                                "concept": col,
+                                "resolved_table": table,
+                                "resolved_column": col,
+                                "confidence": 0.85,
+                                "reason": "dimension/breakdown column meant in the question",
+                            })
         seen_dims = set()
         for d in dims:
             key = (d["resolved_table"], d["resolved_column"])
@@ -389,16 +582,43 @@ class GroundingMixin:
                     metric["confidence"] = 0.9
                 continue
             tokens = concept_tokens.get(concept, {concept})
-            best, best_score = None, 0
+            best, best_key = None, (0, -1, "")
+            # Aggregate-monetary concepts prefer a monetary total column
+            # (amount/total/revenue/sales) over a per-line price or a
+            # quantity/units fact column when match scores tie, so "overall
+            # sales" binds sales.amount rather than sale_lines.quantity
+            # regardless of the order tables appear in the join path.
+            monetary_concepts = {
+                "sales kpi", "revenue kpi", "profit kpi",
+            }
+            monetary_bias = concept in monetary_concepts
             for m in measures:
                 s = 0
+                col_tokens = self._normalize_tokens(m["column"])
+                col_name = m["column"].lower()
                 for tok in tokens:
-                    if tok in self._normalize_tokens(m["column"]):
+                    if tok in col_tokens:
                         s += 2
-                    elif tok.endswith("s") and tok[:-1] in self._normalize_tokens(m["column"]):
+                    elif tok.endswith("s") and tok[:-1] in col_tokens:
                         s += 1
-                if s > best_score:
-                    best, best_score = m, s
+                # A measure only competes if a concept token actually matched
+                # its column; otherwise `best` stays None and the
+                # computed-measure path (quantity * unit_price) runs below.
+                if s == 0:
+                    continue
+                tier = 2
+                if monetary_bias and col_name in self._MONETARY_TOTAL_COLS:
+                    tier = 0
+                elif monetary_bias and col_name in self._MONETARY_LINE_COLS:
+                    tier = 1
+                elif monetary_bias and col_name in self._QUANTITY_COL_TOKENS:
+                    tier = 3
+                key = (s, -tier, col_name)
+                if key > best_key:
+                    best_key = key
+                    best = m
+            # If nothing matched (best is None) the computed-measure path
+            # below synthesizes a quantity*unit_price expression.
             if best:
                 metric["resolved_table"] = best["table"]
                 metric["resolved_column"] = best["column"]

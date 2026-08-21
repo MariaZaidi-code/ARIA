@@ -13,7 +13,7 @@ keeps evidence collection a pure measurement layer.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from schema_engine.candidates import CandidateGroup
 from schema_engine.lexical import is_code_column
@@ -120,7 +120,18 @@ class EvidenceCollector:
         #     -> `vendor.businessentityid`, `purchaseorderdetail.purchaseorderid`
         #     -> `purchaseorderheader`), so the match is a real child->parent
         #     reference, not a coincidence.
-        if not name_hint and not cgroup.is_composite_key_col and isinstance(target_col, str):
+        #   * the target is the source's OWN table (a self-reference): the
+        #     shared-key veto is a cross-table concern (a key name reused as a
+        #     parent identifier in several tables); a column referencing its
+        #     own table's PK is a self-hierarchy, not a shared-domain coincidence,
+        #     so other tables that happen to carry the same key as a composite
+        #     member (e.g. `employee_territories.employee_id`) must not veto it.
+        is_self_reference = (
+            isinstance(cgroup.source_column, str)
+            and target_table == cgroup.source_table
+        )
+        if (not name_hint and not cgroup.is_composite_key_col
+                and isinstance(target_col, str) and not is_self_reference):
             tgt_pk = self.table_pk.get(target_table, [])
             target_is_composite_member = target_col in tgt_pk and len(tgt_pk) > 1
             tgt_key_owners = [

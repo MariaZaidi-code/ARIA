@@ -44,10 +44,11 @@ class DataMixin:
             # outage, rate limit, or a controlled non-SELECT* failure for an
             # aggregating goal); degrade gracefully instead of crash-looping.
             return [], None, {
+                "failed": True,
                 "message": (
                     "The model could not produce a valid query for this goal "
                     "right now. Please try again shortly or switch the model provider."
-                )
+                ),
             }
         current_sql = self._clean_sql(raw_sql)
         if not self._is_read_only_sql(current_sql):
@@ -467,12 +468,13 @@ No explanations, no markdown.
                             # aggregating goal (it charts IDs, not the breakdown the
                             # user asked for). Explain instead of guessing.
                             return [], safe_sql, {
+                                "failed": True,
                                 "message": (
                                     "The model could not produce a working aggregate "
                                     "query for this goal. The raw table data is not a "
                                     "valid substitute for the grouped/aggregated answer "
                                     "requested. Please rephrase or try the other model provider."
-                                )
+                                ),
                             }
                         logger.warning(f"LLM SQL exhausted retries ({exc}); returning safe fallback.")
                         return df.to_dict(orient="records"), safe_sql, None
@@ -504,7 +506,8 @@ Fix it and return only the corrected SQL query. No explanations, no markdown.
                     continue
 
         return [], current_sql, {
-            "message": "Could not produce a working query for this goal after retrying."
+            "failed": True,
+            "message": "Could not produce a working query for this goal after retrying.",
         }
 
     # ---- _clean_data (_clean_data) ----
