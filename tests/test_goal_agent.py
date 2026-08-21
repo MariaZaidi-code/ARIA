@@ -773,6 +773,62 @@ class SemanticValidation(unittest.TestCase):
         _, warnings = self.agent._semantic_validate_sql(ir, sql, join_path, plan)
         self.assertFalse(any("fan-out" in w for w in warnings), warnings)
 
+    def test_over_grouping_flagged_for_scalar_aggregate(self):
+        # "average order value" is a scalar overall aggregate: a GROUP BY in the
+        # outer SELECT splits the single AOV into per-group rows (over-grouping),
+        # the bug Fix 3 closes.
+        ir = {
+            "aggregation": "AVG", "intent": "summary", "ranking": None,
+            "comparison": None, "dimensions": [],
+            "metrics": [{"concept": "average value", "aggregation": "AVG",
+                         "resolved_table": "orders", "resolved_column": "orders.total",
+                         "resolved_expression": "orders.total"}],
+            "filters": [], "time": None,
+        }
+        plan = self.agent._plan_joins(["orders"])
+        sql = ("SELECT AVG(orders.total) AS v FROM orders "
+               "GROUP BY orders.customer_id")
+        issues, _ = self.agent._semantic_validate_sql(ir, sql, ["orders"], plan)
+        self.assertTrue(any("over-grouping" in i for i in issues), issues)
+
+    def test_over_grouping_not_flagged_for_per_entity_breakdown(self):
+        # "average order value per customer" is a grouped breakdown: a GROUP BY
+        # here is correct, not over-grouping.
+        ir = {
+            "aggregation": "AVG", "intent": "distribution", "ranking": None,
+            "comparison": None,
+            "dimensions": [{"concept": "customer", "resolved_table": "customers",
+                            "resolved_column": "customers.name"}],
+            "metrics": [{"concept": "average value", "aggregation": "AVG",
+                         "resolved_table": "orders", "resolved_column": "orders.total",
+                         "resolved_expression": "orders.total"}],
+            "filters": [], "time": None,
+        }
+        plan = self.agent._plan_joins(["orders", "customers"])
+        sql = ("SELECT customers.name, AVG(orders.total) AS v FROM orders "
+               "JOIN customers ON orders.customer_id = customers.id "
+               "GROUP BY customers.name")
+        issues, _ = self.agent._semantic_validate_sql(ir, sql, ["orders", "customers"], plan)
+        self.assertFalse(any("over-grouping" in i for i in issues), issues)
+
+    def test_over_grouping_not_flagged_for_subquery(self):
+        # A correct overall-AOV subquery groups INSIDE the subquery; the outer
+        # SELECT must not be flagged (no depth-0 GROUP BY).
+        ir = {
+            "aggregation": "AVG", "intent": "summary", "ranking": None,
+            "comparison": None, "dimensions": [],
+            "metrics": [{"concept": "average value", "aggregation": "AVG",
+                         "resolved_table": "orders", "resolved_column": "orders.total",
+                         "resolved_expression": "orders.total"}],
+            "filters": [], "time": None,
+        }
+        plan = self.agent._plan_joins(["orders"])
+        sql = ("SELECT AVG(sub.v) AS aov FROM ("
+               "SELECT SUM(orders.total) AS v FROM orders GROUP BY orders.order_id"
+               ") sub")
+        issues, _ = self.agent._semantic_validate_sql(ir, sql, ["orders"], plan)
+        self.assertFalse(any("over-grouping" in i for i in issues), issues)
+
 
 class NullPreservation(unittest.TestCase):
     def setUp(self):

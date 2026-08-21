@@ -908,6 +908,46 @@ Rules:
                     f"SQL uses table(s) {', '.join(sorted(extra))} outside the "
                     "deterministic join plan"
                 )
+
+        # ---- GROUP-BY granularity (spec §12 / Fix 3: AOV over-grouping) ----
+        # A scalar overall aggregate (e.g. "average order value", "total sales")
+        # must yield a single row: the outer SELECT must NOT carry a GROUP BY.
+        # An LLM frequently over-groups AOV (e.g. AVG(total) GROUP BY customer_id),
+        # splitting the single scalar metric into per-group rows and returning the
+        # wrong answer. Flag it so the query is repaired to a single-row aggregate.
+        #
+        # Per-entity / "top N" / "by X" / "per X" / comparison goals are NOT
+        # flagged: they carry intent ranking/comparison/distribution/trend, a
+        # ranking block, a comparison block, or explicit dimensions, so a GROUP BY
+        # is correct for them.
+        #
+        # Only the OUTERMOST (parenthesis-depth-0) GROUP BY is considered, so a
+        # correct per-order AOV subquery
+        #   SELECT AVG(v) FROM (SELECT SUM(x) AS v FROM ... GROUP BY order_id) t
+        # is not mis-flagged -- its GROUP BY lives inside a subquery.
+        _gb_match = re.search(r"\bGROUP\s+BY\s+", sql, re.IGNORECASE)
+        _outer_gb = []
+        if _gb_match:
+            _depth = sql[:_gb_match.start()].count("(") - sql[:_gb_match.start()].count(")")
+            if _depth == 0:
+                _outer_gb = self._extract_sql_group_by(sql)
+        if (
+            _outer_gb
+            and ir.get("aggregation")
+            and ir.get("intent") == "summary"
+            and not ir.get("ranking")
+            and not ir.get("comparison")
+            and not ir.get("dimensions")
+            and re.search(r"\b(SUM|AVG|MIN|MAX|COUNT)\s*\(", sql_upper)
+        ):
+            issues.append(
+                "the goal asks for an overall aggregate (no breakdown) but the SQL "
+                "groups by "
+                + ", ".join(_outer_gb)
+                + " (over-grouping: a single aggregate metric must not be split "
+                "into per-group rows)"
+            )
+
         for w in self._detect_fan_out(ir, join_plan, in_from):
             warnings.append(w)
         return issues, warnings
