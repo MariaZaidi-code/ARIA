@@ -1,16 +1,20 @@
-"""Data source connection routes: relational databases (PostgreSQL / MySQL)."""
+"""Data source connection routes: relational databases (PostgreSQL / MySQL) + CSV files."""
 
 import json
 import re
 import types
+from datetime import datetime
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+import csv_orchestrator
 import schema_agent
-from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, get_session
+from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session
 from core.db import build_db_uri
 from core.deps import require_writable
+from csv_handler import CsvValidationError
 from llm_provider import create_provider
 
 router = APIRouter()
@@ -170,6 +174,101 @@ def connect_postgresql(request: ConnectRequest, user: dict = Depends(require_wri
 def connect_mysql(request: ConnectRequest, user: dict = Depends(require_writable)):
     """Connect to a MySQL source (explicit route)."""
     return _do_connect(request, user, "mysql")
+
+
+@router.post("/api/connect_file")
+def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
+                 llm_api_key: str | None = Form(None),
+                 llm_base_url: str | None = Form(None),
+                 user: dict = Depends(require_writable)):
+    """Connect a semi-structured source: upload a CSV file.
+
+    The file is validated and profiled deterministically with the CSV handler
+    (encoding/dialect detection, header checks, type inference, data-quality
+    warnings), its schema mapping is written in the Goal Agent's ``tables``
+    format, the rows are loaded into a file-based SQLite database, and the
+    session is pointed at it so the Goal Agent and Insight Agent consume it
+    exactly like a relational source (dialect=sqlite).
+    """
+    if provider not in PROVIDER_NAMES:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Choose from {sorted(PROVIDER_NAMES)}.")
+    filename = (file.filename or "").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="No file received.")
+    ext = Path(filename).suffix.lower()
+    if ext != ".csv":
+        raise HTTPException(
+            status_code=400,
+            detail="Only .csv files are accepted for file sources right now. "
+                   "Tabular PDF extraction is not available in this build.",
+        )
+    try:
+        llm = create_provider(provider=provider, api_key=llm_api_key, base_url=llm_base_url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {exc}")
+
+    upload_dir = DATA_DIR / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
+    file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
+    file_path.write_bytes(file.file.read())
+
+    try:
+        table_name = csv_orchestrator.safe_table_name(safe_name)
+        mapping = csv_orchestrator.build_csv_schema_mapping(file_path, table_name=table_name)
+        sqlite_path = upload_dir / f"{safe_name}_{stamp}.db"
+        db_uri, table_name, row_count = csv_orchestrator.load_csv_to_sqlite(
+            file_path, sqlite_path, table_name=table_name
+        )
+    except CsvValidationError as exc:
+        # Deterministic validation failed; the upload is rejected as-is.
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"CSV processing failed: {exc}")
+
+    uid_dir = f"user_{user['user_id']}"
+    safe_db_name = mapping["database"]
+    schema_path = SCHEMA_DIR / uid_dir / f"schema_mapping_{safe_db_name}_latest.json"
+    schema_path.parent.mkdir(parents=True, exist_ok=True)
+    schema_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+
+    session = get_session(user["user_id"])
+    session["provider"] = llm
+    session["provider_name"] = provider
+    session["source_type"] = "semi-structured"
+    session["db"] = {".csv": str(file_path)}
+    session["db_type"] = "sqlite"
+    session["db_uri"] = db_uri
+    session["db_name"] = table_name
+    session["schema_path"] = schema_path
+    session["processed_path"] = PROCESSED_DIR / uid_dir / f"processed_data_{safe_db_name}.json"
+    session["insights_path"] = INSIGHTS_DIR / uid_dir / f"insights_{safe_db_name}.json"
+    session["processed_path"].parent.mkdir(parents=True, exist_ok=True)
+    session["insights_path"].parent.mkdir(parents=True, exist_ok=True)
+    session["dialect"] = "sqlite"
+    session["file_type"] = "csv"
+
+    columns = [c["column"] for c in mapping["tables"][table_name]["columns"]]
+    quality = mapping["tables"][table_name]["csv_profile"]["quality"]
+    return {
+        "ok": True,
+        "provider": provider,
+        "source_type": "semi-structured",
+        "file": filename,
+        "type": "csv",
+        "tables": {table_name: row_count},
+        "table": table_name,
+        "rows": row_count,
+        "columns": columns,
+        "schema_file": schema_path.name,
+        "quality": quality,
+        "db_file": sqlite_path.name,
+    }
 
 
 
