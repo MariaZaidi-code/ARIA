@@ -1,0 +1,197 @@
+﻿// =========================================================
+// ARIA FRONTEND AUTH STORAGE
+// =========================================================
+//
+// Connected to the ARIA FastAPI backend:
+//
+// React (this file)
+//   â†“  POST /api/auth/register | /api/auth/login
+// FastAPI
+//   â†“
+// SQLite + JWT
+//
+// The JWT returned by the backend is stored in localStorage so every
+// later API call can send `Authorization: Bearer <token>`.
+
+const API_BASE = "/api";
+
+const TOKEN_KEY = "aria_auth_token";
+const USER_KEY = "aria_auth_user";
+
+// =========================================================
+// BACKEND USERNAME
+// =========================================================
+//
+// The backend accepts usernames of letters, digits and [._-]
+// only (Pydantic pattern constraint). An email address contains
+// characters such as "@" that are not valid, so a deterministic,
+// reversible username is derived from the email. Register and
+// login must use the exact same derivation.
+// =========================================================
+
+const toBackendUsername = (email) => {
+  const cleaned = normalizeEmail(email).replace(/[^a-z0-9_.-]/g, "");
+
+  return cleaned.length >= 3 ? cleaned : `user${cleaned}`;
+};
+
+// =========================================================
+// NORMALIZE EMAIL
+// =========================================================
+
+const normalizeEmail = (email) => {
+  return (email || "").trim().toLowerCase();
+};
+
+// =========================================================
+// TOKEN / SESSION STORAGE
+// =========================================================
+
+export const getAuthToken = () => {
+  return localStorage.getItem(TOKEN_KEY) || "";
+};
+
+export const getAuthUser = () => {
+  try {
+    return JSON.parse(localStorage.getItem(USER_KEY) || "null");
+  } catch (error) {
+    console.error("Could not read ARIA auth session:", error);
+
+    return null;
+  }
+};
+
+export const setAuthSession = (token, username, email) => {
+  localStorage.setItem(TOKEN_KEY, token || "");
+
+  localStorage.setItem(
+    USER_KEY,
+    JSON.stringify({
+      username: username || email || "",
+      email: email || username || "",
+    }),
+  );
+};
+
+export const clearAuthSession = () => {
+  localStorage.removeItem(TOKEN_KEY);
+
+  localStorage.removeItem(USER_KEY);
+};
+
+// =========================================================
+// BACKEND AUTH REQUEST
+// =========================================================
+
+const authRequest = async (path, payload) => {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+
+    headers: {
+      "Content-Type": "application/json",
+    },
+
+    body: JSON.stringify(payload),
+  });
+
+  let data;
+
+  try {
+    data = await response.json();
+  } catch {
+    data = {};
+  }
+
+  if (!response.ok) {
+    const message =
+      (typeof data?.detail === "string" && data.detail) ||
+      data?.message ||
+      `Request failed (${response.status}).`;
+
+    const error = new Error(message);
+
+    error.status = response.status;
+
+    throw error;
+  }
+
+  return data;
+};
+
+// =========================================================
+// REGISTER USER
+// =========================================================
+
+export const registerLocalUser = async (email, password) => {
+  const currentEmail = normalizeEmail(email);
+
+  try {
+    await authRequest("/auth/register", {
+      username: toBackendUsername(currentEmail),
+
+      password,
+    });
+
+    return {
+      success: true,
+
+      user: {
+        id: toBackendUsername(currentEmail),
+
+        email: currentEmail,
+      },
+    };
+  } catch (error) {
+    console.error("Registration error:", error);
+
+    return {
+      success: false,
+
+      message: error?.message || "Could not create your account.",
+    };
+  }
+};
+
+// =========================================================
+// LOGIN USER
+// =========================================================
+
+export const authenticateLocalUser = async (email, password) => {
+  const currentEmail = normalizeEmail(email);
+
+  try {
+    const data = await authRequest("/auth/login", {
+      username: toBackendUsername(currentEmail),
+
+      password,
+    });
+
+    const username = data?.username || toBackendUsername(currentEmail);
+
+    setAuthSession(data?.token, username, currentEmail);
+
+    return {
+      success: true,
+
+      user: {
+        id: username,
+
+        email: currentEmail,
+      },
+    };
+  } catch (error) {
+    console.error("Login error:", error);
+
+    const isMissing = error?.status === 401;
+
+    return {
+      success: false,
+
+      code: isMissing ? "USER_NOT_FOUND" : undefined,
+
+      message:
+        error?.message || "Incorrect password. Please try again.",
+    };
+  }
+};
+

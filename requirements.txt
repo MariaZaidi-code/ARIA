@@ -12,3 +12,8 @@ uvicorn
 python-multipart
 pdfplumber
 PyJWT
+pdf2image
+pytesseract
+sentence-transformers
+faiss-cpu
+pillow

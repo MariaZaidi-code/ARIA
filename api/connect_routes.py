@@ -1,4 +1,4 @@
-"""Data source connection routes: relational databases (PostgreSQL / MySQL) + CSV files."""
+"""Data source connection routes: relational databases (PostgreSQL / MySQL) + CSV files + PDF documents."""
 
 import json
 import re
@@ -16,6 +16,7 @@ from core.db import build_db_uri
 from core.deps import require_writable
 from csv_handler import CsvValidationError
 from llm_provider import create_provider
+from document_processor import create_document_processor
 
 router = APIRouter()
 
@@ -268,6 +269,108 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
         "schema_file": schema_path.name,
         "quality": quality,
         "db_file": sqlite_path.name,
+    }
+
+
+@router.post("/api/connect_pdf")
+def connect_pdf(
+    provider: str = Form("local"),
+    file: UploadFile = File(...),
+    llm_api_key: str | None = Form(None),
+    llm_base_url: str | None = Form(None),
+    user: dict = Depends(require_writable),
+):
+    """Connect a document source: upload a PDF file.
+    
+    The PDF is processed through ARIA's document intelligence pipeline:
+    - Validation and integrity check
+    - Document type detection (digital, scanned, handwritten, mixed)
+    - Content extraction (text, OCR, vision LLM)
+    - Table extraction
+    - Chunking with metadata
+    - Embedding generation
+    - Vector indexing for RAG retrieval
+    """
+    if provider not in PROVIDER_NAMES:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Choose from {sorted(PROVIDER_NAMES)}.")
+    filename = (file.filename or "").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="No file received.")
+    ext = Path(filename).suffix.lower()
+    if ext != ".pdf":
+        raise HTTPException(
+            status_code=400,
+            detail="Only .pdf files are accepted for document sources.",
+        )
+    
+    try:
+        llm = create_provider(provider=provider, api_key=llm_api_key, base_url=llm_base_url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {exc}")
+    
+    upload_dir = DATA_DIR / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
+    file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
+    file_path.write_bytes(file.file.read())
+    
+    # Create document processor
+    processed_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "documents"
+    vector_index_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "vector_store"
+    
+    processor = create_document_processor(
+        upload_dir=upload_dir,
+        processed_dir=processed_dir,
+        llm_provider=llm if provider == "cloud" else None,
+    )
+    
+    # Process document (this runs synchronously - could be made async with background tasks)
+    result = processor.process_document(
+        file_path=file_path,
+        user_id=user["user_id"],
+        original_name=filename,
+    )
+    
+    if not result.success:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=result.error or "Document processing failed")
+    
+    document = result.document
+    
+    # Update session to include document reference
+    session = get_session(user["user_id"])
+    session["provider"] = llm
+    session["provider_name"] = provider
+    session["source_type"] = "document"
+    session["db"] = {".pdf": str(file_path)}
+    session["db_type"] = "document"
+    session["db_uri"] = f"document://{document.id}"
+    session["db_name"] = document.id
+    session["dialect"] = "document"
+    session["document_id"] = document.id
+    session["document_type"] = document.document_type.value if document.document_type else "unknown"
+    
+    # Ensure processed directories exist
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    vector_index_dir.mkdir(parents=True, exist_ok=True)
+    
+    return {
+        "ok": True,
+        "provider": provider,
+        "source_type": "document",
+        "file": filename,
+        "type": "pdf",
+        "document_id": document.id,
+        "document_type": document.document_type.value if document.document_type else "unknown",
+        "page_count": document.page_count,
+        "element_count": len(document.elements),
+        "chunk_count": len(document.chunks),
+        "table_count": len(document.tables),
+        "status": document.status.value,
+        "processing_method": document.processing_method,
+        "failed_pages": result.failed_pages,
+        "warnings": result.warnings,
     }
 
 
