@@ -1,5 +1,6 @@
 """Document API routes: upload, list, search, retrieve, delete."""
 
+import re
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -10,6 +11,15 @@ from core.deps import require_writable, get_current_user
 from document_processor import create_document_processor
 
 router = APIRouter()
+
+_DOCUMENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _sanitize_document_id(document_id: str) -> str:
+    """Reject document IDs that could enable path traversal."""
+    if not document_id or not _DOCUMENT_ID_RE.match(document_id):
+        raise HTTPException(status_code=400, detail="Invalid document ID.")
+    return document_id
 
 
 class DocumentSearchRequest(BaseModel):
@@ -76,6 +86,7 @@ def get_document(
     user: dict = Depends(get_current_user),
 ):
     """Get document details."""
+    document_id = _sanitize_document_id(document_id)
     processed_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "documents"
     doc_file = processed_dir / f"{document_id}.json"
     
@@ -99,6 +110,7 @@ def search_document(
     user: dict = Depends(get_current_user),
 ):
     """Search within a specific document using RAG."""
+    document_id = _sanitize_document_id(document_id)
     processed_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "documents"
     doc_file = processed_dir / f"{document_id}.json"
     
@@ -180,6 +192,7 @@ def delete_document(
     user: dict = Depends(require_writable),
 ):
     """Delete a document and its associated data."""
+    document_id = _sanitize_document_id(document_id)
     processed_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "documents"
     doc_file = processed_dir / f"{document_id}.json"
     
@@ -217,6 +230,7 @@ def retry_document(
     user: dict = Depends(require_writable),
 ):
     """Retry processing a failed document."""
+    document_id = _sanitize_document_id(document_id)
     processed_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "documents"
     doc_file = processed_dir / f"{document_id}.json"
     

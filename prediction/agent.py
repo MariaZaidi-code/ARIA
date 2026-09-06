@@ -158,7 +158,7 @@ class PredictionAgent:
         if datetime_col is not None:
             ts = pd.to_datetime(df[datetime_col], errors="coerce")
             if getattr(ts.dt, "tz", None) is not None:
-                ts = ts.dt.tz_localize(None)
+                ts = ts.dt.tz_convert(None)
             mask = ts.notna()
             if mask.sum() >= 3:
                 temp = df[mask].copy()

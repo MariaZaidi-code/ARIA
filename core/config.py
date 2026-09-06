@@ -90,7 +90,7 @@ def get_session(user_id=None):
     now = time.time()
     with SESSION_LOCK:
         # Opportunistic cleanup of expired sessions.
-        if len(SESSION_STORE) >= SESSION_MAX_USERS or len(SESSION_STORE) > 0:
+        if len(SESSION_STORE) >= SESSION_MAX_USERS or (len(SESSION_STORE) > 10 and len(SESSION_STORE) % 5 == 0):
             expired = [
                 uid for uid, (created, _session) in SESSION_STORE.items()
                 if now - created > SESSION_TTL_SECONDS
@@ -107,7 +107,9 @@ def get_session(user_id=None):
             entry = (now, deepcopy(DEFAULT_SESSION))
             SESSION_STORE[user_id] = entry
         else:
+            # Return a deep copy of the session to prevent shared mutable state
             SESSION_STORE[user_id] = (now, entry[1])
+            return deepcopy(entry[1])
         return entry[1]
 
 

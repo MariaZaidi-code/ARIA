@@ -381,6 +381,10 @@ class ValueProfiler:
                         values.append(v)
         except Exception as exc:
             logger.debug("distinct sample failed for %s.%s: %s", table, col, exc)
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             return []
         return values
 

@@ -76,7 +76,7 @@ natural-English questions. Never mention raw table or column identifiers
                 if isinstance(suggestions, list) and suggestions:
                     return [str(s) for s in suggestions][:limit]
         except Exception as exc:
-            logging.warning(f"Suggestion generation failed: {exc}. Using template suggestions.")
+            logging.warning("Suggestion generation failed: %s. Using template suggestions.", exc)
 
         return template
 

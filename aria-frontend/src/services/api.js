@@ -314,7 +314,7 @@ export const connectPdf = async (file, provider = "local") => {
 
 export const listDocuments = async () => {
   const data = await request("/documents");
-  return { success: true, data: data?.documents || [] };
+  return { success: true, data: data?.documents || data?.data || [] };
 };
 
 export const getDocument = async (documentId) => {
@@ -448,15 +448,22 @@ const deriveGoalType = (data) => {
 // GOAL AGENT
 // =========================================================
 
-export const analyzeQuestion = async (question, llmMode, sourceContext = {}) => {
+export const analyzeQuestion = async (question, llmMode, sourceContext = {}, multiTurnContext = null) => {
   void llmMode;
 
   void sourceContext;
 
+  const body = { goal: String(question || "") };
+  if (multiTurnContext?.previousGoal) {
+    body.previous_goal = multiTurnContext.previousGoal;
+  }
+  if (multiTurnContext?.previousResult) {
+    body.previous_result = multiTurnContext.previousResult;
+  }
+
   const data = await request("/ask", {
     method: "POST",
-
-    body: JSON.stringify({ goal: String(question || "") }),
+    body: JSON.stringify(body),
   });
 
   const status = data?.status || "success";
@@ -512,6 +519,12 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}) => 
     message: data?.message || "",
 
     warnings: data?.warnings || [],
+
+    proactiveInsights: data?.proactive_insights || [],
+    anomalies: data?.anomalies || [],
+    dataQualityWarnings: data?.data_quality_warnings || [],
+    explanation: data?.explanation || null,
+    confidence: data?.confidence || "high",
 
     historyId: data?.history_id || null,
   };
@@ -983,12 +996,18 @@ export const generateInsights = async (goalResult, analyticsResult) => {
 // in the local history session so it is not lost.
 // =========================================================
 
-export const submitFeedback = async (feedbackData) => {
-  console.log("Feedback received:", feedbackData);
-
-  return {
-    success: true,
-
-    message: "Thank you! Your feedback was recorded.",
-  };
+export const submitFeedback = async (feedbackData = {}) => {
+  try {
+    const data = await request("/feedback", {
+      method: "POST",
+      body: JSON.stringify({
+        message: feedbackData?.message || feedbackData?.text || "",
+        category: feedbackData?.category || "general",
+      }),
+    });
+    return { success: true, message: data?.message || "Thanks for your feedback.", data };
+  } catch (error) {
+    console.warn("Feedback submit failed (non-blocking):", error?.message);
+    return { success: true, message: "Thanks for your feedback." };
+  }
 };

@@ -13,7 +13,7 @@ import csv_orchestrator
 import schema_agent
 from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session
 from core.db import build_db_uri
-from core.deps import require_writable
+from core.deps import require_writable, get_current_user
 from csv_handler import CsvValidationError
 from llm_provider import create_provider
 from document_processor import create_document_processor
@@ -77,8 +77,10 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
         if not (request.db and request.user and request.password):
             raise HTTPException(status_code=400, detail="Relational source requires db, user, and password.")
 
+    # Use user's saved API key for hosted providers if available
+    user_key = session.get("api_keys", {}).get(request.provider) if request.provider == "cloud" else None
     try:
-        llm = create_provider(provider=request.provider)
+        llm = create_provider(provider=request.provider, api_key=user_key or None)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {exc}")
 
@@ -372,6 +374,43 @@ def connect_pdf(
         "failed_pages": result.failed_pages,
         "warnings": result.warnings,
     }
+
+
+class DatabaseTestRequest(BaseModel):
+    host: str = "localhost"
+    port: int = 5432
+    db: str = ""
+    user: str = ""
+    password: str = ""
+    dbType: str = "postgresql"
+
+
+@router.post("/api/database/test")
+async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depends(get_current_user)):
+    """Test a database connection before actually connecting."""
+    try:
+        from sqlalchemy import create_engine, text
+        from core.secret_box import decrypt as _decrypt_secret
+
+        password = req.password
+        if password:
+            try:
+                password = _decrypt_secret(password)
+            except Exception:
+                pass
+
+        if req.dbType == "mysql":
+            url = f"mysql+pymysql://{req.user}:{password}@{req.host}:{req.port}/{req.db}"
+        else:
+            url = f"postgresql+psycopg2://{req.user}:{password}@{req.host}:{req.port}/{req.db}"
+
+        engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+
+        return {"ok": True, "message": "Connection successful"}
+    except Exception as e:
+        return {"ok": False, "message": f"Connection failed: {str(e)}"}
 
 
 

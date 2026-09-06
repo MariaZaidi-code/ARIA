@@ -131,7 +131,7 @@ Rules:
             )
         if predictions and predictions.get("valid") and predictions.get("points"):
             period_word = predictions.get("period") or "periods"
-            if period_word == "sequence":
+            if period_word in ("sequence", "daily", "weekly", "monthly"):
                 period_word = "periods"
             actions.append(
                 f"Plan for the projected {predictions['projected_pct_change']}% change in "

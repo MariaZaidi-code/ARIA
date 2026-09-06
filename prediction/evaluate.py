@@ -14,6 +14,7 @@ Why this is honest (no overfitting):
 - Accuracy = max(0, 100 - MAPE%). It is reported honestly per dataset.
 """
 
+import logging
 import numpy as np
 
 from . import models as M
@@ -156,7 +157,11 @@ def select_model(values, min_points=5, season_period=None):
         if not r["overfit"] and (naive_mape is None or r["oos"] <= naive_mape * 1.01)
     ]
     if not eligible:
-        eligible = results
+        # If no overfit-free candidates beat naive, pick the one with lowest
+        # OOS error (even if overfit) rather than re-enabling all overfit models.
+        eligible = sorted(results, key=lambda r: r["oos"])
+        if eligible and eligible[0]["overfit"]:
+            logging.warning("All models overfit; selecting least-overfit model.")
     eligible.sort(key=lambda r: r["oos"])
     best = eligible[0]
 

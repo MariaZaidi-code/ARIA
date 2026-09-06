@@ -162,8 +162,10 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
 
     sqlite_path = Path(sqlite_path)
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-    if sqlite_path.exists():
-        sqlite_path.unlink()
+    try:
+        sqlite_path.unlink(missing_ok=True)
+    except PermissionError:
+        pass
 
     column_logical_types = {
         column["name"]: column["inferred_type"]

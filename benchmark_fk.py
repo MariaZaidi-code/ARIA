@@ -22,6 +22,7 @@ Run:
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -111,7 +112,7 @@ def clone_and_strip(src, messy=False):
     cur.execute(f'CREATE DATABASE "{dst}" TEMPLATE "{src}"')
     admin.close()
 
-    conn = psycopg2.connect(f"postgresql://postgres:12345@localhost:5432/{dst}")
+    conn = psycopg2.connect(ADMIN.format(dbname=dst))
     conn.autocommit = True
     cur = conn.cursor()
     fks = list_fks(conn)

@@ -21,18 +21,23 @@ from fastapi.staticfiles import StaticFiles
 # core.config loads .env centrally on first import.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core.config import STATIC_DIR  # noqa: E402
+from core.config import STATIC_DIR, BASE_DIR  # noqa: E402
 from core.checks import run_checks  # noqa: E402
 from llm_provider import PROVIDERS  # noqa: E402
-from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes  # noqa: E402
+from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, settings_routes, feedback_routes  # noqa: E402
 
 app = FastAPI(title="ARIA Testing UI")
 
+_cors_origins = os.getenv(
+    "CORS_ORIGINS",
+    "http://127.0.0.1:8000,http://localhost:8000,http://localhost:5173,http://127.0.0.1:5173",
+).split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 app.include_router(auth_routes.router)
@@ -40,6 +45,11 @@ app.include_router(connect_routes.router)
 app.include_router(schema_routes.router)
 app.include_router(query_routes.router)
 app.include_router(document_routes.router)
+app.include_router(kpi_routes.router)
+app.include_router(copilot_routes.router)
+app.include_router(hypothesis_routes.router)
+app.include_router(settings_routes.router)
+app.include_router(feedback_routes.router)
 
 
 @app.exception_handler(Exception)
@@ -51,8 +61,7 @@ async def unhandled_exception(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
         content={
-            "detail": f"Internal error: {type(exc).__name__}. "
-            "Check the server logs for the full traceback."
+            "detail": "An internal error occurred. Check the server logs for details."
         },
     )
 
@@ -79,6 +88,10 @@ def startup_checks():
 
 @app.get("/")
 def index():
+    # Serve the production build if available, otherwise the Figma dev template
+    prod_index = BASE_DIR / "aria-frontend" / "dist" / "index.html"
+    if prod_index.exists():
+        return FileResponse(prod_index)
     return FileResponse(STATIC_DIR / "index.html")
 
 
@@ -118,7 +131,10 @@ def _resolve_port(start_port: int = 8000, max_tries: int = 20) -> int:
 if __name__ == "__main__":
     import uvicorn
 
-    requested_port = int(os.getenv("ARIA_PORT", "8000"))
+    try:
+        requested_port = int(os.getenv("ARIA_PORT", "8000"))
+    except (ValueError, TypeError):
+        requested_port = 8000
     port = _resolve_port(requested_port)
     print(f"ARIA Testing UI running at http://127.0.0.1:{port}")
     uvicorn.run(app, host="127.0.0.1", port=port)

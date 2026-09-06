@@ -476,7 +476,7 @@ No explanations, no markdown.
                                     "requested. Please rephrase or try the other model provider."
                                 ),
                             }
-                        logger.warning(f"LLM SQL exhausted retries ({exc}); returning safe fallback.")
+                        logger.warning("LLM SQL exhausted retries (%s); returning safe fallback.", exc)
                         return df.to_dict(orient="records"), safe_sql, None
                     except Exception as safe_exc:
                         raise RuntimeError(

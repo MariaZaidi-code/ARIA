@@ -144,7 +144,8 @@ class CsvSchemaExtractor:
         """
         if self._df is None:
             self.extract()
-        assert self._df is not None
+        if self._df is None:
+            raise RuntimeError("DataFrame not loaded. Call extract() first.")
         return self._df.copy()
 
     def save_schema_json(self, output_path: str | Path) -> Path:
@@ -271,7 +272,9 @@ class CsvSchemaExtractor:
             raise CsvValidationError("CSV contains one or more blank column names.")
 
         lowered = [name.casefold() for name in cleaned]
-        duplicates = sorted({name for name in lowered if lowered.count(name) > 1})
+        from collections import Counter
+        lowered = [n.lower().strip() for n in self._df.columns]
+        duplicates = sorted({name for name, count in Counter(lowered).items() if count > 1})
         if duplicates:
             raise CsvValidationError(
                 "Duplicate CSV column names are not allowed: " + ", ".join(duplicates)

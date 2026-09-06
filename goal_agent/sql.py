@@ -1044,7 +1044,7 @@ Rules:
             with self.engine.connect() as conn:
                 for table_name in self.tables:
                     try:
-                        result = conn.execute(text(f'SELECT count(*) FROM "{table_name}"'))
+                        result = conn.execute(text(f'SELECT count(*) FROM "{table_name.replace(chr(34), chr(34)+chr(34))}"'))
                         counts[table_name] = int(result.scalar() or 0)
                     except Exception:
                         counts[table_name] = -1

@@ -26,9 +26,12 @@ def serialize_rejected(registry: RelationshipRegistry) -> List[dict]:
     """PART 14 rejection records: candidate, state, confidence, evidence, reasons."""
     out = []
     for o in registry.rejected:
+        src_col = o.source_column
+        if isinstance(src_col, list):
+            src_col = ".".join(str(c) for c in src_col)
         out.append({
             "candidate_id": o.candidate_id,
-            "source": f"{o.source_table}.{o.source_column}",
+            "source": f"{o.source_table}.{src_col}",
             "state": o.state,
             "confidence": None,
             "evidence": o.evidence_signals,

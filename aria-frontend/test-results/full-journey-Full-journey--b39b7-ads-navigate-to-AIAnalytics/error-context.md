@@ -1,0 +1,105 @@
+# Instructions
+
+- Following Playwright test failed.
+- Explain why, be concise, respect Playwright best practices.
+- Provide a snippet of code with the fix, if possible.
+
+# Test info
+
+- Name: full-journey.spec.cjs >> Full journey - every page loads >> navigate to AIAnalytics
+- Location: tests\e2e\full-journey.spec.cjs:23:5
+
+# Error details
+
+```
+ReferenceError: page is not defined
+```
+
+# Page snapshot
+
+```yaml
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e10]:
+      - generic [ref=e11]: ARIA
+      - generic [ref=e12]: AI
+    - navigation [ref=e13]:
+      - button "Dashboard" [ref=e14]
+      - button "AI Analytics" [active] [ref=e21]
+      - button "Insights" [ref=e26]
+      - button "Predictive" [ref=e30]
+      - button "Prescription" [ref=e35]
+      - button "Hypothesis" [ref=e41]
+      - button "Data" [ref=e45]
+      - button "Documents" [ref=e51]
+      - button "Copilot" [ref=e57]
+      - button "History" [ref=e62]
+      - button "Settings" [ref=e67]
+    - generic [ref=e73]:
+      - generic [ref=e74]: A
+      - generic [ref=e75]:
+        - paragraph [ref=e76]: User
+        - paragraph [ref=e77]: user@email.com
+    - button [ref=e78]
+  - generic [ref=e81]:
+    - banner [ref=e82]:
+      - heading "AI Analytics" [level=1] [ref=e84]
+      - button "Search... ⌘K" [ref=e85]:
+        - generic [ref=e89]: Search...
+        - generic [ref=e90]: ⌘K
+      - button "Toggle theme" [ref=e91]
+      - button "Notifications" [ref=e94]
+      - button "A" [ref=e100]
+    - main [ref=e104]:
+      - generic [ref=e106]:
+        - generic [ref=e107]:
+          - heading "AI Analytics" [level=2] [ref=e108]
+          - paragraph [ref=e109]: Ask questions. Explore your data. Get answers.
+        - generic [ref=e110]:
+          - generic [ref=e111]:
+            - textbox "Which product category generated the highest revenue in Q3?" [ref=e115]
+            - button "Analyze" [ref=e116]
+          - generic [ref=e117]:
+            - paragraph [ref=e118]: Recent
+            - generic [ref=e122]:
+              - button "Which product category generated the highest revenue in Q3?" [ref=e123]
+              - button "Compare revenue between North America and Europe" [ref=e124]
+              - button "What is the average order value by customer segment?" [ref=e125]
+              - button "Show me top 10 products by margin" [ref=e126]
+```
+
+# Test source
+
+```ts
+  1  | // CommonJS // Playwright: full journey through all ARIA pages (Figma layer + main)
+  2  | const { test, expect } = require('@playwright/test');
+  3  | 
+  4  | const PAGES = [
+  5  |   { name: 'Dashboard', navText: 'Dashboard', check: () => expect(page.locator('h2')).toContainText('Dashboard') },
+> 6  |   { name: 'AIAnalytics', navText: 'AI Analytics', check: () => expect(page.locator('h2')).toContainText('Analytics') },
+     |                                                                       ^ ReferenceError: page is not defined
+  7  |   { name: 'Insights', navText: 'Insights', check: () => expect(page.locator('h2')).toContainText('Insight') },
+  8  |   { name: 'Predictive', navText: 'Predictive', check: () => expect(page.locator('h2')).toContainText('Predictive') },
+  9  |   { name: 'Prescription', navText: 'Prescription', check: () => expect(page.locator('h2')).toContainText('Prescription') },
+  10 |   { name: 'Hypothesis', navText: 'Hypothesis', check: () => expect(page.locator('h2')).toContainText('Hypothesis') },
+  11 |   { name: 'Data', navText: 'Data', check: () => expect(page.locator('.premium-card')).toBeVisible({ timeout: 5000 }) },
+  12 |   { name: 'Documents', navText: 'Documents', check: () => expect(page.locator('.premium-card, h2')).toBeVisible({ timeout: 5000 }) },
+  13 |   { name: 'Copilot', navText: 'Copilot', check: () => expect(page.locator('textarea, input')).toBeVisible({ timeout: 5000 }) },
+  14 |   { name: 'History', navText: 'History', check: () => expect(page.locator('h2')).toContainText('History') },
+  15 |   { name: 'Settings', navText: 'Settings', check: () => expect(page.locator('.nav-item')).toHaveCount(7) },
+  16 | ];
+  17 | 
+  18 | test.describe('Full journey - every page loads', () => {
+  19 |   let page;
+  20 |   test.beforeAll(async ({ browser }) => { page = await browser.newPage(); await page.goto('http://localhost:5174'); await page.waitForLoadState('networkidle'); });
+  21 | 
+  22 |   for (const p of PAGES) {
+  23 |     test(`navigate to ${p.name}`, async () => {
+  24 |       await page.getByRole('button', { name: new RegExp(p.navText, 'i') }).click();
+  25 |       await page.waitForTimeout(300);
+  26 |       await p.check();
+  27 |     });
+  28 |   }
+  29 | });
+  30 | 
+```

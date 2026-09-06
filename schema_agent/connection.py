@@ -155,8 +155,8 @@ def _lower_keys(row):
 def _quote_ident(db_type, name):
     """Return a SQL-safe quoted identifier (double quotes for PG, backticks for MySQL)."""
     if db_type == "mysql":
-        return "`" + str(name).replace("`", "") + "`"
-    return '"' + str(name).replace('"', "") + '"'
+        return "`" + str(name).replace("`", "``") + "`"
+    return '"' + str(name).replace('"', '""') + '"'
 
 # ---- _qname (alias for _quote_ident, kept for backward compatibility) ----
 

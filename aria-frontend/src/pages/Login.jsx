@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { authenticateLocalUser } from "../utils/authStorage";
+import AriaLogo from "../components/AriaLogo";
 
 function Login({ onLogin, onCreateAccount }) {
   const [email, setEmail] = useState("");
@@ -9,33 +10,6 @@ function Login({ onLogin, onCreateAccount }) {
   const [loading, setLoading] = useState(false);
 
   const [error, setError] = useState("");
-
-  const [kpi, setKpi] = useState(0);
-
-  useEffect(() => {
-    const end = 128420;
-    const prefersReduced = window.matchMedia(
-      "(prefers-reduced-motion: reduce)"
-    ).matches;
-
-    const start = performance.now();
-    const duration = 1400;
-    let raf;
-
-    const tick = (now) => {
-      const t = prefersReduced ? 1 : Math.min(1, (now - start) / duration);
-      const eased = 1 - Math.pow(1 - t, 3);
-      setKpi(Math.round(eased * end));
-
-      if (!prefersReduced && t < 1) {
-        raf = requestAnimationFrame(tick);
-      }
-    };
-
-    raf = requestAnimationFrame(tick);
-
-    return () => cancelAnimationFrame(raf);
-  }, []);
 
   const handleSubmit = async (event) => {
     event.preventDefault();
@@ -77,6 +51,8 @@ function Login({ onLogin, onCreateAccount }) {
         {/* ─── LEFT: ARIA VISUAL AREA ─── */}
         <aside className="login-showcase" aria-hidden="true">
           <div className="login-showcase-brand">
+            <AriaLogo size={40} />
+
             <div>
               <strong>ARIA</strong>
 
@@ -109,14 +85,14 @@ function Login({ onLogin, onCreateAccount }) {
 
               {/* Mini revenue KPI */}
               <div className="login-kpi">
-                <span className="login-float-label">Revenue</span>
-                <strong className="login-kpi-value">${kpi.toLocaleString("en-US")}</strong>
-                <span className="login-kpi-delta">↑ 18.4%</span>
+                <span className="login-float-label">Intelligence</span>
+                <strong className="login-kpi-value">ARIA Agents</strong>
+                <span className="login-kpi-delta">Ask · Explore · Decide</span>
               </div>
 
               {/* Small trend chart */}
               <div className="login-chart">
-                <span className="login-float-label">Revenue Trend</span>
+                <span className="login-float-label">Schema Discovery</span>
                 <svg
                   className="login-chart-svg"
                   viewBox="0 0 140 44"
@@ -131,11 +107,11 @@ function Login({ onLogin, onCreateAccount }) {
                 </svg>
               </div>
 
-              {/* Insight card */}
+              {/* AI capability card */}
               <div className="login-insight">
-                <span className="login-float-tag">INSIGHT</span>
+                <span className="login-float-tag">ARIA</span>
                 <span className="login-insight-text">
-                  Growth driven by Product A
+                  Natural-language analytics
                 </span>
               </div>
             </div>
@@ -147,7 +123,7 @@ function Login({ onLogin, onCreateAccount }) {
 
               <li>Explore your schema automatically</li>
 
-              <li>Discover insights without SQL</li>
+              <li>Ask questions without SQL</li>
             </ul>
 
             <div className="login-showcase-footer">
@@ -159,16 +135,16 @@ function Login({ onLogin, onCreateAccount }) {
         {/* ─── RIGHT: LOGIN AREA ─── */}
         <div className="login-card">
           <div className="login-card-brand">
-            <span className="login-card-mark">✦</span>
+            <span className="login-card-mark">
+              <AriaLogo mono size={20} />
+            </span>
             <span className="login-card-wordmark">ARIA</span>
           </div>
 
           <div className="login-heading">
-            <span className="login-eyebrow">INTELLIGENT ANALYTICS</span>
-
             <h2>Welcome back</h2>
 
-            <p>Sign in to continue to your ARIA workspace.</p>
+            <p>Sign in to your ARIA workspace</p>
           </div>
 
           <form className="login-form" onSubmit={handleSubmit} noValidate>
@@ -230,14 +206,14 @@ function Login({ onLogin, onCreateAccount }) {
                 </span>
               ) : (
                 <span>
-                  Sign In <span aria-hidden="true">→</span>
+                  Access Intelligence Hub <span aria-hidden="true">→</span>
                 </span>
               )}
             </button>
           </form>
 
           <div className="login-footer">
-            <span>Don&apos;t have an account?</span>
+            <span>New here?</span>
 
             <button
               type="button"

@@ -1,86 +1,98 @@
+import { useState } from "react";
+import { Bot, Cpu, Shield, Zap, CheckCircle2 } from "lucide-react";
+
+const LLM_OPTIONS = [
+  {
+    id: "cloud",
+    label: "Cloud AI",
+    sublabel: "Groq-powered",
+    icon: Zap,
+    badge: "Fast",
+    description: "Lightning-fast cloud processing with GPT-4 class models.",
+    speed: "Instant",
+    privacy: "Cloud-processed",
+  },
+  {
+    id: "local",
+    label: "Local AI",
+    sublabel: "On-device",
+    icon: Shield,
+    badge: "Private",
+    description: "Keep all data on your machine. Full privacy guaranteed.",
+    speed: "Hardware-dependent",
+    privacy: "100% local",
+  },
+];
+
 function LLMSelection({ onSelectLLM }) {
+  const [selected, setSelected] = useState(null);
+
+  const handleContinue = () => {
+    if (selected) onSelectLLM(selected);
+  };
+
   return (
     <div className="llm-page">
       <div className="llm-container">
-        <div className="llm-header">
-          <h1>Choose Your AI Mode</h1>
+        <div className="llm-logo">
+          <div className="llm-logo-icon">A</div>
+        </div>
 
-          <p>
-            Select how you want ARIA to process your requests. You can use a
-            faster cloud model or keep processing local for greater privacy.
-          </p>
+        <div className="llm-header">
+          <h1>Choose your AI engine</h1>
+          <p>Select how ARIA processes your analytics. You can change this later.</p>
         </div>
 
         <div className="llm-options">
-          {/* ================= CLOUD LLM ================= */}
-          <div className="llm-card">
-            <div className="llm-card-header">
-              <span className="llm-badge">Cloud</span>
-              <h2>Cloud LLM</h2>
-            </div>
-
-            <p className="llm-description">
-              Use Groq-powered cloud models for faster AI responses.
-            </p>
-
-            <div className="llm-info">
-              <p>
-                <strong>Speed:</strong> Faster
-              </p>
-
-              <p>
-                <strong>Privacy:</strong> Data may be sent to the cloud provider
-                for processing.
-              </p>
-
-              <p>
-                <strong>Best for:</strong> Users who prioritize performance and
-                faster responses.
-              </p>
-            </div>
-
+          {LLM_OPTIONS.map((opt) => (
             <button
-              className="llm-select-button"
-              onClick={() => onSelectLLM("cloud")}
+              key={opt.id}
+              type="button"
+              className={`llm-card ${selected === opt.id ? "selected" : ""}`}
+              onClick={() => setSelected(opt.id)}
             >
-              Use Cloud LLM
+              <div className="llm-card-top">
+                <div className="llm-card-icon-wrap">
+                  <opt.icon size={20} />
+                </div>
+                <span className={`llm-badge ${opt.badge.toLowerCase()}`}>
+                  {opt.badge}
+                </span>
+              </div>
+
+              <div className="llm-card-body">
+                <h3>{opt.label}</h3>
+                <span className="llm-sublabel">{opt.sublabel}</span>
+                <p>{opt.description}</p>
+              </div>
+
+              <div className="llm-card-meta">
+                <div>
+                  <span className="llm-meta-label">Speed</span>
+                  <span className="llm-meta-value">{opt.speed}</span>
+                </div>
+                <div>
+                  <span className="llm-meta-label">Privacy</span>
+                  <span className="llm-meta-value">{opt.privacy}</span>
+                </div>
+              </div>
+
+              <div className="llm-card-radio">
+                <div className={`llm-radio ${selected === opt.id ? "checked" : ""}`}>
+                  {selected === opt.id && <CheckCircle2 size={14} />}
+                </div>
+              </div>
             </button>
-          </div>
-
-          {/* ================= LOCAL LLM ================= */}
-          <div className="llm-card">
-            <div className="llm-card-header">
-              <span className="llm-badge">Private</span>
-              <h2>Local LLM</h2>
-            </div>
-
-            <p className="llm-description">
-              Keep AI processing on your local system for greater data privacy.
-            </p>
-
-            <div className="llm-info">
-              <p>
-                <strong>Speed:</strong> Depends on local hardware
-              </p>
-
-              <p>
-                <strong>Privacy:</strong> Data remains on the user's local
-                system.
-              </p>
-
-              <p>
-                <strong>Best for:</strong> Sensitive or private business data.
-              </p>
-            </div>
-
-            <button
-              className="llm-select-button"
-              onClick={() => onSelectLLM("local")}
-            >
-              Use Local LLM
-            </button>
-          </div>
+          ))}
         </div>
+
+        <button
+          className="llm-continue-btn"
+          disabled={!selected}
+          onClick={handleContinue}
+        >
+          Continue
+        </button>
       </div>
     </div>
   );

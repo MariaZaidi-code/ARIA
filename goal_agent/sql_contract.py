@@ -319,6 +319,6 @@ class SqlContractMixin:
             success=False, message=message, status="query_failed",
         ))
         Path(output_path).write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
-        logging.error("Goal Agent graceful failure for %r: %s", user_goal, exc)
+        logging.getLogger(__name__).error("Goal Agent graceful failure for %r: %s", user_goal, exc)
         return output_path
 

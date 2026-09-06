@@ -121,7 +121,15 @@ class AcceptancePolicy:
             state = "PROBABLE"
 
         rel["relationship_state"] = state
-        rel["review_status"] = self.review_status_for(score)
+        # Derive review_status from the (possibly downgraded) state, not raw score.
+        # When state is downgraded from CONFIRMED to PROBABLE due to insufficient
+        # corroboration groups, review_status must reflect PROBABLE, not auto-accept.
+        if state == "CONFIRMED":
+            rel["review_status"] = "auto-accept"
+        elif state == "PROBABLE":
+            rel["review_status"] = "flagged"
+        else:
+            rel["review_status"] = "review"
         rel["confidence_band"] = self.band_for(score)
         rel["confidence_level"] = self.confidence_level_for(score)
         return "inferred", state
@@ -139,6 +147,9 @@ class AcceptancePolicy:
         rel["review_status"] = self.review_status_for(score)
         rel["relationship_state"] = self.state_for(score)
         rel["confidence_level"] = self.confidence_level_for(score)
-        if evidence not in (rel.setdefault("evidence", []) or []):
-            rel["evidence"].append(evidence)
+        ev_list = rel.get("evidence")
+        if ev_list is None:
+            rel["evidence"] = [evidence]
+        elif evidence not in ev_list:
+            ev_list.append(evidence)
         return rel

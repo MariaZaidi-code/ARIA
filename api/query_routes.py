@@ -11,6 +11,7 @@ from core.config import get_session
 from core.deps import require_data, require_writable
 from core.validation import validate_goal_text
 from goal_agent import GoalAgent
+from goal_agent.proactive_intelligence import analyze_result_intelligence
 from insight_agent import InsightAgent, sanitize_json
 
 router = APIRouter()
@@ -18,6 +19,8 @@ router = APIRouter()
 
 class GoalRequest(BaseModel):
     goal: str
+    previous_goal: str | None = None
+    previous_result: dict | None = None
 
 
 @router.post("/api/suggestions")
@@ -39,7 +42,19 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     """Run the Goal Agent: goal -> SQL -> processed_data.json."""
     session = get_session(user["user_id"])
     provider = require_data(request)
-    goal = validate_goal_text(req.goal)
+
+    # Build goal with multi-turn context if available
+    full_goal = req.goal
+    if req.previous_goal and req.previous_result:
+        prev_data = req.previous_result.get("data", [])
+        prev_cols = req.previous_result.get("columns", [])
+        full_goal = (
+            f"Previous question: {req.previous_goal}\n"
+            f"Previous result columns: {', '.join(prev_cols[:10])}\n"
+            f"Current question: {req.goal}"
+        )
+
+    goal = validate_goal_text(full_goal)
     agent = None
     try:
         agent = GoalAgent(schema_json_path=str(session["schema_path"]), db_uri=session["db_uri"], provider=provider, dialect=session["dialect"])
@@ -58,6 +73,15 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     processed = json.loads(session["processed_path"].read_text(encoding="utf-8"))
     processed = sanitize_json(processed)
     columns = list(processed.get("data", [{}])[0].keys()) if processed.get("data") else []
+
+    # Run proactive intelligence analysis on the result data
+    result_data = processed.get("data", [])
+    proactive = analyze_result_intelligence(
+        data=result_data,
+        goal=req.goal,
+        message=processed.get("message", ""),
+    )
+
     session["pending_history_id"] = auth.add_history(
         user["user_id"],
         goal=goal,
@@ -89,6 +113,11 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "execution": processed.get("execution"),
         "warnings": processed.get("warnings"),
         "suggested_questions": processed.get("suggested_questions"),
+        "proactive_insights": proactive.get("proactive_insights", []),
+        "anomalies": proactive.get("anomalies", []),
+        "data_quality_warnings": proactive.get("data_quality_warnings", []),
+        "explanation": proactive.get("explanation"),
+        "confidence": proactive.get("confidence", "high"),
         "history_id": session["pending_history_id"],
     }
 

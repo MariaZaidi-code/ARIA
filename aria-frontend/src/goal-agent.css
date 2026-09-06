@@ -1,0 +1,84 @@
+/* ============================================================
+   GOAL AGENT PAGE
+   ============================================================ */
+
+.goal-agent-input-row {
+  display: flex;
+  gap: 10px;
+}
+
+.goal-agent-input-row input {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid var(--aria-border);
+  border-radius: 8px;
+  background: var(--aria-bg);
+  color: var(--aria-text);
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.goal-agent-input-row input:focus {
+  border-color: var(--aria-accent);
+  box-shadow: 0 0 0 3px var(--aria-accent-light);
+}
+
+.goal-agent-input-row input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.goal-agent-input-row button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 20px;
+  border: none;
+  border-radius: 8px;
+  background: var(--aria-accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 120ms ease;
+}
+
+.goal-agent-input-row button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.goal-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.goal-suggestion-btn {
+  padding: 10px 14px;
+  border: 1px solid var(--aria-border);
+  border-radius: 8px;
+  background: var(--aria-bg-elevated);
+  color: var(--aria-text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.goal-suggestion-btn:hover {
+  border-color: var(--aria-accent);
+  background: var(--aria-accent-muted);
+}
+
+@media (max-width: 640px) {
+  .goal-agent-input-row {
+    flex-direction: column;
+  }
+  .goal-agent-input-row button {
+    width: 100%;
+    justify-content: center;
+  }
+}

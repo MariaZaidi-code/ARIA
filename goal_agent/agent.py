@@ -304,6 +304,6 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
             "user_goal": user_goal, "kpi_map": {}, "relevant_tables": [],
             "join_path": [], "raw_sql": "", "rows": [], "final_sql": "",
         })
-        logger.info("Goal Agent done! Saved to %s", result['result_path'])
-        return result["result_path"]
+        logger.info("Goal Agent done! Saved to %s", result.get('result_path'))
+        return result.get("result_path")
 

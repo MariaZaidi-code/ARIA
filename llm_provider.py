@@ -109,7 +109,7 @@ class LLMProvider:
         Defaults: 30s for cloud, 60s for local (fast 1.5B coder on CPU).
         """
         if timeout is None:
-            if self.provider == "local" and role in ("story", "prescription"):
+            if self.provider == "local" and role in ("story",):
                 # Slow local model on CPU: generous default, but an explicit
                 # timeout passed by the caller always wins (no hidden hang).
                 timeout = 900
@@ -227,9 +227,10 @@ class LLMProvider:
                     raise
                 wait = 1.5
                 try:
-                    retry_after = float(response.headers.get("retry-after", 0))  # type: ignore[union-attr]
-                    if retry_after > 0:
-                        wait = min(retry_after, 5.0)
+                    if response is not None and hasattr(response, "headers"):
+                        retry_after = float(response.headers.get("retry-after", 0))
+                        if retry_after > 0:
+                            wait = min(retry_after, 5.0)
                 except Exception:
                     pass
                 logging.warning("Rate limit (429); retrying in %.1fs (attempt %d/%d)",

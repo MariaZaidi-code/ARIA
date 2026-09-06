@@ -1,4 +1,8 @@
 import { useEffect, useState } from "react";
+import "./design-system-v4.css";
+import "./styles/sidebar-v4.css";
+import "./styles/header-v4.css";
+import "./styles/dashboard-v4.css";
 import "./App.css";
 import "./aria-enhance.css";
 
@@ -9,10 +13,19 @@ import LLMSelection from "./pages/LLMSelection";
 import Dashboard from "./pages/Dashboard";
 import AskARIA from "./pages/AskARIA";
 import DataSource from "./pages/Datasource";
+import DatabaseConnectionPopup from "./components/DatabaseConnectionPopup";
 import Schema from "./pages/Schema";
 import History from "./pages/History";
 import SavedReports from "./pages/SavedReports";
 import Documents from "./pages/Documents";
+import Insights from "./pages/Insights";
+import AnalyticsPage from "./pages/Analytics";
+import Predictions from "./pages/Predictions";
+import Prescriptions from "./pages/Prescriptions";
+import Hypothesis from "./pages/Hypothesis";
+import GoalAgent from "./pages/GoalAgent";
+import SettingsPage from "./pages/Settings";
+import FigmaApp from "./figma/App.tsx";
 // ================= COMPONENTS =================
 import Sidebar from "./components/Sidebar";
 import AppHeader from "./components/AppHeader";
@@ -51,6 +64,7 @@ function App() {
   // =========================================================
 
   const [appStage, setAppStage] = useState("login");
+  const [showDbPopup, setShowDbPopup] = useState(false);
 
   const [theme, setTheme] = useState("light");
   const [currentUser, setCurrentUser] = useState(null);
@@ -58,29 +72,29 @@ function App() {
   // =========================================================
   // RESTORE AUTH SESSION FROM LOCALSTORAGE ON MOUNT
   // =========================================================
-  queueMicrotask(() => {
-      const token = localStorage.getItem("aria_auth_token");
-      const userStr = localStorage.getItem("aria_auth_user");
+  useEffect(() => {
+    const token = localStorage.getItem("aria_auth_token");
+    const userStr = localStorage.getItem("aria_auth_user");
 
-      if (token && userStr) {
-        try {
-          const user = JSON.parse(userStr);
-          setCurrentUser(user);
-          if (user && user.username) {
-            setAppStage("app");
-          }
-        } catch {
-          localStorage.removeItem("aria_auth_token");
-          localStorage.removeItem("aria_auth_user");
+    if (token && userStr) {
+      try {
+        const user = JSON.parse(userStr);
+        setCurrentUser(user);
+        if (user && user.username) {
+          setAppStage("llm-selection");
         }
+      } catch {
+        localStorage.removeItem("aria_auth_token");
+        localStorage.removeItem("aria_auth_user");
       }
+    }
 
-      // Restore theme preference from localStorage
-      const savedTheme = localStorage.getItem("aria_theme");
-      if (savedTheme) {
-        setTheme(savedTheme);
-      }
-    });
+    // Restore theme preference from localStorage
+    const savedTheme = localStorage.getItem("aria_theme");
+    if (savedTheme) {
+      setTheme(savedTheme);
+    }
+  }, []);
 
     // Apply saved theme and listen for system changes
     useEffect(() => {
@@ -124,7 +138,7 @@ function App() {
   // NAVIGATION
   // =========================================================
 
-  const [activePage, setActivePage] = useState("askAria");
+  const [activePage, setActivePage] = useState("dashboard");
 
   // =========================================================
   // MOBILE NAVIGATION
@@ -211,6 +225,8 @@ function App() {
   const [connectionStatus, setConnectionStatus] = useState("not-connected");
 
   const [connectionError, setConnectionError] = useState("");
+
+  const [isConnecting, setIsConnecting] = useState(false);
 
   // =========================================================
   // DATABASE STATES
@@ -441,23 +457,42 @@ function App() {
   // LLM SELECTION
   // =========================================================
 
-  const handleLLMSelect = (mode) => {
+const handleLLMSelect = (mode) => {
     setSelectedLLM(mode);
-
     localStorage.setItem(LLM_MODE_STORAGE_KEY, mode);
-
-    if (dbConfigured) {
-      setActivePage("dashboard");
-    } else {
-      setActivePage("dataSource");
-    }
-
     setMobileMenuOpen(false);
-
     setAppStage("app");
+    setShowDbPopup(true);
+    setActivePage("dashboard");
+  };
 
-    localStorage.setItem("aria_db_configured", "true");
-    setDbConfigured(true);
+  const handleDbPopupConnect = async (connectionDetails) => {
+    setIsConnecting(true);
+    setConnectionError("");
+
+    try {
+      const response = await connectDatabase(connectionDetails);
+      if (response?.success) {
+        setShowDbPopup(false);
+        setDbConfigured(true);
+        localStorage.setItem("aria_db_configured", "true");
+        setAppStage("app");
+        setActivePage("dashboard");
+      }
+    } catch (err) {
+      console.error("DB connection failed:", err);
+      setConnectionError(err.message || "Unknown error");
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  const handleDbPopupSkip = () => {
+    setShowDbPopup(false);
+    setDbConfigured(false);
+    localStorage.setItem("aria_db_configured", "false");
+    setAppStage("app");
+    setActivePage("dashboard");
   };
 
   // =========================================================
@@ -592,8 +627,14 @@ function App() {
   // FILE SELECTION
   // =========================================================
 
-  const handleFileSelect = (event) => {
-    const file = event.target.files?.[0];
+  // Handles both DOM event (from <input>) and File object (from figma Data page)
+  const handleFileSelect = (eventOrFile) => {
+    let file;
+    if (eventOrFile instanceof File) {
+      file = eventOrFile;
+    } else {
+      file = eventOrFile.target?.files?.[0];
+    }
 
     setConnectionError("");
 
@@ -823,7 +864,9 @@ function App() {
 
       setConnectionError("");
 
-      toast.success("Data source connected");
+      toast.success(`${selectedSourceType === "csv" || selectedSourceType === "pdf" ? "File" : selectedSourceType.charAt(0).toUpperCase() + selectedSourceType.slice(1)} connected — loading your data...`);
+
+      setActivePage("dashboard");
 
       await runSchemaAgent();
     } catch (error) {
@@ -889,18 +932,89 @@ function App() {
   // QUICK ASK (Dashboard quick input → pre-fills Ask ARIA)
   // =========================================================
 
-  const handleQuickAsk = (questionText) => {
+  const handleQuickAsk = async (questionText) => {
     const text = String(questionText || "").trim();
+    if (!text) return;
 
-    if (text) {
-      setQuestion(text);
+    if (connectionStatus !== "connected") {
+      alert("Connect a data source first.");
+      return;
+    }
+    if (schemaStatus !== "success") {
+      alert("Schema is still loading. Please try again in a moment.");
+      return;
     }
 
     setCopilotOpen(false);
-
-    setActivePage("askAria");
-
     setMobileMenuOpen(false);
+    setLoading(true);
+
+    setSubmittedQuestion("");
+    setAnalysisResult(null);
+    resetInsightAgent();
+    setGoalStatus("running");
+    setGoalResult(null);
+    setGoalError("");
+
+    try {
+      const multiTurnContext = submittedQuestion ? {
+        previousGoal: submittedQuestion,
+        previousResult: analysisResult,
+      } : null;
+
+      const response = await analyzeQuestion(text, selectedLLM, {
+        sourceType: selectedSourceType,
+        databaseName: dbName,
+        schema: schemaData,
+      }, multiTurnContext);
+
+      if (!response?.success || !response?.data) {
+        throw new Error("The Goal Agent did not return a valid result.");
+      }
+
+      const goalData = response.data;
+      setSubmittedQuestion(text);
+      setGoalResult(goalData);
+      setGoalStatus("success");
+
+      if (goalData.clarificationRequired || !goalData.nextAgent) {
+        setAnalysisResult(null);
+        resetInsightAgent();
+        setLoading(false);
+        return;
+      }
+
+      const analyticsResponse = await generateAnalyticsResult(goalData);
+      if (!analyticsResponse?.success) {
+        throw new Error("Analytics result could not be generated.");
+      }
+      const analyticsData = analyticsResponse.data;
+      setAnalysisResult(analyticsData);
+
+      setInsightStatus("running");
+      try {
+        const insightResponse = await generateInsights(goalData, analyticsData);
+        if (insightResponse?.success && insightResponse?.data) {
+          setInsightResult(insightResponse.data);
+          setInsightStatus("success");
+        }
+      } catch {
+        setInsightStatus("failed");
+      }
+    } catch (err) {
+      console.error("Dashboard ask error:", err);
+      setGoalStatus("failed");
+      setGoalError(err?.message || "Analysis failed.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleFigmaAsk = (questionText) => {
+    const text = String(questionText || "").trim();
+    if (!text) return;
+    setQuestion(text);
+    handleQuickAsk(text);
   };
 
   // =========================================================
@@ -1485,7 +1599,7 @@ function App() {
   // =========================================================
 
   if (appStage === "llm-selection") {
-    return <LLMSelection onSelectLLM={handleLLMSelect} />;
+    return <LLMSelection onSelectLLM={handleLLMSelect} key={appStage} />;
   }
 
   // =========================================================
@@ -1493,7 +1607,77 @@ function App() {
   // =========================================================
 
   return (
+    <>
+      {showDbPopup && (
+        <DatabaseConnectionPopup
+          onConnect={handleDbPopupConnect}
+          onSkip={handleDbPopupSkip}
+          isConnecting={isConnecting}
+          connectionError={connectionError}
+        />
+      )}
+
+      <FigmaApp
+        user={currentUser}
+        selectedLLM={selectedLLM}
+        question={question}
+        onAsk={handleFigmaAsk}
+        onChangeLLM={handleChangeLLM}
+        onSignOut={handleSignOut}
+        // Connection & Data Source
+        connectionStatus={connectionStatus}
+        selectedSourceType={selectedSourceType}
+        dbName={dbName}
+        schemaData={schemaData}
+        schemaStatus={schemaStatus}
+        schemaError={schemaError}
+        onConnect={handleDatabaseConnect}
+        onDisconnect={handleDataSourceDisconnect}
+        onSchemaRetry={handleSchemaRetry}
+        // Source type & file selection
+        onSourceTypeSelect={handleSourceTypeSelect}
+        selectedFile={selectedFile}
+        onFileSelect={handleFileSelect}
+        onFileUpload={handleFileUpload}
+        // DB credentials
+        dbHost={dbHost}
+        dbPort={dbPort}
+        dbUsername={dbUsername}
+        dbPassword={dbPassword}
+        setDbHost={setDbHost}
+        setDbPort={setDbPort}
+        setDbName={setDbName}
+        setDbUsername={setDbUsername}
+        setDbPassword={setDbPassword}
+        connectionError={connectionError}
+        // Question & Query
+        submittedQuestion={submittedQuestion}
+        setQuestion={setQuestion}
+        questionSuggestions={questionSuggestions}
+        suggestionsLoading={suggestionsLoading}
+        // Goal Agent
+        goalStatus={goalStatus}
+        goalResult={goalResult}
+        goalError={goalError}
+        analysisResult={analysisResult}
+        loading={loading}
+        onAnalyze={handleAnalyze}
+        // Insight Agent
+        insightStatus={insightStatus}
+        insightResult={insightResult}
+        insightError={insightError}
+        onInsightRetry={handleInsightRetry}
+        // History
+        historyRefreshKey={historyRefreshKey}
+        currentHistorySessionId={currentHistorySessionId}
+        onOpenHistory={handleOpenHistorySession}
+        onDeleteHistory={handleDeleteHistorySession}
+      />
+    </>
+  );
+  if (false) { return (
     <div className="app">
+
       {/* =====================================================
           MOBILE TOP BAR
       ====================================================== */}
@@ -1570,6 +1754,8 @@ function App() {
           onOpenHistorySession={handleOpenHistorySession}
           theme={theme}
           setTheme={setTheme}
+          setMobileMenuOpen={setMobileMenuOpen}
+          dbConfigured={dbConfigured}
         />
 
         <div className="page-enter" key={activePage}>
@@ -1697,6 +1883,66 @@ function App() {
             onNavigate={handlePageChange}
           />
         )}
+        {/* INSIGHTS */}
+        {activePage === "insights" && (
+          <Insights
+            insightResult={insightResult}
+            loading={insightStatus === "running"}
+            connectionStatus={connectionStatus}
+            onStartAnalysis={handleAnalyze}
+          />
+        )}
+        {/* ANALYTICS */}
+        {activePage === "analytics" && (
+          <AnalyticsPage
+            key={submittedQuestion || "new-analysis"}
+            analysisResult={analysisResult}
+            connectionStatus={connectionStatus}
+            onStartAnalysis={handleAnalyze}
+          />
+        )}
+        {/* PREDICTIONS */}
+        {activePage === "predictions" && (
+          <Predictions
+            key={submittedQuestion || "new-analysis"}
+            insightResult={insightResult}
+            loading={insightStatus === "running"}
+            connectionStatus={connectionStatus}
+            onStartAnalysis={handleAnalyze}
+          />
+        )}
+        {/* PRESCRIPTIONS */}
+        {activePage === "prescriptions" && (
+          <Prescriptions
+            insightResult={insightResult}
+            loading={insightStatus === "running"}
+            connectionStatus={connectionStatus}
+            onStartAnalysis={handleAnalyze}
+          />
+        )}
+        {/* HYPOTHESIS */}
+        {activePage === "hypothesis" && (
+          <Hypothesis
+            insightResult={insightResult}
+            loading={insightStatus === "running"}
+            connectionStatus={connectionStatus}
+            onStartAnalysis={handleAnalyze}
+          />
+        )}
+        {/* GOALS */}
+        {activePage === "goals" && (
+          <GoalAgent
+            connectionStatus={connectionStatus}
+            goalStatus={goalStatus}
+            goalResult={goalResult}
+            insightResult={insightResult}
+            onStartAnalysis={handleAnalyze}
+          />
+        )}
+        {/* SETTINGS */}
+        {activePage === "settings" && (
+          <SettingsPage currentUser={currentUser} />
+        )}
         </div>
         </div>
       </main>
@@ -1727,7 +1973,7 @@ function App() {
         }}
       />
     </div>
-  );
+  ); }
 }
 
 export default App;

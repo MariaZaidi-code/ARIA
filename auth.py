@@ -97,8 +97,8 @@ def register(username: str, password: str) -> int:
     username = (username or "").strip()
     if len(username) < 3 or not _USERNAME_RE.fullmatch(username):
         raise ValueError("Username must be at least 3 characters using letters, digits, . _ -.")
-    if len(password) < 4:
-        raise ValueError("Password must be at least 4 characters.")
+    if len(password) < 8:
+        raise ValueError("Password must be at least 8 characters.")
     conn = _get_db()
     try:
         conn.execute(
@@ -117,6 +117,8 @@ def register(username: str, password: str) -> int:
 
 
 def authenticate(username: str, password: str) -> int | None:
+    if not username or not isinstance(username, str):
+        return None
     conn = _get_db()
     try:
         row = conn.execute(

@@ -2,6 +2,9 @@
 .env.*
 !.env.example
 kaggle_credentials.local.sh
+data/.jwt_secret
+data/*.db
+data/*.sqlite
 .venv/
 venv/
 env/

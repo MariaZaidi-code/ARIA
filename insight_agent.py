@@ -145,10 +145,11 @@ class InsightAgent:
             if col in numeric:
                 continue
             try:
-                pd.to_datetime(df[col], errors="raise")
-                if col in category:
-                    category.remove(col)
-                datetime_cols.append(col)
+                pd.to_datetime(df[col], errors="coerce")
+                if not pd.to_datetime(df[col], errors="coerce").isna().all():
+                    if col in category:
+                        category.remove(col)
+                    datetime_cols.append(col)
             except Exception:
                 pass
         return numeric, category, datetime_cols
@@ -188,7 +189,7 @@ class InsightAgent:
         for dt_col in datetime_cols[:1]:
             ts = pd.to_datetime(df[dt_col], errors="coerce")
             if getattr(ts.dt, "tz", None) is not None:
-                ts = ts.dt.tz_localize(None)
+                ts = ts.dt.tz_convert(None)
             temp = df.copy()
             temp["_date"] = ts
             for num_col in numeric_cols:
@@ -205,7 +206,7 @@ class InsightAgent:
                     direction = "mixed"
                 pct_change = round(
                     float((values[-1] - values[0]) / values[0] * 100), 2
-                ) if values[0] else 0.0
+                ) if values[0] != 0 else 0.0
                 trends.append({
                     "dimension": dt_col,
                     "direction": direction,
@@ -422,7 +423,7 @@ class InsightAgent:
         if datetime_cols and measures_all:
             ts = pd.to_datetime(df[datetime_cols[0]], errors="coerce")
             if getattr(ts.dt, "tz", None) is not None:
-                ts = ts.dt.tz_localize(None)
+                ts = ts.dt.tz_convert(None)
             temp = df.copy()
             temp["_date"] = ts
             temp = temp.dropna(subset=["_date"]).sort_values("_date")
@@ -764,7 +765,7 @@ Rules:
             )
         if predictions and predictions.get("valid") and predictions.get("points"):
             period_word = predictions.get("period") or "periods"
-            if period_word in ("sequence",):
+            if period_word in ("sequence", "daily", "weekly", "monthly"):
                 period_word = "periods"
             parts.append(
                 f"Looking ahead, {predictions['column']} is projected to change by about "

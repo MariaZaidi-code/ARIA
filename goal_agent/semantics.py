@@ -50,19 +50,21 @@ class SemanticMixin:
 
     # ---- _synonym_bases (_synonym_bases) ----
 
-    def _synonym_bases(self, word):
+    def _synonym_bases(self, word, _depth=0):
         """Set of canonical meaning keys for a word (or the word itself when
         it is not a known business concept). Singular/plural and the generic
         synonym groups are both expanded, so 'client' -> {'client','customer'}."""
+        if _depth > 4:
+            return set()
         w = str(word).lower().strip()
         bases = {w}
         for base, group in self.SEMANTIC_SYNONYMS.items():
             if w == base or w in group:
                 bases.add(base)
         if w.endswith("ies") and len(w) > 4:
-            bases |= self._synonym_bases(w[:-3] + "y")
+            bases |= self._synonym_bases(w[:-3] + "y", _depth + 1)
         if w.endswith("s") and w[:-1] and w[:-1] not in bases:
-            bases |= self._synonym_bases(w[:-1])
+            bases |= self._synonym_bases(w[:-1], _depth + 1)
         return bases
 
     # ---- _schema_token_matches_goal (_schema_token_matches_goal) ----
