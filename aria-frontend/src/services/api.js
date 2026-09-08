@@ -97,10 +97,9 @@ const toNumber = (value) => {
     return null;
   }
 
-  const cleaned = String(value).replace(/[^0-9eE.+-]/g, "");
-
+  const cleaned = String(value).replace(/,/g, "").trim();
+  if (!/^-?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?$/.test(cleaned)) return null;
   const parsed = Number(cleaned);
-
   return Number.isNaN(parsed) ? null : parsed;
 };
 
@@ -190,7 +189,9 @@ const isDateColumn = (rows, key) => {
 
     total += 1;
 
-    if (!Number.isNaN(new Date(String(value)).getTime())) {
+    const sv = String(value).trim();
+    if (/^\d{1,4}(\.\d+)?$/.test(sv)) continue;
+    if (!Number.isNaN(new Date(sv).getTime())) {
       hits += 1;
     }
   }
@@ -209,6 +210,15 @@ const isDateColumn = (rows, key) => {
 // in the current codebase.
 //
 // =========================================================
+
+export const fetchSessionStatus = async () => {
+  try {
+    const data = await request("/session/status");
+    return { success: true, data: data || {} };
+  } catch (e) {
+    return { success: false, data: {} };
+  }
+};
 
 export const connectDatabase = async (databaseDetails = {}) => {
   const payload = {
@@ -231,19 +241,18 @@ export const connectDatabase = async (databaseDetails = {}) => {
     db_schema: databaseDetails?.dbSchema || "public",
   };
 
-  const data = await request("/connect", {
-    method: "POST",
-
-    body: JSON.stringify(payload),
-  });
-
-  return {
-    success: true,
-
-    message: "Database connected.",
-
-    data,
-  };
+  try {
+    const data = await request("/connect", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    return { success: true, message: "Database connected.", data };
+  } catch (error) {
+    return {
+      success: false,
+      message: error?.message || (typeof error === "string" ? error : "Connection failed."),
+    };
+  }
 };
 
 // =========================================================
@@ -286,26 +295,17 @@ export const connectFile = async (file, provider = "local") => {
 
 export const connectPdf = async (file, provider = "local") => {
   if (!file) {
-    return {
-      success: false,
-      message: "No file selected.",
-    };
+    return { success: false, message: "No file selected." };
   }
-
   const formData = new FormData();
   formData.append("provider", provider || getLLMMode());
   formData.append("file", file);
-
-  const data = await request("/connect_pdf", {
-    method: "POST",
-    body: formData,
-  });
-
-  return {
-    success: true,
-    message: "PDF uploaded and processing started.",
-    data,
-  };
+  try {
+    const data = await request("/connect_pdf", { method: "POST", body: formData });
+    return { success: true, message: "PDF uploaded and processing started.", data };
+  } catch (error) {
+    return { success: false, message: error?.message || "PDF upload failed." };
+  }
 };
 
 // =========================================================
@@ -460,6 +460,9 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
   if (multiTurnContext?.previousResult) {
     body.previous_result = multiTurnContext.previousResult;
   }
+  if (multiTurnContext?.conversationId) {
+    body.conversation_id = multiTurnContext.conversationId;
+  }
 
   const data = await request("/ask", {
     method: "POST",
@@ -527,6 +530,10 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
     confidence: data?.confidence || "high",
 
     historyId: data?.history_id || null,
+    suggestedQuestions: data?.suggested_questions || [],
+    provenance: data?.provenance || null,
+    conversationId: data?.conversation_id || null,
+    turnNumber: data?.turn_number || null,
   };
 
   return {

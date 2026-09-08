@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { FlaskConical, ChevronDown, Loader2, CheckCircle, XCircle } from "lucide-react";
 import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { useTheme } from "../App";
@@ -6,10 +6,10 @@ import { useTheme } from "../App";
 type HypStatus = "idle" | "running" | "done" | "error";
 
 const exampleHypotheses = [
-  "Does increasing discounts increase sales?",
-  "Do customers who buy Electronics return faster?",
-  "Is there a correlation between ad spend and revenue?",
-  "Do weekday orders have higher average value than weekend orders?",
+  "Is there a correlation between two numeric measures in the data?",
+  "Do higher quantities correlate with higher total values?",
+  "Is there a relationship between price and quantity?",
+  "Are there patterns between different numeric columns?",
 ];
 
 interface Props {
@@ -22,8 +22,17 @@ export default function Hypothesis({ insightResult }: Props) {
   const [status, setStatus] = useState<HypStatus>("idle");
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState("");
-  const [dataset, setDataset] = useState("Sales Database");
-  const [period, setPeriod] = useState("Last 12 months");
+  const [dbName, setDbName] = useState("Connected Data");
+
+  useEffect(() => {
+    const token = localStorage.getItem("aria_auth_token");
+    if (token) {
+      fetch("/api/session/status", { headers: { Authorization: `Bearer ${token}` } })
+        .then(r => r.json())
+        .then(d => { if (d.db_name) setDbName(d.db_name); })
+        .catch(() => {});
+    }
+  }, []);
 
   const grid = isDark ? "#2A2A35" : "#E5E7EB";
   const axis = isDark ? "#8889A0" : "#9CA3AF";
@@ -46,8 +55,7 @@ export default function Hypothesis({ insightResult }: Props) {
         },
         body: JSON.stringify({
           hypothesis: text,
-          dataset,
-          period,
+          dataset: dbName,
         }),
       });
 
@@ -83,22 +91,9 @@ export default function Hypothesis({ insightResult }: Props) {
           />
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
-          {[
-            { label: "Dataset", value: dataset, options: ["Sales Database", "CRM Database", "All Sources"], set: setDataset },
-            { label: "Time Period", value: period, options: ["Last 3 months", "Last 6 months", "Last 12 months", "Year to date"], set: setPeriod },
-          ].map(({ label, value, options, set }) => (
-            <div key={label} className="space-y-1">
-              <p className="text-xs font-medium text-muted-foreground">{label}</p>
-              <div className="relative">
-                <select value={value} onChange={(e) => set(e.target.value)}
-                  className="w-full appearance-none bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none pr-8 cursor-pointer">
-                  {options.map((o) => <option key={o}>{o}</option>)}
-                </select>
-                <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
-              </div>
-            </div>
-          ))}
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span className="font-medium">Dataset:</span>
+          <span className="px-2 py-0.5 bg-secondary border border-border rounded-md text-foreground">{dbName}</span>
         </div>
 
         <div className="flex gap-2">

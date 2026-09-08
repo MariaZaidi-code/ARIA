@@ -46,8 +46,9 @@ for _dir in (ARTIFACTS_DIR, DATA_DIR, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, F
 SCHEMA_PATH = SCHEMA_DIR / "schema_mapping_latest.json"
 PROCESSED_PATH = PROCESSED_DIR / "processed_data.json"
 INSIGHTS_PATH = INSIGHTS_DIR / "insights.json"
+SESSION_STORE_PATH = DATA_DIR / "session_store.json"
 
-SOURCE_TYPES = {"relational", "semi-structured"}
+SOURCE_TYPES = {"relational", "semi-structured", "document"}
 PROVIDER_NAMES = {"local", "cloud"}
 DB_TYPES = {"postgresql", "mysql"}
 
@@ -67,8 +68,29 @@ DEFAULT_SESSION = {
 }
 
 SESSION = deepcopy(DEFAULT_SESSION)
-SESSION_STORE = {}
+SESSION_STORE: dict[int, tuple[float, dict]] = {}
 SESSION_LOCK = threading.RLock()
+
+# Load persisted sessions from disk (survives server restarts).
+def _load_session_store():
+    """Load persisted session store from disk."""
+    try:
+        import json as _json
+        if SESSION_STORE_PATH.exists():
+            data = _json.loads(SESSION_STORE_PATH.read_text(encoding="utf-8"))
+            for uid_str, (created, session) in data.items():
+                uid = int(uid_str)
+                loaded = dict(session)
+                # Restore Path types (JSON can't represent them)
+                from pathlib import Path as _P
+                for k in ("schema_path", "processed_path", "insights_path"):
+                    if k in loaded and isinstance(loaded[k], str):
+                        loaded[k] = _P(loaded[k])
+                SESSION_STORE[uid] = (float(created), loaded)
+    except Exception:
+        pass
+
+_load_session_store()
 
 # Session store hygiene: cap the number of cached per-user sessions and drop
 # sessions that have not been touched for SESSION_TTL_SECONDS. Prevents
@@ -77,15 +99,61 @@ SESSION_MAX_USERS = 100
 SESSION_TTL_SECONDS = 4 * 60 * 60  # 4 hours
 
 
+def _ensure_provider(session):
+    """Reconstruct the LLMProvider instance if session['provider'] is a string
+    (happens after deserialization from disk where default=str serializes the
+    LLMProvider object to its string representation)."""
+    from llm_provider import create_provider
+    prov = session.get("provider")
+    if prov is None or isinstance(prov, str):
+        name = session.get("provider_name")
+        if name:
+            api_keys = session.get("api_keys", {})
+            api_key = api_keys.get(name) or os.getenv("GROQ_API_KEY") if name == "cloud" else None
+            try:
+                session["provider"] = create_provider(provider=name, api_key=api_key)
+            except Exception:
+                session["provider"] = None
+        else:
+            session["provider"] = None
+
+
+def _copy_session(session):
+    """Shallow-copy the session dict so callers can mutate keys without
+    leaking changes to other requests.  Values like the LLM provider
+    object contain thread locks and cannot be deep-copied."""
+    return dict(session)
+
+
 def get_session(user_id=None):
     """Return the current session for a user, or a fresh default copy.
 
-    The default (unauthenticated) session is never shared: every call gets its
-    own copy, so no request can leak state into another. All write routes
-    require authentication anyway, so the default copy is only a safe fallback.
+    Returns a shallow copy of the session dict so each request gets its
+    own dict but shares immutable / non-copyable values (LLM provider).
+    Use ``save_session`` to persist modifications back to the store.
     """
     if user_id is None:
-        return deepcopy(DEFAULT_SESSION)
+        return dict(DEFAULT_SESSION)
+
+    now = time.time()
+    with SESSION_LOCK:
+        # Re-load from disk on every request so external writes (e.g. via
+        # Python scripts) are picked up immediately without a server restart.
+        try:
+            import json as _json
+            if SESSION_STORE_PATH.exists():
+                data = _json.loads(SESSION_STORE_PATH.read_text(encoding="utf-8"))
+                for uid_str, (created, session) in data.items():
+                    uid = int(uid_str)
+                    if uid not in SESSION_STORE or SESSION_STORE[uid][0] < float(created):
+                        loaded = dict(session)
+                        from pathlib import Path as _P
+                        for k in ("schema_path", "processed_path", "insights_path"):
+                            if k in loaded and isinstance(loaded[k], str):
+                                loaded[k] = _P(loaded[k])
+                        SESSION_STORE[uid] = (float(created), loaded)
+        except Exception:
+            pass
 
     now = time.time()
     with SESSION_LOCK:
@@ -104,13 +172,28 @@ def get_session(user_id=None):
 
         entry = SESSION_STORE.get(user_id)
         if entry is None:
-            entry = (now, deepcopy(DEFAULT_SESSION))
+            entry = (now, dict(DEFAULT_SESSION))
             SESSION_STORE[user_id] = entry
         else:
-            # Return a deep copy of the session to prevent shared mutable state
             SESSION_STORE[user_id] = (now, entry[1])
-            return deepcopy(entry[1])
-        return entry[1]
+        _ensure_provider(entry[1])
+        return _copy_session(entry[1])
+
+
+def save_session(user_id, session):
+    """Persist a modified session copy back to the store and to disk."""
+    now = time.time()
+    with SESSION_LOCK:
+        SESSION_STORE[user_id] = (now, session)
+    # Also write to disk so sessions survive server restarts.
+    try:
+        import json as _json
+        data = {str(uid): entry for uid, entry in SESSION_STORE.items()}
+        tmp_path = SESSION_STORE_PATH.with_suffix('.tmp')
+        tmp_path.write_text(_json.dumps(data, default=str), encoding='utf-8')
+        tmp_path.replace(SESSION_STORE_PATH)
+    except Exception:
+        pass
 
 
 def get_session_for_request(request):

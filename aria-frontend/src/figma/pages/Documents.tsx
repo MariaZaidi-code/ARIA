@@ -38,7 +38,7 @@ export default function Documents() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<any[] | null>(null);
   const [searching, setSearching] = useState(false);
-  const { show: showToast } = useToast();
+  const { error: toastError, success: toastSuccess, info: toastInfo } = useToast();
 
   const fetchAll = async () => {
     setLoading(true);
@@ -46,7 +46,7 @@ export default function Documents() {
       const r: any = await listDocuments();
       if (r.success) setDocuments(r.data || []);
     } catch (e) {
-      showToast({ type: "error", message: "Failed to load documents" });
+      toastError("Failed to load documents");
     } finally {
       setLoading(false);
     }
@@ -60,9 +60,9 @@ export default function Documents() {
     try {
       await deleteDocument(id);
       setDocuments((d) => d.filter((x) => x.id !== id));
-      showToast({ type: "success", message: "Document deleted" });
+      toastSuccess("Document deleted");
     } catch {
-      showToast({ type: "error", message: "Delete failed" });
+      toastError("Delete failed");
     } finally {
       setDeleting(null);
     }
@@ -72,10 +72,10 @@ export default function Documents() {
     setRetrying(doc.id);
     try {
       await retryDocument(doc.id);
-      showToast({ type: "success", message: "Retry started" });
+      toastSuccess("Retry started");
       await fetchAll();
     } catch {
-      showToast({ type: "error", message: "Retry failed" });
+      toastError("Retry failed");
     } finally {
       setRetrying(null);
     }
@@ -91,7 +91,7 @@ export default function Documents() {
       const r: any = await searchDocuments(query, undefined, 20);
       if (r.success) setResults(r.data || []);
     } catch {
-      showToast({ type: "error", message: "Search failed" });
+      toastError("Search failed");
     } finally {
       setSearching(false);
     }
@@ -206,7 +206,7 @@ export default function Documents() {
                 {(doc.status === "ready" || doc.status === "partial") && (
                   <button
                     className="flex-1 px-3 py-2 rounded-lg text-xs font-medium premium-btn"
-                    onClick={() => showToast({ type: "info", message: "Use the Ask ARIA page to query this document." })}
+                    onClick={() => toastInfo("Use the Ask ARIA page to query this document.")}
                   >
                     Ask Questions
                   </button>

@@ -2,16 +2,19 @@
 
 import json
 import re
+import time
 import types
 from datetime import datetime
 from pathlib import Path
+from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import csv_orchestrator
 import schema_agent
-from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session
+from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session, save_session
 from core.db import build_db_uri
 from core.deps import require_writable, get_current_user
 from csv_handler import CsvValidationError
@@ -19,6 +22,49 @@ from llm_provider import create_provider
 from document_processor import create_document_processor
 
 router = APIRouter()
+
+# ── Ingestion progress tracking ──────────────────────────────────────────
+# Maps user_id -> { "step": str, "progress": float 0-100, "message": str, "done": bool, "error": str|None }
+_upload_progress: dict[int, dict] = {}
+
+
+def _set_progress(user_id: int, step: str, progress: float, message: str, done: bool = False, error: str | None = None, result: dict | None = None):
+    _upload_progress[user_id] = {
+        "step": step,
+        "progress": progress,
+        "message": message,
+        "done": done,
+        "error": error,
+        "result": result,
+        "timestamp": time.time(),
+    }
+
+
+@router.get("/api/upload/progress")
+async def get_upload_progress(user: dict = Depends(get_current_user)):
+    """Return current ingestion progress for the user."""
+    prog = _upload_progress.get(user["user_id"])
+    if not prog:
+        return {"ok": True, "active": False}
+    return {"ok": True, "active": True, **prog}
+
+
+@router.get("/api/upload/progress/stream")
+async def stream_upload_progress(user: dict = Depends(get_current_user)):
+    """SSE stream of ingestion progress for the user."""
+    async def event_stream():
+        uid = user["user_id"]
+        last_ts = 0
+        for _ in range(300):  # max 5 minutes
+            prog = _upload_progress.get(uid)
+            if prog and prog.get("timestamp", 0) > last_ts:
+                last_ts = prog["timestamp"]
+                yield f"data: {json.dumps({k: v for k, v in prog.items() if k != 'timestamp'})}\n\n"
+                if prog.get("done") or prog.get("error"):
+                    break
+            await asyncio.sleep(1)
+    import asyncio
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 class ProviderSwitchRequest(BaseModel):
@@ -48,6 +94,11 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
 
     session["provider"] = llm
     session["provider_name"] = request.provider
+    if request.api_key:
+        keys = session.get("api_keys", {})
+        keys[request.provider] = request.api_key
+        session["api_keys"] = keys
+    save_session(user["user_id"], session)
     return {"ok": True, "provider": request.provider, "changed": True}
 
 
@@ -65,7 +116,10 @@ class ConnectRequest(BaseModel):
 
 def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     """Shared connect logic. `db_type` is authoritative (set by the calling endpoint)."""
-    session = get_session(user["user_id"])
+    uid = user["user_id"]
+    _set_progress(uid, "connecting", 15, f"Connecting to {db_type} database...")
+
+    session = get_session(uid)
     if request.provider not in PROVIDER_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{request.provider}'. Choose from {sorted(PROVIDER_NAMES)}.")
     if request.source_type not in SOURCE_TYPES:
@@ -84,8 +138,12 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {exc}")
 
-    session["provider"] = llm
-    session["provider_name"] = request.provider
+    # Preserve existing cloud provider if set — don't downgrade to local on reconnect.
+    existing = session.get("provider")
+    if existing and not isinstance(existing, str) and getattr(existing, "provider", None) == "cloud":
+        session["provider"] = existing
+    else:
+        session["provider"] = llm
     session["source_type"] = request.source_type
     session["db"] = None
     session["db_type"] = db_type
@@ -144,11 +202,48 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
 
     safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", db_name)
     uid_dir = f"user_{user['user_id']}"
-    session["schema_path"] = SCHEMA_DIR / uid_dir / "schema_mapping_latest.json"
+    # Schema Agent writes DB-specific files (e.g. schema_mapping_northwind_latest.json)
+    # so the session must point to the same naming convention.
+    session["schema_path"] = SCHEMA_DIR / uid_dir / f"schema_mapping_{safe}_latest.json"
     session["processed_path"] = PROCESSED_DIR / uid_dir / f"processed_data_{safe}.json"
     session["insights_path"] = INSIGHTS_DIR / uid_dir / f"insights_{safe}.json"
     session["processed_path"].parent.mkdir(parents=True, exist_ok=True)
     session["insights_path"].parent.mkdir(parents=True, exist_ok=True)
+
+    save_session(user["user_id"], session)
+
+    _set_progress(uid, "extracting", 50, "Extracting schema...")
+
+    # Auto-trigger schema extraction so Dashboard KPIs work immediately
+    try:
+        config = dict(session.get("db", {}))
+        if "password" in config and config.get("password"):
+            try:
+                config["password"] = _decrypt_secret(config["password"])
+            except Exception:
+                pass
+        conn = schema_agent.get_connection(types.SimpleNamespace(**config))
+        try:
+            db_type = session.get("db_type", "postgresql")
+            schema_filter = config.get("db_schema", "public") if db_type == "postgresql" else config.get("db", "")
+            mapping = schema_agent.build_schema_mapping(conn, schema_filter, db_type=db_type)
+            conn.close()
+            if mapping.get("tables"):
+                user_schema_dir = SCHEMA_DIR / f"user_{user['user_id']}"
+                user_schema_dir.mkdir(parents=True, exist_ok=True)
+                safe_name_for_file = re.sub(r"[^a-zA-Z0-9_-]+", "_", db_name)[:64] or "db"
+                user_path = user_schema_dir / f"schema_mapping_{safe_name_for_file}_latest.json"
+                user_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+                session["schema_path"] = user_path
+                save_session(user["user_id"], session)
+        except Exception:
+            pass
+    except SystemExit:
+        pass
+    except Exception:
+        pass
+
+    _set_progress(uid, "ready", 100, "Connected", done=True)
 
     return {
         "ok": True,
@@ -210,39 +305,63 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {exc}")
 
+    uid = user["user_id"]
+    _set_progress(uid, "uploading", 10, "Uploading file...")
+
     upload_dir = DATA_DIR / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
     file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
-    file_path.write_bytes(file.file.read())
+    with open(file_path, 'wb') as _f:
+        while True:
+            _chunk = file.file.read(1024 * 1024)
+            if not _chunk:
+                break
+            _f.write(_chunk)
+
+    _set_progress(uid, "validating", 25, "Validating CSV structure...")
 
     try:
         table_name = csv_orchestrator.safe_table_name(safe_name)
         mapping = csv_orchestrator.build_csv_schema_mapping(file_path, table_name=table_name)
+    except CsvValidationError as exc:
+        _set_progress(uid, "error", 0, f"Invalid CSV: {exc}", error=str(exc))
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}")
+    except Exception as exc:
+        _set_progress(uid, "error", 0, f"Validation failed: {exc}", error=str(exc))
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"CSV processing failed: {exc}")
+
+    _set_progress(uid, "extracting", 45, "Extracting schema and structure...")
+
+    try:
         sqlite_path = upload_dir / f"{safe_name}_{stamp}.db"
         db_uri, table_name, row_count = csv_orchestrator.load_csv_to_sqlite(
             file_path, sqlite_path, table_name=table_name
         )
-    except CsvValidationError as exc:
-        # Deterministic validation failed; the upload is rejected as-is.
-        file_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}")
-    except HTTPException:
-        raise
     except Exception as exc:
+        _set_progress(uid, "error", 0, f"Processing failed: {exc}", error=str(exc))
         file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"CSV processing failed: {exc}")
 
-    uid_dir = f"user_{user['user_id']}"
+    _set_progress(uid, "profiling", 65, f"Profiling {row_count} rows...")
+
+    uid_dir = f"user_{uid}"
     safe_db_name = mapping["database"]
     schema_path = SCHEMA_DIR / uid_dir / f"schema_mapping_{safe_db_name}_latest.json"
     schema_path.parent.mkdir(parents=True, exist_ok=True)
     schema_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
 
-    session = get_session(user["user_id"])
-    session["provider"] = llm
-    session["provider_name"] = provider
+    _set_progress(uid, "understanding", 80, "Understanding data structure...")
+
+    session = get_session(uid)
+    existing = session.get("provider")
+    if existing and not isinstance(existing, str) and getattr(existing, "provider", None) == "cloud":
+        session["provider"] = existing
+    else:
+        session["provider"] = llm
     session["source_type"] = "semi-structured"
     session["db"] = {".csv": str(file_path)}
     session["db_type"] = "sqlite"
@@ -256,9 +375,14 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
     session["dialect"] = "sqlite"
     session["file_type"] = "csv"
 
+    save_session(uid, session)
+
+    _set_progress(uid, "generating", 90, "Generating insights...")
+
     columns = [c["column"] for c in mapping["tables"][table_name]["columns"]]
     quality = mapping["tables"][table_name]["csv_profile"]["quality"]
-    return {
+
+    result = {
         "ok": True,
         "provider": provider,
         "source_type": "semi-structured",
@@ -272,6 +396,10 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
         "quality": quality,
         "db_file": sqlite_path.name,
     }
+
+    _set_progress(uid, "ready", 100, "Ready", done=True, result=result)
+
+    return result
 
 
 @router.post("/api/connect_pdf")
@@ -315,7 +443,12 @@ def connect_pdf(
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
     file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
-    file_path.write_bytes(file.file.read())
+    with open(file_path, 'wb') as _f:
+        while True:
+            _chunk = file.file.read(1024 * 1024)
+            if not _chunk:
+                break
+            _f.write(_chunk)
     
     # Create document processor
     processed_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "documents"
@@ -342,8 +475,11 @@ def connect_pdf(
     
     # Update session to include document reference
     session = get_session(user["user_id"])
-    session["provider"] = llm
-    session["provider_name"] = provider
+    existing = session.get("provider")
+    if existing and not isinstance(existing, str) and getattr(existing, "provider", None) == "cloud":
+        session["provider"] = existing
+    else:
+        session["provider"] = llm
     session["source_type"] = "document"
     session["db"] = {".pdf": str(file_path)}
     session["db_type"] = "document"
@@ -356,6 +492,8 @@ def connect_pdf(
     # Ensure processed directories exist
     processed_dir.mkdir(parents=True, exist_ok=True)
     vector_index_dir.mkdir(parents=True, exist_ok=True)
+    
+    save_session(user["user_id"], session)
     
     return {
         "ok": True,
@@ -373,6 +511,20 @@ def connect_pdf(
         "processing_method": document.processing_method,
         "failed_pages": result.failed_pages,
         "warnings": result.warnings,
+    }
+
+
+@router.get("/api/session/status")
+def session_status(user: dict = Depends(get_current_user)):
+    """Return the current session's connectivity and DB info so the frontend can restore state."""
+    session = get_session(user.get("user_id"))
+    is_connected = bool(session.get("db") or session.get("db_uri") or session.get("source_type") == "semi-structured")
+    return {
+        "ok": True,
+        "connection_status": "connected" if is_connected else "not-connected",
+        "db_name": session.get("db_name", ""),
+        "source_type": session.get("source_type", ""),
+        "db_uri": session.get("db_uri", ""),
     }
 
 

@@ -238,3 +238,16 @@ def get_history(user_id: int, history_id: int) -> dict | None:
         "processed": json.loads(r["processed_json"]) if r["processed_json"] else None,
         "insights": json.loads(r["insights_json"]) if r["insights_json"] else None,
     }
+
+
+def delete_history(user_id: int, history_id: int) -> bool:
+    conn = _get_db()
+    try:
+        cur = conn.execute(
+            "DELETE FROM history WHERE id = ? AND user_id = ?",
+            (history_id, user_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()

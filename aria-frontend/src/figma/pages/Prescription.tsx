@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { CheckCircle, Bookmark, MessageSquare, ChevronDown, ChevronUp, AlertTriangle, TrendingUp, TrendingDown, Minus } from "lucide-react";
+import { useState, useEffect, useCallback } from "react";
+import { CheckCircle, Bookmark, MessageSquare, ChevronDown, ChevronUp, Loader2, RefreshCw } from "lucide-react";
 
 interface PrescriptionProps {
   insightResult?: any;
@@ -11,25 +11,109 @@ const priorityStyle: Record<string, string> = {
   low: "text-positive bg-positive/10 border-positive/20",
 };
 
+const priorities = ["high", "medium", "low"];
+
 export default function Prescription({ insightResult = null }: PrescriptionProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [accepted, setAccepted] = useState<string[]>([]);
   const [saved, setSaved] = useState<string[]>([]);
+  const [prescriptions, setPrescriptions] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
-  // Extract recommendations from insight result
-  const recommendations = insightResult?.recommendations || [];
+  // Try to get recommendations from insightResult first (from InsightAgent)
+  const propRecommendations = insightResult?.recommendations || [];
 
-  // Show empty state if no recommendations
-  if (!recommendations.length) {
+  const fetchPrescriptions = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const token = localStorage.getItem("aria_auth_token");
+      const res = await fetch("/api/prescription/generate", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json();
+      if (data.ok && data.prescriptions) {
+        const actions = data.prescriptions.actions || [];
+        const mapped = actions.map((action: string, i: number) => ({
+          title: action,
+          description: action,
+          priority: priorities[i % 3],
+          evidence: null,
+        }));
+        setPrescriptions(mapped);
+      } else {
+        setPrescriptions([]);
+      }
+    } catch (e: any) {
+      setError(e.message || "Failed to load prescriptions");
+      setPrescriptions([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // Use insightResult recommendations if available, otherwise fetch from API
+    if (propRecommendations.length > 0) {
+      setPrescriptions(propRecommendations);
+    } else {
+      fetchPrescriptions();
+    }
+  }, [propRecommendations.length, fetchPrescriptions]);
+
+  const recommendations = prescriptions;
+
+  if (loading) {
     return (
       <div className="p-6 max-w-4xl mx-auto">
         <div>
           <h2 className="text-xl font-semibold text-foreground tracking-tight">Prescription</h2>
           <p className="text-sm text-muted-foreground mt-0.5">Turn insights into actionable decisions.</p>
         </div>
+        <div className="mt-8 text-center py-12">
+          <Loader2 size={24} className="animate-spin text-primary mx-auto mb-3" />
+          <p className="text-sm text-muted-foreground">Generating recommendations...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error && !recommendations.length) {
+    return (
+      <div className="p-6 max-w-4xl mx-auto">
+        <div>
+          <h2 className="text-xl font-semibold text-foreground tracking-tight">Prescription</h2>
+          <p className="text-sm text-muted-foreground mt-0.5">Turn insights into actionable decisions.</p>
+        </div>
+        <div className="bg-negative/10 border border-negative/20 rounded-xl p-5 mt-4">
+          <p className="text-sm text-negative font-medium">{error}</p>
+          <button onClick={fetchPrescriptions} className="mt-2 text-xs text-primary hover:underline">Try again</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!recommendations.length) {
+    return (
+      <div className="p-6 max-w-4xl mx-auto">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-xl font-semibold text-foreground tracking-tight">Prescription</h2>
+            <p className="text-sm text-muted-foreground mt-0.5">Turn insights into actionable decisions.</p>
+          </div>
+          <button onClick={fetchPrescriptions} className="p-2 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors">
+            <RefreshCw size={14} />
+          </button>
+        </div>
         <div className="mt-8 text-center py-12 bg-card border border-border rounded-xl">
           <p className="text-muted-foreground">No recommendations available yet.</p>
-          <p className="text-xs text-muted-foreground mt-2">Run an analysis to generate actionable prescriptions.</p>
+          <p className="text-xs text-muted-foreground mt-2">Connect a database to generate actionable prescriptions.</p>
         </div>
       </div>
     );
@@ -37,9 +121,14 @@ export default function Prescription({ insightResult = null }: PrescriptionProps
 
   return (
     <div className="p-6 max-w-4xl mx-auto space-y-6">
-      <div className="animate-fade-in">
-        <h2 className="text-xl font-bold text-foreground tracking-tight">Prescription</h2>
-        <p className="text-sm text-muted-foreground mt-0.5">Turn insights into actionable decisions.</p>
+      <div className="flex items-center justify-between animate-fade-in">
+        <div>
+          <h2 className="text-xl font-bold text-foreground tracking-tight">Prescription</h2>
+          <p className="text-sm text-muted-foreground mt-0.5">Turn insights into actionable decisions.</p>
+        </div>
+        <button onClick={fetchPrescriptions} className="p-2 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors">
+          <RefreshCw size={14} />
+        </button>
       </div>
 
       <div className="flex gap-4 text-sm text-muted-foreground">
@@ -57,7 +146,6 @@ export default function Prescription({ insightResult = null }: PrescriptionProps
           return (
             <div key={idx} className={`premium-card bg-card border rounded-xl overflow-hidden cursor-default ${isAccepted ? "border-positive/40" : "border-border"}`}>
               <div className="p-5 space-y-3">
-                {/* Header */}
                 <div className="flex items-start gap-3">
                   <div className="flex-1 min-w-0 space-y-1.5">
                     <div className="flex items-center gap-2 flex-wrap">
@@ -75,7 +163,6 @@ export default function Prescription({ insightResult = null }: PrescriptionProps
                   </div>
                 </div>
 
-                {/* Actions */}
                 <div className="flex items-center justify-between pt-2">
                   <div className="flex items-center gap-2">
                     <button
@@ -104,10 +191,22 @@ export default function Prescription({ insightResult = null }: PrescriptionProps
                 </div>
               </div>
 
-              {/* Expanded detail */}
               {isExpanded && (
-                <div className="border-t border-border bg-muted/30 px-5 py-5">
+                <div className="border-t border-border bg-muted/30 px-5 py-5 space-y-3">
                   <p className="text-sm text-foreground leading-relaxed">{rec.description}</p>
+                  {rec.evidence && (
+                    <div className="bg-card border border-border rounded-lg p-3 space-y-2">
+                      <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">Supporting Evidence</p>
+                      {rec.evidence.metric && <div className="text-xs"><span className="text-muted-foreground">Metric: </span><span className="text-foreground font-medium">{rec.evidence.metric}</span></div>}
+                      {rec.evidence.impact && <div className="text-xs"><span className="text-muted-foreground">Estimated Impact: </span><span className="text-foreground font-medium">{rec.evidence.impact}</span></div>}
+                      {rec.evidence.confidence != null && <div className="text-xs"><span className="text-muted-foreground">Confidence: </span><span className="text-foreground font-medium">{String(rec.evidence.confidence)}%</span></div>}
+                    </div>
+                  )}
+                  <div className="grid grid-cols-3 gap-3 text-center">
+                    {rec.impact && <div className="bg-card border border-border rounded-lg p-2"><p className="text-[10px] text-muted-foreground uppercase">Impact</p><p className="text-xs font-semibold text-foreground capitalize">{rec.impact}</p></div>}
+                    {rec.difficulty && <div className="bg-card border border-border rounded-lg p-2"><p className="text-[10px] text-muted-foreground uppercase">Difficulty</p><p className="text-xs font-semibold text-foreground capitalize">{rec.difficulty}</p></div>}
+                    {rec.risk && <div className="bg-card border border-border rounded-lg p-2"><p className="text-[10px] text-muted-foreground uppercase">Risk</p><p className="text-xs font-semibold text-foreground capitalize">{rec.risk}</p></div>}
+                  </div>
                 </div>
               )}
             </div>

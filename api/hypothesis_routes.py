@@ -1,13 +1,15 @@
 """Hypothesis testing routes: statistical tests against connected data."""
 
 import re
+import math
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
+from urllib.parse import quote_plus
 import numpy as np
 
 from core.config import get_session
-from core.deps import require_data, get_current_user
+from core.deps import require_data, require_writable, get_current_user
 from core.secret_box import decrypt as _decrypt_secret
 
 router = APIRouter()
@@ -26,13 +28,18 @@ class HypothesisRequest(BaseModel):
 
 
 @router.post("/api/hypothesis")
-async def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depends(require_data)):
+async def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depends(require_writable)):
+    require_data(request)
     session = get_session(user["user_id"])
     if not session or not session.get("db"):
         return {"ok": False, "detail": "No data source connected"}
 
     db_config = session["db"]
     db_type = session.get("db_type", "postgresql")
+
+    if db_type in ("sqlite", "document"):
+        return {"ok": False, "detail": "Hypothesis testing requires a relational database connection."}
+
     driver = "mysql" if db_type == "mysql" else "postgresql"
     dialect = "mysql" if driver == "mysql" else "postgresql"
 
@@ -49,9 +56,9 @@ async def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = 
             except Exception:
                 pass
         if driver == "mysql":
-            engine_url = f"mysql+pymysql://{user_name}:{password}@{host}:{port}/{db}"
+            engine_url = f"mysql+pymysql://{quote_plus(str(user_name))}:{quote_plus(str(password))}@{host}:{port}/{db}"
         else:
-            engine_url = f"postgresql+psycopg2://{user_name}:{password}@{host}:{port}/{db}"
+            engine_url = f"postgresql+psycopg2://{quote_plus(str(user_name))}:{quote_plus(str(password))}@{host}:{port}/{db}"
 
         engine = create_engine(engine_url, pool_pre_ping=True)
 
@@ -119,11 +126,8 @@ def _get_tables(conn, dialect):
 
 
 def _find_numeric_pairs(conn, tables, dialect):
-    numeric_kw = [
-        "amount", "price", "cost", "revenue", "sales", "total", "value",
-        "profit", "quantity", "qty", "count", "discount", "rate", "score",
-        "weight", "stock", "income", "balance", "fee", "tax",
-    ]
+    NUMERIC_TYPES = {"int", "integer", "bigint", "decimal", "numeric", "real",
+                    "double precision", "float", "money", "smallint"}
     pairs = []
     for table in tables[:20]:
         try:
@@ -139,10 +143,9 @@ def _find_numeric_pairs(conn, tables, dialect):
 
             numeric_cols = []
             for col_name, col_type in cols:
-                if any(kw in col_name.lower() for kw in numeric_kw):
-                    numeric_cols.append(col_name)
-                elif col_type and any(t in col_type.lower() for t in ["int", "numeric", "decimal", "float", "double", "real", "bigint"]):
-                    numeric_cols.append(col_name)
+                if col_type and any(t in col_type.lower() for t in NUMERIC_TYPES):
+                    if not col_name.lower().endswith("_id") and col_name.lower() != "id":
+                        numeric_cols.append(col_name)
 
             if len(numeric_cols) >= 2:
                 for i in range(len(numeric_cols)):
@@ -201,42 +204,63 @@ def _compute_correlation(x, y):
 
 
 def _t_cdf(t, df):
-    x = df / (df + t ** 2)
-    if df % 2 == 0:
-        return 1 - 0.5 * _incomplete_beta(df / 2, 0.5, x)
-    return 1 - 0.5 * _incomplete_beta(df / 2, 0.5, x)
+    try:
+        from scipy import stats
+        return float(stats.t.cdf(t, df))
+    except ImportError:
+        x = df / (df + t ** 2)
+        return 1.0 - 0.5 * _regularized_incomplete_beta(df / 2.0, 0.5, x)
 
 
-def _incomplete_beta(a, b, x):
-    if x < 0 or x > 1:
+def _regularized_incomplete_beta(a, b, x):
+    if x <= 0:
         return 0.0
-    if x == 0 or x == 1:
-        return x
+    if x >= 1:
+        return 1.0
+    lbeta = math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+    front = math.exp(math.log(x) * a + math.log(1 - x) * b - lbeta)
+    if x < (a + 1) / (a + b + 2):
+        return front * _beta_cf(a, b, x) / a
+    else:
+        return 1.0 - front * _beta_cf(b, a, 1 - x) / b
 
+
+def _beta_cf(a, b, x):
     max_iter = 200
-    eps = 1e-10
-
-    front = np.exp(
-        np.math.lgamma(a + b) - np.math.lgamma(a) - np.math.lgamma(b)
-        + a * np.log(x) + b * np.log(1 - x)
-    ) / a
-
-    f, c, d = 1.0, 1.0, 0.0
-    for i in range(1, max_iter + 1):
-        m = i
-        num = (i * (b - i) * x) / ((a + 2 * i - 1) * (a + 2 * i))
-        d = 1 + num * d
-        if abs(d) < eps:
-            d = eps
-        d = 1 / d
-        c = 1 + num / c
-        if abs(c) < eps:
-            c = eps
-        f *= c * d
-        if abs(c * d - 1) < eps:
+    eps = 1e-14
+    qab = a + b
+    qap = a + 1
+    qam = a - 1
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < 1e-30:
+        d = 1e-30
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < 1e-30:
+            d = 1e-30
+        c = 1.0 + aa / c
+        if abs(c) < 1e-30:
+            c = 1e-30
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < 1e-30:
+            d = 1e-30
+        c = 1.0 + aa / c
+        if abs(c) < 1e-30:
+            c = 1e-30
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
             break
-
-    return front * (f - 1)
+    return h
 
 
 def _build_interpretation(hypothesis, stats, supported, x_col, y_col):

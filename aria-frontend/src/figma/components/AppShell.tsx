@@ -3,7 +3,7 @@ import { useTheme } from "../App";
 import type { Page } from "../App";
 import {
   LayoutDashboard, Sparkles, Lightbulb, TrendingUp, Target,
-  FlaskConical, Database, Bot, Clock, Settings,
+  FlaskConical, Database, Bot, Clock, Settings, FileText,
   ChevronLeft, ChevronRight, Bell, Sun, Moon,
   Search, LogOut, ChevronDown,
 } from "lucide-react";
@@ -16,7 +16,7 @@ const navItems: { id: Page; label: string; icon: React.ElementType }[] = [
   { id: "prescription", label: "Prescription", icon: Target },
   { id: "hypothesis", label: "Hypothesis", icon: FlaskConical },
   { id: "data", label: "Data", icon: Database },
-  { id: "documents", label: "Documents", icon: Database },
+  { id: "documents", label: "Documents", icon: FileText },
   { id: "copilot", label: "Copilot", icon: Bot },
   { id: "history", label: "History", icon: Clock },
   { id: "settings", label: "Settings", icon: Settings },
@@ -30,6 +30,7 @@ const pageTitles: Record<Page, string> = {
   prescription: "Prescription",
   hypothesis: "Hypothesis",
   data: "Data",
+  documents: "Documents",
   copilot: "Copilot",
   history: "History",
   settings: "Settings",

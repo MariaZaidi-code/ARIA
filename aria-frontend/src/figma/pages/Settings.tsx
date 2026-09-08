@@ -18,9 +18,12 @@ interface SettingsProps {
   selectedLLM?: string;
   onChangeLLM?: () => void;
   user?: { email?: string; username?: string } | null;
+  connectionStatus?: string;
+  dbName?: string;
+  selectedSourceType?: string;
 }
 
-export default function Settings({ selectedLLM, onChangeLLM, user }: SettingsProps) {
+export default function Settings({ selectedLLM, onChangeLLM, user, connectionStatus, dbName, selectedSourceType }: SettingsProps) {
   const { isDark, toggleTheme } = useTheme();
   const [tab, setTab] = useState<Tab>("profile");
   const [displayName, setDisplayName] = useState(user?.username || "User");
@@ -31,6 +34,9 @@ export default function Settings({ selectedLLM, onChangeLLM, user }: SettingsPro
   const [selectedProvider, setSelectedProvider] = useState("groq");
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
+  const [notifAnalysis, setNotifAnalysis] = useState(true);
+  const [notifInsights, setNotifInsights] = useState(true);
+  const [notifSystem, setNotifSystem] = useState(false);
 
   useEffect(() => { fetchProviders(); }, []);
 
@@ -109,7 +115,24 @@ export default function Settings({ selectedLLM, onChangeLLM, user }: SettingsPro
                   className="mt-1 w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none focus:border-primary focus:shadow-[0_0_0_3px_rgba(99,102,241,0.08)] transition-all duration-150" />
               </div>
             </div>
-            <button onClick={() => { setSaving(true); setTimeout(() => { setSaving(false); setSaveMsg("Profile saved"); setTimeout(() => setSaveMsg(""), 3000); }, 500); }}
+            <button onClick={async () => {
+                setSaving(true);
+                try {
+                  const token = localStorage.getItem("aria_auth_token");
+                  await fetch("/api/settings/general", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                    body: JSON.stringify({ theme: isDark ? "dark" : "light", language: "en" }),
+                  });
+                  setSaveMsg("Profile saved");
+                  setTimeout(() => setSaveMsg(""), 3000);
+                } catch {
+                  setSaveMsg("Failed to save");
+                  setTimeout(() => setSaveMsg(""), 3000);
+                } finally {
+                  setSaving(false);
+                }
+              }}
               className="bg-primary text-primary-foreground px-4 py-2 rounded-lg text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50" disabled={saving}>
               {saving ? "Saving..." : "Save changes"}
             </button>
@@ -190,7 +213,31 @@ export default function Settings({ selectedLLM, onChangeLLM, user }: SettingsPro
               <h2 className="text-base font-semibold text-foreground">Data Sources</h2>
               <p className="text-xs text-muted-foreground mt-0.5">Manage connected databases and files.</p>
             </div>
-            <p className="text-sm text-muted-foreground">Connected data sources will appear here.</p>
+            {connectionStatus === "connected" && dbName ? (
+              <div className="bg-primary/5 border border-primary/20 rounded-xl p-5 space-y-3">
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 rounded-full bg-positive" />
+                  <p className="text-sm font-medium text-foreground">Connected</p>
+                </div>
+                <div className="space-y-2 text-sm">
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Database</span>
+                    <span className="text-foreground font-medium">{dbName}</span>
+                  </div>
+                  {selectedSourceType && (
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Source Type</span>
+                      <span className="text-foreground font-medium capitalize">{selectedSourceType}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="bg-card border border-border rounded-xl p-6 text-center">
+                <p className="text-sm text-muted-foreground">No data source connected.</p>
+                <p className="text-xs text-muted-foreground mt-1">Go to the Data Sources page to connect a database.</p>
+              </div>
+            )}
           </div>
         )}
 
@@ -201,12 +248,17 @@ export default function Settings({ selectedLLM, onChangeLLM, user }: SettingsPro
               <p className="text-xs text-muted-foreground mt-0.5">Configure notification preferences.</p>
             </div>
             <div className="space-y-3">
-              {["Analysis complete", "New insights detected", "System alerts"].map((item) => (
-                <div key={item} className="flex items-center justify-between py-2 border-b border-border last:border-0">
-                  <p className="text-sm text-foreground">{item}</p>
-                  <div className="relative w-9 h-5 rounded-full bg-primary cursor-pointer">
-                    <div className="absolute top-0.5 left-4 w-4 h-4 rounded-full bg-white transition-transform" />
-                  </div>
+              {[
+                { label: "Analysis complete", state: notifAnalysis, toggle: setNotifAnalysis },
+                { label: "New insights detected", state: notifInsights, toggle: setNotifInsights },
+                { label: "System alerts", state: notifSystem, toggle: setNotifSystem },
+              ].map((item) => (
+                <div key={item.label} className="flex items-center justify-between py-2 border-b border-border last:border-0">
+                  <p className="text-sm text-foreground">{item.label}</p>
+                  <button onClick={() => item.toggle(!item.state)}
+                    className={`relative w-9 h-5 rounded-full transition-colors ${item.state ? "bg-primary" : "bg-secondary border border-border"}`}>
+                    <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${item.state ? "translate-x-4" : "translate-x-0.5"}`} />
+                  </button>
                 </div>
               ))}
             </div>

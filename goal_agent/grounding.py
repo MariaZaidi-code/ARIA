@@ -357,7 +357,8 @@ class GroundingMixin:
     def _find_price_quantity_expression(self, relevant, concept_tokens):
         """Spec §3: when no single measure column matches a sales-like concept,
         look for a fact table with BOTH a quantity and a unit-price column and
-        synthesize quantity * unit_price. Generic, schema-driven, no DB names."""
+        synthesize quantity * unit_price.  Also includes discount when present.
+        Generic, schema-driven, no DB names."""
         for table in relevant:
             info = self.tables.get(table, {})
             cols = list(info.get("columns", {}))
@@ -367,11 +368,18 @@ class GroundingMixin:
                           or "price" in c.lower() or "amount" in c.lower()), None)
             if qty and price and qty != price:
                 if self._is_measure_column(table, qty) and self._is_measure_column(table, price):
+                    disc = next((c for c in cols if "discount" in c.lower()), None)
+                    if disc:
+                        expr = (f"{table}.{qty} * {table}.{price} "
+                                f"* (1 - COALESCE({table}.{disc}, 0))")
+                    else:
+                        expr = f"{table}.{qty} * {table}.{price}"
                     return {
                         "table": table,
-                        "expression": f"{table}.{qty} * {table}.{price}",
+                        "expression": expr,
                         "quantity": qty,
                         "price": price,
+                        "discount": disc,
                     }
         return None
 
@@ -619,12 +627,34 @@ class GroundingMixin:
                     best = m
             # If nothing matched (best is None) the computed-measure path
             # below synthesizes a quantity*unit_price expression.
+            # Also prefer the computed expression when monetary_bias is on
+            # and the best match is only a per-line price column (tier 1),
+            # because revenue/sales should be qty * price * (1-discount).
+            computed = self._find_price_quantity_expression(relevant, tokens)
             if best:
-                metric["resolved_table"] = best["table"]
-                metric["resolved_column"] = best["column"]
-                metric["resolved_expression"] = f"{best['table']}.{best['column']}"
-                metric["confidence"] = 0.9
-                metric["reason"] = "measure column matched the requested metric"
+                best_tier = 2
+                if monetary_bias and best["column"].lower() in self._MONETARY_TOTAL_COLS:
+                    best_tier = 0
+                elif monetary_bias and best["column"].lower() in self._MONETARY_LINE_COLS:
+                    best_tier = 1
+                # For monetary concepts, prefer computed expression over a bare
+                # price/line column (tier 1), since revenue = qty * price * (1-disc).
+                if computed and best_tier >= 1 and monetary_bias:
+                    metric["resolved_table"] = computed["table"]
+                    metric["resolved_column"] = None
+                    metric["resolved_expression"] = computed["expression"]
+                    metric["computed_measure"] = True
+                    metric["confidence"] = 0.85
+                    metric["reason"] = (
+                        f"monetary concept; computed "
+                        f"{computed['expression']} from the schema"
+                    )
+                else:
+                    metric["resolved_table"] = best["table"]
+                    metric["resolved_column"] = best["column"]
+                    metric["resolved_expression"] = f"{best['table']}.{best['column']}"
+                    metric["confidence"] = 0.9
+                    metric["reason"] = "measure column matched the requested metric"
             else:
                 # Spec §3: sales-like concept with no single column -> try a
                 # computed quantity * unit_price expression from the schema.

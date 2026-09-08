@@ -3,11 +3,12 @@
 import json
 import re
 import types
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 import schema_agent
-from core.config import SCHEMA_DIR, get_session
+from core.config import SCHEMA_DIR, get_session, save_session
 from core.deps import get_current_user, require_data, require_writable
 
 router = APIRouter()
@@ -128,6 +129,7 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
         path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
 
     session["schema_path"] = latest_path
+    save_session(user["user_id"], session)
 
     summary = mapping.get("summary", {})
 
@@ -229,7 +231,20 @@ def get_schema(request: Request, user: dict = Depends(get_current_user)):
     """Return the current schema mapping (tables, columns, relationships)."""
     session = get_session(user["user_id"])
     require_data(request)
-    path = session["schema_path"]
+    path = session.get("schema_path")
+    if not path:
+        raise HTTPException(status_code=404, detail="No schema path configured. Connect a database first.")
+    path = Path(str(path))
     if not path.exists():
-        raise HTTPException(status_code=404, detail="No schema extracted yet. Call POST /api/extract_schema first.")
-    return {"ok": True, "schema": json.loads(path.read_text(encoding="utf-8"))}
+        # Auto-extract schema when reconnecting — the DB was never disconnected,
+        # so the schema file just needs to be rebuilt from the live connection.
+        try:
+            _extract_schema_impl(request, user, session.get("db_type") or "postgresql")
+        except Exception:
+            # If extraction fails, return graceful message instead of blocking user.
+            return {"ok": False, "detail": "Schema not found and could not be rebuilt automatically. The database connection is active, but schema extraction may require a manual retry or a different database. Try reconnecting or selecting a source with declared relationships."}
+    # Re-read session schema_path after extraction (file path may have changed).
+    updated_path = Path(str(session.get("schema_path", path)))
+    if not updated_path.exists():
+        return {"ok": False, "detail": "Schema file still missing after extraction attempt. The database is connected but may be empty or use a different schema name."}
+    return {"ok": True, "schema": json.loads(updated_path.read_text(encoding="utf-8"))}

@@ -70,7 +70,26 @@ class IntentMixin:
         if self._has_resolvable_analytical_structure(goal_l):
             return False, None
 
-        # 3) Nothing at all matched: graceful clarification that names what was
+        # 3) Anti-join / existence patterns: "never", "without", "not", "no"
+        anti_patterns = ("never", "without", "not sold", "no orders",
+                         "no sales", "no records", "missing", "absent",
+                         "not present", "has not", "have not", "did not")
+        if any(p in goal_l for p in anti_patterns):
+            return False, None
+
+        # 4) Comparison patterns: "compare", "vs", "versus", "difference"
+        comparison_patterns = ("compare", " vs ", "versus", "difference between",
+                               "how does", "how do", "which is more", "which is less")
+        if any(p in goal_l for p in comparison_patterns):
+            return False, None
+
+        # 5) "Why" patterns: "why", "what caused", "reason for"
+        why_patterns = ("why", "what caused", "reason for", "explain",
+                        "what happened", "what made")
+        if any(p in goal_l for p in why_patterns):
+            return False, None
+
+        # 6) Nothing at all matched: graceful clarification that names what was
         #    looked for, never a raw exception or matching failure.
         table_names = ", ".join(sorted(self.tables))[:300] if self.tables else "none"
         return True, (

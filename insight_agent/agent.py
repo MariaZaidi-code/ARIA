@@ -500,14 +500,36 @@ class InsightAgent:
                                   labels, [ds_style("count", data, "bar", palette[0])]))
 
         # ---- 5) KPI cards ----
-        if numeric_cols:
+        # Defensive: when schema classification misses numeric columns
+        # (e.g. new database format or Decimal objects that select_dtypes
+        # skips), detect numeric values directly from the data so KPI cards
+        # never vanish for any future database source.
+        effective_numeric = list(numeric_cols)
+        if not effective_numeric:
+            for col in df.columns:
+                if col in numeric_cols:
+                    continue
+                sample = df[col].dropna()
+                if len(sample) >= 1:
+                    try:
+                        coerced = pd.to_numeric(sample, errors="coerce")
+                        if int(coerced.notna().sum()) / len(sample) >= 0.7:
+                            effective_numeric.append(col)
+                    except Exception:
+                        continue
+                # Also treat pure float/int numpy dtypes that may have been
+                # missed by the initial classification for any reason.
+                if col not in effective_numeric and pd.api.types.is_numeric_dtype(df[col]):
+                    effective_numeric.append(col)
+
+        if effective_numeric:
             specs.append({
                 "chart_type": "kpi_card",
                 "title": "Key performance indicators",
                 "x": None, "y": None, "labels": [], "datasets": [],
                 "template": templates.get("kpi_card", {}).get("config", {}),
                 "config": {"type": "kpi_card", "data": {"labels": [], "datasets": []}, "options": {}},
-                "data": self.compute_kpis(df, numeric_cols),
+                "data": self.compute_kpis(df, effective_numeric),
             })
 
         return specs

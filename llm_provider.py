@@ -63,6 +63,16 @@ PROVIDERS = {
             "vision": "qwen/qwen3.6-27b",
         },
     },
+    "omniroute": {
+        "label": "OmniRoute",
+        "privacy": "Aggregated model routing; schema and queries are sent to the OmniRoute API.",
+        "models": {
+            "free-best": "omniroute/free-best",
+            "free-fast": "omniroute/free-fast",
+            "free-chat": "omniroute/free-chat",
+            "open": "omniroute/open",
+        },
+    },
 }
 
 GROQ_MODEL = PROVIDERS["cloud"]["models"]["sql"]
@@ -80,6 +90,7 @@ class LLMProvider:
         if provider not in PROVIDERS:
             raise ValueError(f"Unknown provider '{provider}'. Choose from {list(PROVIDERS)}")
         self.provider = provider
+        self.base_url = base_url
         self.models = dict(PROVIDERS[provider]["models"])
         if models:
             self.models.update(models)
@@ -90,7 +101,7 @@ class LLMProvider:
                 raise RuntimeError("groq package is not installed. Run: pip install groq")
             # max_retries=0: the SDK's internal retry/backoff on 429s can block for
             # minutes. We handle rate limits ourselves with a short, bounded retry.
-            self._groq_client = Groq(api_key=api_key or os.getenv("GROQ_API_KEY"), max_retries=0)
+            self._groq_client = Groq(api_key=api_key or os.getenv("GROQ_API_KEY"), max_retries=0, base_url=base_url) if base_url else Groq(api_key=api_key or os.getenv("GROQ_API_KEY"), max_retries=0)
             if not self._groq_client.api_key:
                 raise RuntimeError("Missing GROQ_API_KEY. Set it in .env or pass api_key.")
 
@@ -114,7 +125,9 @@ class LLMProvider:
                 # timeout passed by the caller always wins (no hidden hang).
                 timeout = 900
             else:
-                timeout = 30 if self.provider != "local" else 60
+                # Short, bounded timeouts so analytical queries respond quickly
+                # rather than blocking indefinitely on a slow LLM response.
+                timeout = 15 if self.provider == "cloud" else 30
         model = self.model_for(role)
         if not model:
             raise ValueError(f"No model configured for role '{role}'")
@@ -299,7 +312,7 @@ def create_provider(provider="local", api_key=None, models=None, base_url=None):
                 "The Cloud provider is unavailable because the 'groq' package is not "
                 "installed (pip install groq). Stay on Local or fix this first."
             )
-        llm = LLMProvider("cloud", api_key=api_key or os.getenv("GROQ_API_KEY"), models=models)
+        llm = LLMProvider("cloud", api_key=api_key or os.getenv("GROQ_API_KEY"), models=models, base_url=base_url)
         if not llm._groq_client.api_key:
             raise RuntimeError("Missing GROQ_API_KEY. Set it in .env or pass api_key.")
         return llm

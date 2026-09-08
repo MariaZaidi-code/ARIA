@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 class DataMixin:
     # ---- _execute_with_retry (_execute_with_retry) ----
 
-    def _execute_with_retry(self, user_goal, join_path, kpi_map, raw_sql, retries=2,
+    def _execute_with_retry(self, user_goal, join_path, kpi_map, raw_sql, retries=6,
                             ir=None, join_plan=None):
         """Execute the SQL with a validation layer + LLM repair.
 

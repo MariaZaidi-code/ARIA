@@ -141,7 +141,7 @@ def test_aria():
                         page.screenshot(path="C:\\Users\\Go\\Desktop\\ARIA\\test_screenshot_5.png")
                         print("  Screenshot saved: test_screenshot_5.png")
                         break
-                except:
+                except Exception:
                     pass
         except Exception as e:
             print(f"  Error: {e}")
@@ -160,7 +160,7 @@ def test_aria():
                         page.screenshot(path="C:\\Users\\Go\\Desktop\\ARIA\\test_screenshot_6.png")
                         print("  Screenshot saved: test_screenshot_6.png")
                         break
-                except:
+                except Exception:
                     pass
         except Exception as e:
             print(f"  Error: {e}")

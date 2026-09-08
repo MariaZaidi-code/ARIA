@@ -64,3 +64,12 @@ def history_detail(history_id: int, user: dict = Depends(get_current_user)):
     if not record:
         raise HTTPException(status_code=404, detail="History record not found.")
     return {"ok": True, "record": record}
+
+
+@router.delete("/api/history/{history_id}")
+def history_delete(history_id: int, user: dict = Depends(get_current_user)):
+    """Delete a saved analysis."""
+    deleted = auth.delete_history(user["user_id"], history_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="History record not found.")
+    return {"ok": True}

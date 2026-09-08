@@ -1,44 +1,57 @@
 import { useState } from "react";
-import { authenticateLocalUser } from "../utils/authStorage";
+import { authenticateLocalUser, registerLocalUser } from "../../utils/authStorage";
 import AriaLogo from "../components/AriaLogo";
 
-function Login({ onLogin, onCreateAccount }) {
+interface LoginProps {
+  onLogin: () => void;
+}
+
+export default function Login({ onLogin }: LoginProps) {
+  const [mode, setMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
-
   const [password, setPassword] = useState("");
-
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [loading, setLoading] = useState(false);
-
   const [error, setError] = useState("");
 
-  const handleSubmit = async (event) => {
-    event.preventDefault();
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
     setError("");
 
     if (email.trim() === "" || password.trim() === "") {
       setError("Please enter your email and password.");
-
       return;
     }
 
     setLoading(true);
-
     try {
-      const result = await authenticateLocalUser(email, password);
-      if (!result.success) {
-        setError(result.message || "Unable to sign in.");
-
-        if (result.code === "USER_NOT_FOUND") {
-          onCreateAccount();
+      if (mode === "register") {
+        if (password !== confirmPassword) {
+          setError("Passwords do not match");
+          setLoading(false);
+          return;
         }
-
+        if (password.length < 6) {
+          setError("Password must be at least 6 characters");
+          setLoading(false);
+          return;
+        }
+        await registerLocalUser(email, password);
+        setMode("login");
+        setLoading(false);
         return;
       }
 
-      onLogin(result.user);
+      const result = await authenticateLocalUser(email, password);
+      if (!result.success) {
+        setError(result.message || "Unable to sign in.");
+        if (result.code === "USER_NOT_FOUND") {
+          setMode("register");
+        }
+        return;
+      }
+      onLogin();
     } catch (err) {
-      console.error("Login error:", err);
-
       setError("ARIA could not sign you in. Please try again.");
     } finally {
       setLoading(false);
@@ -52,10 +65,8 @@ function Login({ onLogin, onCreateAccount }) {
         <aside className="login-showcase" aria-hidden="true">
           <div className="login-showcase-brand">
             <AriaLogo size={40} />
-
             <div>
               <strong>ARIA</strong>
-
               <span>Intelligent Business Analytics</span>
             </div>
           </div>
@@ -67,7 +78,6 @@ function Login({ onLogin, onCreateAccount }) {
                 <br />
                 into smarter decisions.
               </h3>
-
               <p>
                 Ask business questions in plain language, explore your data,
                 and uncover meaningful insights with ARIA.
@@ -75,7 +85,6 @@ function Login({ onLogin, onCreateAccount }) {
             </div>
 
             <div className="login-stage" aria-hidden="true">
-              {/* ARIA intelligence node */}
               <div className="login-focal">
                 <span className="login-focal-ring" />
                 <span className="login-focal-symbol">✦</span>
@@ -83,14 +92,12 @@ function Login({ onLogin, onCreateAccount }) {
                 <span className="login-focal-signal login-focal-signal--out" />
               </div>
 
-              {/* Mini revenue KPI */}
               <div className="login-kpi">
                 <span className="login-float-label">Intelligence</span>
                 <strong className="login-kpi-value">ARIA Agents</strong>
                 <span className="login-kpi-delta">Ask · Explore · Decide</span>
               </div>
 
-              {/* Small trend chart */}
               <div className="login-chart">
                 <span className="login-float-label">Schema Discovery</span>
                 <svg
@@ -107,7 +114,6 @@ function Login({ onLogin, onCreateAccount }) {
                 </svg>
               </div>
 
-              {/* AI capability card */}
               <div className="login-insight">
                 <span className="login-float-tag">ARIA</span>
                 <span className="login-insight-text">
@@ -120,19 +126,16 @@ function Login({ onLogin, onCreateAccount }) {
           <div className="login-showcase-bottom">
             <ul className="login-showcase-features">
               <li>Connect your databases &amp; files</li>
-
               <li>Explore your schema automatically</li>
-
               <li>Ask questions without SQL</li>
             </ul>
-
             <div className="login-showcase-footer">
               Secure intelligent analytics · ARIA
             </div>
           </div>
         </aside>
 
-        {/* ─── RIGHT: LOGIN AREA ─── */}
+        {/* ─── RIGHT: LOGIN / REGISTER AREA ─── */}
         <div className="login-card">
           <div className="login-card-brand">
             <span className="login-card-mark">
@@ -142,29 +145,26 @@ function Login({ onLogin, onCreateAccount }) {
           </div>
 
           <div className="login-heading">
-            <h2>Welcome back</h2>
-
-            <p>Sign in to your ARIA workspace</p>
+            <h2>{mode === "login" ? "Welcome back" : "Create account"}</h2>
+            <p>
+              {mode === "login"
+                ? "Sign in to your ARIA workspace"
+                : "Get started with ARIA Intelligence"}
+            </p>
           </div>
 
           <form className="login-form" onSubmit={handleSubmit} noValidate>
-            {error ? (
-              <p className="login-error" role="alert">
-                {error}
-              </p>
-            ) : null}
+            {error && (
+              <p className="login-error" role="alert">{error}</p>
+            )}
 
             <div className="login-form-group">
               <label htmlFor="login-email">Email Address</label>
-
               <input
                 id="login-email"
                 type="email"
                 value={email}
-                onChange={(event) => {
-                  setEmail(event.target.value);
-                  setError("");
-                }}
+                onChange={(e) => { setEmail(e.target.value); setError(""); }}
                 placeholder="you@company.com"
                 autoComplete="email"
                 aria-invalid={error ? "true" : undefined}
@@ -174,25 +174,34 @@ function Login({ onLogin, onCreateAccount }) {
             <div className="login-form-group">
               <div className="login-label-row">
                 <label htmlFor="login-password">Password</label>
-
-                <a className="login-forgot" href="#forgot">
-                  Forgot password?
-                </a>
+                {mode === "login" && (
+                  <a className="login-forgot" href="#forgot">Forgot password?</a>
+                )}
               </div>
-
               <input
                 id="login-password"
                 type="password"
                 value={password}
-                onChange={(event) => {
-                  setPassword(event.target.value);
-                  setError("");
-                }}
+                onChange={(e) => { setPassword(e.target.value); setError(""); }}
                 placeholder="Enter your password"
-                autoComplete="current-password"
+                autoComplete={mode === "login" ? "current-password" : "new-password"}
                 aria-invalid={error ? "true" : undefined}
               />
             </div>
+
+            {mode === "register" && (
+              <div className="login-form-group">
+                <label htmlFor="login-confirm">Confirm Password</label>
+                <input
+                  id="login-confirm"
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="Confirm your password"
+                  autoComplete="new-password"
+                />
+              </div>
+            )}
 
             <button
               type="submit"
@@ -202,25 +211,25 @@ function Login({ onLogin, onCreateAccount }) {
               {loading ? (
                 <span className="login-button-loading">
                   <span className="login-button-spinner" aria-hidden="true" />
-                  Signing in…
+                  {mode === "login" ? "Signing in…" : "Creating account…"}
                 </span>
               ) : (
                 <span>
-                  Access Intelligence Hub <span aria-hidden="true">→</span>
+                  {mode === "login" ? "Access Intelligence Hub" : "Create Account"}{" "}
+                  <span aria-hidden="true">→</span>
                 </span>
               )}
             </button>
           </form>
 
           <div className="login-footer">
-            <span>New here?</span>
-
+            <span>{mode === "login" ? "New here?" : "Already have an account?"}</span>
             <button
               type="button"
               className="register-login-link"
-              onClick={onCreateAccount}
+              onClick={() => { setMode(mode === "login" ? "register" : "login"); setError(""); }}
             >
-              Create Account
+              {mode === "login" ? "Create Account" : "Sign In"}
             </button>
           </div>
         </div>
@@ -228,5 +237,3 @@ function Login({ onLogin, onCreateAccount }) {
     </div>
   );
 }
-
-export default Login;

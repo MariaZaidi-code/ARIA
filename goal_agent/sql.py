@@ -756,7 +756,7 @@ class SqlMixin:
 
         prompt = f"""
 ### Task
-Generate a single {self.dialect} query that answers the user's business goal.
+Generate a single {self.dialect} SQL query that answers the user's business goal.
 User goal: {user_goal}
 Aligned KPIs: {kpi_desc}
 Dimensions: {', '.join(kpi_map['dimensions']) if kpi_map['dimensions'] else 'auto-detect'}
@@ -768,34 +768,347 @@ The query will run on a database with the following schema:
 Preferred starting tables (inspect these first, but you may use any table
 needed to answer the goal, joining via the FOREIGN KEY relationships above):
 {join_path}
-{join_plan_text}{dialect_note}### SQL
+{join_plan_text}{dialect_note}
+### SQL
 Output only the final SQL statement. No explanations, no markdown, nothing after it.
-Rules:
-- Aggregate functions must NEVER be nested (AVG(SUM(x)), SUM(COUNT(x)), etc. are invalid SQL).
-- An average per group is SUM(x) / COUNT(DISTINCT key) or a subquery.
-- If the goal asks for BOTH extremes (e.g. "highest AND lowest", "most and least",
-  "top and bottom", "max and min", "best and worst"), do NOT use LIMIT 1: return the
-  full ranked list (ORDER BY ... ASC or DESC, no LIMIT) so both ends are present.
-- If the goal asks for a single extreme ("the highest", "the lowest", "top 5"), a
-  one-sided ORDER BY + LIMIT is fine.
-- Do not add a trailing semicolon only statement marker; a single trailing semicolon is fine.
+
+### CRITICAL RULES
+1. Aggregate functions must NEVER be nested (AVG(SUM(x)), SUM(COUNT(x)) are INVALID).
+2. An average per group = SUM(x) / COUNT(DISTINCT key) or a subquery.
+3. For "highest AND lowest" / "most and least" / "top and bottom" / "best and worst":
+   do NOT use LIMIT 1. Return the full ranked list so both ends are present.
+4. For "the highest" / "the lowest" / "top N": use ORDER BY + LIMIT.
+5. Never add a trailing semicolon-only statement; a single trailing semicolon is fine.
+
+### QUERY PATTERNS — match the goal to the correct pattern:
+
+#### COUNT pattern ("how many", "count of", "number of")
+SELECT COUNT(*) FROM table;
+
+#### TOTAL/SUM pattern ("total revenue", "sum of sales", "total amount")
+SELECT SUM(column) FROM table;
+For revenue: SUM(quantity * unit_price * (1 - COALESCE(discount, 0)))
+
+#### AVERAGE pattern ("average order value", "mean price")
+SELECT AVG(column) FROM table;
+
+#### GROUP BY pattern ("revenue by category", "sales by region", "orders by country")
+SELECT dimension, SUM(measure) FROM fact_table JOIN dimension_table GROUP BY dimension ORDER BY SUM(measure) DESC;
+
+#### RANKING pattern ("top 10 products", "best customers", "highest revenue")
+SELECT dimension, SUM(measure) FROM table GROUP BY dimension ORDER BY SUM(measure) DESC LIMIT N;
+
+#### TREND/TIME SERIES pattern ("revenue over time", "monthly revenue", "trend")
+SELECT date_trunc('month', date_col) AS month, SUM(measure) FROM table GROUP BY month ORDER BY month;
+
+#### COMPARISON pattern ("compare sales between regions", "revenue by country")
+SELECT dimension, SUM(measure) FROM table GROUP BY dimension ORDER BY SUM(measure) DESC;
+
+#### ANTI-JOIN pattern ("products never ordered", "customers without orders", "items not sold")
+SELECT t1.* FROM table1 t1 LEFT JOIN table2 t2 ON t1.key = t2.key WHERE t2.key IS NULL;
+
+#### PERCENTAGE/SHARE pattern ("percentage of revenue by category")
+SELECT dimension, SUM(measure) * 100.0 / SUM(SUM(measure)) OVER() AS pct FROM table GROUP BY dimension;
+
+#### WINDOW FUNCTION pattern ("rank by revenue", "running total", "percentile")
+Use ROW_NUMBER(), RANK(), SUM() OVER(), etc.
+
+#### SUBQUERY pattern ("products above average price", "orders with revenue above median")
+SELECT * FROM table WHERE column > (SELECT AVG(column) FROM table);
+
+#### DISTINCT pattern ("how many unique customers", "list all countries")
+SELECT COUNT(DISTINCT column) FROM table;
+SELECT DISTINCT column FROM table;
+
+#### NULL HANDLING ("products never ordered" = LEFT JOIN + IS NULL)
+Always use LEFT JOIN ... WHERE t2.key IS NULL for anti-joins.
+
+#### DATE FILTERING ("last year", "Q3", "this month", "2024")
+Use WHERE date_col >= '2024-01-01' AND date_col < '2025-01-01' for year 2024.
+Use date_trunc('quarter', date_col) for quarter filtering.
 """
         try:
-            raw = self.llm.complete("sql", prompt, temperature=0.1, num_predict=500)
+            # Fast, bounded LLM call: if it exceeds a short cap we fall back
+            # to the fully dynamic deterministic SQL (no hardcoded table/column
+            # names) so any database query is handled rather than hanging.
+            raw = self.llm.complete("sql", prompt, temperature=0.1, num_predict=800, timeout=8)
             return self._clean_sql(raw)
         except Exception as exc:
             logger.warning(f"LLM SQL generation failed: {exc}.")
+            # Try deterministic template-based SQL before giving up
+            det = self._deterministic_sql(user_goal, join_path, kpi_map, ir)
+            if det:
+                return det
             if self._llm_unavailable(exc):
-                # Provider down/exhausted: do NOT fall back to a bare SELECT *
-                # (that would only trigger pointless repair loops). Signal the
-                # caller to degrade gracefully.
                 return None
             if self._goal_asks_for_aggregation(user_goal):
-                # Spec §15: a bare SELECT * is NOT a valid substitute for an
-                # aggregated answer. Fail controlled instead of silently
-                # returning raw rows that mislead the user.
                 return None
             return self._fallback_sql(join_path)
+
+    # ---- _deterministic_sql (_deterministic_sql) ----
+
+    def _deterministic_sql(self, user_goal, join_path, kpi_map, ir=None):
+        """Generate SQL deterministically (no LLM) by pattern-matching the
+        user goal against the schema. Used as a fallback when the LLM fails."""
+        goal = user_goal.lower().strip()
+        relevant = [t for t in join_path if t in self.tables]
+        if not relevant:
+            return None
+
+        def _safe(name):
+            return f'"{name}"'
+
+        def _find_table(patterns):
+            for pat in patterns:
+                for t in relevant:
+                    if pat in t.lower():
+                        return t
+            for pat in patterns:
+                for t in self.tables:
+                    if pat in t.lower():
+                        return t
+            return None
+
+        def _find_col(table, patterns):
+            cols = list(self.tables.get(table, {}).get("columns", {}))
+            for pat in patterns:
+                for c in cols:
+                    if pat in c.lower():
+                        return c
+            return None
+
+        def _revenue_expr(table):
+            """Build revenue expression for a table."""
+            t_info = self.tables.get(table, {})
+            cols = list(t_info.get("columns", {}))
+            price = next((c for c in cols if "price" in c.lower() and "unit" in c.lower()), None)
+            qty = next((c for c in cols if "quantity" in c.lower() or "qty" in c.lower()), None)
+            disc = next((c for c in cols if "discount" in c.lower()), None)
+            if price and qty:
+                expr = f'{_safe(qty)} * {_safe(price)}'
+                if disc:
+                    expr += f' * (1 - COALESCE({_safe(disc)}, 0))'
+                return expr, table
+            return None, None
+
+        # --- COUNT pattern ---
+        if any(kw in goal for kw in ("how many", "count", "number of")):
+            # Dynamic: extract entity tokens from goal, match against schema table names
+            goal_words = set(goal.split())
+            entity_tokens = [w for w in goal_words
+                            if len(w) > 2
+                            and w not in ("how", "many", "count", "number", "the", "are",
+                                          "there", "in", "of", "for", "with", "total", "sum")]
+            t = None
+            for tok in entity_tokens:
+                t = _find_table([tok])
+                if t:
+                    break
+            if not t:
+                t = relevant[0]
+            return f'SELECT COUNT(*) AS count FROM {_safe(t)};'
+
+        # --- TOTAL/SUM pattern ---
+        if any(kw in goal for kw in ("total", "sum", "overall")):
+            # Try to find revenue-like pattern
+            for t in relevant:
+                expr, _ = _revenue_expr(t)
+                if expr:
+                    return f'SELECT SUM({expr}) AS total FROM {_safe(t)};'
+            # Fallback to any numeric column
+            for t in relevant:
+                t_info = self.tables.get(t, {})
+                cols = list(t_info.get("columns", {}))
+                num_cols = [c for c in cols if any(k in c.lower() for k in (
+                    "amount", "price", "revenue", "sales", "quantity", "qty", "cost", "value", "total"
+                )) and not c.lower().endswith("_id")]
+                if num_cols:
+                    return f'SELECT SUM({_safe(num_cols[0])}) AS total FROM {_safe(t)};'
+
+        # --- AVERAGE pattern ---
+        if any(kw in goal for kw in ("average", "avg", "mean")):
+            # Dynamic: find fact table (many FKs + numerics) joined to dimension table
+            fact_tables = [t for t in relevant if self._is_pure_fact_table(t)]
+            if not fact_tables:
+                fact_tables = [t for t in relevant
+                              if len(self.tables.get(t, {}).get("columns", {})) > 3
+                              and any(c.lower().endswith("_id") for c in self.tables.get(t, {}).get("columns", {}))]
+            if fact_tables:
+                ft = fact_tables[0]
+                ft_info = self.tables.get(ft, {})
+                ft_cols = list(ft_info.get("columns", {}))
+                # Find the FK in the fact table that joins to another relevant table
+                fk_col = next((c for c in ft_cols if c.lower().endswith("_id") and c.lower() != "id"), None)
+                if fk_col:
+                    # Find the dimension table this FK references
+                    ref_table = None
+                    for t2 in relevant:
+                        if t2 == ft:
+                            continue
+                        t2_info = self.tables.get(t2, {})
+                        t2_pk = next((c for c in t2_info.get("columns", {})
+                                      if c.lower().endswith("_id") or c.lower() == "id"), None)
+                        if t2_pk and t2_pk.lower() == fk_col.lower():
+                            ref_table = t2
+                            break
+                    if not ref_table:
+                        ref_table = next((t2 for t2 in relevant if t2 != ft), None)
+                    if ref_table:
+                        expr, _ = _revenue_expr(ft)
+                        ref_pk = next((c for c in self.tables.get(ref_table, {}).get("columns", {})
+                                       if c.lower().endswith("_id") or c.lower() == "id"), None)
+                        if expr and ref_pk:
+                            return (f'SELECT SUM({expr}) / COUNT(DISTINCT {_safe(ref_table)}.{_safe(ref_pk)}) AS average '
+                                    f'FROM {_safe(ft)} JOIN {_safe(ref_table)} ON {_safe(ref_table)}.{_safe(ref_pk)} = {_safe(ft)}.{_safe(fk_col)};')
+            for t in relevant:
+                t_info = self.tables.get(t, {})
+                cols = list(t_info.get("columns", {}))
+                num_cols = [c for c in cols if any(k in c.lower() for k in (
+                    "amount", "price", "revenue", "sales", "quantity", "cost", "value"
+                )) and not c.lower().endswith("_id")]
+                if num_cols:
+                    return f'SELECT AVG({_safe(num_cols[0])}) AS average FROM {_safe(t)};'
+
+        # --- TREND/TIME SERIES pattern ---
+        if any(kw in goal for kw in ("trend", "over time", "monthly", "daily", "weekly", "yearly", "by month", "by year", "by day")):
+            # Dynamic: find datetime columns by data_type classification
+            DATETIME_TYPES = {"date", "time", "timestamp", "timestamp without time zone",
+                             "timestamp with time zone", "datetime", "smalldatetime"}
+            for t in relevant:
+                t_info = self.tables.get(t, {})
+                cols_raw = t_info.get("columns", [])
+                date_col = None
+                if isinstance(cols_raw, list):
+                    for c in cols_raw:
+                        if isinstance(c, dict):
+                            dtype = c.get("data_type", "").lower().strip()
+                            if dtype in DATETIME_TYPES or any(k in dtype for k in ("date", "time", "timestamp")):
+                                date_col = c.get("column", "")
+                                break
+                if not date_col:
+                    continue
+                expr, _ = _revenue_expr(t)
+                if expr:
+                    return (f"SELECT date_trunc('month', {_safe(t)}.{_safe(date_col)}) AS period, "
+                            f'SUM({expr}) AS value '
+                            f'FROM {_safe(t)} '
+                            f'GROUP BY period ORDER BY period;')
+                # Just count over time
+                return (f"SELECT date_trunc('month', {_safe(t)}.{_safe(date_col)}) AS period, "
+                        f'COUNT(*) AS value '
+                        f'FROM {_safe(t)} '
+                        f'GROUP BY period ORDER BY period;')
+
+        # --- GROUP BY / BY pattern ---
+        if any(kw in goal for kw in (" by ", " per ", "breakdown", "distribution")):
+            for t in relevant:
+                t_info = self.tables.get(t, {})
+                cols_raw = t_info.get("columns", [])
+                TEXT_TYPES = {"character varying", "varchar", "character", "char", "text", "citext", "uuid"}
+                # Dynamic: find text columns (non-ID, non-PK) by data_type
+                cat_cols = []
+                if isinstance(cols_raw, list):
+                    for c in cols_raw:
+                        if isinstance(c, dict):
+                            cname = c.get("column", "")
+                            dtype = c.get("data_type", "").lower().strip()
+                            is_text = dtype in TEXT_TYPES or any(k in dtype for k in ("char", "text", "varchar"))
+                            if is_text and not cname.lower().endswith("_id") and cname.lower() != "id":
+                                cat_cols.append(cname)
+                expr, _ = _revenue_expr(t)
+                if cat_cols and expr:
+                    cat = cat_cols[0]
+                    return (f'SELECT {_safe(t)}.{_safe(cat)}, SUM({expr}) AS value '
+                            f'FROM {_safe(t)} GROUP BY {_safe(t)}.{_safe(cat)} ORDER BY value DESC;')
+                if cat_cols:
+                    cat = cat_cols[0]
+                    return (f'SELECT {_safe(t)}.{_safe(cat)}, COUNT(*) AS value '
+                            f'FROM {_safe(t)} GROUP BY {_safe(t)}.{_safe(cat)} ORDER BY value DESC;')
+
+        # --- RANKING pattern ---
+        if any(kw in goal for kw in ("top", "best", "highest", "most", "leading", "largest")):
+            for t in relevant:
+                t_info = self.tables.get(t, {})
+                cols_raw = t_info.get("columns", [])
+                TEXT_TYPES = {"character varying", "varchar", "character", "char", "text", "citext", "uuid"}
+                # Dynamic: find text columns (non-ID, non-PK) by data_type
+                name_cols = []
+                if isinstance(cols_raw, list):
+                    for c in cols_raw:
+                        if isinstance(c, dict):
+                            cname = c.get("column", "")
+                            dtype = c.get("data_type", "").lower().strip()
+                            is_text = dtype in TEXT_TYPES or any(k in dtype for k in ("char", "text", "varchar"))
+                            if is_text and not cname.lower().endswith("_id") and cname.lower() != "id":
+                                name_cols.append(cname)
+                expr, _ = _revenue_expr(t)
+                if name_cols and expr:
+                    return (f'SELECT {_safe(name_cols[0])}, SUM({expr}) AS value '
+                            f'FROM {_safe(t)} GROUP BY {_safe(name_cols[0])} ORDER BY value DESC LIMIT 10;')
+                if name_cols:
+                    return (f'SELECT {_safe(name_cols[0])}, COUNT(*) AS value '
+                            f'FROM {_safe(t)} GROUP BY {_safe(name_cols[0])} ORDER BY value DESC LIMIT 10;')
+
+        # --- COMPARISON pattern ---
+        if any(kw in goal for kw in ("compare", "vs", "versus", "between")):
+            for t in relevant:
+                t_info = self.tables.get(t, {})
+                cols_raw = t_info.get("columns", [])
+                TEXT_TYPES = {"character varying", "varchar", "character", "char", "text", "citext", "uuid"}
+                cat_cols = []
+                if isinstance(cols_raw, list):
+                    for c in cols_raw:
+                        if isinstance(c, dict):
+                            cname = c.get("column", "")
+                            dtype = c.get("data_type", "").lower().strip()
+                            is_text = dtype in TEXT_TYPES or any(k in dtype for k in ("char", "text", "varchar"))
+                            if is_text and not cname.lower().endswith("_id") and cname.lower() != "id":
+                                cat_cols.append(cname)
+                expr, _ = _revenue_expr(t)
+                if cat_cols and expr:
+                    return (f'SELECT {_safe(t)}.{_safe(cat_cols[0])}, SUM({expr}) AS value '
+                            f'FROM {_safe(t)} GROUP BY {_safe(t)}.{_safe(cat_cols[0])} ORDER BY value DESC;')
+
+        # --- ANTI-JOIN pattern ---
+        if any(kw in goal for kw in ("never", "without", "not sold", "no orders", "no sales", "no records")):
+            fact_tables = [t for t in relevant if self._is_pure_fact_table(t)]
+            if fact_tables and len(relevant) >= 2:
+                dim_table = [t for t in relevant if t not in fact_tables]
+                if dim_table:
+                    dt, ft = dim_table[0], fact_tables[0]
+                    dt_info = self.tables.get(dt, {})
+                    ft_info = self.tables.get(ft, {})
+                    dt_pk = next((c for c in dt_info.get("columns", {})
+                                   if c.lower().endswith("_id") or c.lower() == "id"), None)
+                    ft_fk = next((c for c in ft_info.get("columns", {})
+                                   if c.lower() == f"{dt.lower()}_id" or c.lower().endswith("_id")), None)
+                    if dt_pk and ft_fk:
+                        return (f'SELECT t1.* FROM {_safe(dt)} t1 '
+                                f'LEFT JOIN {_safe(ft)} t2 ON t1.{_safe(dt_pk)} = t2.{_safe(ft_fk)} '
+                                f'WHERE t2.{_safe(ft_fk)} IS NULL LIMIT 50;')
+
+        # --- PERCENTAGE pattern ---
+        if any(kw in goal for kw in ("percentage", "percent", "share", "proportion")):
+            for t in relevant:
+                t_info = self.tables.get(t, {})
+                cols_raw = t_info.get("columns", [])
+                TEXT_TYPES = {"character varying", "varchar", "character", "char", "text", "citext", "uuid"}
+                cat_cols = []
+                if isinstance(cols_raw, list):
+                    for c in cols_raw:
+                        if isinstance(c, dict):
+                            cname = c.get("column", "")
+                            dtype = c.get("data_type", "").lower().strip()
+                            is_text = dtype in TEXT_TYPES or any(k in dtype for k in ("char", "text", "varchar"))
+                            if is_text and not cname.lower().endswith("_id") and cname.lower() != "id":
+                                cat_cols.append(cname)
+                expr, _ = _revenue_expr(t)
+                if cat_cols and expr:
+                    return (f'SELECT {_safe(t)}.{_safe(cat_cols[0])}, '
+                            f'SUM({expr}) * 100.0 / SUM(SUM({expr})) OVER() AS percentage '
+                            f'FROM {_safe(t)} GROUP BY {_safe(t)}.{_safe(cat_cols[0])} ORDER BY percentage DESC;')
+
+        return None
 
     # ---- _semantic_validate_sql (_semantic_validate_sql) ----
 
@@ -1025,11 +1338,140 @@ Rules:
     # ---- _fallback_sql (_fallback_sql) ----
 
     def _fallback_sql(self, join_path):
+        """Smart template-based fallback when the LLM fails.
+        Tries to match the user goal to common SQL patterns."""
         relevant = [t for t in join_path if t in self.tables]
         if not relevant:
             if self.dialect == "sqlite":
                 return "SELECT name FROM sqlite_master WHERE type='table' LIMIT 10;"
             return "SELECT table_name FROM information_schema.tables LIMIT 10;"
+
+        goal = (getattr(self, "_active_original_goal", "") or "").lower()
+
+        NUMERIC_TYPES = {"int", "integer", "bigint", "decimal", "numeric", "real",
+                        "double precision", "float", "money", "smallint"}
+
+        # Anti-join: "never ordered", "without orders", "not sold"
+        if any(kw in goal for kw in ("never", "without", "not sold", "not ordered", "no orders", "no sales")):
+            fact_tables = [t for t in relevant if self._is_pure_fact_table(t)]
+            if fact_tables and len(relevant) >= 2:
+                dim_table = [t for t in relevant if t not in fact_tables]
+                if dim_table:
+                    dt = dim_table[0]
+                    ft = fact_tables[0]
+                    dt_info = self.tables.get(dt, {})
+                    ft_info = self.tables.get(ft, {})
+                    dt_pk = next((c for c in dt_info.get("columns", {})
+                                   if c.lower().endswith("_id") or c.lower() == "id"), None)
+                    ft_fk = next((c for c in ft_info.get("columns", {})
+                                   if c.lower() == f"{dt.lower()}_id" or c.lower().endswith("_id")), None)
+                    if dt_pk and ft_fk:
+                        return (f'SELECT t1.* FROM "{dt}" t1 '
+                                f'LEFT JOIN "{ft}" t2 ON t1."{dt_pk}" = t2."{ft_fk}" '
+                                f'WHERE t2."{ft_fk}" IS NULL LIMIT 50;')
+
+        # COUNT pattern
+        if any(kw in goal for kw in ("how many", "count", "number of")):
+            table = relevant[0]
+            return f'SELECT COUNT(*) AS count FROM "{table}";'
+
+        # TOTAL/SUM pattern
+        if any(kw in goal for kw in ("total", "sum", "overall")):
+            for t in relevant:
+                cols_raw = self.tables.get(t, {}).get("columns", [])
+                num_cols = []
+                if isinstance(cols_raw, list):
+                    for c in cols_raw:
+                        if isinstance(c, dict):
+                            cname = c.get("column", "")
+                            dtype = c.get("data_type", "").lower().strip()
+                            is_num = dtype in NUMERIC_TYPES or any(k in dtype for k in (
+                                "int", "decimal", "numeric", "float", "real", "double", "money"
+                            ))
+                            if is_num and not cname.lower().endswith("_id") and cname.lower() != "id":
+                                num_cols.append(cname)
+                if num_cols:
+                    return f'SELECT SUM("{num_cols[0]}") AS total FROM "{t}";'
+
+        # AVERAGE pattern
+        if any(kw in goal for kw in ("average", "avg", "mean")):
+            for t in relevant:
+                cols_raw = self.tables.get(t, {}).get("columns", [])
+                num_cols = []
+                if isinstance(cols_raw, list):
+                    for c in cols_raw:
+                        if isinstance(c, dict):
+                            cname = c.get("column", "")
+                            dtype = c.get("data_type", "").lower().strip()
+                            is_num = dtype in NUMERIC_TYPES or any(k in dtype for k in (
+                                "int", "decimal", "numeric", "float", "real", "double", "money"
+                            ))
+                            if is_num and not cname.lower().endswith("_id") and cname.lower() != "id":
+                                num_cols.append(cname)
+                if num_cols:
+                    return f'SELECT AVG("{num_cols[0]}") AS average FROM "{t}";'
+
+        # GROUP BY pattern ("by category", "by region", "by country")
+        by_match = None
+        for kw in (" by ", " per ", " breakdown", " distribution"):
+            if kw in goal:
+                by_match = kw.strip()
+                break
+
+        if by_match:
+            TEXT_TYPES = {"character varying", "varchar", "character", "char", "text", "citext", "uuid"}
+            for t in relevant:
+                t_info = self.tables.get(t, {})
+                cols_raw = t_info.get("columns", [])
+                cat_cols = []
+                num_cols = []
+                if isinstance(cols_raw, list):
+                    for c in cols_raw:
+                        if isinstance(c, dict):
+                            cname = c.get("column", "")
+                            dtype = c.get("data_type", "").lower().strip()
+                            is_text = dtype in TEXT_TYPES or any(k in dtype for k in ("char", "text", "varchar"))
+                            is_num = dtype in NUMERIC_TYPES or any(k in dtype for k in (
+                                "int", "decimal", "numeric", "float", "real", "double", "money"
+                            ))
+                            if is_text and not cname.lower().endswith("_id") and cname.lower() != "id":
+                                cat_cols.append(cname)
+                            if is_num and not cname.lower().endswith("_id") and cname.lower() != "id":
+                                num_cols.append(cname)
+                if cat_cols and num_cols:
+                    cat = cat_cols[0]
+                    num = num_cols[0]
+                    return (f'SELECT t."{cat}", SUM("{num}") AS total '
+                            f'FROM "{t}" t GROUP BY t."{cat}" ORDER BY total DESC;')
+
+        # RANKING pattern ("top", "best", "highest", "most")
+        if any(kw in goal for kw in ("top", "best", "highest", "most", "leading", "largest")):
+            TEXT_TYPES = {"character varying", "varchar", "character", "char", "text", "citext", "uuid"}
+            for t in relevant:
+                t_info = self.tables.get(t, {})
+                cols_raw = t_info.get("columns", [])
+                name_cols = []
+                num_cols = []
+                if isinstance(cols_raw, list):
+                    for c in cols_raw:
+                        if isinstance(c, dict):
+                            cname = c.get("column", "")
+                            dtype = c.get("data_type", "").lower().strip()
+                            is_text = dtype in TEXT_TYPES or any(k in dtype for k in ("char", "text", "varchar"))
+                            is_num = dtype in NUMERIC_TYPES or any(k in dtype for k in (
+                                "int", "decimal", "numeric", "float", "real", "double", "money"
+                            ))
+                            if is_text and not cname.lower().endswith("_id") and cname.lower() != "id":
+                                name_cols.append(cname)
+                            if is_num and not cname.lower().endswith("_id") and cname.lower() != "id":
+                                num_cols.append(cname)
+                if name_cols and num_cols:
+                    name = name_cols[0]
+                    num = num_cols[0]
+                    return (f'SELECT "{name}", SUM("{num}") AS total '
+                            f'FROM "{t}" GROUP BY "{name}" ORDER BY total DESC LIMIT 10;')
+
+        # Default: SELECT from the first table
         return f'SELECT * FROM "{relevant[0]}" LIMIT 50;'
 
     # ---- _row_counts (_row_counts) ----

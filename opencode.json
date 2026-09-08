@@ -94,6 +94,14 @@
             "input": 1048576
           }
         },
+        "open": {
+          "name": "open (OmniRoute)",
+          "limit": {
+            "context": 1048576,
+            "output": 8192,
+            "input": 1048576
+          }
+        },
         "oc/deepseek-v4-flash-free": {
           "name": "DeepSeek V4 Flash (Free)",
           "limit": {

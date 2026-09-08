@@ -125,7 +125,7 @@ class ConstantsMixin:
         "decline", "increase", "decrease", "change", "distribution",
         "breakdown", "percentage", "share", "ratio", "monthly", "daily",
         "weekly", "yearly", "month", "year", "over", "by", "per", "overall",
-        "group", "between", "among",
+        "group", "between", "among", "total", "give", "show",
     })
 
     # ---- _PROTECTED_GOAL_WORDS (_PROTECTED_GOAL_WORDS) ----

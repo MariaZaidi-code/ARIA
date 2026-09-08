@@ -126,17 +126,21 @@ export const registerLocalUser = async (email, password) => {
   const currentEmail = normalizeEmail(email);
 
   try {
-    await authRequest("/auth/register", {
+    const data = await authRequest("/auth/register", {
       username: toBackendUsername(currentEmail),
 
       password,
     });
 
+    const username = data?.username || toBackendUsername(currentEmail);
+
+    setAuthSession(data?.token, username, currentEmail);
+
     return {
       success: true,
 
       user: {
-        id: toBackendUsername(currentEmail),
+        id: username,
 
         email: currentEmail,
       },

@@ -51,7 +51,7 @@ export default function History({ historyRefreshKey = 0, onOpenHistory, onDelete
       });
       if (res.ok) {
         const data = await res.json();
-        const mapped = (data.history || []).map((h: any) => ({
+        const mapped = (data.items || data.history || []).map((h: any) => ({
           id: String(h.id),
           type: h.source_type || "Analytics",
           title: h.goal || "Untitled analysis",
@@ -77,12 +77,23 @@ export default function History({ historyRefreshKey = 0, onOpenHistory, onDelete
   });
 
   const sorted = [...filtered].sort((a, b) => {
-    if (sort === "newest") return b.id.localeCompare(a.id);
-    if (sort === "oldest") return a.id.localeCompare(b.id);
+    const aNum = parseInt(a.id, 10) || 0;
+    const bNum = parseInt(b.id, 10) || 0;
+    if (sort === "newest") return bNum - aNum;
+    if (sort === "oldest") return aNum - bNum;
     return a.type.localeCompare(b.type);
   });
 
   const handleDelete = async (id: string) => {
+    try {
+      const token = localStorage.getItem("aria_auth_token");
+      await fetch(`/api/history/${id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch (err) {
+      console.error("Delete failed:", err);
+    }
     setDeleted((d) => [...d, id]);
     onDeleteHistory?.(id);
   };

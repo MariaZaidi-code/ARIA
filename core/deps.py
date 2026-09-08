@@ -24,20 +24,20 @@ def is_mobile(request: Request) -> bool:
 def require_provider(request: Request):
     """Fail unless an LLM provider is active in the request-scoped session."""
     session = get_session_for_request(request)
-    if not session["provider"]:
+    if not session.get("provider"):
         raise HTTPException(status_code=400, detail="Choose an LLM provider and connect a source first (POST /api/connect).")
-    return session["provider"]
+    return session.get("provider")
 
 
 def require_data(request: Request):
     """Require a provider plus a usable source (relational DB or uploaded CSV/PDF)."""
     session = get_session_for_request(request)
-    provider = session["provider"]
+    provider = session.get("provider")
     if not provider:
         raise HTTPException(status_code=400, detail="Choose an LLM provider and connect a source first (POST /api/connect).")
-    if session["source_type"] == "relational" and not session["db"]:
+    if session.get("source_type") == "relational" and not session.get("db"):
         raise HTTPException(status_code=400, detail="Connect to a relational database first (POST /api/connect).")
-    if session["source_type"] == "semi-structured" and not session["db_uri"]:
+    if session.get("source_type") == "semi-structured" and not session.get("db_uri"):
         raise HTTPException(status_code=400, detail="Upload a CSV or PDF file first (POST /api/connect_file).")
     return provider
 

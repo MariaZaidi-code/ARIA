@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core.config import STATIC_DIR, BASE_DIR  # noqa: E402
 from core.checks import run_checks  # noqa: E402
 from llm_provider import PROVIDERS  # noqa: E402
-from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, settings_routes, feedback_routes  # noqa: E402
+from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, settings_routes, feedback_routes, autocomplete_routes, data_routes  # noqa: E402
 
 app = FastAPI(title="ARIA Testing UI")
 
@@ -50,18 +50,30 @@ app.include_router(copilot_routes.router)
 app.include_router(hypothesis_routes.router)
 app.include_router(settings_routes.router)
 app.include_router(feedback_routes.router)
+app.include_router(autocomplete_routes.router)
+app.include_router(data_routes.router)
+
+from api import insights_routes
+app.include_router(insights_routes.router)
+
+from api import predictive_routes
+app.include_router(predictive_routes.router)
 
 
 @app.exception_handler(Exception)
 async def unhandled_exception(request: Request, exc: Exception):
     """Return a clean JSON 500 with guidance instead of a raw stack trace page."""
     import logging
+    import traceback
 
-    logging.getLogger("uvicorn.error").exception("Unhandled error on %s", request.url.path)
+    logger = logging.getLogger("uvicorn.error")
+    logger.exception("Unhandled error on %s", request.url.path)
+    tb = traceback.format_exc()
+    logger.error("Full traceback:\n%s", tb)
     return JSONResponse(
         status_code=500,
         content={
-            "detail": "An internal error occurred. Check the server logs for details."
+            "detail": f"An internal error occurred: {str(exc)}"
         },
     )
 
@@ -86,15 +98,6 @@ def startup_checks():
     logging.getLogger("uvicorn.error").info("ARIA startup checks complete.")
 
 
-@app.get("/")
-def index():
-    # Serve the production build if available, otherwise the Figma dev template
-    prod_index = BASE_DIR / "aria-frontend" / "dist" / "index.html"
-    if prod_index.exists():
-        return FileResponse(prod_index)
-    return FileResponse(STATIC_DIR / "index.html")
-
-
 @app.get("/api/health")
 def health():
     """Live dependency/health status for ops and the UI."""
@@ -112,7 +115,27 @@ def providers():
     }
 
 
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+# Serve the built React frontend (aria-frontend/dist/) at root
+DIST_DIR = BASE_DIR / "aria-frontend" / "dist"
+# Mount dist contents so /assets/ resolves correctly (vite builds to /assets/)
+# Use StaticFiles directly at root with html=True for SPA fallback
+from fastapi.staticfiles import StaticFiles
+app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="assets")
+# Also serve root files (favicon, index.html) via direct response
+@app.get("/")
+def index():
+    prod_index = DIST_DIR / "index.html"
+    if prod_index.exists():
+        return FileResponse(prod_index)
+    return FileResponse(STATIC_DIR / "index.html")
+
+# Fallback: any unmatched route -> index.html (SPA routing)
+@app.get("/{full_path:path}")
+def catch_all(full_path: str):
+    prod_index = DIST_DIR / "index.html"
+    if prod_index.exists():
+        return FileResponse(prod_index)
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 def _resolve_port(start_port: int = 8000, max_tries: int = 20) -> int:

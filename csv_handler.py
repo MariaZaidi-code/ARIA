@@ -273,7 +273,7 @@ class CsvSchemaExtractor:
 
         lowered = [name.casefold() for name in cleaned]
         from collections import Counter
-        lowered = [n.lower().strip() for n in self._df.columns]
+        lowered = [name.lower().strip() for name in cleaned]
         duplicates = sorted({name for name, count in Counter(lowered).items() if count > 1})
         if duplicates:
             raise CsvValidationError(

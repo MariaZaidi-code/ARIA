@@ -66,8 +66,9 @@ natural-English questions. Never mention raw table or column identifiers
 (e.g. write "customers" as a word, not customers.customer_id).
 """
         try:
+            # Short, bounded LLM call so suggestions never hang the endpoint.
             content = self.llm.chat("suggest", messages=[{"role": "user", "content": prompt}],
-                                    temperature=0.5, num_predict=300)
+                                    temperature=0.5, num_predict=300, timeout=5)
             content = re.sub(r"```json\s*", "", content)
             content = re.sub(r"```\s*", "", content)
             start, end = content.find("["), content.rfind("]")
