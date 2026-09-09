@@ -60,7 +60,12 @@ Rules:
             )
             actions = self._parse_actions(text, max_actions)
             if actions:
-                return {"actions": actions, "source": "llm"}
+                return {
+                    "actions": actions,
+                    "source": "llm",
+                    # Honesty guard (t.txt section 43): never invent financial impact.
+                    "impact_note": "Impact could not be reliably estimated from the available data.",
+                }
         except Exception as exc:
             logging.warning("Prescription LLM failed: %s. Using template actions.", exc)
 
@@ -68,6 +73,8 @@ Rules:
             "actions": self._template_actions(kpis, trends, anomalies, hypotheses,
                                               predictions, max_actions),
             "source": "template",
+            # Honesty guard (t.txt section 43): never invent financial impact.
+            "impact_note": "Impact could not be reliably estimated from the available data.",
         }
 
     @staticmethod
@@ -139,8 +146,10 @@ Rules:
                 f"(backtest accuracy {predictions['accuracy_pct']}% if shown)."
             )
         if kpis and not actions:
-            top = max(kpis, key=lambda k: k["mean"])
-            actions.append(f"Keep monitoring {top['column']} (mean {top['mean']}).")
+            valid = [k for k in kpis if isinstance(k, dict) and k.get("mean") is not None]
+            if valid:
+                top = max(valid, key=lambda k: k.get("mean", 0))
+                actions.append(f"Keep monitoring {top.get('column', 'key metric')} (mean {top.get('mean')}).")
         if not actions:
             actions.append("Continue monitoring the key metrics; no urgent action is indicated.")
         return actions[:max_actions]

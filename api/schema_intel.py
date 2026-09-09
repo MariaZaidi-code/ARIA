@@ -260,10 +260,18 @@ class SchemaIntelligence:
     def find_best_datetime(self, table: str):
         """Pick the most analytically useful datetime column."""
         dts = self.get_datetime_cols(table)
-        if not dts:
-            return None
-        # No hardcoded name preferences — just return the first datetime column
-        return dts[0]
+        if dts:
+            # No hardcoded name preferences — just return the first datetime column
+            return dts[0]
+        # Fallback for sources with weak typing (CSV dates arrive as TEXT):
+        # a text column whose NAME is date-like is usable with strftime/date_trunc.
+        date_hints = ("date", "time", "day", "month", "year", "created",
+                      "updated", "timestamp", "period")
+        for col in self.get_text_cols(table):
+            low = col.lower()
+            if any(h in low for h in date_hints):
+                return col
+        return None
 
     def find_join_path(self, from_table: str, to_table: str) -> list:
         """Find a join path using FK relationships.

@@ -79,6 +79,11 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
     session = get_session(user["user_id"])
     if request.provider not in PROVIDER_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{request.provider}'. Choose from {sorted(PROVIDER_NAMES)}.")
+    # SSRF guard: custom endpoints only over https for hosted providers.
+    # Local provider (ollama) may use loopback http; hosted must not probe internal http.
+    if request.base_url and request.provider != "local":
+        if not request.base_url.startswith("https://"):
+            raise HTTPException(status_code=400, detail="Custom base_url must use https:// (http/internal hosts blocked).")
     current = session.get("provider_name")
     if current == request.provider:
         return {"ok": True, "provider": current, "changed": False}

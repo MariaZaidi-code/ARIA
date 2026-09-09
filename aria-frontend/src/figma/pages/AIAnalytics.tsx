@@ -94,7 +94,7 @@ export default function AIAnalytics({
           body: JSON.stringify({ suggestion_text: text, source: "analytics" }),
         });
       }
-    } catch {}
+    } catch (err) { console.debug("[ARIA] background request failed:", err); }
   };
   const rateInsight = async (rating: "useful" | "not_useful") => {
     setInsightRating(rating);
@@ -111,7 +111,7 @@ export default function AIAnalytics({
           }),
         });
       }
-    } catch {}
+    } catch (err) { console.debug("[ARIA] background request failed:", err); }
   };
 
   // Determine chart type from data shape
@@ -211,15 +211,29 @@ export default function AIAnalytics({
         )}
       </div>
 
-      {/* Processing */}
+      {/* Processing — stages reflect real lifecycle milestones, never timers:
+          engine working (no result yet) vs finalizing visualization (result arrived) */}
       {state === "processing" && (
         <div className="bg-card border border-border rounded-xl p-6 flex flex-col items-center gap-5">
           <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center">
             <Loader2 size={20} className="text-primary animate-spin" />
           </div>
           <div className="text-center space-y-1">
-            <p className="text-sm font-medium text-foreground">Analyzing your question...</p>
-            <p className="text-xs text-muted-foreground">Generating SQL, executing query, and preparing results</p>
+            <p className="text-sm font-medium text-foreground">
+              {goalResult ? "Preparing visualization..." : "Understanding your question..."}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {goalResult
+                ? "Analysis received, building charts and supporting data"
+                : "Inspecting data and generating analysis against real data"}
+            </p>
+          </div>
+          <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+            <span className={goalResult ? "text-positive" : "text-primary font-medium"}>● Understand</span>
+            <span>→</span>
+            <span className={goalResult ? "text-primary font-medium" : ""}>● Visualize</span>
+            <span>→</span>
+            <span>○ Result</span>
           </div>
         </div>
       )}
@@ -417,6 +431,12 @@ export default function AIAnalytics({
                     <div className="flex gap-2">
                       <button onClick={copySQL} className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors">
                         {copied ? <><CheckCircle size={12} className="text-positive" /> Copied!</> : <><Copy size={12} /> Copy</>}
+                      </button>
+                      <button
+                        onClick={() => { const q = `Explain what this SQL query does in business terms: ${sqlUsed}`; setQuery(q); runAnalysis(q); }}
+                        className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                      >
+                        <Sparkles size={12} /> Explain
                       </button>
                     </div>
                   </div>

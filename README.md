@@ -1,74 +1,66 @@
-# ARIA Schema Agent
+# ARIA — AI Business Analytics & Intelligence Platform
 
-Fully automated — connects to your PostgreSQL database and produces `schema_mapping.json` with
-tables, columns, primary keys, declared foreign keys, null/data-quality stats, and **inferred**
-relationships (for foreign keys that aren't formally declared as constraints — common in messy,
-real-world databases).
+ARIA is a unified AI analytics system: connect **PostgreSQL / MySQL / CSV / PDF**,
+ask natural-language business questions, and get validated answers with evidence,
+provenance, visualizations, insights, forecasts, prescriptions and statistical
+hypothesis tests. One semantic layer, many product views
+(Dashboard, AI Analytics, Insights, Predictive, Prescription, Hypothesis, Data,
+Copilot, History, Settings). RL-ready: deterministic truth layer with a
+separate ranking/personalization layer (`core/rl.py`).
 
-## 1. Install dependencies
+## Quick start
 
-```
-pip install psycopg2-binary python-dotenv
-```
-
-## 2. Configure your database connection
-
-Copy `.env.example` to `.env` and fill in your real values:
-
-```
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=your_database_name
-DB_USER=postgres
-DB_PASSWORD=your_password
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # fill in DB_* + API keys (see Secrets below)
+python app.py                 # serves API + built frontend on 127.0.0.1:8000
+cd aria-frontend && npm install && npm run dev   # optional: frontend dev server
 ```
 
-## 3. Run it
+## Architecture
 
+| Layer | Location | Role |
+|---|---|---|
+| API | `app.py`, `api/` (16 routers) | FastAPI routes, auth, CORS, static serving |
+| Auth | `auth.py`, `api/auth_routes.py` | PBKDF2 passwords, HS256 JWT, per-user history |
+| Shared | `core/` | config+DPAPI secrets, session store, guards, semantic helpers (`semantic.py`), RL (`rl.py`) |
+| NL→SQL | `goal_agent/` | intent → semantic grounding → SQL contract → execution + validation |
+| Schema intel | `schema_agent/` + `schema_engine/` | introspection, PK/FK inference, drift, snapshots |
+| Insights | `insight_agent/` (+ root legacy) | trends/anomalies/correlations + chart catalog |
+| Prediction | `prediction/` | walk-forward validated forecasting (gated: refuses weak data) |
+| Prescription | `prescription_agent.py` | evidence-based actions (never invents financial impact) |
+| Hypothesis | `api/hypothesis_routes.py` | real Pearson tests, PG/MySQL/SQLite |
+| Documents | `document_processor/` | PDF text/table/OCR → chunks → embeddings (faiss) → RAG |
+| CSV | `csv_handler.py`, `csv_orchestrator.py` | validated ingestion → per-upload SQLite |
+| Frontend | `aria-frontend/src/figma/` | React 19 + Vite; `mock.ts` is a test fixture, never imported by pages |
+| Tests | `tests/` (pytest) | unit + contract tests; run `python -m pytest tests/ -q` |
+
+## Secrets
+
+API keys in `.env` are stored **DPAPI-encrypted** (`enc1:<base64>`, Windows-only) and
+decrypted transparently at startup (`core/config.py`). To encrypt a new key:
+
+```bash
+python -c "import sys; sys.path.insert(0,'.'); from core.secret_box import encrypt; print(encrypt('<KEY>'))"
 ```
-python schema_agent.py
-```
 
-That's it — no manual steps, no pgAdmin, no copy-pasting query results. It will print a summary
-and write `schema_mapping.json` in the same folder.
+Never commit `.env`, `data/.jwt_secret`, `*.db`, or token files (all gitignored).
+`TOKEN_TTL_DAYS` (default 7) and login rate limits live in `auth.py` /
+`api/auth_routes.py`. Rotate provider keys in their dashboards if ever exposed.
 
-### Optional: override connection info on the command line instead of .env
+## Key API contracts
 
-```
-python schema_agent.py --host localhost --port 5432 --db mydb --user postgres --password mypass
-```
+- `POST /api/auth/register|login` → `{ok, token, username}` (30 req / 5 min / IP)
+- `POST /api/connect_file` (multipart CSV) → `{ok, table, rows, columns, quality}`
+- `GET /api/schema`, `POST /api/data/preview` (`{table, limit, offset, search, sort_*}`)
+- `POST /api/data/schema/override` — user PK/FK corrections outrank inference
+- `POST /api/ask` → answer + `provenance {sql, tables, methodology, confidence, timestamp}`
+- `POST /api/predictive/forecast`, `POST /api/prescription/generate`, `POST /api/hypothesis`
+- `POST /api/rl/event`, `GET /api/rl/events` — RL telemetry (summaries only, never raw datasets)
 
-### Optional: point it at a different schema (default is "public")
+## Honesty rules (enforced)
 
-```
-python schema_agent.py --schema sales
-```
-
-## What it does
-
-1. Reads every table/column/data type/nullability from `information_schema.columns`
-2. Reads declared primary keys from `information_schema.table_constraints`
-3. Reads declared foreign keys the same way
-4. Computes null counts and null % for every column (real row counts, no guessing)
-5. **Heuristic inference step**: for any column that looks like a foreign key (ends in `id`)
-   but has *no* declared FK constraint, checks whether its name matches another table's primary
-   key column name (e.g. `store_id` in `sales` matching `stores.store_id`). If so, it's added
-   to `inferred_relationships` with a `"confidence": "heuristic-name-match"` tag, so you can
-   always tell a real declared relationship apart from a guessed one.
-6. Assembles everything into `schema_mapping.json`
-
-## Tested against
-
-This script was tested end-to-end against a live PostgreSQL 16 database containing a mix of:
-- Properly declared foreign keys (`sales.cust_id -> customers.cust_id`)
-- Deliberately undeclared "messy" relationships (`sales.store_id`, `inventory.prod_id`,
-  `inventory.store_id` — no FK constraints, only matching column names)
-
-The script correctly extracted both declared relationships in `declared_relationships` and
-correctly guessed all three undeclared ones in `inferred_relationships` — confirming it works on
-both clean and messy schemas.
-
-## Re-running
-
-Safe to re-run any time (e.g. after a schema change) — it simply overwrites `schema_mapping.json`
-with a fresh extraction.
+No mock data in production responses; insufficient data → clear `detail`
+(`needs_clarification` contract, `valid: false` forecasts, `ok: false` hypothesis);
+every prescription carries "Impact could not be reliably estimated…";
+document content is data, never instructions.

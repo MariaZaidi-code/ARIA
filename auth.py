@@ -19,7 +19,16 @@ import jwt
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "aria.db"
 JWT_ALGO = "HS256"
-TOKEN_TTL_DAYS = 7
+
+
+def _token_ttl_days() -> int:
+    try:
+        return max(1, int(os.getenv("TOKEN_TTL_DAYS", "7")))
+    except (TypeError, ValueError):
+        return 7
+
+
+TOKEN_TTL_DAYS = _token_ttl_days()
 PBKDF2_ITERATIONS = 120_000
 
 _USERNAME_RE = re.compile(r"[A-Za-z0-9_.-]+")

@@ -1,3 +1,6 @@
+// DEPRECATED — test fixture only (t.txt section 5/84).
+// Nothing in src/ imports this module (verified). Do NOT import it from
+// production pages; all runtime data must come from backend APIs.
 export const revenueData = [
   { month: "Jan", revenue: 842000, sales: 12400, orders: 3820, profit: 194000 },
   { month: "Feb", revenue: 910000, sales: 13800, orders: 4100, profit: 218000 },

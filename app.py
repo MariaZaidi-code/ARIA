@@ -32,6 +32,15 @@ _cors_origins = os.getenv(
     "CORS_ORIGINS",
     "http://127.0.0.1:8000,http://localhost:8000,http://localhost:5173,http://127.0.0.1:5173",
 ).split(",")
+if "*" in [o.strip() for o in _cors_origins]:
+    # "*" + allow_credentials is rejected by browsers anyway; drop it loudly
+    # rather than running an insecure no-op config.
+    import logging as _logging
+
+    _logging.getLogger("uvicorn.error").warning(
+        "CORS_ORIGINS contains '*', which is incompatible with allow_credentials; ignoring '*'."
+    )
+    _cors_origins = [o for o in _cors_origins if o.strip() != "*"] or ["http://localhost:8000"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -59,6 +68,9 @@ app.include_router(insights_routes.router)
 from api import predictive_routes
 app.include_router(predictive_routes.router)
 
+from api import rl_routes
+app.include_router(rl_routes.router)
+
 
 @app.exception_handler(Exception)
 async def unhandled_exception(request: Request, exc: Exception):
@@ -70,10 +82,11 @@ async def unhandled_exception(request: Request, exc: Exception):
     logger.exception("Unhandled error on %s", request.url.path)
     tb = traceback.format_exc()
     logger.error("Full traceback:\n%s", tb)
+    # Generic message to the client (detail is logged server-side only).
     return JSONResponse(
         status_code=500,
         content={
-            "detail": f"An internal error occurred: {str(exc)}"
+            "detail": "An internal error occurred. Check server logs for details."
         },
     )
 
@@ -118,9 +131,9 @@ def providers():
 # Serve the built React frontend (aria-frontend/dist/) at root
 DIST_DIR = BASE_DIR / "aria-frontend" / "dist"
 # Mount dist contents so /assets/ resolves correctly (vite builds to /assets/)
-# Use StaticFiles directly at root with html=True for SPA fallback
-from fastapi.staticfiles import StaticFiles
-app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="assets")
+# Guarded: missing build dir must not crash the backend (API still works).
+if (DIST_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="assets")
 # Also serve root files (favicon, index.html) via direct response
 @app.get("/")
 def index():

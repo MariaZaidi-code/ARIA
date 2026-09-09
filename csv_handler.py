@@ -271,9 +271,8 @@ class CsvSchemaExtractor:
         if any(not name for name in cleaned):
             raise CsvValidationError("CSV contains one or more blank column names.")
 
-        lowered = [name.casefold() for name in cleaned]
         from collections import Counter
-        lowered = [name.lower().strip() for name in cleaned]
+        lowered = [name.casefold().strip() for name in cleaned]
         duplicates = sorted({name for name, count in Counter(lowered).items() if count > 1})
         if duplicates:
             raise CsvValidationError(
@@ -298,7 +297,7 @@ class CsvSchemaExtractor:
             )
         except EmptyDataError as exc:
             raise CsvValidationError("CSV contains no tabular data.") from exc
-        except (ParserError, UnicodeDecodeError) as exc:
+        except (ParserError, UnicodeDecodeError, ValueError) as exc:
             raise CsvValidationError(f"CSV parsing failed: {exc}") from exc
 
         # Header whitespace is formatting noise; data values are left untouched.

@@ -67,8 +67,23 @@ class IntentMixin:
         #    column ("overall sales", "top brands by model year"). Only a vague
         #    goal with neither a grounded subject nor a resolvable metric
         #    concept + operation is ambiguous.
-        if self._has_resolvable_analytical_structure(goal_l):
+        grounded_subject = bool(tables or columns)
+        analytical = self._has_resolvable_analytical_structure(goal_l)
+        if analytical:
             return False, None
+
+        # 3-5) Anti-join / comparison / why patterns only bypass clarification
+        #    when SOMETHING is grounded. "why did sales drop" grounds via
+        #    sales->orders; but "explain the weather forecast" grounds to
+        #    nothing and must clarify instead of hallucinating SQL.
+        if not grounded_subject:
+            table_names = ", ".join(sorted(self.tables))[:300] if self.tables else "none"
+            return True, (
+                "I couldn't find a table or column in the connected database that "
+                "clearly corresponds to your question. Available data covers: "
+                f"{table_names}. Please rephrase using one of those areas (for "
+                "example 'total sales by month' or 'top products')."
+            )
 
         # 3) Anti-join / existence patterns: "never", "without", "not", "no"
         anti_patterns = ("never", "without", "not sold", "no orders",

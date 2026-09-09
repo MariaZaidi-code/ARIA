@@ -158,10 +158,12 @@ export default function Insights({
   insightResult = null,
   insightStatus = "idle",
   insightError = "",
+  onAskQuestion,
 }: {
   insightResult?: any;
   insightStatus?: string;
   insightError?: string;
+  onAskQuestion?: (question: string) => void;
 }) {
   const { isDark } = useTheme();
   const [typeFilter, setTypeFilter] = useState("All");
@@ -205,7 +207,7 @@ export default function Insights({
       if (data.ok && data.saved) {
         setSavedIds(data.saved.map((s: any) => s.insight_id));
       }
-    } catch {}
+    } catch (err) { console.debug("[ARIA] background request failed:", err); }
   }, []);
 
   useEffect(() => {
@@ -248,7 +250,7 @@ export default function Insights({
         });
         setSavedIds((s) => [...s, ins.id]);
       }
-    } catch {}
+    } catch (err) { console.debug("[ARIA] background request failed:", err); }
   };
 
   const handleShare = async (ins: Insight) => {
@@ -256,7 +258,7 @@ export default function Insights({
     if (navigator.share) {
       try {
         await navigator.share({ title: ins.title, text });
-      } catch {}
+      } catch (err) { console.debug("[ARIA] background request failed:", err); }
     } else {
       await navigator.clipboard.writeText(text);
     }
@@ -271,8 +273,13 @@ export default function Insights({
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ question, insight_id: ins.id }),
       });
-    } catch {}
-    // Store question for AI Analytics to pick up
+    } catch (err) { console.debug("[ARIA] background request failed:", err); }
+    // Primary path: run the question in AI Analytics with full context.
+    if (onAskQuestion) {
+      onAskQuestion(question);
+      return;
+    }
+    // Legacy fallback (no handler wired): prefill for AI Analytics to pick up.
     sessionStorage.setItem("aria_prefill_question", question);
     window.location.hash = "#/ai-analytics";
   };

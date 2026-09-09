@@ -263,6 +263,12 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "join_path": [{"from": j[0], "from_col": j[1], "to": j[2], "to_col": j[3]} for j in join_path] if join_path else [],
         "row_count": sql_row_count,
         "data_preview": result_data[:3] if result_data else [],
+        # Structured envelope (t.txt section 7/57 — additive keys only).
+        "methodology": processed.get("methodology", "SQL aggregation over connected source; LLM used for intent/explanation only."),
+        "confidence": proactive.get("confidence", "high"),
+        "assumptions": processed.get("assumptions", []),
+        "warnings": processed.get("warnings", []),
+        "timestamp": datetime.now().isoformat(),
     }
 
     # ── Enhanced follow-up suggestions ─────────────────────────────────

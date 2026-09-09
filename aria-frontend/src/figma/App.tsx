@@ -76,6 +76,34 @@ export default function App() {
     localStorage.setItem("aria_theme", isDark ? "dark" : "light");
   }, [isDark]);
 
+  // Validate any stored session on mount: a stale localStorage token must not
+  // skip login (audit BUG_REPORT 2026-09-07). Force login stage on 401.
+  useEffect(() => {
+    (async () => {
+      const token = localStorage.getItem("aria_auth_token");
+      if (!token) {
+        setAppStage("login");
+        return;
+      }
+      try {
+        const res = await fetch("/api/session/status", {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (res.status === 401) {
+          clearAuthSession();
+          setCurrentUser(null);
+          setAppStage("login");
+        }
+      } catch {
+        // Offline/backend down: stay on login; do not trust the stored user.
+        clearAuthSession();
+        setCurrentUser(null);
+        setAppStage("login");
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const toggleTheme = () => setIsDark((d) => !d);
 
   // ---- Connection state ----
@@ -268,6 +296,8 @@ export default function App() {
     setLoading(true);
     setGoalStatus("loading");
     setSubmittedQuestion(q);
+    setGoalResult(null);
+    setGoalError("");
     setInsightResult(null);
     try {
       // Pass multi-turn context when available (follow-up questions)
@@ -321,11 +351,61 @@ export default function App() {
   // HISTORY HANDLER
   // =========================================================
 
-  const handleOpenHistory = (session: any) => {
-    if (session?.goal) {
-      setSubmittedQuestion(session.goal);
-      setPage("analytics");
+  // Reopen a history entry WITH its result/context (t.txt section 10),
+  // not just the question text. Falls back to question-only on failure.
+  const handleOpenHistory = async (session: any) => {
+    if (!session) return;
+    const questionText = session.goal || session.title || "";
+    setSubmittedQuestion(questionText);
+    setQuestion(questionText);
+    const id = session.id;
+    if (id) {
+      try {
+        const token = localStorage.getItem("aria_auth_token");
+        const res = await fetch(`/api/history/${id}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = await res.json();
+        const rec = data?.record;
+        if (res.ok && rec) {
+          const proc = rec.processed || {};
+          setGoalResult({
+            interpretedGoal: rec.goal || questionText,
+            goalType: "analysis",
+            clarificationRequired: false,
+            clarificationMessage: "",
+            relevantTables: proc?.data_selection?.tables || [],
+            joinPlan: proc?.join_path || [],
+            generatedSql: rec.sql_used || proc?.sql_used || proc?.sql || "",
+            preprocessing: [],
+            processedDataSummary: {
+              rowCount: rec.row_count ?? 0,
+              columns: rec.columns || [],
+            },
+            nextAgent: "Insight Agent",
+            data: proc?.data || [],
+            message: proc?.message || "",
+            warnings: proc?.warnings || [],
+            proactiveInsights: [],
+            anomalies: [],
+            dataQualityWarnings: [],
+            explanation: null,
+            confidence: "high",
+            historyId: rec.id,
+            suggestedQuestions: proc?.suggested_questions || [],
+            provenance: null,
+            conversationId: null,
+            turnNumber: null,
+          });
+          setGoalStatus("success");
+          const analytics = await generateAnalyticsResult({ data: proc?.data || [] });
+          setAnalysisResult(analytics?.data || null);
+        }
+      } catch {
+        // question-only restore below
+      }
     }
+    setPage("analytics");
   };
 
   const handleDeleteHistory = (_id: string) => {
@@ -386,14 +466,25 @@ export default function App() {
                   insightResult={insightResult}
                   insightStatus={insightStatus}
                   insightError={insightError}
+                  onAskQuestion={(q) => { handleAsk(q); setPage("analytics"); }}
                 />
               );
             case "predictive":
               return <Predictive insightResult={insightResult} goalResult={goalResult} />;
             case "prescription":
-              return <Prescription insightResult={insightResult} />;
+              return (
+                <Prescription
+                  insightResult={insightResult}
+                  onAskQuestion={(q) => { handleAsk(q); setPage("analytics"); }}
+                />
+              );
             case "hypothesis":
-              return <Hypothesis insightResult={insightResult} />;
+              return (
+                <Hypothesis
+                  insightResult={insightResult}
+                  onAskQuestion={(q) => { handleAsk(q); setPage("analytics"); }}
+                />
+              );
             case "data":
               return (
                 <Data

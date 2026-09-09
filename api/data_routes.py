@@ -243,15 +243,16 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
     config, db_type, engine_url = _get_db_config(session)
     if not engine_url:
         if db_type == "sqlite" and config:
-            sqlite_path = None
-            if isinstance(config, dict):
-                for ext in (".csv",):
+            # CSV uploads store the real SQLite URI in session["db_uri"];
+            # session["db"][".csv"] is the raw CSV file, NOT a database.
+            engine_url = session.get("db_uri") or None
+            if not engine_url and isinstance(config, dict):
+                for ext in (".db", ".sqlite", ".sqlite3"):
                     if ext in config:
-                        sqlite_path = config[ext]
+                        engine_url = f"sqlite:///{config[ext]}"
                         break
-            if not sqlite_path:
+            if not engine_url:
                 return {"ok": True, "rows": [], "columns": columns, "total": 0}
-            engine_url = f"sqlite:///{sqlite_path}"
         else:
             return {"ok": True, "rows": [], "columns": columns, "total": 0}
 
@@ -602,10 +603,37 @@ class OverrideRequest(BaseModel):
 @router.post("/api/data/schema/override")
 def apply_override(req: OverrideRequest, request: Request, user: dict = Depends(require_writable)):
     """Apply a user override to the schema (PK/FK/relationship changes)."""
+    from core.semantic import is_valid_identifier
+
     session = get_session(user["user_id"])
     mapping = _get_schema_mapping(session, user["user_id"])
     if not mapping:
         raise HTTPException(status_code=400, detail="No schema extracted.")
+
+    # Identifier hygiene (t.txt section 58): never trust raw table/column strings.
+    for label, value in (
+        ("table", req.table),
+        ("column", req.column),
+        ("references_table", req.references_table),
+        ("references_column", req.references_column),
+    ):
+        if value and not is_valid_identifier(value):
+            raise HTTPException(status_code=400, detail=f"Invalid {label} name: {value!r}")
+    tables = mapping.get("tables", {})
+    if isinstance(tables, dict) and tables:
+        if req.table not in tables:
+            raise HTTPException(status_code=400, detail=f"Unknown table: {req.table!r}")
+        cols = tables[req.table].get("columns", []) if isinstance(tables[req.table], dict) else []
+        if req.column and cols:
+            if isinstance(cols, dict):
+                col_names = set(cols.keys())
+            else:
+                col_names = {
+                    (c.get("column") or c.get("name")) if isinstance(c, dict) else c
+                    for c in cols
+                }
+            if req.column not in col_names:
+                raise HTTPException(status_code=400, detail=f"Unknown column: {req.table}.{req.column}")
 
     db_name = session.get("db_name", "")
     overrides = _load_user_overrides(user["user_id"], db_name)

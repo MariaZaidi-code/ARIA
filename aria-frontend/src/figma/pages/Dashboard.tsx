@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback, useRef } from "react";
-import { ArrowUpRight, ArrowDownRight, Zap, Search, AlertTriangle, ChevronRight, RefreshCw, TrendingUp, TrendingDown, Users, ShoppingCart, Package, DollarSign, Award, BarChart3, Brain, Lightbulb, LineChart, Pill, FlaskConical, Database } from "lucide-react";
-import { AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, ResponsiveContainer, Tooltip, CartesianGrid, XAxis, YAxis } from "recharts";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { ArrowRight, ArrowUpRight, ArrowDownRight, Zap, Search, AlertTriangle, ChevronRight, RefreshCw } from "lucide-react";
+import { AreaChart, Area, BarChart, Bar, ResponsiveContainer, Tooltip, CartesianGrid, XAxis, YAxis } from "recharts";
 import { useTheme } from "../App";
 import type { Page } from "../App";
 
@@ -15,154 +15,82 @@ interface DashboardProps {
   connectionError?: string;
 }
 
-const ICON_MAP: Record<string, any> = {
-  database: Database, dollar: DollarSign, users: Users, "shopping-cart": ShoppingCart,
-  package: Package, "trending-up": TrendingUp, award: Award, "bar-chart": BarChart3,
+// Fallback suggestions when the backend has none yet (domain-neutral).
+const fallbackExamples = [
+  "What are the totals of the main measures?",
+  "Which segments appear most frequently?",
+  "Show the trend over time",
+  "Find unusual changes in the data",
+];
+
+const typeColor: Record<string, string> = {
+  Growth: "text-positive bg-positive/10",
+  Anomaly: "text-negative bg-negative/10",
+  Opportunity: "text-warning bg-warning/10",
+  Risk: "text-negative bg-negative/10",
+  Trend: "text-primary bg-primary/10",
 };
 
-const SECTION_ICONS: Record<string, any> = {
-  analytics: Brain, insights: Lightbulb, predictive: LineChart, prescription: Pill, hypothesis: FlaskConical,
+const severityDot: Record<string, string> = {
+  high: "bg-negative",
+  medium: "bg-warning",
+  low: "bg-positive",
 };
 
-const SECTION_PAGES: Record<string, Page> = {
-  analytics: "analytics", insights: "insights", predictive: "predictive",
-  prescription: "prescription", hypothesis: "hypothesis",
-};
+const fmt = (n: number, prefix = "") =>
+  n >= 1_000_000
+    ? `${prefix}${(n / 1_000_000).toFixed(2)}M`
+    : n >= 1_000
+    ? `${prefix}${(n / 1_000).toFixed(1)}K`
+    : `${prefix}${Number(n).toLocaleString()}`;
 
-const SECTION_COLORS: Record<string, string> = {
-  analytics: "#4F46E5", insights: "#059669", predictive: "#F59E0B",
-  prescription: "#EC4899", hypothesis: "#8B5CF6",
-};
-
-function AnimatedKPICard({ kpi, index }: { kpi: any; index: number }) {
-  const [mounted, setMounted] = useState(false);
-  const [sparkData, setSparkData] = useState<{ v: number }[]>([]);
-  const Icon = ICON_MAP[kpi.icon] || TrendingUp;
-  const positive = (kpi.change || 0) >= 0;
-  const color = kpi.color || "#4F46E5";
-  const rawValue = typeof kpi.rawValue === "number" ? kpi.rawValue : parseFloat(String(kpi.value).replace(/[^0-9eE.+-]/g, "")) || 0;
-
-  useEffect(() => {
-    const t = setTimeout(() => setMounted(true), index * 80);
-    return () => clearTimeout(t);
-  }, [index]);
-
-  useEffect(() => {
-    if (!mounted) return;
-    const base = rawValue;
-    const points = 20;
-    const data: { v: number }[] = [];
-    for (let i = 0; i < points; i++) {
-      const progress = i / (points - 1);
-      const trend = positive ? 1 + progress * 0.3 : 1 - progress * 0.2;
-      const noise = 1 + (Math.sin(i * 1.7 + index) * 0.08);
-      data.push({ v: base * trend * noise * (0.85 + Math.random() * 0.15) });
-    }
-    setSparkData(data);
-  }, [mounted, rawValue, positive, index]);
-
-  const formatValue = (v: number) => {
-    if (kpi.format === "currency") {
-      if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(2)}M`;
-      if (v >= 1_000) return `$${(v / 1_000).toFixed(1)}K`;
-      return `$${v.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
-    }
-    if (kpi.format === "text") return String(kpi.value);
-    if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
-    if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;
-    return v.toLocaleString();
-  };
-
+function MetricCard({ kpi }: { kpi: any }) {
+  const rawValue = typeof kpi.rawValue === "number"
+    ? kpi.rawValue
+    : parseFloat(String(kpi.value).replace(/[^0-9eE.+-]/g, "")) || 0;
+  const change = Number(kpi.change) || 0;
+  const positive = change >= 0;
+  const prefix = kpi.format === "currency" ? "$" : "";
+  // Real sparkline only: backend-provided points, otherwise no sparkline (never fake).
+  const spark = Array.isArray(kpi.spark) && kpi.spark.length > 1
+    ? kpi.spark.map((v: any) => ({ v: Number(v) || 0 }))
+    : Array.isArray(kpi.trend) && kpi.trend.length > 1
+      ? kpi.trend.map((v: any) => ({ v: Number(v?.value ?? v) || 0 }))
+      : [];
   return (
-    <div
-      className={`premium-card bg-card border border-border rounded-xl p-4 flex flex-col gap-2 cursor-default overflow-hidden relative transition-all duration-500 ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-3"}`}
-      style={{ transitionDelay: `${index * 80}ms` }}
-    >
-      {sparkData.length > 0 && (
-        <div className="absolute inset-0 opacity-[0.06] pointer-events-none">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={sparkData}>
-              <defs>
-                <linearGradient id={`spark-bg-${index}`} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={color} stopOpacity={1} />
-                  <stop offset="100%" stopColor={color} stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <Area type="monotone" dataKey="v" stroke="none" fill={`url(#spark-bg-${index})`} />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-      <div className="flex items-center justify-between relative z-10">
-        <div className="flex items-center gap-1.5">
-          <div className="w-6 h-6 rounded-md flex items-center justify-center" style={{ background: `${color}18` }}>
-            <Icon size={12} style={{ color }} />
-          </div>
-          <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">{kpi.label}</p>
-        </div>
-        {kpi.change !== 0 && kpi.format !== "text" && (
-          <span className={`flex items-center gap-0.5 text-[11px] font-semibold px-1.5 py-0.5 rounded-full ${positive ? "text-positive bg-positive/10" : "text-negative bg-negative/10"}`}>
-            {positive ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
-            {Math.abs(kpi.change)}%
-          </span>
-        )}
-      </div>
-      <p className="text-[22px] font-bold text-foreground tracking-tight relative z-10">
-        {kpi.format === "text" ? kpi.value : formatValue(rawValue)}
-      </p>
-      {sparkData.length > 0 && (
-        <div className="h-8 -mx-1 relative z-10">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={sparkData}>
-              <defs>
-                <linearGradient id={`spark-${index}`} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor={color} stopOpacity={0.25} />
-                  <stop offset="95%" stopColor={color} stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <Area type="monotone" dataKey="v" stroke={color} strokeWidth={1.5} fill={`url(#spark-${index})`} dot={false} />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-      <p className="text-[10px] text-muted-foreground relative z-10">{kpi.period || "All time"}</p>
-    </div>
-  );
-}
-
-function SectionCard({ section, setPage }: { section: any; setPage: (p: Page) => void }) {
-  const [mounted, setMounted] = useState(false);
-  const Icon = SECTION_ICONS[section.type] || Brain;
-  const color = SECTION_COLORS[section.type] || "#4F46E5";
-
-  useEffect(() => {
-    const t = setTimeout(() => setMounted(true), 100);
-    return () => clearTimeout(t);
-  }, []);
-
-  return (
-    <div className={`premium-card bg-card border border-border rounded-xl p-4 flex flex-col gap-3 transition-all duration-500 ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-3"}`}>
+    <div className="bg-card border border-border rounded-xl p-5 flex flex-col gap-3 hover:shadow-sm transition-shadow">
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <div className="w-7 h-7 rounded-lg flex items-center justify-center" style={{ background: `${color}15` }}>
-            <Icon size={14} style={{ color }} />
-          </div>
-          <p className="text-sm font-semibold text-foreground">{section.title}</p>
-        </div>
-        {section.metric && (
-          <span className="text-xs font-bold px-2 py-0.5 rounded-full" style={{ color, background: `${color}12` }}>
-            {section.metric}
+        <p className="text-xs font-medium text-muted-foreground">{kpi.label}</p>
+        {change !== 0 && kpi.format !== "text" && (
+          <span className={`flex items-center gap-0.5 text-xs font-medium ${positive ? "text-positive" : "text-negative"}`}>
+            {positive ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}
+            {Math.abs(change)}%
           </span>
         )}
       </div>
-      <p className="text-xs text-muted-foreground leading-relaxed line-clamp-2">{section.description}</p>
-      <button
-        onClick={() => setPage(SECTION_PAGES[section.type] || "analytics")}
-        className="self-start text-xs font-semibold px-3 py-1.5 rounded-lg transition-all hover:opacity-80"
-        style={{ color, background: `${color}12`, border: `1px solid ${color}25` }}
-      >
-        Thorough Analysis
-      </button>
+      <p className="text-2xl font-semibold text-foreground tracking-tight">
+        {kpi.format === "text" ? String(kpi.value) : fmt(rawValue, prefix)}
+      </p>
+      {spark.length > 0 && (
+        <div className="h-10">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={spark}>
+              <defs>
+                <linearGradient id={`grad-${kpi.id || kpi.label}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor={positive ? "var(--positive)" : "var(--negative)"} stopOpacity={0.2} />
+                  <stop offset="95%" stopColor={positive ? "var(--positive)" : "var(--negative)"} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <Area
+                type="monotone" dataKey="v"
+                stroke={positive ? "var(--positive)" : "var(--negative)"}
+                strokeWidth={1.5} fill={`url(#grad-${kpi.id || kpi.label})`} dot={false}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+      <p className="text-xs text-muted-foreground">{kpi.period || "All time"}</p>
     </div>
   );
 }
@@ -182,7 +110,6 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
   const grid = isDark ? "#2A2A35" : "#E5E7EB";
   const axis = isDark ? "#8889A0" : "#9CA3AF";
 
-  // Track suggestion clicks for personalization (Section 62)
   const trackSuggestionClick = async (text: string) => {
     try {
       const token = localStorage.getItem("aria_auth_token");
@@ -193,7 +120,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           body: JSON.stringify({ suggestion_text: text, source: "dashboard" }),
         });
       }
-    } catch {}
+    } catch (err) { console.debug("[ARIA] background request failed:", err); }
   };
 
   const fetchConfig = useCallback(async () => {
@@ -254,20 +181,27 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     if (q) { onAsk?.(q); setPage("analytics"); }
   };
 
+  const askExample = (q: string) => {
+    trackSuggestionClick(q);
+    setQuery(q);
+    onAsk?.(q);
+    setPage("analytics");
+  };
+
   if (connectionStatus !== "connected") {
     return (
       <div className="p-6 max-w-screen-xl mx-auto">
-        <div className="text-center py-20 animate-fade-in">
+        <div className="text-center py-20">
           <div className="w-16 h-16 rounded-2xl mx-auto mb-5 flex items-center justify-center" style={{ background: "var(--gradient-primary)" }}>
             <Search size={24} className="text-white" />
           </div>
-          <h2 className="text-2xl font-bold text-foreground mb-2">
+          <h2 className="text-2xl font-semibold text-foreground tracking-tight mb-2">
             {connectionStatus === "failed" ? "Connection Failed" : "Connect a Data Source"}
           </h2>
           <p className="text-sm text-muted-foreground mb-4 max-w-sm mx-auto">
             {connectionStatus === "failed" && connectionError ? connectionError : "Get started by connecting your database to unlock AI-powered insights."}
           </p>
-          <button onClick={() => setPage("data")} className="premium-btn btn-glow px-6 py-2.5 rounded-xl text-sm font-semibold text-white transition-all" style={{ background: "var(--gradient-primary)" }}>
+          <button onClick={() => setPage("data")} className="px-6 py-2.5 rounded-xl text-sm font-semibold text-white transition-all" style={{ background: "var(--gradient-primary)" }}>
             Connect Now
           </button>
         </div>
@@ -275,25 +209,37 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     );
   }
 
-  const metrics = config?.metrics || [];
-  const charts = config?.visualizations || [];
-  const sections = config?.sections || [];
-  const recommendations = config?.recommendations || [];
+  const metrics: any[] = config?.metrics || [];
+  const charts: any[] = config?.visualizations || [];
+  const recommendations: any[] = config?.recommendations || [];
   const summary = config?.summary || {};
-  const quality = config?.quality || {};
-  const insights = insightResult?.keyInsights || insightResult?.insights || [];
+  const rawInsights: any[] = insightResult?.keyInsights || insightResult?.insights || [];
+  const anomalies: any[] = insightResult?.anomalies || analysisResult?.anomalies || [];
+  const exampleQuestions = recommendations.length > 0
+    ? recommendations.slice(0, 4).map((r: any) => typeof r === "string" ? r : r.question)
+    : fallbackExamples;
+  const recommendedCards = recommendations.length > 0
+    ? recommendations.slice(0, 4).map((r: any, i: number) => ({
+        q: typeof r === "string" ? r : r.question,
+        tag: (typeof r === "object" && r.tag) || ["Analysis", "Trend", "Forecast", "Segments"][i % 4],
+      }))
+    : fallbackExamples.map((q, i) => ({ q, tag: ["Analysis", "Trend", "Segments", "Overview"][i % 4] }));
+
+  const hour = new Date().getHours();
+  const greeting = `Good ${hour < 12 ? "morning" : hour < 18 ? "afternoon" : "evening"}, ${user?.email?.split("@")[0] || "there"}`;
+
+  const areaChart = charts.find((c: any) => ["area", "line"].includes(c.type)) || charts[0];
+  const barChart = charts.find((c: any) => c.type === "bar" && c !== areaChart) || charts[1];
 
   return (
     <div className="p-6 max-w-screen-xl mx-auto space-y-8">
-      {/* Greeting + Search */}
-      <div className="space-y-4 animate-fade-in">
+      {/* Greeting + Query */}
+      <div className="space-y-4">
         <div className="flex items-start justify-between gap-4 flex-wrap">
           <div>
-            <h2 className="text-2xl font-bold text-foreground tracking-tight">
-              Good {new Date().getHours() < 12 ? "morning" : new Date().getHours() < 18 ? "afternoon" : "evening"}, {user?.email?.split("@")[0] || "User"}
-            </h2>
-            <p className="text-sm text-muted-foreground mt-1">
-              {summary.title || (dbName ? `Here's what ARIA found in ${dbName}.` : "Here's what ARIA found in your data.")}
+            <h2 className="text-2xl font-semibold text-foreground tracking-tight">{greeting}</h2>
+            <p className="text-sm text-muted-foreground mt-0.5">
+              {summary.title || (dbName ? `Here's what ARIA found in ${dbName}.` : "Here's what ARIA found in your business data.")}
             </p>
             {summary.totalRows > 0 && (
               <p className="text-xs text-muted-foreground mt-0.5">
@@ -310,26 +256,25 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           </div>
         </div>
 
-        {/* Search bar */}
         <div className="relative">
-          <div className="flex items-center gap-3 bg-card border border-border rounded-xl px-4 py-3 focus-within:border-primary/50 focus-within:shadow-[0_0_0_3px_var(--primary-light)] transition-all duration-200" style={{ boxShadow: "var(--shadow-sm)" }}>
+          <div className="flex items-center gap-3 bg-card border border-border rounded-xl px-4 py-3.5 focus-within:border-primary transition-colors shadow-sm">
             <Search size={16} className="text-muted-foreground flex-shrink-0" />
             <input ref={inputRef} value={query} onChange={(e) => setQuery(e.target.value)}
               onFocus={() => setShowSuggestions(true)}
               onBlur={() => setTimeout(() => setShowSuggestions(false), 200)}
               onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
-              placeholder="Ask ARIA anything about your data..."
+              placeholder="Ask ARIA anything about your business..."
               className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none" />
             <button onClick={handleSubmit}
-              className="premium-btn btn-glow flex-shrink-0 px-4 py-1.5 rounded-lg text-xs font-semibold text-white transition-all"
-              style={{ background: "var(--gradient-primary)" }}>
+              className="flex-shrink-0 bg-primary text-primary-foreground px-3 py-1.5 rounded-lg text-xs font-medium hover:opacity-90 transition-opacity">
               Ask
             </button>
           </div>
-          {showSuggestions && (query.length > 0 ? suggestions.length > 0 : recommendations.length > 0) && (
-            <div className="absolute top-full left-0 right-0 mt-2 bg-card border border-border rounded-xl shadow-lg py-1 z-20 max-h-[260px] overflow-y-auto">
-              {(query.length > 0 ? suggestions : recommendations.map((r: any) => r.question)).map((s: string, i: number) => (
-                <button key={s + i} onMouseDown={() => { trackSuggestionClick(s); setQuery(s); onAsk?.(s); setPage("analytics"); }}
+
+          {showSuggestions && (query.length > 0 ? suggestions.length > 0 : exampleQuestions.length > 0) && (
+            <div className="absolute top-full left-0 right-0 mt-2 bg-card border border-border rounded-xl shadow-lg py-1.5 z-20 max-h-[260px] overflow-y-auto">
+              {(query.length > 0 ? suggestions : exampleQuestions).map((s: string, i: number) => (
+                <button key={s + i} onMouseDown={() => askExample(s)}
                   className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-foreground hover:bg-secondary transition-colors text-left">
                   <Zap size={13} className="text-primary flex-shrink-0" />
                   <span className="truncate">{s}</span>
@@ -339,38 +284,35 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           )}
         </div>
 
-        {/* Recommendations from backend */}
-        {recommendations.length > 0 && (
-          <div className="flex flex-wrap gap-2">
-            {recommendations.slice(0, 6).map((r: any, i: number) => (
-              <button key={r.id || i} onClick={() => { setQuery(r.question); onAsk?.(r.question); setPage("analytics"); }}
-                className="text-xs px-3 py-1.5 rounded-full bg-secondary hover:bg-secondary/70 text-muted-foreground hover:text-foreground transition-colors border border-border">
-                {r.question}
-              </button>
-            ))}
-          </div>
-        )}
+        <div className="flex flex-wrap gap-2">
+          {exampleQuestions.map((ex) => (
+            <button key={ex} onClick={() => askExample(ex)}
+              className="text-xs px-3 py-1.5 rounded-full bg-secondary hover:bg-secondary/80 text-muted-foreground hover:text-foreground transition-colors border border-border">
+              {ex}
+            </button>
+          ))}
+        </div>
       </div>
 
       {error && <div className="bg-negative/10 border border-negative/30 text-negative text-sm rounded-xl px-4 py-2">{error}</div>}
 
-      {/* KPI Cards — backend-driven, no hardcoded logic */}
+      {/* KPI Cards */}
       <section className="space-y-3">
-        <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Key Metrics</h3>
+        <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Business Overview</h3>
         {loading && metrics.length === 0 ? (
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
             {[1, 2, 3, 4, 5].map((i) => (
-              <div key={i} className="bg-card border border-border rounded-xl p-4 animate-pulse">
+              <div key={i} className="bg-card border border-border rounded-xl p-5 animate-pulse">
                 <div className="h-3 bg-secondary rounded w-16 mb-3" />
-                <div className="h-6 bg-secondary rounded w-24 mb-2" />
-                <div className="h-8 bg-secondary rounded w-full" />
+                <div className="h-7 bg-secondary rounded w-24 mb-2" />
+                <div className="h-10 bg-secondary rounded w-full" />
               </div>
             ))}
           </div>
         ) : metrics.length > 0 ? (
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-            {metrics.slice(0, 5).map((kpi: any, i: number) => (
-              <AnimatedKPICard key={kpi.id} kpi={kpi} index={i} />
+            {metrics.slice(0, 5).map((kpi: any) => (
+              <MetricCard key={kpi.id || kpi.label} kpi={kpi} />
             ))}
           </div>
         ) : (
@@ -378,112 +320,179 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
         )}
       </section>
 
-      {/* Charts — backend-driven */}
-      {charts.length > 0 && (
-        <section className="space-y-3">
-          <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Visualizations</h3>
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {charts.slice(0, 2).map((chart: any, ci: number) => (
-              <div key={chart.id || ci} className="premium-card bg-card border border-border rounded-xl p-5 cursor-default">
-                <div className="flex items-center justify-between mb-4">
-                  <p className="text-sm font-semibold text-foreground">{chart.title}</p>
-                </div>
-                {chart.type === "area" || chart.type === "bar" ? (
-                  <ResponsiveContainer width="100%" height={200}>
-                    {chart.type === "area" ? (
-                      <AreaChart data={chart.data}>
-                        <defs>
-                          <linearGradient id={`chartGrad-${ci}`} x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%" stopColor="var(--primary)" stopOpacity={0.15} />
-                            <stop offset="95%" stopColor="var(--primary)" stopOpacity={0} />
-                          </linearGradient>
-                        </defs>
-                        <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
-                        <XAxis dataKey={chart.xKey || "period"} tick={{ fontSize: 10, fill: axis }} axisLine={false} tickLine={false} />
-                        <YAxis tick={{ fontSize: 10, fill: axis }} axisLine={false} tickLine={false} width={55} tickFormatter={(v) => chart.format === "currency" ? `$${(v / 1000).toFixed(0)}K` : v.toLocaleString()} />
-                        <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 11 }} labelStyle={{ color: "var(--foreground)", fontWeight: 600 }} formatter={(v: any) => [chart.format === "currency" ? `$${Number(v).toLocaleString()}` : Number(v).toLocaleString(), ""]} />
-                        <Area type="monotone" dataKey={chart.dataKey || "value"} stroke="var(--primary)" strokeWidth={2} fill={`url(#chartGrad-${ci})`} dot={false} />
-                      </AreaChart>
-                    ) : (
-                      <BarChart data={chart.data} barSize={28}>
-                        <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
-                        <XAxis dataKey={chart.xKey || "name"} tick={{ fontSize: 9, fill: axis }} axisLine={false} tickLine={false} />
-                        <YAxis tick={{ fontSize: 10, fill: axis }} axisLine={false} tickLine={false} width={55} tickFormatter={(v) => chart.format === "currency" ? `$${(v / 1000).toFixed(0)}K` : v.toLocaleString()} />
-                        <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 11 }} labelStyle={{ color: "var(--foreground)", fontWeight: 600 }} formatter={(v: any) => [chart.format === "currency" ? `$${Number(v).toLocaleString()}` : Number(v).toLocaleString(), ""]} />
-                        <Bar dataKey={chart.dataKey || "value"} fill="var(--primary)" radius={[4, 4, 0, 0]} />
-                      </BarChart>
-                    )}
-                  </ResponsiveContainer>
-                ) : chart.type === "donut" ? (
-                  <ResponsiveContainer width="100%" height={200}>
-                    <PieChart>
-                      <Pie data={chart.data} cx="50%" cy="50%" innerRadius={55} outerRadius={85} dataKey="value" paddingAngle={2}>
-                        {chart.data.map((entry: any, i: number) => (
-                          <Cell key={i} fill={entry.fill || "#4F46E5"} />
-                        ))}
-                      </Pie>
-                      <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 11 }} formatter={(v: any) => [Number(v).toLocaleString(), ""]} />
-                    </PieChart>
-                  </ResponsiveContainer>
-                ) : (
-                  <div className="h-[200px] flex items-center justify-center text-muted-foreground text-xs">No data available</div>
-                )}
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {/* ARIA Intelligence — backend-driven sections */}
-      {sections.length > 0 && (
-        <section className="space-y-3">
+      {/* AI Highlights */}
+      <section className="space-y-3">
+        <div className="flex items-center justify-between">
           <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">ARIA Intelligence</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {sections.map((section: any, idx: number) => (
-              <SectionCard key={idx} section={section} setPage={setPage} />
-            ))}
-          </div>
-        </section>
-      )}
-
-      {/* Fallback: show insightResult if no sections yet */}
-      {sections.length === 0 && insights.length > 0 && (
-        <section className="space-y-3">
-          <div className="flex items-center justify-between">
-            <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">ARIA Intelligence</h3>
-            <button onClick={() => setPage("insights")} className="text-xs text-primary hover:underline flex items-center gap-1 font-medium">View all <ChevronRight size={12} /></button>
-          </div>
+          <button onClick={() => setPage("insights")} className="text-xs text-primary hover:underline flex items-center gap-1">
+            View all <ChevronRight size={12} />
+          </button>
+        </div>
+        {rawInsights.length > 0 ? (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {insights.slice(0, 4).map((ins: any, idx: number) => (
-              <div key={idx} className="premium-card bg-card border border-border rounded-xl p-4 flex gap-3">
-                <div className="mt-1 w-2 h-2 rounded-full flex-shrink-0 bg-primary" />
-                <div className="flex-1 min-w-0 space-y-1">
-                  <p className="text-sm font-medium text-foreground leading-snug">{ins.title}</p>
-                  <p className="text-xs text-muted-foreground leading-relaxed line-clamp-2">{ins.description}</p>
+            {rawInsights.slice(0, 4).map((ins: any, i: number) => (
+              <div key={ins.id || i} className="bg-card border border-border rounded-xl p-4 hover:shadow-sm transition-shadow flex gap-4">
+                <div className={`mt-0.5 w-2 h-2 rounded-full flex-shrink-0 ${severityDot[ins.severity] || "bg-primary"}`} />
+                <div className="flex-1 min-w-0 space-y-1.5">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="text-sm font-medium text-foreground leading-snug">{ins.title || "Insight"}</p>
+                    {(ins.type || ins.category) && (
+                      <span className={`flex-shrink-0 text-xs font-medium px-2 py-0.5 rounded-full ${typeColor[ins.type] || typeColor[ins.category] || "text-muted-foreground bg-secondary"}`}>
+                        {ins.type || ins.category}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground leading-relaxed line-clamp-2">{ins.description || ins.explanation || ""}</p>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                      {ins.magnitude && <span className="font-semibold text-foreground">{ins.magnitude}</span>}
+                      {ins.confidence && <span>{ins.confidence}{String(ins.confidence).includes("%") ? "" : "%"} confidence</span>}
+                    </div>
+                    <button onClick={() => setPage("insights")} className="text-xs text-primary hover:underline flex items-center gap-0.5">
+                      Explore <ArrowRight size={11} />
+                    </button>
+                  </div>
                 </div>
               </div>
             ))}
           </div>
+        ) : (
+          <div className="bg-card border border-border rounded-xl p-6 text-center text-muted-foreground text-sm">Insights will appear after analysis.</div>
+        )}
+      </section>
+
+      {/* Charts */}
+      {(areaChart || barChart) && (
+        <section className="space-y-3">
+          <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Analytics Overview</h3>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {areaChart && (
+              <div className="bg-card border border-border rounded-xl p-5">
+                <div className="flex items-center justify-between mb-5">
+                  <div>
+                    <p className="text-sm font-semibold text-foreground">{areaChart.title || "Trend"}</p>
+                    {areaChart.subtitle && <p className="text-xs text-muted-foreground mt-0.5">{areaChart.subtitle}</p>}
+                  </div>
+                </div>
+                <ResponsiveContainer width="100%" height={180}>
+                  <AreaChart data={areaChart.data || []}>
+                    <defs>
+                      <linearGradient id="dashAreaGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="var(--primary)" stopOpacity={0.2} />
+                        <stop offset="95%" stopColor="var(--primary)" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
+                    <XAxis dataKey={areaChart.xKey || "period"} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
+                    <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={48} />
+                    <Tooltip
+                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
+                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
+                      itemStyle={{ color: "var(--muted-foreground)" }}
+                    />
+                    <Area type="monotone" dataKey={areaChart.dataKey || "value"} stroke="var(--primary)" strokeWidth={2} fill="url(#dashAreaGrad)" dot={false} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+            {barChart && (
+              <div className="bg-card border border-border rounded-xl p-5">
+                <div className="flex items-center justify-between mb-5">
+                  <div>
+                    <p className="text-sm font-semibold text-foreground">{barChart.title || "Breakdown"}</p>
+                    {barChart.subtitle && <p className="text-xs text-muted-foreground mt-0.5">{barChart.subtitle}</p>}
+                  </div>
+                </div>
+                <ResponsiveContainer width="100%" height={180}>
+                  <BarChart data={barChart.data || []} barSize={28}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
+                    <XAxis dataKey={barChart.xKey || "name"} tick={{ fontSize: 10, fill: axis }} axisLine={false} tickLine={false} />
+                    <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={52} />
+                    <Tooltip
+                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
+                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
+                      itemStyle={{ color: "var(--muted-foreground)" }}
+                    />
+                    <Bar dataKey={barChart.dataKey || "value"} fill="var(--primary)" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </div>
         </section>
       )}
+
+      {/* Anomalies */}
+      <section className="space-y-3">
+        <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2">
+          <AlertTriangle size={12} /> Detected Anomalies
+        </h3>
+        {anomalies.length > 0 ? (
+          <div className="bg-card border border-border rounded-xl overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-border">
+                  <th className="text-left text-xs font-medium text-muted-foreground px-5 py-3">Metric</th>
+                  <th className="text-left text-xs font-medium text-muted-foreground px-5 py-3">Date</th>
+                  <th className="text-left text-xs font-medium text-muted-foreground px-5 py-3">Deviation</th>
+                  <th className="text-left text-xs font-medium text-muted-foreground px-5 py-3 hidden md:table-cell">Explanation</th>
+                  <th className="text-left text-xs font-medium text-muted-foreground px-5 py-3">Severity</th>
+                </tr>
+              </thead>
+              <tbody>
+                {anomalies.map((a: any, i: number) => (
+                  <tr key={a.id || i} className={`${i < anomalies.length - 1 ? "border-b border-border" : ""} hover:bg-secondary/40 transition-colors`}>
+                    <td className="px-5 py-3 font-medium text-foreground text-sm">{a.metric || a.column || "—"}</td>
+                    <td className="px-5 py-3 text-muted-foreground text-sm">{a.date || a.detected || "—"}</td>
+                    <td className="px-5 py-3">
+                      <span className="text-sm font-semibold text-foreground">{a.deviation || a.magnitude || `${a.z_score ?? ""}`}</span>
+                    </td>
+                    <td className="px-5 py-3 text-muted-foreground text-xs leading-relaxed hidden md:table-cell max-w-xs truncate">{a.explanation || a.description || ""}</td>
+                    <td className="px-5 py-3">
+                      <span className={`text-xs font-medium px-2 py-0.5 rounded-full capitalize
+                        ${a.severity === "high" ? "text-negative bg-negative/10" : a.severity === "medium" ? "text-warning bg-warning/10" : "text-positive bg-positive/10"}`}>
+                        {a.severity || "low"}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="bg-card border border-border rounded-xl p-5 text-center text-muted-foreground text-sm">No anomalies detected in the current data.</div>
+        )}
+      </section>
+
+      {/* Recommended Questions */}
+      <section className="space-y-3 pb-4">
+        <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Recommended Questions</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {recommendedCards.map(({ q, tag }) => (
+            <button key={q}
+              onClick={() => askExample(q)}
+              className="flex items-center justify-between bg-card border border-border rounded-xl px-4 py-3.5 hover:border-primary/40 hover:shadow-sm transition-all text-left group">
+              <div className="space-y-1">
+                <p className="text-sm text-foreground group-hover:text-primary transition-colors">{q}</p>
+                <span className="text-xs text-muted-foreground bg-secondary px-2 py-0.5 rounded-full">{tag}</span>
+              </div>
+              <ArrowRight size={14} className="text-muted-foreground group-hover:text-primary transition-colors ml-3 flex-shrink-0" />
+            </button>
+          ))}
+        </div>
+      </section>
 
       {/* Data Quality */}
-      {quality.score > 0 && quality.score < 100 && quality.issues?.length > 0 && (
-        <section className="space-y-3">
+      {config?.quality && Object.keys(config.quality).length > 0 && (
+        <section className="space-y-3 pb-4">
           <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Data Quality</h3>
-          <div className="premium-card bg-card border border-border rounded-xl p-5">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="text-2xl font-bold text-foreground">{quality.score}%</div>
-              <div className="text-xs text-muted-foreground">Quality Score</div>
-            </div>
-            <div className="space-y-2">
-              {quality.issues.slice(0, 5).map((issue: any, i: number) => (
-                <div key={i} className="flex items-center gap-2 text-xs">
-                  <div className={`w-1.5 h-1.5 rounded-full ${issue.severity === "critical" ? "bg-negative" : "bg-yellow-500"}`} />
-                  <span className="text-muted-foreground">{issue.field}: {issue.issue}</span>
-                </div>
-              ))}
-            </div>
+          <div className="bg-card border border-border rounded-xl p-5 text-sm text-muted-foreground">
+            {Object.entries(config.quality).slice(0, 6).map(([k, v]: [string, any]) => (
+              <div key={k} className="flex items-center justify-between py-1.5 border-b border-border last:border-0">
+                <span className="capitalize">{k.replace(/_/g, " ")}</span>
+                <span className="font-semibold text-foreground">{typeof v === "number" ? v.toLocaleString() : String(v)}</span>
+              </div>
+            ))}
           </div>
         </section>
       )}

@@ -52,6 +52,51 @@ def _fmt_pct(v):
 
 # ── Insight Detection Engine ─────────────────────────────────────────────
 
+def _translate_sql_for_sqlite(sql: str) -> str:
+    """Translate the PG-isms used by InsightsEngine detectors to SQLite."""
+    import re as _re
+
+    sql = _re.sub(
+        r"date_trunc\(\s*'month'\s*,\s*(.*?)\)",
+        r"strftime('%Y-%m', \1)",
+        sql,
+        flags=_re.IGNORECASE,
+    )
+    return sql.replace("%s", "?")
+
+
+class _SQLiteCursor:
+    """Wrap a sqlite3 cursor so InsightsEngine's PG-style calls work."""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql, params=()):
+        return self._cur.execute(_translate_sql_for_sqlite(sql), params or ())
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class _SQLiteCompatConnection:
+    """Wrap a sqlite3 connection with the DB-API surface InsightsEngine uses."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _SQLiteCursor(self._conn.cursor())
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 class InsightsEngine:
     """Detect real insights from any connected database. Fully dynamic.
 
@@ -875,42 +920,60 @@ def get_insights(request: Request, user: dict = Depends(require_writable)):
     from core.secret_box import decrypt as _decrypt_secret
     db_config = dict(session.get("db") or {})
     db_type = session.get("db_type", "postgresql")
-    if not db_config or session.get("source_type") != "relational":
-        raise HTTPException(status_code=400, detail="Insights require a connected relational database.")
-    if db_config.get("password"):
-        try:
-            db_config["password"] = _decrypt_secret(db_config["password"])
-        except Exception:
-            pass
+    if not db_config:
+        raise HTTPException(status_code=400, detail="No database configuration found.")
 
-    if db_type == "mysql":
+    conn = None
+    sqlite_compat = False
+    if session.get("source_type") != "relational" or db_type in ("sqlite", "document"):
+        # CSV-backed SQLite sources: run the same detectors against the .db file.
+        db_uri = session.get("db_uri") or ""
+        if not db_uri.startswith("sqlite:///"):
+            raise HTTPException(status_code=400, detail="Insights require a connected database.")
+        import sqlite3 as _sqlite3
+
         try:
-            import pymysql
-            conn = pymysql.connect(
-                host=db_config.get("host", "localhost"),
-                port=int(db_config.get("port", 3306)),
-                user=db_config.get("user"),
-                password=db_config.get("password"),
-                database=db_config.get("db"),
-                charset="utf8mb4",
-                connect_timeout=10,
-            )
+            conn = _SQLiteCompatConnection(_sqlite3.connect(db_uri[len("sqlite:///"):]))
+            sqlite_compat = True
         except Exception:
-            raise HTTPException(status_code=500, detail="Could not connect to database.")
-    else:
-        try:
-            import psycopg2
-            conn = psycopg2.connect(
-                host=db_config.get("host", "localhost"),
-                port=int(db_config.get("port", 5432)),
-                dbname=db_config.get("db"),
-                user=db_config.get("user"),
-                password=db_config.get("password"),
-                options=f"-c search_path={db_config.get('db_schema', 'public')}",
-                connect_timeout=10,
-            )
-        except Exception:
-            raise HTTPException(status_code=500, detail="Could not connect to database.")
+            raise HTTPException(status_code=500, detail="Could not open the connected database file.")
+    if conn is None and not db_config:
+        raise HTTPException(status_code=400, detail="Insights require a connected relational database.")
+    if conn is None:
+        if db_config.get("password"):
+            try:
+                db_config["password"] = _decrypt_secret(db_config["password"])
+            except Exception:
+                pass
+
+        if db_type == "mysql":
+            try:
+                import pymysql
+                conn = pymysql.connect(
+                    host=db_config.get("host", "localhost"),
+                    port=int(db_config.get("port", 3306)),
+                    user=db_config.get("user"),
+                    password=db_config.get("password"),
+                    database=db_config.get("db"),
+                    charset="utf8mb4",
+                    connect_timeout=10,
+                )
+            except Exception:
+                raise HTTPException(status_code=500, detail="Could not connect to database.")
+        else:
+            try:
+                import psycopg2
+                conn = psycopg2.connect(
+                    host=db_config.get("host", "localhost"),
+                    port=int(db_config.get("port", 5432)),
+                    dbname=db_config.get("db"),
+                    user=db_config.get("user"),
+                    password=db_config.get("password"),
+                    options=f"-c search_path={db_config.get('db_schema', 'public')}",
+                    connect_timeout=10,
+                )
+            except Exception:
+                raise HTTPException(status_code=500, detail="Could not connect to database.")
 
     try:
         engine = InsightsEngine(conn, mapping)

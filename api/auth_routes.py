@@ -1,5 +1,7 @@
 """Authentication and per-user history routes."""
 
+import time
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
@@ -8,6 +10,22 @@ from core.deps import get_current_user, is_mobile
 
 router = APIRouter()
 
+# Brute-force guard: sliding-window per client IP (generous so real users
+# and E2E never trip it; only credential-stuffing bursts get 429).
+_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+_LOGIN_WINDOW_S = 300
+_LOGIN_MAX = 30
+
+
+def _check_login_rate_limit(request: Request) -> None:
+    now = time.monotonic()
+    ip = request.client.host if request.client else "unknown"
+    hits = [t for t in _LOGIN_ATTEMPTS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
+    if len(hits) >= _LOGIN_MAX:
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again in a few minutes.")
+    hits.append(now)
+    _LOGIN_ATTEMPTS[ip] = hits
+
 
 class AuthRequest(BaseModel):
     username: str
@@ -15,8 +33,9 @@ class AuthRequest(BaseModel):
 
 
 @router.post("/api/auth/register")
-def register(auth_req: AuthRequest):
+def register(auth_req: AuthRequest, request: Request):
     """Create a user account and return a JWT."""
+    _check_login_rate_limit(request)
     try:
         user_id = auth.register(auth_req.username, auth_req.password)
     except ValueError as exc:
@@ -26,8 +45,9 @@ def register(auth_req: AuthRequest):
 
 
 @router.post("/api/auth/login")
-def login(auth_req: AuthRequest):
+def login(auth_req: AuthRequest, request: Request):
     """Exchange username/password for a JWT."""
+    _check_login_rate_limit(request)
     user_id = auth.authenticate(auth_req.username, auth_req.password)
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid username or password.")

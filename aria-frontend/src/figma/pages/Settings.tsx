@@ -37,6 +37,23 @@ export default function Settings({ selectedLLM, onChangeLLM, user, connectionSta
   const [notifAnalysis, setNotifAnalysis] = useState(true);
   const [notifInsights, setNotifInsights] = useState(true);
   const [notifSystem, setNotifSystem] = useState(false);
+  // Browser-local avatar (no backend storage; honest about scope).
+  const [avatar, setAvatar] = useState<string | null>(() => localStorage.getItem("aria_avatar"));
+
+  const pickAvatar = (file: File | undefined) => {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) { setSaveMsg("Please choose an image file"); return; }
+    if (file.size > 2 * 1024 * 1024) { setSaveMsg("Image must be under 2MB"); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const url = String(reader.result || "");
+      setAvatar(url);
+      try { localStorage.setItem("aria_avatar", url); } catch { /* quota: keep session-only */ }
+      setSaveMsg("Avatar updated in this browser");
+      setTimeout(() => setSaveMsg(""), 3000);
+    };
+    reader.readAsDataURL(file);
+  };
 
   useEffect(() => { fetchProviders(); }, []);
 
@@ -45,7 +62,7 @@ export default function Settings({ selectedLLM, onChangeLLM, user, connectionSta
       const token = localStorage.getItem("aria_auth_token");
       const res = await fetch("/api/settings/providers", { headers: { Authorization: `Bearer ${token}` } });
       if (res.ok) { const data = await res.json(); setProviders(data.providers || []); }
-    } catch {}
+    } catch (err) { console.debug("[ARIA] background request failed:", err); }
   };
 
   const saveProvider = async () => {
@@ -92,10 +109,17 @@ export default function Settings({ selectedLLM, onChangeLLM, user, connectionSta
               <p className="text-xs text-muted-foreground mt-0.5">Manage your personal information.</p>
             </div>
             <div className="flex items-center gap-4">
-              <div className="w-14 h-14 rounded-full bg-primary/10 flex items-center justify-center text-lg font-semibold text-primary shadow-md" style={{ background: "var(--gradient-primary)", color: "white" }}>A</div>
+              {avatar ? (
+                <img src={avatar} alt="Profile avatar" className="w-14 h-14 rounded-full object-cover shadow-md" />
+              ) : (
+                <div className="w-14 h-14 rounded-full bg-primary/10 flex items-center justify-center text-lg font-semibold text-primary shadow-md" style={{ background: "var(--gradient-primary)", color: "white" }}>A</div>
+              )}
               <div>
-                <button className="text-sm text-primary hover:underline">Change avatar</button>
-                <p className="text-[11px] text-muted-foreground">JPG, PNG up to 2MB</p>
+                <label className="text-sm text-primary hover:underline cursor-pointer">
+                  Change avatar
+                  <input type="file" accept="image/*" className="hidden" onChange={(e) => pickAvatar(e.target.files?.[0])} />
+                </label>
+                <p className="text-[11px] text-muted-foreground">JPG, PNG up to 2MB · stored in this browser</p>
               </div>
             </div>
             <div className="space-y-4">

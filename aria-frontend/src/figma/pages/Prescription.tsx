@@ -3,6 +3,7 @@ import { CheckCircle, Bookmark, MessageSquare, ChevronDown, ChevronUp, Loader2, 
 
 interface PrescriptionProps {
   insightResult?: any;
+  onAskQuestion?: (question: string) => void;
 }
 
 const priorityStyle: Record<string, string> = {
@@ -13,11 +14,12 @@ const priorityStyle: Record<string, string> = {
 
 const priorities = ["high", "medium", "low"];
 
-export default function Prescription({ insightResult = null }: PrescriptionProps) {
+export default function Prescription({ insightResult = null, onAskQuestion }: PrescriptionProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [accepted, setAccepted] = useState<string[]>([]);
   const [saved, setSaved] = useState<string[]>([]);
   const [prescriptions, setPrescriptions] = useState<any[]>([]);
+  const [impactNote, setImpactNote] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -47,8 +49,10 @@ export default function Prescription({ insightResult = null }: PrescriptionProps
           evidence: null,
         }));
         setPrescriptions(mapped);
+        setImpactNote(data.prescriptions.impact_note || "");
       } else {
         setPrescriptions([]);
+        setImpactNote("");
       }
     } catch (e: any) {
       setError(e.message || "Failed to load prescriptions");
@@ -132,9 +136,13 @@ export default function Prescription({ insightResult = null }: PrescriptionProps
       </div>
 
       <div className="flex gap-4 text-sm text-muted-foreground">
-        <span className="text-foreground font-semibold">{recommendations.length}</span> recommendations ·
-        <span className="text-foreground font-semibold">{accepted.length}</span> accepted
+        <span><span className="text-foreground font-semibold">{recommendations.length}</span> recommendations ·</span>
+        <span><span className="text-positive font-semibold">{recommendations.filter((r: any) => (r.priority || "medium").toLowerCase() === "high").length}</span> high priority ·</span>
+        <span><span className="text-foreground font-semibold">{accepted.length}</span> accepted</span>
       </div>
+      {impactNote && (
+        <p className="text-xs text-muted-foreground bg-secondary/50 border border-border rounded-lg px-3 py-2">{impactNote}</p>
+      )}
 
       <div className="space-y-4">
         {recommendations.map((rec, idx) => {
@@ -167,26 +175,36 @@ export default function Prescription({ insightResult = null }: PrescriptionProps
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => setAccepted((a) => isAccepted ? a.filter((x) => x !== String(idx)) : [...a, String(idx)])}
-                      className={`text-xs px-3 py-1.5 rounded-lg border transition-colors ${
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
                         isAccepted
-                          ? "bg-positive text-white border-positive"
-                          : "bg-card text-foreground border-border hover:border-positive"
+                          ? "bg-positive/10 text-positive border border-positive/20"
+                          : "bg-primary text-primary-foreground hover:opacity-90"
                       }`}
                     >
-                      {isAccepted ? "Accepted" : "Accept"}
+                      <CheckCircle size={12} /> {isAccepted ? "Accepted" : "Accept"}
                     </button>
                     <button
                       onClick={() => setSaved((s) => isSaved ? s.filter((x) => x !== String(idx)) : [...s, String(idx)])}
-                      className={`p-1.5 rounded-lg transition-colors ${isSaved ? "text-primary" : "text-muted-foreground hover:text-foreground"} hover:bg-secondary`}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                        isSaved ? "text-primary border-primary/40 bg-primary/5" : "text-muted-foreground border-border hover:text-foreground hover:bg-secondary"
+                      }`}
                     >
-                      <Bookmark size={13} fill={isSaved ? "currentColor" : "none"} />
+                      <Bookmark size={12} fill={isSaved ? "currentColor" : "none"} /> Save
                     </button>
+                    {onAskQuestion && (
+                      <button
+                        onClick={() => onAskQuestion(`What data supports this recommendation: ${rec.title || rec.description}`)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+                      >
+                        <MessageSquare size={12} /> Ask ARIA
+                      </button>
+                    )}
                   </div>
                   <button
                     onClick={() => setExpandedId(isExpanded ? null : String(idx))}
-                    className="text-xs text-primary hover:underline flex items-center gap-1"
+                    className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 transition-colors"
                   >
-                    {isExpanded ? "Collapse" : "Details"} <ChevronDown size={12} className={`transition-transform ${isExpanded ? "rotate-180" : ""}`} />
+                    Evidence {isExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
                   </button>
                 </div>
               </div>

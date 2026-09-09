@@ -38,7 +38,17 @@ async def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = 
     db_type = session.get("db_type", "postgresql")
 
     if db_type in ("sqlite", "document"):
-        return {"ok": False, "detail": "Hypothesis testing requires a relational database connection."}
+        # CSV-backed SQLite sources: test against the generated .db file.
+        # Honest gating stays: <10 points or no numeric pairs -> clear detail.
+        engine_url = session.get("db_uri")
+        if not engine_url:
+            return {"ok": False, "detail": "No queryable database file for this source."}
+        dialect = "sqlite"
+        try:
+            engine = create_engine(engine_url, pool_pre_ping=True)
+            return _run_test(engine, dialect, req)
+        except Exception as exc:
+            return {"ok": False, "detail": f"Hypothesis test failed: {str(exc)[:200]}"}
 
     driver = "mysql" if db_type == "mysql" else "postgresql"
     dialect = "mysql" if driver == "mysql" else "postgresql"
@@ -62,6 +72,15 @@ async def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = 
 
         engine = create_engine(engine_url, pool_pre_ping=True)
 
+        return _run_test(engine, dialect, req)
+
+    except Exception as e:
+        return {"ok": False, "detail": f"Hypothesis test failed: {str(e)}"}
+
+
+def _run_test(engine, dialect, req):
+    """Shared test body for PG/MySQL/SQLite (honest gating, no fabricated stats)."""
+    try:
         with engine.connect() as conn:
             tables = _get_tables(conn, dialect)
             if not tables:
@@ -110,7 +129,6 @@ async def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = 
                 "x_label": x_col,
                 "y_label": y_col,
             }
-
     except Exception as e:
         return {"ok": False, "detail": f"Hypothesis test failed: {str(e)}"}
 
@@ -118,6 +136,10 @@ async def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = 
 def _get_tables(conn, dialect):
     if dialect == "mysql":
         result = conn.execute(text("SHOW TABLES"))
+    elif dialect == "sqlite":
+        result = conn.execute(text(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ))
     else:
         result = conn.execute(text(
             "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'"
@@ -132,8 +154,14 @@ def _find_numeric_pairs(conn, tables, dialect):
     for table in tables[:20]:
         try:
             if dialect == "mysql":
-                cols_result = conn.execute(text(f"SHOW COLUMNS FROM `{table}`"))
+                safe_t = table.replace("`", "``")
+                cols_result = conn.execute(text(f"SHOW COLUMNS FROM `{safe_t}`"))
                 cols = [(row[0], row[1]) for row in cols_result]
+            elif dialect == "sqlite":
+                # Table name comes from sqlite_master (self-derived); quote it.
+                safe_t = table.replace('"', '""')
+                cols_result = conn.execute(text(f'PRAGMA table_info("{safe_t}")'))
+                cols = [(row[1], row[2]) for row in cols_result]
             else:
                 cols_result = conn.execute(text(
                     "SELECT column_name, data_type FROM information_schema.columns "

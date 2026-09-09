@@ -14,9 +14,10 @@ const exampleHypotheses = [
 
 interface Props {
   insightResult?: any;
+  onAskQuestion?: (question: string) => void;
 }
 
-export default function Hypothesis({ insightResult }: Props) {
+export default function Hypothesis({ insightResult, onAskQuestion }: Props) {
   const { isDark } = useTheme();
   const [hypothesis, setHypothesis] = useState("");
   const [status, setStatus] = useState<HypStatus>("idle");
@@ -151,6 +152,14 @@ export default function Hypothesis({ insightResult }: Props) {
                 {result.supported ? "Hypothesis Supported" : "Hypothesis Not Supported"}
               </p>
               <p className="text-sm text-foreground leading-relaxed">{result.interpretation}</p>
+              {onAskQuestion && (
+                <button
+                  onClick={() => onAskQuestion(`Investigate further: ${hypothesis} (tested ${result.x_label || "X"} vs ${result.y_label || "Y"})`)}
+                  className="mt-2 text-xs text-primary hover:underline"
+                >
+                  Ask ARIA to explore this further →
+                </button>
+              )}
             </div>
           </div>
 

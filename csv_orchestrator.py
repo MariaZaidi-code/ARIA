@@ -144,6 +144,11 @@ def _coerce_value(raw: Any, logical_type: str) -> Any:
     return value
 
 
+def _quote_ident(name: str) -> str:
+    """Quote a SQLite identifier safely (escape embedded double quotes)."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+
 def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
                        table_name: str | None = None) -> tuple[str, str, int]:
     """Load a validated CSV into a file-based SQLite database.
@@ -177,25 +182,25 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
     }
     col_names = list(column_types)
 
-    ddl_cols = ", ".join(f'"{name}" {column_types[name]}' for name in col_names)
-    col_sql = ", ".join(f'"{name}"' for name in col_names)
+    ddl_cols = ", ".join(f'{_quote_ident(name)} {column_types[name]}' for name in col_names)
+    col_sql = ", ".join(_quote_ident(name) for name in col_names)
     placeholders = ", ".join("?" for _ in col_names)
 
     conn = sqlite3.connect(str(sqlite_path))
     try:
-        conn.execute(f'CREATE TABLE "{table}" ({ddl_cols})')
+        conn.execute(f'CREATE TABLE {_quote_ident(table)} ({ddl_cols})')
         batch: list[list[Any]] = []
         for record in df.to_dict(orient="records"):
             batch.append([_coerce_value(record.get(name), column_logical_types[name]) for name in col_names])
             if len(batch) >= _INSERT_BATCH:
                 conn.executemany(
-                    f'INSERT INTO "{table}" ({col_sql}) VALUES ({placeholders})',
+                    f'INSERT INTO {_quote_ident(table)} ({col_sql}) VALUES ({placeholders})',
                     batch,
                 )
                 batch = []
         if batch:
             conn.executemany(
-                f'INSERT INTO "{table}" ({col_sql}) VALUES ({placeholders})',
+                f'INSERT INTO {_quote_ident(table)} ({col_sql}) VALUES ({placeholders})',
                 batch,
             )
         conn.commit()

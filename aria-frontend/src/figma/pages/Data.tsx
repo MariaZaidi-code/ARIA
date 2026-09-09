@@ -33,8 +33,18 @@ const api = async (path: string, opts?: RequestInit) => {
     ...opts,
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...opts?.headers },
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+  let data: any = {};
+  try {
+    data = await res.json();
+  } catch (err) {
+    console.debug("[ARIA] non-JSON response:", err);
+    if (!res.ok) throw new Error(`HTTP ${res.status}: server returned a non-JSON error`);
+    return data;
+  }
+  if (!res.ok) {
+    const detail = (data as any)?.detail ?? (data as any)?.message ?? `HTTP ${res.status}`;
+    throw new Error(Array.isArray(detail) ? detail.map((d: any) => d?.msg || JSON.stringify(d)).join("; ") : detail);
+  }
   return data;
 };
 

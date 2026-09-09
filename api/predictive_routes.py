@@ -202,6 +202,7 @@ def generate_prescription(req: PrescriptionRequest, request: Request, user: dict
                 "Monitor the trends highlighted in the data",
             ],
             "source": "template",
+            "impact_note": "Impact could not be reliably estimated from the available data.",
         }
 
     return {

@@ -43,11 +43,21 @@ def require_data(request: Request):
 
 
 def get_current_user(request: Request, authorization: str | None = Header(default=None)) -> dict:
-    """Resolve the Bearer token into a {user_id, username} dict or 401."""
+    """Resolve the Bearer token into a {user_id, username} dict or 401.
+
+    Header auth is preferred; ?token= is deprecated (leaks into logs/history)
+    but still accepted for backwards compatibility with existing clients.
+    """
+    import logging
+
     token = None
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
     elif request.query_params.get("token"):
+        logging.getLogger("uvicorn.error").warning(
+            "Deprecated ?token= query auth used on %s; switch to Authorization header.",
+            request.url.path,
+        )
         token = request.query_params.get("token")
     user = auth.verify_token(token) if token else None
     if not user:

@@ -63,8 +63,15 @@ export default function Predictive({ insightResult = null, goalResult = null }: 
             }
             setDateColumns(allDates.slice(0, 8));
             setColumns(allNumeric.slice(0, 8));
+            // Prefer real measures over id/key/code columns (forecasting a
+            // synthetic key is meaningless; the backend refuses it too).
+            const isIdLike = (c: string) => {
+              const base = c.split(" (")[0].toLowerCase().trim();
+              return base.endsWith("_id") || base.endsWith("_key") || ["id", "key", "code"].includes(base);
+            };
+            const measures = allNumeric.filter((c) => !isIdLike(c));
             if (allNumeric.length > 0 && !selectedTarget) {
-              setSelectedTarget(allNumeric[0]);
+              setSelectedTarget(measures.length > 0 ? measures[0] : allNumeric[0]);
             }
             if (allDates.length > 0 && !selectedTime) {
               setSelectedTime(allDates[0]);
@@ -152,10 +159,10 @@ export default function Predictive({ insightResult = null, goalResult = null }: 
   return (
     <div className="p-6 max-w-screen-xl mx-auto space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between animate-fade-in">
+      <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-xl font-bold text-foreground tracking-tight">Predictive Analysis</h2>
-          <p className="text-sm text-muted-foreground mt-0.5">Forecast future values from your connected data.</p>
+          <h2 className="text-xl font-semibold text-foreground tracking-tight">Predictive Analysis</h2>
+          <p className="text-sm text-muted-foreground mt-0.5">Understand what is likely to happen next.</p>
         </div>
         <button
           onClick={() => setShowControls(!showControls)}
@@ -165,75 +172,82 @@ export default function Predictive({ insightResult = null, goalResult = null }: 
         </button>
       </div>
 
-      {/* Controls */}
+      {/* Forecast Configuration */}
       {showControls && (
-        <div className="bg-card border border-border rounded-xl p-5 space-y-4 animate-fade-in">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {/* Target selection */}
+        <div className="bg-card border border-border rounded-xl p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <SlidersHorizontal size={14} className="text-muted-foreground" />
+            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Forecast Configuration</p>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">Forecast Target</label>
+              <p className="text-xs font-medium text-muted-foreground">Metric</p>
               <div className="relative">
                 <select
                   value={selectedTarget}
                   onChange={(e) => { setSelectedTarget(e.target.value); setForecast(null); }}
-                  className="w-full appearance-none bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none focus:border-primary transition-colors"
+                  className="w-full appearance-none bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none transition-colors pr-8 cursor-pointer"
                 >
                   <option value="">Select a measure...</option>
                   {columns.map((c) => (
                     <option key={c} value={c}>{c}</option>
                   ))}
                 </select>
-                <ChevronDown size={14} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+                <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
               </div>
             </div>
-
-            {/* Time dimension */}
             <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">Time Dimension</label>
+              <p className="text-xs font-medium text-muted-foreground">Dataset</p>
               <div className="relative">
                 <select
                   value={selectedTime}
                   onChange={(e) => { setSelectedTime(e.target.value); setForecast(null); }}
-                  className="w-full appearance-none bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none focus:border-primary transition-colors"
+                  className="w-full appearance-none bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none transition-colors pr-8 cursor-pointer"
                 >
                   <option value="">Auto-detect...</option>
                   {dateColumns.map((c) => (
                     <option key={c} value={c}>{c}</option>
                   ))}
                 </select>
-                <ChevronDown size={14} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+                <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
               </div>
             </div>
-
-            {/* Horizon */}
             <div className="space-y-1.5">
-              <label className="text-xs font-medium text-muted-foreground">Forecast Horizon ({horizon} periods)</label>
-              <input
-                type="range"
-                min={3}
-                max={24}
-                step={1}
-                value={horizon}
-                onChange={(e) => { setHorizon(Number(e.target.value)); setForecast(null); }}
-                className="w-full accent-primary"
-              />
-              <div className="flex justify-between text-[10px] text-muted-foreground">
-                <span>3</span>
-                <span>6</span>
-                <span>12</span>
-                <span>24</span>
+              <p className="text-xs font-medium text-muted-foreground">Forecast Horizon</p>
+              <div className="relative">
+                <select
+                  value={horizon}
+                  onChange={(e) => { setHorizon(Number(e.target.value)); setForecast(null); }}
+                  className="w-full appearance-none bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none transition-colors pr-8 cursor-pointer"
+                >
+                  {[3, 6, 12, 24].map((h) => (
+                    <option key={h} value={h}>{h} periods</option>
+                  ))}
+                </select>
+                <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <p className="text-xs font-medium text-muted-foreground">Granularity</p>
+              <div className="relative">
+                <select
+                  value="auto"
+                  onChange={() => {}}
+                  className="w-full appearance-none bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none transition-colors pr-8 cursor-pointer"
+                >
+                  <option value="auto">Auto-detect</option>
+                </select>
+                <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
               </div>
             </div>
           </div>
-
-          <div className="flex gap-2 pt-2">
+          <div className="flex gap-2 pt-4">
             <button
               onClick={() => fetchForecast(selectedTarget || columns[0], selectedTime || dateColumns[0], horizon)}
               disabled={loading || !columns.length}
-              className="premium-btn btn-glow px-4 py-2 rounded-lg text-xs font-semibold text-white transition-all disabled:opacity-50"
-              style={{ background: "var(--gradient-primary)" }}
+              className="bg-primary text-primary-foreground px-5 py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition-opacity disabled:opacity-50"
             >
-              {loading ? "Analyzing..." : "Generate Forecast"}
+              {loading ? "Analyzing..." : "Run Forecast"}
             </button>
             <button
               onClick={() => setForecast(null)}
@@ -360,7 +374,12 @@ export default function Predictive({ insightResult = null, goalResult = null }: 
           <div className="flex items-center justify-between mb-5">
             <div>
               <p className="text-sm font-semibold text-foreground">{predictions?.column || "Forecast"} — Forecast</p>
-              <p className="text-xs text-muted-foreground mt-0.5">{forecastData.length} forecast points · {predictions?.period || "auto"} frequency</p>
+              <p className="text-xs text-muted-foreground mt-0.5">Historical data + forecast with confidence interval</p>
+            </div>
+            <div className="flex gap-4 text-xs text-muted-foreground items-center">
+              <span className="flex items-center gap-1.5"><span className="w-4 h-0.5 bg-foreground inline-block rounded" /> Actual</span>
+              <span className="flex items-center gap-1.5"><span className="w-4 h-0.5 border-t-2 border-dashed border-primary inline-block" /> Forecast</span>
+              <span className="flex items-center gap-1.5"><span className="w-3 h-3 bg-primary/15 inline-block rounded" /> Confidence</span>
             </div>
           </div>
           <ResponsiveContainer width="100%" height={320}>
@@ -388,10 +407,10 @@ export default function Predictive({ insightResult = null, goalResult = null }: 
         </div>
       )}
 
-      {/* Analysis notes */}
-      {predictions?.reason && (
-        <div className="bg-card border border-border rounded-xl p-5">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Analysis Notes</p>
+      {/* ARIA Interpretation — only for validated forecasts; errors use the error block */}
+      {hasPredictions && predictions?.valid && predictions?.reason && (
+        <div className="bg-primary/5 border border-primary/20 rounded-xl p-5 space-y-2">
+          <p className="text-xs font-semibold text-primary uppercase tracking-wider">ARIA Interpretation</p>
           <p className="text-sm text-foreground leading-relaxed">{predictions.reason}</p>
         </div>
       )}
