@@ -73,6 +73,25 @@ def test_trend_gets_movement_answer_and_line_chart():
     assert "increased" in res["answer"]
 
 
+def test_short_table_name_uses_grouping_column_for_entity():
+    """A CSV upload's table is the filename stem ('s'); the answer must name
+    the grouping column, not the useless table name."""
+    ir = {
+        "operation": "aggregation",
+        "intent": "distribution",
+        "dimensions": [{"concept": "s", "resolved_table": "s", "resolved_column": "region"}],
+        "metrics": [{"concept": "row count", "aggregation": "COUNT", "resolved_expression": "COUNT(*)"}],
+    }
+    rows = [{"region": "North", "value": 5}, {"region": "South", "value": 3}]
+    res = analyze_result(
+        ir=ir, columns=list(rows[0].keys()), rows=rows,
+        goal="total by region", row_count=8,
+    )
+    assert "Region North" in res["answer"]
+    assert "S North" not in res["answer"]
+    assert res["analysis"]["entity"] == "region"
+
+
 def test_empty_result_is_invalid():
     res = analyze_result(
         ir=RANKING_IR, columns=["last_name", "total"], rows=[],

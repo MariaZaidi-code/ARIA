@@ -29,6 +29,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 class DataMixin:
+    # Bounded budget for each LLM repair call. Without this a slow/unavailable
+    # local model (Ollama) defaults to a 900s timeout and a repair loop can
+    # block a request for many minutes. Repairs that exceed this are abandoned
+    # and the caller degrades gracefully instead of hanging.
+    _REPAIR_TIMEOUT = 12
+
     # ---- _execute_with_retry (_execute_with_retry) ----
 
     def _execute_with_retry(self, user_goal, join_path, kpi_map, raw_sql, retries=6,
@@ -92,7 +98,8 @@ Return only the corrected SQL query using real tables from the schema.
 No explanations, no markdown.
 """
                 try:
-                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500)
+                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1,
+                                            num_predict=500, timeout=self._REPAIR_TIMEOUT)
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
@@ -142,7 +149,8 @@ Return only the corrected SQL query using real columns from the schema.
 No explanations, no markdown.
 """
                 try:
-                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500)
+                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1,
+                                            num_predict=500, timeout=self._REPAIR_TIMEOUT)
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
@@ -193,7 +201,8 @@ Broken SQL:
 Return only the corrected SQL query. No explanations, no markdown.
 """
                 try:
-                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500)
+                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1,
+                                            num_predict=500, timeout=self._REPAIR_TIMEOUT)
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
@@ -235,7 +244,8 @@ Broken SQL:
 Return only the corrected SQL query. No explanations, no markdown.
 """
                 try:
-                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500)
+                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1,
+                                            num_predict=500, timeout=self._REPAIR_TIMEOUT)
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:

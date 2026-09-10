@@ -369,8 +369,19 @@ def _measure_label(intent, measure_col, aggregation) -> str:
 
 
 def _entity_label(intent) -> str:
+    """Human noun for the entity being grouped/ranked.
+
+    Prefers the entity concept/table name, but when that is not a meaningful
+    word (e.g. a CSV upload whose table is the filename stem 's'), falls back
+    to the resolved grouping column so the answer reads "Region North …"
+    rather than "S North …".
+    """
     ent = intent.get("entity") or {}
-    return natural_label(ent.get("concept") or ent.get("table") or "group")
+    concept = ent.get("concept") or ent.get("table") or "group"
+    col = ent.get("column")
+    if col and not _is_id_like(col) and len(str(concept).strip()) < 3:
+        return natural_label(col)
+    return natural_label(concept)
 
 
 def synthesize_answer(frame, measure_label, entity_label) -> str:

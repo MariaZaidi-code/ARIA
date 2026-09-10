@@ -6,7 +6,10 @@ type Message = {
   role: "user" | "assistant";
   content: string;
   timestamp: string;
-  chartData?: { month: string; value: number }[];
+  sql?: string | null;
+  provider?: string | null;
+  rows?: Record<string, any>[];
+  chart?: { type: string; x: string; y: string; reason?: string } | null;
 };
 
 interface Conversation {
@@ -25,6 +28,56 @@ const suggestions = [
   "Which categories have the most records?",
   "What trends do you see in the data?",
 ];
+
+// Render the chart-ready payload returned by the backend. The type is chosen
+// dynamically from the question + returned data (bar/line/pie/scatter); this
+// only lays out whatever the backend decided — no hardcoded chart mapping.
+function renderChart(msg: Message) {
+  const rows = msg.rows || [];
+  const spec = msg.chart;
+  if (!spec || !rows.length) return null;
+  const x = spec.x;
+  const y = spec.y;
+  const values = rows.map((r) => Number(r[y])).filter((v) => !isNaN(v));
+  if (!values.length) return null;
+  const maxVal = Math.max(...values, 1);
+  const isLine = spec.type === "line" || spec.type === "area";
+  const isPie = spec.type === "pie" || spec.type === "doughnut";
+  return (
+    <div className="mt-2 pt-2 border-t border-border">
+      {isPie ? (
+        <div className="flex flex-wrap gap-2">
+          {rows.slice(0, 8).map((r, i) => (
+            <span key={i} className="text-[10px] text-muted-foreground">
+              {String(r[x])}: {Number(r[y]).toLocaleString()}
+            </span>
+          ))}
+        </div>
+      ) : isLine ? (
+        <div className="flex items-end gap-0.5 h-12">
+          {rows.slice(0, 40).map((r, i) => (
+            <div key={i} className="flex-1 bg-primary/30 rounded-t"
+                 style={{ height: `${(Number(r[y]) / maxVal) * 100}%` }}
+                 title={`${String(r[x])}: ${Number(r[y]).toLocaleString()}`} />
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-1">
+          {rows.slice(0, 8).map((r, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <span className="text-[10px] text-muted-foreground w-24 truncate">{String(r[x])}</span>
+              <div className="flex-1 bg-primary/20 rounded" style={{ height: 8 }}>
+                <div className="bg-primary rounded" style={{ height: 8, width: `${(Number(r[y]) / maxVal) * 100}%` }} />
+              </div>
+              <span className="text-[10px] text-foreground w-16 text-right">{Number(r[y]).toLocaleString()}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <p className="text-[10px] text-muted-foreground mt-1.5">{spec.reason || spec.type}</p>
+    </div>
+  );
+}
 
 export default function Copilot() {
   const [conversations, setConversations] = useState(defaultConversations);
@@ -84,6 +137,10 @@ export default function Copilot() {
         role: "assistant",
         content: data.answer || data.detail || "I couldn't generate a response.",
         timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        sql: data.sql || null,
+        provider: data.provider || null,
+        rows: Array.isArray(data.data) ? data.data : [],
+        chart: data.chart || null,
       };
       setConversations((prev) =>
         prev.map((c) => c.id === targetId ? { ...c, messages: [...c.messages, reply] } : c)
@@ -140,7 +197,13 @@ export default function Copilot() {
             <div className="px-5 py-3 border-b border-border flex items-center justify-between flex-shrink-0">
               <div>
                 <p className="text-sm font-semibold text-foreground">{active.title}</p>
-                <p className="text-[11px] text-muted-foreground">{active.subtitle}</p>
+                <p className="text-[11px] text-muted-foreground">
+                  {active.subtitle}
+                  {(() => {
+                    const lastAssistant = [...active.messages].reverse().find(m => m.role === "assistant" && m.provider);
+                    return lastAssistant?.provider ? ` · ${lastAssistant.provider} mode` : "";
+                  })()}
+                </p>
               </div>
               <button className="p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors">
                 <MoreHorizontal size={14} />
@@ -167,17 +230,14 @@ export default function Copilot() {
                     <div className="flex-1 space-y-1.5">
                       <div className="bg-card/90 border border-border/80 rounded-2xl rounded-tl-md px-4 py-3 shadow-sm backdrop-blur-sm">
                         <p className="text-[13px] text-foreground leading-relaxed">{msg.content}</p>
-                        {msg.chartData && msg.chartData.length > 0 && (
-                          <div className="mt-2 pt-2 border-t border-border">
-                            <div className="flex items-end gap-1 h-8">
-                              {msg.chartData.map((d, i) => {
-                                const maxVal = Math.max(...msg.chartData!.map(v => v.value), 1);
-                                return (
-                                  <div key={i} className="flex-1 bg-primary/20 rounded-t" style={{ height: `${(d.value / maxVal) * 100}%` }} />
-                                );
-                              })}
-                            </div>
-                          </div>
+                        {renderChart(msg)}
+                        {msg.sql && (
+                          <details className="mt-2 pt-2 border-t border-border">
+                            <summary className="text-[11px] text-muted-foreground cursor-pointer hover:text-foreground">
+                              Show SQL
+                            </summary>
+                            <pre className="mt-1.5 text-[10px] font-mono text-muted-foreground overflow-x-auto whitespace-pre-wrap">{msg.sql}</pre>
+                          </details>
                         )}
                       </div>
                       <p className="text-[10px] text-muted-foreground px-1">{msg.timestamp}</p>
