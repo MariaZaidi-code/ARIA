@@ -57,7 +57,7 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
     # ---- __init__ (__init__) ----
 
     def __init__(self, schema_json_path=None, db_uri=None,
-                 provider=None, dialect="postgresql"):
+                 provider=None, dialect="postgresql", overrides=None):
         if schema_json_path:
             schema_file = Path(schema_json_path)
         else:
@@ -83,6 +83,9 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
         self.uncertain_edge_keys = self._collect_uncertain_edges(self.full_schema)
         self.relationship_graph = self._build_relationship_graph()
         self.relationship_edges = self._build_relationship_edges()
+        # Journey E: user corrections outrank inference in all future planning.
+        self.user_overrides = overrides or {}
+        self._apply_user_overrides()
         self.dialect = dialect
         self.schema = (self.full_schema.get("schema") or "public").strip()
         self.engine = self._build_engine(db_uri)

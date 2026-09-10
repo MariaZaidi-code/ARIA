@@ -1,6 +1,7 @@
 """Data source connection routes: relational databases (PostgreSQL / MySQL) + CSV files + PDF documents."""
 
 import json
+import os
 import re
 import time
 import types
@@ -17,11 +18,148 @@ import schema_agent
 from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session, save_session
 from core.db import build_db_uri
 from core.deps import require_writable, get_current_user
+from core.secret_box import decrypt as _decrypt_secret
 from csv_handler import CsvValidationError
 from llm_provider import create_provider
 from document_processor import create_document_processor
 
 router = APIRouter()
+
+# Upload bounds (§40): enforced while streaming so oversized bodies never
+# fill the disk. CSV cap matches the handler's 100 MB post-write check.
+MAX_UPLOAD_BYTES_CSV = int(os.getenv("ARIA_MAX_UPLOAD_CSV_MB", "100")) * 1024 * 1024
+MAX_UPLOAD_BYTES_PDF = int(os.getenv("ARIA_MAX_UPLOAD_PDF_MB", "50")) * 1024 * 1024
+
+
+def _spool_limited(upload_file, dest: Path, max_bytes: int, label: str) -> int:
+    """Stream an upload to disk, aborting with 413 past max_bytes."""
+    total = 0
+    with open(dest, "wb") as _f:
+        while True:
+            chunk = upload_file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                try:
+                    _f.close()
+                    dest.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"{label} exceeds the {max_bytes // (1024 * 1024)} MB upload limit.",
+                )
+            _f.write(chunk)
+    return total
+
+
+def _pdf_tables_to_sqlite(document, upload_dir: Path, stem: str, stamp: str):
+    """Load clean PDF tables into a queryable SQLite DB (§5/§15).
+
+    Returns (db_uri, mapping_tables, loaded_names) or (None, {}, []) when
+    no table is well-formed enough to query. Never raises: failures degrade
+    to document-only (RAG) mode, which keeps working.
+    """
+    import sqlite3 as _sqlite3
+
+    from csv_orchestrator import _quote_ident
+
+    usable = []
+    for i, t in enumerate(getattr(document, "tables", []) or []):
+        try:
+            raw_headers = t.get("headers", []) or []
+            headers = [str(h or "").strip() or f"col_{j}" for j, h in enumerate(raw_headers)]
+            rows = [r for r in (t.get("rows", []) or [])
+                    if any(str(c or "").strip() for c in r)]
+            if len(headers) < 2 or not rows:
+                continue
+            clean, seen = [], set()
+            for h in headers:
+                base = re.sub(r"[^0-9a-zA-Z]+", "_", h).strip("_") or "col"
+                name, k = base, 2
+                while name.lower() in seen:
+                    name, k = f"{base}_{k}", k + 1
+                seen.add(name.lower())
+                clean.append(name)
+            # Infer REAL columns (all non-empty cells numeric) for aggregation.
+            col_types = []
+            for j in range(len(clean)):
+                vals = [str(r[j]).strip() for r in rows if j < len(r) and str(r[j]).strip()]
+                numeric = [v.replace(",", "").replace("$", "").replace("%", "") for v in vals]
+                if vals and all(_is_num(v) for v in numeric):
+                    col_types.append("REAL")
+                else:
+                    col_types.append("TEXT")
+            usable.append({"name": f"pdf_t{i}", "columns": clean,
+                           "types": col_types, "rows": rows, "page": t.get("page")})
+        except Exception:
+            continue
+    if not usable:
+        return None, {}, []
+
+    db_path = upload_dir / f"{stem}_{stamp}_tables.db"
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            db_path.unlink(missing_ok=True)
+        except PermissionError:
+            pass
+        conn = _sqlite3.connect(str(db_path))
+        mapping_tables: dict = {}
+        loaded: list[str] = []
+        try:
+            for t in usable:
+                ddl = ", ".join(f"{_quote_ident(c)} {typ}"
+                                for c, typ in zip(t["columns"], t["types"]))
+                conn.execute(f"CREATE TABLE {_quote_ident(t['name'])} ({ddl})")
+                placeholders = ", ".join("?" for _ in t["columns"])
+                cols = ", ".join(_quote_ident(c) for c in t["columns"])
+                batch = []
+                for r in t["rows"]:
+                    vals = []
+                    for j, typ in enumerate(t["types"]):
+                        cell = str(r[j]).strip() if j < len(r) else ""
+                        if not cell:
+                            vals.append(None)
+                        elif typ == "REAL":
+                            try:
+                                vals.append(float(cell.replace(",", "").replace("$", "").replace("%", "")))
+                            except ValueError:
+                                vals.append(None)
+                        else:
+                            vals.append(cell)
+                    batch.append(vals)
+                conn.executemany(
+                    f"INSERT INTO {_quote_ident(t['name'])} ({cols}) VALUES ({placeholders})",
+                    batch,
+                )
+                mapping_tables[t["name"]] = {
+                    "columns": [{"column": c, "data_type": ("REAL" if typ == "REAL" else "TEXT"),
+                                 "nullable": True} for c, typ in zip(t["columns"], t["types"])],
+                    "primary_key": [],
+                    "row_count": len(batch),
+                    "source": f"pdf page {t['page']}",
+                }
+                loaded.append(t["name"])
+            conn.commit()
+        finally:
+            conn.close()
+        return f"sqlite:///{db_path}", mapping_tables, loaded
+    except Exception:
+        try:
+            db_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None, {}, []
+
+
+def _is_num(value: str) -> bool:
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 # ── Ingestion progress tracking ──────────────────────────────────────────
 # Maps user_id -> { "step": str, "progress": float 0-100, "message": str, "done": bool, "error": str|None }
@@ -220,14 +358,28 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     _set_progress(uid, "extracting", 50, "Extracting schema...")
 
     # Auto-trigger schema extraction so Dashboard KPIs work immediately
+    import logging as _logging
+
+    _conn_log = _logging.getLogger("aria.connect")
+    session["schema_status"] = "pending"
     try:
         config = dict(session.get("db", {}))
         if "password" in config and config.get("password"):
             try:
                 config["password"] = _decrypt_secret(config["password"])
-            except Exception:
-                pass
-        conn = schema_agent.get_connection(types.SimpleNamespace(**config))
+            except Exception as exc:
+                _conn_log.error("Stored DB credential failed to decrypt; "
+                                "reconnect with a fresh password. (%s)", exc)
+                raise HTTPException(
+                    status_code=400,
+                    detail="Stored database credential is unreadable. "
+                           "Please reconnect with your password.",
+                )
+        try:
+            conn = schema_agent.get_connection(types.SimpleNamespace(**config))
+        except SystemExit as _sx:
+            _conn_log.error("Schema extraction refused connection setup: %s", _sx)
+            raise
         try:
             db_type = session.get("db_type", "postgresql")
             schema_filter = config.get("db_schema", "public") if db_type == "postgresql" else config.get("db", "")
@@ -240,13 +392,27 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
                 user_path = user_schema_dir / f"schema_mapping_{safe_name_for_file}_latest.json"
                 user_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
                 session["schema_path"] = user_path
+                session["schema_status"] = "ok"
                 save_session(user["user_id"], session)
-        except Exception:
-            pass
+            else:
+                session["schema_status"] = "empty"
+                save_session(user["user_id"], session)
+                _conn_log.warning("Schema extraction returned no tables for db '%s' (user %s).",
+                                  db_name, user["user_id"])
+        except Exception as exc:
+            session["schema_status"] = "failed"
+            save_session(user["user_id"], session)
+            _conn_log.exception("Schema extraction failed for db '%s' (user %s).",
+                                db_name, user["user_id"])
     except SystemExit:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        session["schema_status"] = "failed"
+        try:
+            save_session(user["user_id"], session)
+        except Exception:
+            pass
+        _conn_log.exception("Schema extraction setup failed for db '%s'.", db_name)
 
     _set_progress(uid, "ready", 100, "Connected", done=True)
 
@@ -257,7 +423,8 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
         "database": db_name,
         "schema": current_db_schema,
         "db_type": db_type,
-        "schema_file": session["schema_path"].name,
+        "schema_file": Path(str(session.get("schema_path", ""))).name,
+        "schema_status": session.get("schema_status", "unknown"),
     }
 
 
@@ -318,12 +485,7 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
     file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
-    with open(file_path, 'wb') as _f:
-        while True:
-            _chunk = file.file.read(1024 * 1024)
-            if not _chunk:
-                break
-            _f.write(_chunk)
+    _spool_limited(file.file, file_path, MAX_UPLOAD_BYTES_CSV, "CSV file")
 
     _set_progress(uid, "validating", 25, "Validating CSV structure...")
 
@@ -448,13 +610,8 @@ def connect_pdf(
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
     file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
-    with open(file_path, 'wb') as _f:
-        while True:
-            _chunk = file.file.read(1024 * 1024)
-            if not _chunk:
-                break
-            _f.write(_chunk)
-    
+    _spool_limited(file.file, file_path, MAX_UPLOAD_BYTES_PDF, "PDF file")
+
     # Create document processor
     processed_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "documents"
     vector_index_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "vector_store"
@@ -493,6 +650,33 @@ def connect_pdf(
     session["dialect"] = "document"
     session["document_id"] = document.id
     session["document_type"] = document.document_type.value if document.document_type else "unknown"
+
+    # Structured PDF tables become queryable SQLite + schema mapping (§5/§15).
+    # RAG over the narrative keeps working regardless.
+    pdf_tables_loaded: list[str] = []
+    try:
+        _pdf_uri, _pdf_mapping, pdf_tables_loaded = _pdf_tables_to_sqlite(
+            document, upload_dir, safe_name, stamp)
+        if _pdf_uri and _pdf_mapping:
+            from core.config import SCHEMA_DIR as _SCHEMA_DIR
+
+            _uid_dir = f"user_{user['user_id']}"
+            _safe_db = re.sub(r"[^a-zA-Z0-9_-]+", "_", f"pdf_{safe_name}")[:64] or "pdf_doc"
+            _schema_path = _SCHEMA_DIR / _uid_dir / f"schema_mapping_{_safe_db}_latest.json"
+            _schema_path.parent.mkdir(parents=True, exist_ok=True)
+            _schema_path.write_text(json.dumps({
+                "database": _safe_db,
+                "tables": _pdf_mapping,
+            }, indent=2), encoding="utf-8")
+            session["source_type"] = "semi-structured"
+            session["db"] = {"document_tables": _pdf_uri}
+            session["db_type"] = "sqlite"
+            session["db_uri"] = _pdf_uri
+            session["db_name"] = _safe_db
+            session["dialect"] = "sqlite"
+            session["schema_path"] = _schema_path
+    except Exception:
+        pass
     
     # Ensure processed directories exist
     processed_dir.mkdir(parents=True, exist_ok=True)
@@ -512,6 +696,8 @@ def connect_pdf(
         "element_count": len(document.elements),
         "chunk_count": len(document.chunks),
         "table_count": len(document.tables),
+        "tables_loaded": pdf_tables_loaded,
+        "queryable": bool(pdf_tables_loaded),
         "status": document.status.value,
         "processing_method": document.processing_method,
         "failed_pages": result.failed_pages,
@@ -523,15 +709,18 @@ def connect_pdf(
 def session_status(user: dict = Depends(get_current_user)):
     """Return the current session's connectivity and DB info so the frontend can restore state."""
     session = get_session(user.get("user_id"))
-    is_connected = bool(session.get("db") or session.get("db_uri") or session.get("source_type") == "semi-structured")
+    is_connected = bool(session.get("db") or session.get("db_uri") or
+                        session.get("source_type") == "semi-structured")
+    # Never expose credentials: db_uri embeds user:password (§41).
+    raw_uri = session.get("db_uri", "") or ""
+    safe_uri = re.sub(r"://([^:/@]+):[^@/]*@", r"://\1:***@", raw_uri)
     return {
         "ok": True,
         "connection_status": "connected" if is_connected else "not-connected",
         "db_name": session.get("db_name", ""),
         "source_type": session.get("source_type", ""),
-        "db_uri": session.get("db_uri", ""),
+        "db_uri": safe_uri,
     }
-
 
 class DatabaseTestRequest(BaseModel):
     host: str = "localhost"

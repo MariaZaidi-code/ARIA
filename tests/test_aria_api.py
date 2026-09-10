@@ -150,5 +150,224 @@ class TestPredictionGating(unittest.TestCase):
         self.assertFalse(out["valid"])
 
 
+class TestDashboardScoring(unittest.TestCase):
+    def test_variation(self):
+        from api.kpi_routes import _variation
+
+        self.assertEqual(_variation(0, 0, 0), 0.0)
+        self.assertEqual(_variation(100, 100, 100), 0.0)
+        self.assertGreater(_variation(100, 50, 150), 0.5)
+        self.assertEqual(_variation(None, 1, 2), 0.0)
+
+    def test_kpi_score_orders_semantics(self):
+        from api.kpi_routes import _score_kpi
+
+        prof = {"n": 100.0, "nn": 98.0, "distinct": 50.0, "sum": 1000.0,
+                "avg": 10.0, "min": 1.0, "max": 50.0}
+        s_out, _ = _score_kpi("outcome", "revenue", prof, True, True)
+        s_vol, _ = _score_kpi("volume", "revenue", prof, True, True)
+        self.assertGreater(s_out, s_vol)
+        # Heavy nulls penalize below a clean column.
+        bad = dict(prof, nn=10.0)
+        s_bad, _ = _score_kpi("outcome", "revenue", bad, False, False)
+        self.assertGreater(s_out, s_bad)
+
+    def test_kpi_score_has_reason(self):
+        from api.kpi_routes import _score_kpi
+
+        prof = {"n": 10.0, "nn": 10.0, "distinct": 5.0, "sum": 100.0,
+                "avg": 10.0, "min": 10.0, "max": 10.0}
+        _, reason = _score_kpi("efficiency", "amount", prof, False, False)
+        self.assertIn("no variation", reason)
+
+    def test_time_grain(self):
+        from api.kpi_routes import _time_grain_expr
+
+        _, g = _time_grain_expr("d", "sqlite", 30)
+        self.assertEqual(g, "day")
+        _, g = _time_grain_expr("d", "sqlite", 100)
+        self.assertEqual(g, "week")
+        _, g = _time_grain_expr("d", "sqlite", 800)
+        self.assertEqual(g, "month")
+        _, g = _time_grain_expr("d", "sqlite", 2000)
+        self.assertEqual(g, "quarter")
+        _, g = _time_grain_expr("d", "postgresql", 800)
+        self.assertEqual(g, "month")
+
+
+class TestUserOverrides(unittest.TestCase):
+    def _agent(self, tmpdir, overrides=None):
+        import json as _json
+        import os as _os
+        from goal_agent import GoalAgent
+
+        mapping = {
+            "schema": "public",
+            "tables": {
+                "customers": {"columns": ["id", "name"], "primary_key": ["id"]},
+                "orders": {"columns": ["order_id", "customer_id", "total"],
+                           "primary_key": ["order_id"]},
+            },
+            "relationship_edges": [],
+            "declared_relationships": [],
+            "inferred_relationships": [{
+                "table": "orders", "column": "customer_id",
+                "references_table": "customers", "references_column": "id",
+                "relationship_state": "UNCERTAIN", "confidence_score": 55,
+            }],
+            "ambiguous_relationships": [],
+        }
+        p = _os.path.join(tmpdir, "schema.json")
+        open(p, "w").write(_json.dumps(mapping))
+        return GoalAgent(schema_json_path=p, db_uri="postgresql://u:p@localhost:5432/x",
+                         provider=object(), dialect="postgresql", overrides=overrides)
+
+    def test_rejected_edge_removed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            ag = self._agent(d, {"rejected": ["orders.customer_id->customers.id"],
+                                 "fk": {}, "pk": {}})
+            keys = {(e["left_table"], e["left_column"], e["right_table"], e["right_column"])
+                    for e in ag.relationship_edges}
+            self.assertNotIn(("orders", "customer_id", "customers", "id"), keys)
+
+    def test_user_fk_outranks_inference(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            ag = self._agent(d, {"rejected": [], "pk": {},
+                                 "fk": {"orders.customer_id->customers.id": {
+                                     "table": "orders", "column": "customer_id",
+                                     "references_table": "customers", "references_column": "id"}}})
+            trusts = [e["trust"] for e in ag.relationship_edges
+                      if (e["left_table"], e["left_column"]) == ("orders", "customer_id")]
+            self.assertIn("USER_CONFIRMED", trusts)
+            plan = ag._plan_joins(["orders", "customers"])
+            used = [e.get("trust") for e in plan["edges"]]
+            self.assertIn("USER_CONFIRMED", used)
+
+    def test_no_overrides_unchanged(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            ag = self._agent(d)
+            self.assertTrue(any(e["left_table"] == "orders" for e in ag.relationship_edges))
+
+
+class TestWhyStoryEnvelope(unittest.TestCase):
+    def test_builders(self):
+        from api.query_routes import _build_why, _build_story, _chart_spec_for_result, _check_consistency
+
+        rows = [{"customer": "alice", "total": 250.0}, {"customer": "bob", "total": 200.0}]
+        why = _build_why(goal="total by customer", tables=["sales"], columns=["customer", "total"],
+                         row_count=2, sql="SELECT ...", explanation="Alice leads.",
+                         confidence="high", warnings=[])
+        self.assertIn("limitations", why)
+        self.assertEqual(why["evidence"]["row_count"], 2)
+        story = _build_story(goal="g", tables=["sales"], columns=["customer", "total"],
+                             result_data=rows, why_block=why)
+        self.assertIn("alice", story.lower())
+        spec = _chart_spec_for_result(["customer", "total"], rows)
+        self.assertIn("chart_type", spec)
+        self.assertEqual(spec["chart_type"], "bar")
+        cons = _check_consistency(spec, rows, why)
+        self.assertTrue(cons["consistent"])
+        cons2 = _check_consistency({"chart_type": "bar"}, [], why)
+        self.assertFalse(cons2["consistent"])
+        self.assertEqual(cons2["chart_spec"]["chart_type"], "table")
+
+
+class TestCrossSource(unittest.TestCase):
+    def test_no_intent_no_docs(self):
+        from api.query_routes import _document_evidence
+
+        self.assertEqual(_document_evidence("nouser_xyz", "total sales by region"), [])
+
+    def test_doc_keywords(self):
+        from api.query_routes import _DOC_INTENT_WORDS
+
+        self.assertIn("target", _DOC_INTENT_WORDS)
+        self.assertTrue(any(w in "compare revenue with the targets in the report".lower()
+                            for w in _DOC_INTENT_WORDS))
+
+
+class TestUploadCapsAndRedaction(unittest.TestCase):
+    def test_spool_limit(self):
+        import io
+        from fastapi import HTTPException
+        from api.connect_routes import _spool_limited
+
+        class FakeUpload:
+            def __init__(self, data):
+                self._io = io.BytesIO(data)
+
+            def read(self, n):
+                return self._io.read(n)
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "f.csv"
+            n = _spool_limited(FakeUpload(b"a,b\n1,2\n"), dest, 1024 * 1024, "CSV file")
+            self.assertGreater(n, 0)
+            self.assertTrue(dest.exists())
+            dest2 = Path(d) / "big.csv"
+            with self.assertRaises(HTTPException) as ctx:
+                _spool_limited(FakeUpload(b"x" * (2 * 1024 * 1024)), dest2, 1024 * 1024, "CSV file")
+            self.assertEqual(ctx.exception.status_code, 413)
+            self.assertFalse(dest2.exists())
+
+    def test_db_uri_redaction(self):
+        import re
+
+        raw = "postgresql://admin:s3cr3t@db.internal:5432/sales"
+        safe = re.sub(r"://([^:/@]+):[^@/]*@", r"://\1:***@", raw)
+        self.assertEqual(safe, "postgresql://admin:***@db.internal:5432/sales")
+        self.assertNotIn("s3cr3t", safe)
+
+
+class TestSecretBoxKeepalive(unittest.TestCase):
+    def test_roundtrip(self):
+        from core.secret_box import encrypt, decrypt, PREFIX
+
+        enc = encrypt("s3cr3t-value")
+        self.assertTrue(enc.startswith(PREFIX))
+        self.assertEqual(decrypt(enc), "s3cr3t-value")
+        self.assertEqual(decrypt("plain"), "plain")
+
+
+class TestSlashDateNormalization(unittest.TestCase):
+    def test_mdy_resolved(self):
+        from csv_orchestrator import _resolve_slash_date_format
+
+        self.assertEqual(
+            _resolve_slash_date_format(["11/8/2016", "6/14/2017", "1/5/2018"]), "MDY")
+
+    def test_dmy_resolved(self):
+        from csv_orchestrator import _resolve_slash_date_format
+
+        self.assertEqual(
+            _resolve_slash_date_format(["8/11/2016", "14/6/2017"]), "DMY")
+
+    def test_ambiguous_unresolved(self):
+        from csv_orchestrator import _resolve_slash_date_format
+
+        self.assertIsNone(_resolve_slash_date_format(["3/4/2016", "5/6/2017"]))
+        self.assertIsNone(_resolve_slash_date_format(["11/8/2016", "not a date"]))
+
+    def test_to_iso(self):
+        from csv_orchestrator import _slash_to_iso
+
+        self.assertEqual(_slash_to_iso("11/8/2016", "MDY"), "2016-11-08")
+        self.assertEqual(_slash_to_iso("8/11/2016", "DMY"), "2016-11-08")
+        self.assertIsNone(_slash_to_iso("13/40/2016", "MDY"))
+
+    def test_load_normalizes(self):
+        import pandas as pd
+        from csv_orchestrator import _normalize_date_columns
+
+        df = pd.DataFrame({"order_date": ["11/8/2016", "6/14/2017"], "v": ["1", "2"]})
+        notes = _normalize_date_columns(df, {"order_date": "STRING", "v": "STRING"})
+        self.assertIn("order_date", notes)
+        self.assertEqual(list(df["order_date"]), ["2016-11-08", "2017-06-14"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect } from "react";
+import { createContext, useContext, useState, useEffect, useRef } from "react";
 import "./index.css";
 import "../aria-enhance.css";
 import AppShell from "./components/AppShell";
@@ -125,6 +125,8 @@ export default function App() {
   // ---- Question / Query ----
   const [question, setQuestion] = useState("");
   const [submittedQuestion, setSubmittedQuestion] = useState("");
+  // Cancel obsolete analyses when the user asks again (§25 performance).
+  const askAbortRef = useRef<AbortController | null>(null);
   const [questionSuggestions, setQuestionSuggestions] = useState<string[]>([]);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
 
@@ -293,6 +295,10 @@ export default function App() {
 
   const handleAsk = async (q: string) => {
     if (!q?.trim()) return;
+    // Abort any in-flight analysis before starting a new one.
+    askAbortRef.current?.abort();
+    const controller = new AbortController();
+    askAbortRef.current = controller;
     setLoading(true);
     setGoalStatus("loading");
     setSubmittedQuestion(q);
@@ -307,21 +313,28 @@ export default function App() {
       const result = await analyzeQuestion(q, selectedLLM, {
         sourceType: selectedSourceType,
         dbName,
-      }, multiTurnContext);
+      }, multiTurnContext, { signal: controller.signal });
+      if (controller.signal.aborted) return;
       if (result?.success) {
         setGoalResult(result?.data || null);
         setGoalStatus("success");
         const analytics = await generateAnalyticsResult(result?.data);
+        if (controller.signal.aborted) return;
         setAnalysisResult(analytics?.data || null);
       } else {
         setGoalStatus("error");
         setGoalError(result?.message || "Analysis failed");
       }
     } catch (err: any) {
+      if (err?.name === "AbortError" || controller.signal.aborted) {
+        setGoalStatus("idle");
+        return;
+      }
       setGoalStatus("error");
       setGoalError(err?.message || "Analysis failed");
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
+      else setLoading(false);
     }
   };
 

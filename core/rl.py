@@ -60,14 +60,21 @@ def record_event(
         path.parent.mkdir(parents=True, exist_ok=True)
         record = {
             "ts": time.time(),
-            "event": event,
+            "event": str(event)[:64],
             "state": state or {},
             "action": action or {},
             "outcome": outcome or {},
             "reward": reward or {},
         }
+        # Bound telemetry size: references and summaries, never datasets.
+        blob = json.dumps(record, default=str)
+        if len(blob) > 8192:
+            record = {"ts": record["ts"], "event": record["event"] + ":truncated",
+                      "state": {}, "action": {}, "outcome": {},
+                      "reward": {"note": "oversized event dropped"}}
+            blob = json.dumps(record, default=str)
         with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
+            fh.write(blob + "\n")
     except Exception as exc:  # telemetry is best-effort
         log.debug("RL record_event failed: %s", exc)
 

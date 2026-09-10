@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
-import { Search, X, Clock, Copy, ChevronDown, ChevronUp, Sparkles, ArrowRight, CheckCircle, Loader2, Code2, Table2, AlertCircle, Database, GitBranch } from "lucide-react";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, LineChart, Line, PieChart, Pie, Cell } from "recharts";
+import { Search, X, Clock, Copy, ChevronDown, ChevronUp, Sparkles, ArrowRight,
+CheckCircle, Loader2, Code2, Table2, AlertCircle, Database, GitBranch, HelpCircle, BookOpen } from "lucide-react";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, LineChart, Line, PieChart, Pie, Cell, ScatterChart, Scatter } from "recharts";
 import { useTheme } from "../App";
 
 type AnalysisState = "idle" | "processing" | "done" | "clarification" | "error";
@@ -47,6 +48,7 @@ export default function AIAnalytics({
   const [sqlExpanded, setSqlExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showTable, setShowTable] = useState(true);
+  const [showWhy, setShowWhy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const grid = isDark ? "#2A2A35" : "#E5E7EB";
@@ -66,6 +68,7 @@ export default function AIAnalytics({
     const text = q || query;
     if (!text.trim()) return;
     setQuery(text);
+    setChartOverride("");
     onAsk?.(text);
   };
 
@@ -84,6 +87,23 @@ export default function AIAnalytics({
 
   // Feedback tracking (personalization layer — Section 62)
   const [insightRating, setInsightRating] = useState<"useful" | "not_useful" | null>(null);
+  // User chart override: changing visualization records a preference so the
+  // backend learns contextual chart taste (RL loop). Never overrides validity.
+  const [chartOverride, setChartOverride] = useState("");
+  const trackChartSwitch = async (toType: string) => {
+    setChartOverride(toType);
+    try {
+      const token = localStorage.getItem("aria_auth_token");
+      if (token) {
+        const cols = Object.keys(chartData[0] || {}).sort().join("_");
+        await fetch("/api/feedback/chart", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ chart_type: toType, context: cols || "general" }),
+        });
+      }
+    } catch (err) { console.debug("[ARIA] background request failed:", err); }
+  };
   const trackSuggestionClick = async (text: string) => {
     try {
       const token = localStorage.getItem("aria_auth_token");
@@ -114,47 +134,109 @@ export default function AIAnalytics({
     } catch (err) { console.debug("[ARIA] background request failed:", err); }
   };
 
-  // Determine chart type from data shape
-  const getChartType = () => {
-    if (!chartData.length) return "bar";
+  // Determine chart plan from data shape, preferring the backend registry
+  // spec (chartSpec) when the shape genuinely supports it — never forcing.
+  const getChartPlan = () => {
+    if (!chartData.length) return null;
     const keys = Object.keys(chartData[0]);
     const dateKeys = keys.filter(k => /date|time|month|year|period|day/i.test(k));
     const numKeys = keys.filter(k => {
       const v = chartData[0]?.[k];
-      return typeof v === "number" || (typeof v === "string" && !isNaN(Number(v)));
+      return typeof v === "number" || (typeof v === "string" && v !== "" && !isNaN(Number(v)));
     });
     const catKeys = keys.filter(k => !dateKeys.includes(k) && !numKeys.includes(k));
+    const pickNum = (exclude: string[] = []) =>
+      numKeys.find(k => !exclude.includes(k)) || "";
+    const specType = goalResult?.chartSpec?.chart_type || "";
 
-    if (dateKeys.length && numKeys.length) return "area";
-    if (catKeys.length && numKeys.length && chartData.length <= 8) return "pie";
-    return "bar";
+    // Two numerics → scatter (backend "relationship" shape).
+    if (numKeys.length >= 2 && !dateKeys.length && !catKeys.length) {
+      if (["scatter", "hexbin", "contour", "bubble"].includes(specType)
+          || !["bar", "pie", "line", "area"].includes(specType)) {
+        return { type: "scatter", data: chartData, xKey: numKeys[0], yKey: numKeys[1], series: [] as string[] };
+      }
+    }
+    // Single numeric, no categories → histogram (client-side binning of real values).
+    if (numKeys.length >= 1 && !catKeys.length && !dateKeys.length) {
+      const col = numKeys[0];
+      const vals = chartData.map(r => Number(r[col])).filter(v => !isNaN(v));
+      if (vals.length >= 5) {
+        const lo = Math.min(...vals), hi = Math.max(...vals);
+        const bins = Math.max(4, Math.min(12, Math.round(Math.sqrt(vals.length))));
+        const width = (hi - lo) / bins || 1;
+        const counts = new Array(bins).fill(0);
+        vals.forEach(v => {
+          const i = Math.min(bins - 1, Math.max(0, Math.floor((v - lo) / width)));
+          counts[i]++;
+        });
+        const data = counts.map((c, i) => ({
+          bin: `${(lo + i * width).toFixed(1)}–${(lo + (i + 1) * width).toFixed(1)}`,
+          count: c,
+        }));
+        return { type: "histogram", data, xKey: "bin", yKey: "count", series: [] as string[] };
+      }
+    }
+    // Time + numeric → area/line.
+    if (dateKeys.length && numKeys.length) {
+      const t = (specType === "line" || specType === "step_line" || specType === "sparkline") ? "line" : "area";
+      return { type: t, data: chartData, xKey: dateKeys[0], yKey: pickNum(), series: [] as string[] };
+    }
+    // Category + 2 numerics → stacked bar.
+    if (catKeys.length && numKeys.length >= 2) {
+      return { type: "stacked", data: chartData.slice(0, 10), xKey: catKeys[0], yKey: numKeys[0], series: numKeys.slice(0, 3) };
+    }
+    // Category + numeric → bar (horizontal for long labels / many cats).
+    if (catKeys.length && numKeys.length) {
+      const labels = chartData.map(r => String(r[catKeys[0]] ?? ""));
+      const avgLen = labels.reduce((a, s) => a + s.length, 0) / Math.max(1, labels.length);
+      const horizontal = chartData.length > 8 || avgLen > 14;
+      const preferPie = ["pie", "doughnut", "donut", "polar_area"].includes(specType)
+        && chartData.length <= 6;
+      if (preferPie) return { type: "pie", data: chartData, xKey: catKeys[0], yKey: pickNum(), series: [] as string[] };
+      return { type: horizontal ? "hbar" : "bar", data: horizontal ? chartData.slice(0, 12) : chartData, xKey: catKeys[0], yKey: pickNum(), series: [] as string[] };
+    }
+    // Single category (counts) → bar of frequencies.
+    if (catKeys.length) {
+      const freq: Record<string, number> = {};
+      chartData.forEach(r => { const k = String(r[catKeys[0]] ?? "—"); freq[k] = (freq[k] || 0) + 1; });
+      const data = Object.entries(freq).map(([name, value]) => ({ name, value }))
+        .sort((a, b) => b.value - a.value).slice(0, 10);
+      return { type: "bar", data, xKey: "name", yKey: "value", series: [] as string[] };
+    }
+    return { type: "bar", data: chartData, xKey: keys[0], yKey: pickNum([keys[0]]), series: [] as string[] };
   };
 
-  const chartType = getChartType();
-
-  // Get X and Y keys for chart
-  const getXKey = () => {
-    if (!chartData.length) return "";
-    const keys = Object.keys(chartData[0]);
-    const dateKeys = keys.filter(k => /date|time|month|year|period|day/i.test(k));
-    if (dateKeys.length) return dateKeys[0];
-    const catKeys = keys.filter(k => {
-      const v = chartData[0]?.[k];
-      return typeof v === "string" || typeof v === "boolean";
-    });
-    return catKeys[0] || keys[0];
+  const chartPlan = getChartPlan();
+  // Backend registry names → locally renderable families.
+  const mapBackendType = (t: string): string | null => {
+    const v = (t || "").toLowerCase();
+    if (["line", "step_line", "sparkline", "slope", "multi_line", "control_chart"].includes(v)) return "line";
+    if (["area", "stacked_area", "density", "ecdf", "calendar_heatmap"].includes(v)) return "area";
+    if (["bar_horizontal"].includes(v)) return "hbar";
+    if (["bar_stacked", "bar_grouped", "bar_normalized", "combo", "heatmap"].includes(v)) return "stacked";
+    if (["bar", "bar_diverging", "lollipop", "pareto", "waterfall", "funnel", "bullet"].includes(v)) return "bar";
+    if (["pie", "doughnut", "donut", "polar_area", "gauge"].includes(v)) return "pie";
+    if (["scatter", "hexbin", "contour", "bubble"].includes(v)) return "scatter";
+    if (["histogram"].includes(v)) return "histogram";
+    if (["kpi_card"].includes(v)) return "bar";
+    return null;
   };
-
-  const getYKey = () => {
-    if (!chartData.length) return "";
-    const keys = Object.keys(chartData[0]);
-    const xKey = getXKey();
-    const numKeys = keys.filter(k => k !== xKey && (typeof chartData[0]?.[k] === "number" || !isNaN(Number(chartData[0]?.[k]))));
-    return numKeys[0] || keys.find(k => k !== xKey) || "";
-  };
-
-  const xKey = getXKey();
-  const yKey = getYKey();
+  const _autoType = chartPlan?.type || "bar";
+  const _compatTypes: string[] = [
+    ...(goalResult?.chartSpec?.compatible || []),
+    goalResult?.chartSpec?.chart_type || "",
+  ];
+  const chartOptions: string[] = [];
+  [_autoType, ..._compatTypes].forEach((t) => {
+    const m = mapBackendType(t);
+    if (m && !chartOptions.includes(m)) chartOptions.push(m);
+  });
+  if (!chartOptions.includes(_autoType)) chartOptions.unshift(_autoType);
+  const chartType = chartOverride && chartOptions.includes(chartOverride) ? chartOverride : _autoType;
+  const xKey = chartPlan?.xKey || "";
+  const yKey = chartPlan?.yKey || "";
+  const chartSeries: string[] = chartPlan?.series || [];
+  const chartRenderData = chartPlan?.data || chartData;
 
   return (
     <div className="p-6 max-w-4xl mx-auto space-y-6">
@@ -168,10 +250,11 @@ export default function AIAnalytics({
       <div className="space-y-3">
         <div className="flex items-center gap-3 bg-card border border-border rounded-xl px-4 py-3.5 focus-within:border-primary/50 focus-within:shadow-[0_0_0_3px_var(--primary-light)] transition-all duration-200" style={{ boxShadow: 'var(--shadow-sm)' }}>
           <Sparkles size={16} className="text-primary flex-shrink-0" />
-          <input
-            ref={inputRef}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            <input
+              ref={inputRef}
+              value={query}
+              aria-label="Ask ARIA a business question"
+              onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && !loading && runAnalysis()}
             placeholder="How many records? What is the total? Which categories rank highest? How has the metric changed over time?"
             className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none"
@@ -319,12 +402,35 @@ export default function AIAnalytics({
           )}
 
           {/* Visualization */}
-          {chartData.length > 0 && xKey && yKey && (
+          {chartRenderData.length > 0 && xKey && yKey && (
             <div className="bg-card border border-border rounded-xl p-5">
-              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-4">Visualization</p>
+              <div className="flex items-center justify-between mb-4">
+                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Visualization</p>
+                <div className="flex items-center gap-2">
+                  {goalResult?.chartSpec?.reason && (
+                    <p className="text-[10px] text-muted-foreground hidden md:block" title={goalResult.chartSpec.reason}>
+                      {goalResult.chartSpec.label || chartType}
+                    </p>
+                  )}
+                  {chartOptions.length > 1 && (
+                    <select
+                      value={chartType}
+                      aria-label="Change chart type"
+                      onChange={(e) => trackChartSwitch(e.target.value)}
+                      className="text-[11px] bg-secondary border border-border rounded-lg px-2 py-1 text-foreground outline-none focus:border-primary cursor-pointer"
+                    >
+                      {chartOptions.map((t) => (
+                        <option key={t} value={t}>
+                          {t === "hbar" ? "Horizontal bar" : t === "stacked" ? "Stacked bar" : t[0].toUpperCase() + t.slice(1)}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              </div>
               <ResponsiveContainer width="100%" height={260}>
-                {chartType === "area" ? (
-                  <AreaChart data={chartData}>
+                {chartType === "area" || chartType === "line" ? (
+                  <AreaChart data={chartRenderData}>
                     <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
                     <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
@@ -334,10 +440,45 @@ export default function AIAnalytics({
                     />
                     <Area type="monotone" dataKey={yKey} stroke="#4F46E5" fill="#4F46E5" fillOpacity={0.15} strokeWidth={2} />
                   </AreaChart>
+                ) : chartType === "scatter" ? (
+                  <ScatterChart>
+                    <CartesianGrid strokeDasharray="3 3" stroke={grid} />
+                    <XAxis dataKey={xKey} name={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
+                    <YAxis dataKey={yKey} name={yKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
+                    <Tooltip
+                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
+                      cursor={{ strokeDasharray: "3 3" }}
+                    />
+                    <Scatter data={chartRenderData} fill="#4F46E5" fillOpacity={0.6} />
+                  </ScatterChart>
+                ) : chartType === "hbar" ? (
+                  <BarChart data={chartRenderData} layout="vertical" barSize={22}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={grid} horizontal={false} />
+                    <XAxis type="number" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
+                    <YAxis type="category" dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={110} />
+                    <Tooltip
+                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
+                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
+                    />
+                    <Bar dataKey={yKey} fill="#4F46E5" radius={[0, 5, 5, 0]} />
+                  </BarChart>
+                ) : chartType === "stacked" ? (
+                  <BarChart data={chartRenderData} barSize={28}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
+                    <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
+                    <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
+                    <Tooltip
+                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
+                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
+                    />
+                    {chartSeries.map((s, i) => (
+                      <Bar key={s} dataKey={s} stackId="a" fill={CHART_COLORS[i % CHART_COLORS.length]} radius={i === chartSeries.length - 1 ? [5, 5, 0, 0] : [0, 0, 0, 0]} />
+                    ))}
+                  </BarChart>
                 ) : chartType === "pie" ? (
                   <PieChart>
                     <Pie
-                      data={chartData}
+                      data={chartRenderData}
                       cx="50%"
                       cy="50%"
                       outerRadius={90}
@@ -346,7 +487,7 @@ export default function AIAnalytics({
                       label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
                       labelLine={false}
                     >
-                      {chartData.map((_, i) => (
+                      {chartRenderData.map((_, i) => (
                         <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />
                       ))}
                     </Pie>
@@ -355,7 +496,7 @@ export default function AIAnalytics({
                     />
                   </PieChart>
                 ) : (
-                  <BarChart data={chartData} barSize={36}>
+                  <BarChart data={chartRenderData} barSize={36}>
                     <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
                     <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
@@ -363,12 +504,73 @@ export default function AIAnalytics({
                       contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
                       labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
                     />
-                    <Bar dataKey={yKey} fill="#4F46E5" radius={[5, 5, 0, 0]} />
+                    <Bar dataKey={yKey} fill="#4F46E5" radius={[5, 5, 0, 0]}>
+                      {chartType === "histogram" && chartRenderData.map((_, i) => (
+                        <Cell key={i} fill="#4F46E5" fillOpacity={0.55 + (0.45 * i) / Math.max(1, chartRenderData.length)} />
+                      ))}
+                    </Bar>
                   </BarChart>
                 )}
               </ResponsiveContainer>
             </div>
           )}
+
+          {/* Why? — stored structured explanation (§21), shown on demand */}
+          {goalResult?.why && (
+            <div className="bg-card border border-border rounded-xl overflow-hidden">
+              <button
+                onClick={() => setShowWhy((w) => !w)}
+                className="w-full flex items-center justify-between px-5 py-3.5 hover:bg-secondary/40 transition-colors"
+              >
+                <div className="flex items-center gap-2">
+                  <HelpCircle size={14} className="text-primary" />
+                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Why this result?</p>
+                  <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                    {goalResult.why.confidence} confidence
+                  </span>
+                </div>
+                {showWhy ? <ChevronUp size={14} className="text-muted-foreground" /> : <ChevronDown size={14} className="text-muted-foreground" />}
+              </button>
+              {showWhy && (
+                <div className="border-t border-border px-5 py-4 space-y-3">
+                  <div>
+                    <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">What happened</p>
+                    <p className="text-sm text-foreground leading-relaxed">{goalResult.why.what_happened}</p>
+                  </div>
+                  <div>
+                    <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Why it matters</p>
+                    <p className="text-sm text-foreground leading-relaxed">{goalResult.why.why_it_matters}</p>
+                  </div>
+                  {goalResult.why.contributing_factors?.length > 0 && (
+                    <div>
+                      <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Contributing factors</p>
+                      <p className="text-sm text-foreground">{goalResult.why.contributing_factors.join(", ")}</p>
+                    </div>
+                  )}
+                  {goalResult.why.limitations?.length > 0 && (
+                    <div className="bg-secondary/40 rounded-lg p-3">
+                      <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Limitations</p>
+                      {goalResult.why.limitations.map((lim: string, i: number) => (
+                        <p key={i} className="text-xs text-muted-foreground leading-relaxed">· {lim}</p>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Story — coherent evidence-based narrative (§23) */}
+          {goalResult?.story && (
+            <div className="bg-primary/5 border border-primary/20 rounded-xl p-5 space-y-2">
+              <div className="flex items-center gap-2">
+                <BookOpen size={14} className="text-primary" />
+                <p className="text-xs font-semibold text-primary uppercase tracking-wider">Data Story</p>
+              </div>
+              <p className="text-sm text-foreground leading-relaxed">{goalResult.story}</p>
+            </div>
+          )}
+
 
           {/* Table */}
           <div className="bg-card border border-border rounded-xl overflow-hidden">
@@ -508,6 +710,19 @@ export default function AIAnalytics({
                   <p className="text-foreground font-mono text-[11px]">
                     {goalResult.provenance.join_path.map((j: any) => `${j.from}.${j.from_col} = ${j.to}.${j.to_col}`).join(" → ")}
                   </p>
+                </div>
+              )}
+              {goalResult.provenance.document_evidence?.length > 0 && (
+                <div className="text-xs space-y-2">
+                  <p className="text-muted-foreground mb-1">Related documents</p>
+                  {goalResult.provenance.document_evidence.map((d: any, i: number) => (
+                    <div key={i} className="bg-secondary/40 border border-border rounded-lg p-2.5">
+                      <p className="text-foreground leading-relaxed">{d.excerpt}</p>
+                      <p className="text-[10px] text-muted-foreground mt-1">
+                        Document {String(d.document_id).slice(0, 8)}{d.page ? ` · page ${d.page}` : ""}
+                      </p>
+                    </div>
+                  ))}
                 </div>
               )}
               {goalResult.conversationId && (

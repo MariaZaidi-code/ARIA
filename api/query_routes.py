@@ -12,6 +12,7 @@ from core.config import get_session, save_session
 from core.deps import require_data, require_writable
 from core.validation import validate_goal_text
 from goal_agent import GoalAgent
+from goal_agent.schema import load_user_overrides
 from goal_agent.proactive_intelligence import analyze_result_intelligence
 from insight_agent import InsightAgent, sanitize_json
 
@@ -23,6 +24,152 @@ class GoalRequest(BaseModel):
     previous_goal: str | None = None
     previous_result: dict | None = None
     conversation_id: str | None = None
+
+
+def _build_why(*, goal, tables, columns, row_count, sql, explanation,
+               confidence, warnings) -> dict:
+    """Structured Why block (§21): stored at analysis time, shown on demand."""
+    limitations = []
+    if not row_count:
+        limitations.append("The query returned no rows, so no conclusion can be drawn.")
+    if warnings:
+        limitations.append(f"{len(warnings)} data-quality warning(s) apply to this result.")
+    limitations.append("Aggregates describe association in this dataset, not external causation.")
+    return {
+        "what_happened": (explanation or "Analysis completed over the connected data.").strip()[:800],
+        "why_it_matters": (
+            f"Answers '{goal}' from {row_count} row(s) across "
+            f"{', '.join(tables[:3]) or 'the connected source'}."
+        ),
+        "evidence": {
+            "tables": tables,
+            "columns": columns[:10],
+            "row_count": row_count,
+            "sql": sql,
+        },
+        "contributing_factors": columns[1:4] if len(columns) > 1 else [],
+        "comparisons": [],
+        "confidence": confidence,
+        "limitations": limitations,
+    }
+
+
+def _build_story(*, goal, tables, columns, result_data, why_block) -> str:
+    """Coherent data story (§23): finding → evidence → contributors → next step."""
+    n = len(result_data or [])
+    first = (result_data or [{}])[0] if result_data else {}
+    if isinstance(first, dict) and first:
+        lead_col = next(iter(first.keys()))
+        lead_val = first[lead_col]
+        finding = f"Top result: {lead_col} = {lead_val} across {n} row(s)."
+    elif n:
+        finding = f"Query returned {n} row(s) from {', '.join(tables[:3]) or 'the source'}."
+    else:
+        finding = "No matching rows were found for this question."
+    evidence = f"Evidence: {why_block['evidence']['row_count']} row(s), columns {', '.join(columns[:5]) or '—'}."
+    factors = ""
+    if why_block["contributing_factors"]:
+        factors = f" Segmented by {', '.join(why_block['contributing_factors'])}."
+    return (
+        f"{finding} {evidence}{factors} "
+        f"Confidence: {why_block['confidence']}. "
+        f"Limitation: {why_block['limitations'][0]}"
+    )
+
+
+def _chart_spec_for_result(columns, result_data) -> dict:
+    """Chart spec generated from the actual result shape (§19) via the registry."""
+    try:
+        from insight_agent.chart_catalog import compatible_chart_options
+    except Exception:
+        return {"chart_type": "table", "reason": "chart catalog unavailable"}
+    rows = result_data or []
+    first = rows[0] if rows and isinstance(rows[0], dict) else {}
+    num, cat, dt = 0, 0, 0
+    for c in columns or []:
+        v = first.get(c)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            num += 1
+        elif isinstance(v, str) and any(k in c.lower() for k in
+                                        ("date", "time", "month", "year", "day", "period")):
+            dt += 1
+        elif v is not None:
+            cat += 1
+    card = len(set(str((r or {}).get(columns[0])) for r in rows[:200] if isinstance(r, dict))) if columns else 0
+    options = compatible_chart_options(num, cat, dt, card)
+    if not options:
+        return {"chart_type": "table", "reason": "no compatible chart for this shape"}
+    top = options[0]
+    return {"chart_type": top["chart_type"], "label": top["label"],
+            "reason": top["analyst_use"], "compatible": [o["chart_type"] for o in options[1:4]]}
+
+
+def _summarize_result(goal, columns, result_data) -> str:
+    """Deterministic answer sentence from real rows (fallback when the agent
+    returns no message, so the Answer section is never empty on success)."""
+    rows = result_data or []
+    if not rows:
+        return f"No matching rows were found for '{goal}'."
+    first = rows[0] if isinstance(rows[0], dict) else {}
+    if first:
+        lead_col = next(iter(first.keys()))
+        lead_val = first[lead_col]
+        extra = ""
+        if len(rows) > 1:
+            extra = f" ({len(rows)} rows, led by {lead_val})"
+        return f"Top result: {lead_col} = {lead_val}{extra}."
+    return f"Query returned {len(rows)} row(s)."
+
+
+_DOC_INTENT_WORDS = ("target", "goal", "plan", "report", "forecast says",
+                      "document", "mentioned", "according to", "versus", "vs ",
+                      "compare with", "management", "says", "stated")
+
+
+def _document_evidence(user_id, goal_text, limit: int = 3) -> list[dict]:
+    """Cross-source evidence (§6): search the user's documents when the
+    question hints at external information. Returns [] otherwise (cheap:
+    skipped entirely when no documents or no doc-intent signal)."""
+    try:
+        from pathlib import Path as _Path
+
+        from core.config import PROCESSED_DIR
+        from document_processor import create_document_processor
+
+        if not any(w in goal_text.lower() for w in _DOC_INTENT_WORDS):
+            return []
+        doc_dir = PROCESSED_DIR / f"user_{user_id}" / "documents"
+        if not _Path(doc_dir).exists() or not any(_Path(doc_dir).iterdir()):
+            return []
+        processor = create_document_processor(
+            upload_dir="data/uploads", processed_dir=doc_dir)
+        results = processor.search_documents(query=goal_text, user_id=user_id, k=limit)
+        out = []
+        for r in results or []:
+            out.append({
+                "document_id": getattr(r, "document_id", ""),
+                "content": (getattr(r, "content", "") or "")[:500],
+                "score": getattr(r, "score", 0),
+                "page_number": getattr(r, "page_number", None),
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _check_consistency(chart_spec, result_data, why_block) -> dict:
+    """§24: chart + result + explanation must describe the same outcome."""
+    issues = []
+    rows = result_data or []
+    ctype = (chart_spec or {}).get("chart_type", "table")
+    if not rows and ctype != "table":
+        issues.append("empty result paired with a non-table chart; downgraded to table")
+        chart_spec = dict(chart_spec or {}, chart_type="table")
+    if why_block.get("evidence", {}).get("row_count", 0) != len(rows):
+        issues.append("row-count drift between evidence and returned data")
+    return {"consistent": not issues, "issues": issues, "chart_spec": chart_spec}
 
 
 @router.post("/api/suggestions")
@@ -172,6 +319,33 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         full_goal = "Conversation context:\n" + "\n".join(context_parts) + f"\nCurrent question: {req.goal}"
 
     goal = validate_goal_text(full_goal)
+    # Explicit-intent-wins (§12): a fresh COUNT/ranking-of-records question
+    # must not inherit measures from previous turns ("most readings" means
+    # COUNT, even after discussing averages). Only when no measure word is
+    # present ("most valuable" stays a revenue ranking).
+    import re as _re
+
+    _gl = req.goal.lower()
+    _measure_words = ("amount", "value", "price", "revenue", "profit", "total",
+                      "average", "avg", "cost", "temperature", "temp", "sales",
+                      "money", "score", "rate", "percent")
+    _count_like = _re.search(
+        r"\b(how many|number of|count\b|most\s+\w+|fewest\s+\w+|least\s+\w+)", _gl)
+    if _count_like and not any(w in _gl for w in _measure_words):
+        goal = (goal + "\nNOTE: the current question explicitly asks for a count "
+                "of records. Use COUNT(*) and do not reuse measures or averages "
+                "from previous questions.")
+    # Fail fast with an actionable error when schema extraction never
+    # completed, instead of leaking an internal path from the agent.
+    _schema_path = session.get("schema_path")
+    if not _schema_path or not Path(str(_schema_path)).exists():
+        status_note = session.get("schema_status", "unknown")
+        raise HTTPException(
+            status_code=400,
+            detail=("Schema extraction did not complete for this connection "
+                    f"(status: {status_note}). Reconnect or use Rescan Schema on the Data page, "
+                    "then ask again."),
+        )
     agent = None
     try:
         agent = GoalAgent(
@@ -179,6 +353,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             db_uri=session["db_uri"],
             provider=provider,
             dialect=session.get("dialect"),
+            overrides=load_user_overrides(user["user_id"], session.get("db_name", "")),
         )
         # Use a bounded execution so slow LLM calls never hang the endpoint.
         agent.process_goal(goal, output_path=str(session["processed_path"]))
@@ -251,6 +426,18 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     # ── Provenance ─────────────────────────────────────────────────────
     tables_used = processed.get("data_selection", {}).get("tables", [])
     join_path = processed.get("join_path", [])
+    # Normalize join-path entries: 4-tuples, edge-dicts, or opaque strings.
+    norm_joins = []
+    for j in join_path or []:
+        try:
+            if isinstance(j, dict) and {"from", "to"} <= set(j):
+                norm_joins.append({
+                    "from": j.get("from"), "from_col": j.get("from_col"),
+                    "to": j.get("to"), "to_col": j.get("to_col")})
+            elif isinstance(j, (list, tuple)) and len(j) >= 4:
+                norm_joins.append({"from": j[0], "from_col": j[1], "to": j[2], "to_col": j[3]})
+        except Exception:
+            continue
     # For aggregate queries, row_count is the number of result rows, not total records
     sql_row_count = processed.get("row_count", 0)
     provenance = {
@@ -260,7 +447,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "tables": tables_used,
         "columns": columns[:10],
         "sql": processed.get("sql_used", ""),
-        "join_path": [{"from": j[0], "from_col": j[1], "to": j[2], "to_col": j[3]} for j in join_path] if join_path else [],
+        "join_path": norm_joins,
         "row_count": sql_row_count,
         "data_preview": result_data[:3] if result_data else [],
         # Structured envelope (t.txt section 7/57 — additive keys only).
@@ -292,13 +479,35 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             proactive_suggestions.append(f"Which {cat_cols[0]} has the highest {num_cols[0]}?")
         if len(num_cols) >= 2:
             proactive_suggestions.append(f"Is there a correlation between {num_cols[0]} and {num_cols[1]}?")
-    # Always add general analytical suggestions
-    general_suggestions = [
-        "Show me the top items by value",
-        "How has this metric changed over time?",
-        "What are the main categories?",
-        "Are there any outliers or anomalies?",
-    ]
+    # Schema-derived fallback suggestions (spec §21): built from the actual
+    # connected schema, never a static generic list.
+    general_suggestions = []
+    try:
+        from api.schema_intel import SchemaIntelligence
+
+        _schema_path = Path(str(session.get("schema_path", "")))
+        if _schema_path.exists():
+            with open(_schema_path, "r", encoding="utf-8") as _fh:
+                _schema_data = json.load(_fh)
+            _intel = SchemaIntelligence(_schema_data)
+            for _t in list(_intel.tables.keys())[:3]:
+                _m = _intel.find_best_measure(_t)
+                _d = _intel.find_best_dimension(_t)
+                _dt = _intel.find_best_datetime(_t)
+                if _m and _d:
+                    general_suggestions.append(f"Show {_m} breakdown by {_d}")
+                    general_suggestions.append(f"Which {_d} has the highest {_m}?")
+                elif _m:
+                    general_suggestions.append(f"What is the total {_m}?")
+                if _m and _dt:
+                    general_suggestions.append(f"How has {_m} changed over time?")
+                if len(general_suggestions) >= 6:
+                    break
+    except Exception:
+        pass
+    if not general_suggestions:
+        # No schema context at all: say so honestly instead of inventing specifics.
+        general_suggestions = ["What data is currently connected?"]
     all_suggestions = list(dict.fromkeys(base_suggestions + proactive_suggestions + general_suggestions))[:8]
 
     # ── Preference-aware follow-up ranking ──────────────────────────────
@@ -349,6 +558,30 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         dialect=session.get("dialect"),
         processed=processed,
     )
+    # ── Why / story / chart-spec envelope (§20-24, deterministic) ─────────
+    why_block = _build_why(
+        goal=req.goal, tables=tables_used, columns=columns,
+        row_count=processed.get("row_count", 0),
+        sql=processed.get("sql_used", ""),
+        explanation=proactive.get("explanation"),
+        confidence=proactive.get("confidence", "high"),
+        warnings=processed.get("warnings", []),
+    )
+    story_text = _build_story(
+        goal=req.goal, tables=tables_used, columns=columns,
+        result_data=result_data, why_block=why_block,
+    )
+    chart_spec = _chart_spec_for_result(columns, result_data)
+    consistency = _check_consistency(chart_spec, result_data, why_block)
+    answer_message = processed.get("message") or _summarize_result(
+        req.goal, columns, result_data)
+    # Cross-source: document evidence fused alongside the structured answer.
+    doc_evidence = _document_evidence(user["user_id"], req.goal)
+    if doc_evidence:
+        provenance["document_evidence"] = [
+            {"document_id": d["document_id"], "page": d["page_number"],
+             "excerpt": d["content"][:200]} for d in doc_evidence
+        ]
     return {
         "ok": True,
         "provider": session["provider_name"],
@@ -360,7 +593,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "sql_used": processed.get("sql_used"),
         "row_count": processed.get("row_count"),
         "columns": columns,
-        "message": processed.get("message"),
+        "message": answer_message,
         "preprocessing": processed.get("preprocessing"),
         "data": processed.get("data", [])[:50],
         "goal": processed.get("goal"),
@@ -374,6 +607,11 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "data_quality_warnings": proactive.get("data_quality_warnings", []),
         "explanation": proactive.get("explanation"),
         "confidence": proactive.get("confidence", "high"),
+        "why": why_block,
+        "story": story_text,
+        "chart_spec": chart_spec,
+        "consistency": consistency,
+        "document_evidence": doc_evidence,
         "history_id": session["pending_history_id"],
         "conversation_id": conv_id,
         "turn_number": len(conv_history),

@@ -30,6 +30,116 @@ class PrescriptionRequest(BaseModel):
     insight_id: str = ""
 
 
+class ScenarioRequest(BaseModel):
+    column: str | None = None
+    pct_change: float = 10.0
+    periods: int = 3
+
+
+@router.post("/api/predictive/scenario")
+def run_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(require_writable)):
+    """Deterministic what-if analysis on real aggregates (spec §16).
+
+    Applies a user-supplied percentage change to the trailing average of a
+    measure. Pure arithmetic — labelled an estimate, never a forecast.
+    """
+    session = get_session(user["user_id"])
+    schema_path = session.get("schema_path")
+    if not schema_path or not Path(str(schema_path)).exists():
+        raise HTTPException(status_code=400, detail="No database connected.")
+    mapping = json.loads(Path(str(schema_path)).read_text(encoding="utf-8"))
+    tables = mapping.get("tables", {})
+    if not tables:
+        raise HTTPException(status_code=400, detail="No tables found in schema.")
+
+    from api.kpi_routes import _build_engine
+    from api.schema_intel import SchemaIntelligence, _safe_name
+    from sqlalchemy import text as _text
+
+    intel = SchemaIntelligence(mapping)
+    target_table, target_col = None, None
+    if req.column:
+        want = req.column.split(" (")[0].strip().lower()
+        for tname, tinfo in tables.items():
+            cols = tinfo.get("columns", []) if isinstance(tinfo, dict) else []
+            names = [(c.get("column") if isinstance(c, dict) else c) for c in cols]
+            for n in names:
+                if n and str(n).lower() == want:
+                    target_table, target_col = tname, n
+                    break
+            if target_table:
+                break
+    if not target_col:
+        for tname in tables:
+            m = intel.find_best_measure(tname)
+            if m:
+                target_table, target_col = tname, m
+                break
+    if not target_col:
+        raise HTTPException(status_code=400, detail="No numeric measure available for scenario analysis.")
+
+    pct = max(-95.0, min(95.0, float(req.pct_change or 0.0)))
+    n_periods = max(1, min(12, int(req.periods or 3)))
+
+    engine, dialect, _dbt = _build_engine(session)
+    if engine is None:
+        raise HTTPException(status_code=400, detail="No queryable database for this source.")
+    dt_col = intel.find_best_datetime(target_table)
+    try:
+        with engine.connect() as conn:
+            if dt_col:
+                if dialect == "sqlite":
+                    gexpr = f"strftime('%Y-%m', {_safe_name(dt_col, dialect)})"
+                elif dialect == "mysql":
+                    gexpr = f"DATE_FORMAT({_safe_name(dt_col, dialect)}, '%Y-%m')"
+                else:
+                    gexpr = f"TO_CHAR({_safe_name(dt_col, dialect)}, 'YYYY-MM')"
+                rows = conn.execute(_text(
+                    f"SELECT {gexpr} AS p, SUM({_safe_name(target_col, dialect)}) AS v "
+                    f"FROM {_safe_name(target_table, dialect)} "
+                    f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
+                    f"GROUP BY p ORDER BY p DESC LIMIT {n_periods}"
+                )).fetchall()
+                series = [{"period": str(r[0]), "actual": float(r[1])}
+                          for r in rows if r[1] is not None]
+                series.reverse()
+            else:
+                total_row = conn.execute(_text(
+                    f"SELECT SUM({_safe_name(target_col, dialect)}) "
+                    f"FROM {_safe_name(target_table, dialect)}")).fetchone()
+                total = float(total_row[0]) if total_row and total_row[0] is not None else 0.0
+                series = [{"period": "all data", "actual": total}]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Scenario data retrieval failed: {str(exc)[:200]}")
+    if not series:
+        raise HTTPException(status_code=400, detail="Not enough data for scenario analysis.")
+    baseline = sum(s["actual"] for s in series) / len(series)
+    factor = 1.0 + pct / 100.0
+    for s in series:
+        s["scenario"] = round(s["actual"] * factor, 2)
+    scenario_value = round(baseline * factor, 2)
+    return {
+        "ok": True,
+        "estimate": True,
+        "table": target_table,
+        "column": target_col,
+        "pct_change": pct,
+        "periods_used": len(series),
+        "baseline": round(baseline, 2),
+        "scenario_value": scenario_value,
+        "delta": round(scenario_value - baseline, 2),
+        "series": series,
+        "assumptions": [
+            f"Uniform {pct:+.1f}% change applied to {target_col} across the last {len(series)} period(s).",
+            "No seasonality, trend, capacity, or cost effects modelled.",
+            "Baseline is the trailing average, not a forecast.",
+        ],
+        "limitations": "Arithmetic estimate only. Combine with the validated forecast for a fuller picture.",
+    }
+
+
 @router.post("/api/predictive/forecast")
 def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depends(require_writable)):
     """Generate a real forecast from the connected database."""
@@ -57,6 +167,7 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
     question = req.question or "Show me the trend of the main measure over time"
     try:
         from goal_agent.agent import GoalAgent
+        from goal_agent.schema import load_user_overrides
 
         output_dir = Path("artifacts/processed_data") / f"user_{user['user_id']}"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -67,6 +178,7 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
             db_uri=db_uri,
             provider=provider,
             dialect=dialect,
+            overrides=load_user_overrides(user["user_id"], session.get("db_name", "")),
         )
         goal_result = agent.process_goal(question, output_path=str(output_path))
     except Exception as e:
@@ -132,6 +244,7 @@ def generate_prescription(req: PrescriptionRequest, request: Request, user: dict
     # Step 1: Run GoalAgent
     try:
         from goal_agent.agent import GoalAgent
+        from goal_agent.schema import load_user_overrides
 
         output_dir = Path("artifacts/processed_data") / f"user_{user['user_id']}"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -142,6 +255,7 @@ def generate_prescription(req: PrescriptionRequest, request: Request, user: dict
             db_uri=db_uri,
             provider=provider,
             dialect=dialect,
+            overrides=load_user_overrides(user["user_id"], session.get("db_name", "")),
         )
         goal_result = agent.process_goal(
             "Analyze the data and identify key metrics, trends, and anomalies",

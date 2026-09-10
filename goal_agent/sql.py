@@ -695,7 +695,7 @@ class SqlMixin:
                     if not expr:
                         return None
                     if expr.upper() == "COUNT(*)" or agg == "COUNT":
-                        return expr
+                        return "COUNT(*) (MANDATORY — count records, do not substitute SUM/AVG)"
                     if agg:
                         return f"{agg}({expr})"
                     return expr
@@ -1146,7 +1146,11 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 f"required table(s) {', '.join(missing)} are missing from FROM/JOIN"
             )
 
-        if ir.get("aggregation") == "COUNT" and "COUNT(" not in sql_upper:
+        wants_count = ir.get("aggregation") == "COUNT" or any(
+            str(m.get("aggregation", "")).upper() == "COUNT"
+            for m in ir.get("metrics", [])
+        )
+        if wants_count and "COUNT(" not in sql_upper:
             issues.append("the goal asks for a count but the SQL has no COUNT(...)")
         elif ir.get("aggregation") and not re.search(
                 r"\b(SUM|AVG|MIN|MAX|COUNT)\s*\(", sql_upper):
@@ -1158,16 +1162,21 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         for m in ir.get("metrics", []):
             agg = m.get("aggregation")
             col = m.get("resolved_column")
-            if not agg or not col:
+            if not agg:
                 continue
             if agg.upper() == "COUNT":
+                if "COUNT(" not in sql_upper:
+                    issues.append(
+                        "the resolved metric requires a COUNT of records "
+                        "but the SQL has no COUNT(...)"
+                    )
                 continue
             if f"{agg.upper()}(" not in sql_upper:
                 issues.append(
                     f"the resolved metric requires {agg.upper()} over "
                     f"{m.get('resolved_expression')} but the SQL has no {agg.upper()}"
                 )
-            elif col.lower() not in sql_lower:
+            elif col and col.lower() not in sql_lower:
                 issues.append(
                     f"the resolved measure column {m.get('resolved_expression')} "
                     "is not referenced by the SQL"

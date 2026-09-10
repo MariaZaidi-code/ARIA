@@ -28,8 +28,98 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+USER_TRUST_LEVELS = ("USER_CONFIRMED", "USER_CREATED")
+
+
+def load_user_overrides(user_id, db_name) -> dict:
+    """Load persisted user corrections for (user, db) — PK/FK/rejections.
+
+    Returns {"pk": {}, "fk": {}, "rejected": []} when nothing stored.
+    Same file data_routes writes, so corrections survive across sessions.
+    """
+    path = SCHEMA_DIR / f"user_{user_id}" / f"overrides_{db_name or ''}.json"
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return {"pk": data.get("pk", {}), "fk": data.get("fk", {}),
+                    "rejected": data.get("rejected", [])}
+    except Exception:
+        pass
+    return {"pk": {}, "fk": {}, "rejected": []}
+
+
 class SchemaMixin:
-    # ---- _normalize_schema (_normalize_schema) ----
+    # ---- user overrides (Journey E: corrections persist into planning) ----
+
+    @staticmethod
+    def _edge_key(left_table, left_column, right_table, right_column) -> str:
+        return f"{left_table}.{left_column}->{right_table}.{right_column}"
+
+    def _apply_user_overrides(self) -> None:
+        """Apply user corrections with higher authority than inference.
+
+        - rejected rel_ids: removed from edges + traversal graph.
+        - fk entries: upserted as USER_CONFIRMED edges (top join priority).
+        - confirmations of existing edges: upgraded to USER_CONFIRMED.
+        """
+        ov = getattr(self, "user_overrides", None) or {}
+        rejected = set(ov.get("rejected", []) or [])
+        fk_specs = ov.get("fk", {}) or {}
+        if not rejected and not fk_specs:
+            return
+
+        def key_of(e) -> str:
+            return self._edge_key(e.get("left_table"), e.get("left_column"),
+                                  e.get("right_table"), e.get("right_column"))
+
+        if rejected:
+            self.relationship_edges = [e for e in self.relationship_edges
+                                       if key_of(e) not in rejected]
+            for rel_id in rejected:
+                try:
+                    left, _, right = rel_id.partition("->")
+                    lt = left.rsplit(".", 1)[0]
+                    rt = right.rsplit(".", 1)[0]
+                    if lt in self.relationship_graph:
+                        self.relationship_graph[lt] = [t for t in self.relationship_graph[lt] if t != rt]
+                    if rt in self.relationship_graph:
+                        self.relationship_graph[rt] = [t for t in self.relationship_graph[rt] if t != lt]
+                except Exception:
+                    continue
+
+        for rel_id, spec in fk_specs.items():
+            if rel_id in rejected or not isinstance(spec, dict):
+                continue
+            lt, lc = spec.get("table", ""), spec.get("column", "")
+            rt, rc = spec.get("references_table", ""), spec.get("references_column", "")
+            if not (lt and lc and rt and rc):
+                # Bare confirmation of an inferred edge: upgrade in place.
+                for e in self.relationship_edges:
+                    if key_of(e) == rel_id:
+                        e["relationship_type"] = "user_confirmed"
+                        e["confidence"] = 1.0
+                        e["trust"] = "USER_CONFIRMED"
+                continue
+            if lt not in self.tables or rt not in self.tables:
+                continue
+            # Remove any competing edge for the same source column first.
+            self.relationship_edges = [
+                e for e in self.relationship_edges
+                if not (e.get("left_table") == lt and e.get("left_column") == lc)
+            ]
+            self.relationship_edges.append({
+                "left_table": lt, "left_column": lc,
+                "right_table": rt, "right_column": rc,
+                "relationship_type": "user_confirmed",
+                "confidence": 1.0,
+                "trust": "USER_CONFIRMED",
+                "cardinality": "many_to_one",
+                "source": "user",
+            })
+            if rt not in self.relationship_graph.get(lt, []):
+                self.relationship_graph[lt].append(rt)
+            if lt not in self.relationship_graph.get(rt, []):
+                self.relationship_graph[rt].append(lt)
 
     def _normalize_schema(self, raw_schema):
         raw_tables = raw_schema.get("tables", {})
@@ -49,6 +139,12 @@ class SchemaMixin:
         known_tables = set(raw_tables)
 
         def add_fk(table_name, source_column, target_table, target_column, rel_type, confidence=None):
+            if not table_name or not source_column or not target_table or not target_column:
+                logger.warning(
+                    "Skipping malformed relationship entry %r -> %r (missing endpoint names).",
+                    table_name, target_table,
+                )
+                return
             tables.setdefault(table_name, {
                 "columns": {}, "primary_key": [], "foreign_keys": [],
             })
@@ -148,11 +244,14 @@ class SchemaMixin:
     def _relationship_trust(self, rel_type, confidence):
         """Explicit relationship trust level (spec §6).
 
+        USER_CONFIRMED / USER_CREATED -> outrank everything (Journey E).
         DECLARED                     -> safe for deterministic join planning
         HIGH_CONFIDENCE_INFERRED     -> may be used when required
         MEDIUM_CONFIDENCE_INFERRED   -> candidate only / needs stronger evidence
         LOW_CONFIDENCE_INFERRED      -> never joined automatically
         """
+        if (rel_type or "") in ("user_confirmed", "user_created"):
+            return "USER_CONFIRMED"
         if rel_type == "declared":
             return "DECLARED"
         try:
@@ -332,7 +431,7 @@ class SchemaMixin:
         if not req:
             return {"required_tables": [], "nodes": [], "edges": []}
 
-        trust_rank = {"DECLARED": 0, "HIGH_CONFIDENCE_INFERRED": 1,
+        trust_rank = {"USER_CONFIRMED": -1, "DECLARED": 0, "HIGH_CONFIDENCE_INFERRED": 1,
                       "MEDIUM_CONFIDENCE_INFERRED": 2, "LOW_CONFIDENCE_INFERRED": 3}
         adj = defaultdict(list)
         for e in self.relationship_edges:

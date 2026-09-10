@@ -5,6 +5,7 @@ Zero hardcoded table/column names. Uses SchemaIntelligence for all decisions.
 """
 
 import json
+import os
 import re
 import types
 from datetime import datetime, timedelta
@@ -116,9 +117,11 @@ def _recommend_chart(columns: list, data: list, col_types: dict = None) -> dict:
 
     col_types = col_types or {}
     num_cols = [c for c in columns if col_types.get(c) == "numeric" or
+                col_types.get(c.lower()) == "numeric" or
                 (data and isinstance(data[0].get(c), (int, float)))]
     cat_cols = [c for c in columns if c not in num_cols and
-                data and data[0].get(c) is not None]
+                (col_types.get(c, col_types.get(c.lower(), "")) in ("text", "category", "")
+                 or (data and data[0].get(c) is not None))]
     time_cols = [c for c in columns if any(k in c.lower() for k in
                  ("date", "time", "year", "month", "day", "created", "updated"))]
 
@@ -179,6 +182,107 @@ def _recommend_chart(columns: list, data: list, col_types: dict = None) -> dict:
 
 
 # ── Schema loading ───────────────────────────────────────────────────────
+
+# ── Dynamic dashboard composition (spec: profile → score → dedupe → select) ──
+# Relevance > completeness > quantity. Threshold configurable via env (§17).
+
+DASHBOARD_MIN_SCORE = float(os.getenv("DASHBOARD_MIN_SCORE", "0.35"))
+
+_AMOUNT_HINTS = ("amount", "revenue", "sales", "profit", "price", "cost", "total",
+                 "value", "payment", "expense", "income", "salary", "turnover", "billing")
+_ENTITY_HINTS = ("customer", "user", "client", "member", "employee", "product",
+                 "order", "account", "patient", "student", "ticket")
+_DATE_HINTS = ("date", "time", "day", "month", "year", "created", "updated",
+               "timestamp", "period")
+
+
+def _profile_numeric(conn, tname: str, col: str, dialect: str) -> dict | None:
+    """One-query profile of a numeric column (spec §1)."""
+    try:
+        row = conn.execute(text(
+            f"SELECT COUNT(*) AS n, COUNT({_safe_name(col, dialect)}) AS nn, "
+            f"COUNT(DISTINCT {_safe_name(col, dialect)}) AS d, "
+            f"SUM({_safe_name(col, dialect)}) AS s, AVG({_safe_name(col, dialect)}) AS a, "
+            f"MIN({_safe_name(col, dialect)}) AS mi, MAX({_safe_name(col, dialect)}) AS ma "
+            f"FROM {_safe_name(tname, dialect)}"
+        )).fetchone()
+        if not row or not row[0]:
+            return None
+        n = float(row[0])
+        return {"n": n, "nn": float(row[1] or 0), "distinct": float(row[2] or 0),
+                "sum": row[3], "avg": row[4], "min": row[5], "max": row[6]}
+    except Exception:
+        return None
+
+
+def _variation(mean, lo, hi) -> float:
+    try:
+        mean, lo, hi = float(mean), float(lo), float(hi)
+    except (TypeError, ValueError):
+        return 0.0
+    if mean == 0 or hi == lo:
+        return 0.0
+    return max(0.0, min(1.0, (hi - lo) / abs(mean)))
+
+
+def _score_kpi(kind: str, col: str, prof: dict, has_date: bool, is_currency: bool) -> tuple[float, str]:
+    """Spec §2 relevance score + human-readable reason (§18)."""
+    coverage = (prof["nn"] / prof["n"]) if prof["n"] else 0.0
+    null_pct = 1.0 - coverage
+    var = _variation(prof["avg"], prof["min"], prof["max"])
+    low = col.lower()
+    semantic = 0.10
+    why = [f"covers {coverage:.0%} of records"]
+    if kind == "outcome":
+        semantic = 0.30 if any(h in low for h in _AMOUNT_HINTS) else 0.20
+        why.append("additive business measure" if any(h in low for h in _AMOUNT_HINTS) else "summable measure")
+    elif kind == "entity":
+        semantic = 0.25
+        why.append("unique-entity count")
+    elif kind == "efficiency":
+        semantic = 0.20
+        why.append("per-unit efficiency view")
+    elif kind == "volume":
+        semantic = 0.15
+        why.append("dataset volume")
+    business = 0.15 if is_currency else (0.10 if kind in ("outcome", "entity") else 0.05)
+    trend = 0.10 if has_date else 0.0
+    if has_date:
+        why.append("trend comparable over time")
+    score = (semantic + coverage * 0.25 + var * 0.20 + business + trend
+             - null_pct * 0.50)
+    if var == 0:
+        why.append("no variation detected")
+        score -= 0.15
+    return round(score, 3), "; ".join(why)
+
+
+def _time_grain_expr(col: str, dialect: str, span_days: float) -> tuple[str, str]:
+    """Pick time grain from span (§6): daily / weekly / monthly / quarterly."""
+    c = _safe_name(col, dialect)
+    if dialect == "sqlite":
+        if span_days < 62:
+            return f"strftime('%Y-%m-%d', {c})", "day"
+        if span_days < 200:
+            return f"strftime('%Y-W%W', {c})", "week"
+        if span_days < 1200:
+            return f"strftime('%Y-%m', {c})", "month"
+        return f"strftime('%Y', {c}) || '-Q' || ((CAST(strftime('%m', {c}) AS INTEGER) + 2) / 3)", "quarter"
+    if dialect == "mysql":
+        if span_days < 62:
+            return f"DATE_FORMAT({c}, '%Y-%m-%d')", "day"
+        if span_days < 200:
+            return f"DATE_FORMAT({c}, '%Y-u%v')", "week"
+        if span_days < 1200:
+            return f"DATE_FORMAT({c}, '%Y-%m')", "month"
+        return f"CONCAT(YEAR({c}), '-Q', QUARTER({c}))", "quarter"
+    if span_days < 62:
+        return f"TO_CHAR({c}, 'YYYY-MM-DD')", "day"
+    if span_days < 200:
+        return f"TO_CHAR({c}, 'IYYY-\"W\"IW')", "week"
+    if span_days < 1200:
+        return f"TO_CHAR({c}, 'YYYY-MM')", "month"
+    return f"TO_CHAR({c}, 'YYYY') || '-Q' || TO_CHAR({c}, 'Q')", "quarter"
 
 def _load_schema(session, user_id=None):
     """Load the schema mapping and build SchemaIntelligence."""
@@ -728,6 +832,8 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
     The frontend renders whatever this endpoint returns — zero business logic
     on the client side. This is the single source of truth for the dashboard.
     """
+    import time as _time
+
     session = get_session(user["user_id"])
     intel = _load_schema(session, user["user_id"])
     if not intel or not intel.tables:
@@ -742,6 +848,24 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                 "recommendations": [],
             },
         }
+
+    # Short-TTL cache (§40): keyed by schema file mtime so reconnects/uploads
+    # invalidate automatically. Bounded size, no stale-data risk beyond TTL.
+    global _DASH_CONFIG_CACHE
+    try:
+        _DASH_CONFIG_CACHE
+    except NameError:
+        _DASH_CONFIG_CACHE = {}
+    try:
+        _schema_mtime = Path(str(session.get("schema_path", ""))).stat().st_mtime
+    except Exception:
+        _schema_mtime = 0.0
+    _cache_key = (user["user_id"], session.get("db_name", ""), _schema_mtime)
+    _cached = _DASH_CONFIG_CACHE.get(_cache_key)
+    if _cached and _time.monotonic() - _cached[0] < float(os.getenv("ARIA_DASH_CACHE_TTL", "120")):
+        return {"ok": True, "config": _cached[1], "cached": True}
+    if len(_DASH_CONFIG_CACHE) > 200:
+        _DASH_CONFIG_CACHE.clear()
 
     engine, dialect, db_type = _build_engine(session)
     db_name = session.get("db_name", session.get("source_type", "data"))
@@ -779,64 +903,155 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         "color": "#4F46E5",
                     })
 
-                # ── Per-table measures ──
+                # ── Scored KPI candidates (spec §2-4, §13-15, §17) ──
+                # Profile → score → diversity → threshold. Shape unchanged.
+                kpi_candidates: list[dict] = []
                 tables_with_measures = []
                 for tname in tables_list[:10]:
                     if intel.tables[tname].get("empty"):
                         continue
-                    measure = intel.find_best_measure(tname)
-                    if not measure:
-                        continue
-                    tables_with_measures.append((tname, measure))
-
+                    _m = intel.find_best_measure(tname)
+                    if _m:
+                        tables_with_measures.append((tname, _m))
                 for tname, measure in tables_with_measures[:5]:
-                    is_curr = _is_currency_col(measure)
-                    try:
-                        result = conn.execute(text(
-                            f"SELECT SUM({_safe_name(measure, dialect)}) FROM {_safe_name(tname, dialect)}"
-                        ))
-                        row = result.fetchone()
-                        if row and row[0] is not None:
-                            val = float(row[0])
-                            tdesc = intel.tables[tname].get("description", tname)
-                            metrics.append({
-                                "id": f"{tname}_{measure}",
-                                "label": f"{measure} ({tdesc[:20]})",
-                                "value": _fmt(val, is_curr),
-                                "rawValue": val,
-                                "format": "currency" if is_curr else "number",
-                                "period": "Total",
-                                "icon": "trending-up",
-                                "color": "#059669" if is_curr else "#4F46E5",
-                            })
-                    except Exception:
+                    if intel.tables[tname].get("empty"):
                         continue
-
-                # ── Per-table averages ──
-                for tname, measure in tables_with_measures[:3]:
-                    is_curr = _is_currency_col(measure)
-                    try:
-                        result = conn.execute(text(
-                            f"SELECT AVG({_safe_name(measure, dialect)}) FROM {_safe_name(tname, dialect)}"
-                        ))
-                        row = result.fetchone()
-                        if row and row[0] is not None:
-                            val = float(row[0])
-                            if len(metrics) < 8:
-                                metrics.append({
-                                    "id": f"avg_{tname}_{measure}",
-                                    "label": f"Avg {measure}",
-                                    "value": _fmt(val, is_curr),
-                                    "rawValue": val,
-                                    "format": "currency" if is_curr else "number",
-                                    "period": "Average",
-                                    "icon": "bar-chart",
-                                    "color": "#F59E0B",
-                                })
-                    except Exception:
+                    prof = _profile_numeric(conn, tname, measure, dialect)
+                    if not prof or not prof["nn"]:
                         continue
+                    is_curr = _is_currency_col(measure)
+                    dt_col = intel.find_best_datetime(tname)
+                    tdesc = intel.tables[tname].get("description", tname)
+                    val = float(prof["sum"]) if prof["sum"] is not None else None
+                    avg = float(prof["avg"]) if prof["avg"] is not None else None
 
-                # ── Time-series charts ──
+                    if val is not None:
+                        score, reason = _score_kpi("outcome", measure, prof, bool(dt_col), is_curr)
+                        kpi_candidates.append({
+                            "kind": "outcome", "table": tname, "column": measure,
+                            "agg": "SUM", "value": val, "score": score, "reason": reason,
+                            "is_currency": is_curr, "date_col": dt_col, "tdesc": tdesc,
+                        })
+                    if avg is not None:
+                        score, reason = _score_kpi("efficiency", measure, prof, bool(dt_col), is_curr)
+                        kpi_candidates.append({
+                            "kind": "efficiency", "table": tname, "column": measure,
+                            "agg": "AVG", "value": avg, "score": score, "reason": reason,
+                            "is_currency": is_curr, "date_col": dt_col, "tdesc": tdesc,
+                        })
+                    # Entity count: distinct values of the best dimension (§3).
+                    dim = intel.find_best_dimension(tname)
+                    if dim:
+                        try:
+                            erow = conn.execute(text(
+                                f"SELECT COUNT(DISTINCT {_safe_name(dim, dialect)}) "
+                                f"FROM {_safe_name(tname, dialect)}"
+                            )).fetchone()
+                            if erow and erow[0]:
+                                ecount = int(erow[0])
+                                nrow = conn.execute(text(
+                                    f"SELECT COUNT(*) FROM {_safe_name(tname, dialect)}")).fetchone()
+                                total_n = float(nrow[0]) if nrow and nrow[0] else 0.0
+                                # Redundancy (§15): a unique-per-row column restates
+                                # Total Records — skip it.
+                                if 2 <= ecount <= max(10, total_n) and ecount < 0.98 * (total_n or 1.0):
+                                    eprof = {"n": total_n or 1.0, "nn": total_n or 1.0,
+                                             "distinct": float(ecount), "sum": None,
+                                             "avg": None, "min": 0, "max": 1}
+                                    score, reason = _score_kpi("entity", dim, eprof, bool(dt_col), False)
+                                    kpi_candidates.append({
+                                        "kind": "entity", "table": tname, "column": dim,
+                                        "agg": "DISTINCT", "value": float(ecount),
+                                        "score": score, "reason": reason,
+                                        "is_currency": False, "date_col": dt_col, "tdesc": tdesc,
+                                    })
+                        except Exception:
+                            pass
+
+                # Diversity pass: best of each kind first, then fill by score.
+                # Redundancy: same (column, agg) admitted once; ≤2 KPIs per table.
+                picked: list[dict] = []
+                seen_col_agg: set[tuple] = set()
+                per_table: dict[str, int] = {}
+
+                def _accept(c: dict) -> bool:
+                    key = (c["column"].lower(), c["agg"])
+                    if key in seen_col_agg:
+                        return False
+                    if per_table.get(c["table"], 0) >= 3:
+                        return False
+                    if c["score"] < DASHBOARD_MIN_SCORE:
+                        return False
+                    seen_col_agg.add(key)
+                    per_table[c["table"]] = per_table.get(c["table"], 0) + 1
+                    picked.append(c)
+                    return True
+
+                for kind in ("outcome", "entity", "efficiency", "volume"):
+                    best = next((c for c in sorted(kpi_candidates, key=lambda x: -x["score"])
+                                 if c["kind"] == kind), None)
+                    if best and len(picked) < 5:
+                        _accept(best)
+                for c in sorted(kpi_candidates, key=lambda x: -x["score"]):
+                    if len(picked) >= 5:
+                        break
+                    _accept(c)
+
+                for c in picked:
+                    is_curr = c["is_currency"]
+                    change = None
+                    period = "Total" if c["agg"] == "SUM" else ("Average" if c["agg"] == "AVG" else "All data")
+                    # Period comparison (§4): current vs previous grain period.
+                    if c["agg"] == "SUM" and c["date_col"]:
+                        try:
+                            if dialect == "sqlite":
+                                gexpr = f"strftime('%Y-%m', {_safe_name(c['date_col'], dialect)})"
+                            elif dialect == "mysql":
+                                gexpr = f"DATE_FORMAT({_safe_name(c['date_col'], dialect)}, '%Y-%m')"
+                            else:
+                                gexpr = f"TO_CHAR({_safe_name(c['date_col'], dialect)}, 'YYYY-MM')"
+                            prow = conn.execute(text(
+                                f"SELECT {gexpr} AS p, SUM({_safe_name(c['column'], dialect)}) AS v "
+                                f"FROM {_safe_name(c['table'], dialect)} "
+                                f"WHERE {_safe_name(c['date_col'], dialect)} IS NOT NULL "
+                                f"GROUP BY p ORDER BY p DESC LIMIT 2"
+                            )).fetchall()
+                            vals = [float(r[1]) for r in prow if r[1] is not None]
+                            if len(vals) >= 2 and vals[1] != 0:
+                                change = round(((vals[0] - vals[1]) / abs(vals[1])) * 100, 1)
+                                period = "vs prev period"
+                        except Exception:
+                            pass
+                    label = (f"{c['column']} ({c['tdesc'][:20]})" if c["agg"] == "SUM"
+                             else (f"Avg {c['column']}" if c["agg"] == "AVG"
+                                   else f"{c['column']} ({c['tdesc'][:20]})"))
+                    metrics.append({
+                        "id": f"{c['agg'].lower()}_{c['table']}_{c['column']}",
+                        "label": label,
+                        "value": _fmt(c["value"], is_curr),
+                        "rawValue": c["value"],
+                        "format": "currency" if is_curr else "number",
+                        "period": period,
+                        "icon": "trending-up" if c["agg"] == "SUM" else "bar-chart",
+                        "color": "#059669" if is_curr else "#4F46E5",
+                        "score": c["score"],
+                        "reason": f"Selected ({c['kind']}, score {c['score']}): {c['reason']}.",
+                    })
+                    if change is not None:
+                        metrics[-1]["change"] = change
+
+                # ── Scored chart candidates (spec §5-12, §15, §17) ──
+                # Grain-aware time series + Top-N categoricals, deduped, capped at 4.
+                chart_candidates: list[dict] = []
+                used_measure_kind: set[tuple] = set()
+
+                def _chart_score(periods: int, variation: float, groups: int = 0) -> float:
+                    base = min(1.0, periods / 8) * 0.5 + min(1.0, variation) * 0.3
+                    if groups:
+                        # A valid Top-N breakdown already carries comparison value.
+                        base += 0.25 + min(1.0, groups / 6) * 0.2
+                    return round(base, 3)
+
                 for tname in tables_list[:14]:
                     if intel.tables[tname].get("empty"):
                         continue
@@ -845,77 +1060,158 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     if not dt_col or not measure:
                         continue
                     try:
-                        if dialect == "sqlite":
-                            time_expr = f"strftime('%Y-%m', {_safe_name(dt_col, dialect)})"
-                        elif dialect == "mysql":
-                            time_expr = f"DATE_FORMAT({_safe_name(dt_col, dialect)}, '%Y-%m')"
-                        else:
-                            time_expr = f"TO_CHAR({_safe_name(dt_col, dialect)}, 'YYYY-MM')"
+                        srow = conn.execute(text(
+                            f"SELECT MIN({_safe_name(dt_col, dialect)}), "
+                            f"MAX({_safe_name(dt_col, dialect)}), "
+                            f"SUM({_safe_name(measure, dialect)}), "
+                            f"AVG({_safe_name(measure, dialect)}), "
+                            f"MIN({_safe_name(measure, dialect)}), "
+                            f"MAX({_safe_name(measure, dialect)}) "
+                            f"FROM {_safe_name(tname, dialect)} "
+                            f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL"
+                        )).fetchone()
+                        if not srow or srow[0] is None:
+                            continue
+                        try:
+                            span_days = max(
+                                0.0,
+                                (datetime.fromisoformat(str(srow[1])[:19])
+                                 - datetime.fromisoformat(str(srow[0])[:19])).total_seconds() / 86400,
+                            )
+                        except Exception:
+                            span_days = 365.0
+                        time_expr, grain = _time_grain_expr(dt_col, dialect, span_days)
+                        limit_n = 60 if grain == "day" else 30
                         result = conn.execute(text(
                             f"SELECT {time_expr} AS period, "
                             f"SUM({_safe_name(measure, dialect)}) AS val "
                             f"FROM {_safe_name(tname, dialect)} "
                             f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
-                            f"GROUP BY period ORDER BY period LIMIT 30"
+                            f"GROUP BY period ORDER BY period LIMIT {limit_n}"
                         ))
                         rows = result.fetchall()
-                        if rows:
-                            chart_data = [{"period": str(r[0]), "value": float(r[1])} for r in rows if r[1] is not None]
-                            if chart_data:
-                                tdesc = intel.tables[tname].get("description", tname)
-                                is_curr = _is_currency_col(measure)
-                                charts.append({
-                                    "id": f"ts_{tname}_{measure}",
-                                    "title": f"{measure} over time ({tdesc[:15]})",
-                                    "type": "area",
-                                    "data": chart_data,
-                                    "dataKey": "value",
-                                    "xKey": "period",
-                                    "format": "currency" if is_curr else "number",
-                                })
-                                if len(charts) >= 3:
-                                    break
+                        chart_data = [{"period": str(r[0]), "value": float(r[1])}
+                                      for r in rows if r[1] is not None]
+                        if len(chart_data) >= 2:
+                            var = _variation(srow[3], srow[4], srow[5])
+                            chart_candidates.append({
+                                "kind": "time", "table": tname, "column": measure,
+                                "score": _chart_score(len(chart_data), var),
+                                "grain": grain, "data": chart_data,
+                                "reason": (f"{len(chart_data)} {grain} periods with "
+                                           f"{'strong' if var > 0.5 else 'moderate' if var > 0.15 else 'low'} variation."),
+                            })
                     except Exception:
                         continue
 
-                # ── Categorical charts ──
-                if len(charts) < 3:
+                if True:
                     for tname in tables_list[:14]:
                         if intel.tables[tname].get("empty"):
                             continue
-                        dim = intel.find_best_dimension(tname)
                         measure = intel.find_best_measure(tname)
-                        if not dim or not measure:
+                        if not measure:
                             continue
-                        if any(tname in str(c.get("title", "")) for c in charts):
-                            continue
-                        try:
-                            result = conn.execute(text(
-                                f"SELECT {_safe_name(dim, dialect)} AS dim_val, "
-                                f"SUM({_safe_name(measure, dialect)}) AS val "
-                                f"FROM {_safe_name(tname, dialect)} "
-                                f"WHERE {_safe_name(dim, dialect)} IS NOT NULL "
-                                f"GROUP BY dim_val ORDER BY val DESC LIMIT 8"
-                            ))
-                            rows = result.fetchall()
-                            if rows:
-                                chart_data = [{"name": str(r[0]), "value": float(r[1])} for r in rows if r[1] is not None]
-                                if chart_data:
-                                    tdesc = intel.tables[tname].get("description", tname)
-                                    is_curr = _is_currency_col(measure)
-                                    charts.append({
-                                        "id": f"cat_{tname}_{measure}",
-                                        "title": f"{measure} by {dim} ({tdesc[:15]})",
-                                        "type": "bar",
-                                        "data": chart_data,
-                                        "dataKey": "value",
-                                        "xKey": "name",
-                                        "format": "currency" if is_curr else "number",
-                                    })
-                                    if len(charts) >= 3:
-                                        break
-                        except Exception:
-                            continue
+                        # Candidate dimensions: best first, then other text cols.
+                        # Skip near-unique ones (§13) instead of charting IDs.
+                        dim_candidates = []
+                        _bd = intel.find_best_dimension(tname)
+                        if _bd:
+                            dim_candidates.append(_bd)
+                        for _c in intel.get_text_cols(tname):
+                            if _c not in dim_candidates:
+                                dim_candidates.append(_c)
+                        chart_done = False
+                        # Rank candidate dims by cardinality first (cheap): prefer
+                        # compact breakdowns (Region, Category) over near-unique
+                        # columns (IDs, dates). One data query for the winner.
+                        ranked_dims: list[tuple] = []
+                        for dim in dim_candidates[:4]:
+                            try:
+                                crow = conn.execute(text(
+                                    f"SELECT COUNT(*) AS n, COUNT(DISTINCT {_safe_name(dim, dialect)}) AS d "
+                                    f"FROM {_safe_name(tname, dialect)}"
+                                )).fetchone()
+                                if not crow or not crow[0]:
+                                    continue
+                                ratio = float(crow[1] or 0) / float(crow[0])
+                                if ratio > 0.5 or (crow[1] or 0) < 2:
+                                    continue
+                                ranked_dims.append((crow[1], dim))
+                            except Exception:
+                                continue
+                        ranked_dims.sort(key=lambda x: x[0])
+                        for _, dim in ranked_dims[:2]:
+                            if chart_done:
+                                break
+                            try:
+                                result = conn.execute(text(
+                                    f"SELECT {_safe_name(dim, dialect)} AS dim_val, "
+                                    f"SUM({_safe_name(measure, dialect)}) AS val "
+                                    f"FROM {_safe_name(tname, dialect)} "
+                                    f"WHERE {_safe_name(dim, dialect)} IS NOT NULL "
+                                    f"GROUP BY dim_val ORDER BY val DESC LIMIT 8"
+                                ))
+                                rows = result.fetchall()
+                                chart_data = [{"name": str(r[0]), "value": float(r[1])}
+                                              for r in rows if r[1] is not None]
+                                # §7-8: 2..12 groups; skip single-slice or micro-fragmented.
+                                if 2 <= len(chart_data) <= 12:
+                                    total_v = sum(c["value"] for c in chart_data) or 1.0
+                                    top_share = max(c["value"] for c in chart_data) / total_v
+                                    if top_share < 0.98:
+                                        vals = [c["value"] for c in chart_data]
+                                        var = _variation(sum(vals) / len(vals), min(vals), max(vals))
+                                        chart_candidates.append({
+                                            "kind": "category", "table": tname, "column": measure,
+                                            "dim": dim,
+                                            "score": _chart_score(0, var, len(chart_data)),
+                                            "data": chart_data,
+                                            "reason": (f"Top-{len(chart_data)} {dim} comparison with "
+                                                       f"{'clear' if var > 0.4 else 'moderate'} spread."),
+                                        })
+                                        chart_done = True
+                            except Exception:
+                                continue
+
+                # Diversity: one time + one category per measure first, then fill.
+                chart_candidates.sort(key=lambda c: -c["score"])
+                for c in chart_candidates:
+                    if len(charts) >= 4:
+                        break
+                    if c["score"] < DASHBOARD_MIN_SCORE:
+                        continue
+                    key = (c["column"].lower(), c["kind"])
+                    if key in used_measure_kind:
+                        continue
+                    used_measure_kind.add(key)
+                    tdesc = intel.tables[c["table"]].get("description", c["table"])
+                    is_curr = _is_currency_col(c["column"])
+                    if c["kind"] == "time":
+                        charts.append({
+                            "id": f"ts_{c['table']}_{c['column']}",
+                            "title": f"{c['column']} over time ({tdesc[:15]})",
+                            "subtitle": f"{len(c['data'])} {c['grain']} periods",
+                            "type": "area",
+                            "data": c["data"],
+                            "dataKey": "value",
+                            "xKey": "period",
+                            "format": "currency" if is_curr else "number",
+                            "score": c["score"],
+                            "reason": c["reason"],
+                        })
+                    else:
+                        charts.append({
+                            "id": f"cat_{c['table']}_{c['column']}",
+                            "title": f"{c['column']} by {c['dim']} ({tdesc[:15]})",
+                            "subtitle": f"Top {len(c['data'])}",
+                            "type": "bar",
+                            "data": c["data"],
+                            "dataKey": "value",
+                            "xKey": "name",
+                            "format": "currency" if is_curr else "number",
+                            "score": c["score"],
+                            "reason": c["reason"],
+                        })
 
                 # ── Section summaries (analytics, insights, predictive, etc.) ──
                 # Analytics
@@ -1101,12 +1397,16 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
             "totalRows": total_rows,
             "database": db_name,
         },
-        "metrics": metrics[:8],
-        "visualizations": charts[:3],
+        "metrics": metrics[:6],
+        "visualizations": charts[:4],
         "sections": sections[:5],
         "quality": {"score": max(0, quality_score), "issues": quality_issues[:10]},
         "recommendations": recommendations[:6],
     }
+    try:
+        _DASH_CONFIG_CACHE[_cache_key] = (_time.monotonic(), config)
+    except Exception:
+        pass
 
     return {"ok": True, "config": config}
 
@@ -1121,7 +1421,27 @@ def recommend_chart(request: Request, columns: str = "", user: dict = Depends(ge
     session = get_session(user["user_id"])
     cols = [c.strip() for c in columns.split(",") if c.strip()]
 
-    # Get data sample if available
+    # Column types from the schema mapping (always available — no dependence
+    # on a prior analysis having written processed rows).
+    col_types: dict[str, str] = {}
+    try:
+        _intel = _load_schema(session, user["user_id"])
+        if _intel is not None:
+            _num = set()
+            for _t in _intel.tables:
+                _num.update(_intel.get_numeric_cols(_t))
+                for _c in _intel.get_datetime_cols(_t):
+                    col_types[_c] = "datetime"
+                    col_types[_c.lower()] = "datetime"
+            for _c in _num:
+                col_types.setdefault(_c, "numeric")
+                col_types.setdefault(_c.lower(), "numeric")
+            for _c in cols:
+                col_types.setdefault(_c, "text" if _c not in col_types else col_types[_c])
+    except Exception:
+        pass
+
+    # Get data sample if available (refines cardinality/type guesses)
     data_sample = []
     processed_path = session.get("processed_path")
     if processed_path:
@@ -1133,7 +1453,7 @@ def recommend_chart(request: Request, columns: str = "", user: dict = Depends(ge
         except Exception:
             pass
 
-    result = _recommend_chart(cols, data_sample)
+    result = _recommend_chart(cols, data_sample, col_types or None)
 
     # Apply user preference override if available
     from api.feedback_routes import _load_prefs

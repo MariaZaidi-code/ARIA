@@ -448,7 +448,7 @@ const deriveGoalType = (data) => {
 // GOAL AGENT
 // =========================================================
 
-export const analyzeQuestion = async (question, llmMode, sourceContext = {}, multiTurnContext = null) => {
+export const analyzeQuestion = async (question, llmMode, sourceContext = {}, multiTurnContext = null, options = {}) => {
   void llmMode;
 
   void sourceContext;
@@ -467,6 +467,7 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
   const data = await request("/ask", {
     method: "POST",
     body: JSON.stringify(body),
+    ...(options.signal ? { signal: options.signal } : {}),
   });
 
   const status = data?.status || "success";
@@ -534,6 +535,11 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
     provenance: data?.provenance || null,
     conversationId: data?.conversation_id || null,
     turnNumber: data?.turn_number || null,
+    // Explainability envelope (§20-21): why, story, chart spec, consistency.
+    why: data?.why || null,
+    story: data?.story || "",
+    chartSpec: data?.chart_spec || null,
+    consistency: data?.consistency || null,
   };
 
   return {

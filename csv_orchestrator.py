@@ -38,6 +38,105 @@ _FALSE_TOKENS = {"false", "no", "n", "0"}
 
 _INSERT_BATCH = 5_000
 
+_DATE_NAME_HINTS = ("date", "time", "day", "month", "year", "created",
+                    "updated", "timestamp", "period", "shipped", "ordered")
+
+_SLASH_DATE_RE = re.compile(
+    r"\s*(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})"
+    r"(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?\s*"
+)
+
+
+def _resolve_slash_date_format(samples: list[str]) -> str | None:
+    """Resolve ambiguous slash dates via the >12 rule.
+
+    Returns "MDY"/"DMY", or None when inconsistent, contradictory, or fully
+    ambiguous (all components ≤ 12 — guessing would fabricate meaning).
+    """
+    mdy_evidence = dmy_evidence = False
+    seen = False
+    for raw in samples:
+        s = str(raw).strip()
+        if not s:
+            continue
+        m = _SLASH_DATE_RE.fullmatch(s)
+        if not m:
+            return None
+        seen = True
+        a, b = int(m.group(1)), int(m.group(2))
+        if a > 12 and b > 12:
+            return None
+        if a > 12:
+            dmy_evidence = True
+        elif b > 12:
+            mdy_evidence = True
+    if not seen or (mdy_evidence and dmy_evidence):
+        return None
+    if mdy_evidence:
+        return "MDY"
+    if dmy_evidence:
+        return "DMY"
+    return None
+
+
+def _slash_to_iso(value: str, fmt: str) -> str | None:
+    """Convert a resolved slash date to ISO (YYYY-MM-DD[ HH:MM:SS])."""
+    m = _SLASH_DATE_RE.fullmatch(str(value).strip())
+    if not m:
+        return None
+    a, b, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    month, day = (a, b) if fmt == "MDY" else (b, a)
+    if year < 100:
+        year += 2000 if year < 70 else 1900
+    hh, mm, ss = m.group(4), m.group(5), m.group(6)
+    try:
+        if hh is None:
+            datetime(year, month, day)
+            return f"{year:04d}-{month:02d}-{day:02d}"
+        datetime(year, month, day, int(hh), int(mm), int(ss or 0))
+        return f"{year:04d}-{month:02d}-{day:02d} {int(hh):02d}:{int(mm):02d}:{int(ss or 0):02d}"
+    except ValueError:
+        return None
+
+
+def _normalize_date_columns(df, column_logical_types: dict) -> dict[str, str]:
+    """Normalize resolvable non-ISO date columns to ISO in place.
+
+    Only touches STRING columns with date-like names whose slash format is
+    provably resolved. Ambiguous columns are left untouched (values preserved).
+    Returns {column: note} for observability.
+    """
+    notes: dict[str, str] = {}
+    for name, logical in column_logical_types.items():
+        if logical != "STRING" or name not in df.columns:
+            continue
+        low = str(name).lower()
+        if not any(h in low for h in _DATE_NAME_HINTS):
+            continue
+        samples = [v for v in df[name].dropna().astype(str).tolist() if v.strip()][:200]
+        if not samples or any("-" in s and "/" not in s for s in samples[:5]):
+            continue  # already ISO-like or empty
+        fmt = _resolve_slash_date_format(samples)
+        if not fmt:
+            notes[name] = "non-ISO date format left as-is (ambiguous)"
+            continue
+        converted = 0
+        iso_vals = []
+        for v in df[name].tolist():
+            if v is None or (isinstance(v, str) and not v.strip()):
+                iso_vals.append(v)
+                continue
+            iso = _slash_to_iso(v, fmt)
+            if iso is None:
+                iso_vals.append(v)
+            else:
+                iso_vals.append(iso)
+                converted += 1
+        if converted:
+            df[name] = iso_vals
+            notes[name] = f"normalized {converted} values from {fmt} to ISO"
+    return notes
+
 
 def _safe_db_name(name: str) -> str:
     normalised = re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
@@ -176,6 +275,12 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
         column["name"]: column["inferred_type"]
         for column in profile["columns"]
     }
+    # Normalize provably-resolvable non-ISO dates to ISO so time SQL works.
+    # Never breaks ingestion: wrapped defensively, ambiguous formats untouched.
+    try:
+        _date_notes = _normalize_date_columns(df, column_logical_types)
+    except Exception:
+        _date_notes = {}
     column_types = {
         name: _SQLITE_TYPE.get(logical, "TEXT")
         for name, logical in column_logical_types.items()

@@ -136,7 +136,7 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
           <div className="flex-1" />
 
           {/* Search */}
-          <button className="hidden md:flex items-center gap-2 px-3 h-8 rounded-lg bg-secondary/70 text-muted-foreground hover:text-foreground hover:bg-secondary text-[12.5px] transition-all border border-border/60 hover:border-border hover:shadow-sm">
+          <button aria-label="Search analyses" className="hidden md:flex items-center gap-2 px-3 h-8 rounded-lg bg-secondary/70 text-muted-foreground hover:text-foreground hover:bg-secondary text-[12.5px] transition-all border border-border/60 hover:border-border hover:shadow-sm">
             <Search size={12} />
             <span>Search...</span>
             <span className="ml-1.5 text-muted-foreground/60 text-[10px] font-mono bg-background/60 px-1.5 py-0.5 rounded border border-border/50">⌘K</span>
@@ -145,6 +145,7 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
           {/* Theme toggle */}
           <button
             onClick={toggleTheme}
+            aria-label={isDark ? "Switch to light mode" : "Switch to dark mode"}
             className="p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-all"
             title="Toggle theme"
           >
@@ -153,6 +154,7 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
 
           {/* Notifications */}
           <button
+            aria-label="Notifications"
             className="relative p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-all"
             title="Notifications"
           >

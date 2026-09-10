@@ -21,7 +21,12 @@ if sys.platform == "win32":
 
     def _blob(data: bytes) -> DATA_BLOB:
         buf = ctypes.create_string_buffer(data, len(data))
-        return DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        blob = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        # Keep the buffer alive: without this reference the bytes are freed
+        # when _blob returns, leaving a dangling pointer (use-after-free that
+        # fails intermittently, typically in long-lived server processes).
+        blob._keepalive = buf
+        return blob
 
     def _protect(data: bytes) -> bytes:
         blob_in = _blob(data)

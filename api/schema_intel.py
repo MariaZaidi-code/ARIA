@@ -271,6 +271,11 @@ class SchemaIntelligence:
             low = col.lower()
             if any(h in low for h in date_hints):
                 return col
+            # Bare abbreviations (ts/dt/...) only on word boundaries —
+            # avoids matching "hits", "parts", "assets".
+            import re as _re
+            if _re.search(r"(^|_)(ts|dt|dttm|datetime|ymd)(_|$)", low):
+                return col
         return None
 
     def find_join_path(self, from_table: str, to_table: str) -> list:

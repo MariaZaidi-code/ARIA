@@ -19,6 +19,40 @@ export default function Predictive({ insightResult = null, goalResult = null }: 
   const [selectedTime, setSelectedTime] = useState<string>("");
   const [horizon, setHorizon] = useState(6);
   const [showControls, setShowControls] = useState(false);
+  // What-if scenario (spec §16): deterministic estimate, never a forecast.
+  const [scenarioPct, setScenarioPct] = useState(10);
+  const [scenario, setScenario] = useState<any>(null);
+  const [scenarioLoading, setScenarioLoading] = useState(false);
+  const [scenarioError, setScenarioError] = useState("");
+
+  const runScenario = useCallback(async () => {
+    setScenarioLoading(true);
+    setScenarioError("");
+    try {
+      const token = localStorage.getItem("aria_auth_token");
+      const res = await fetch("/api/predictive/scenario", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          column: (selectedTarget || "").split(" (")[0] || undefined,
+          pct_change: Number(scenarioPct) || 0,
+          periods: 3,
+        }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setScenario(data);
+      } else {
+        setScenario(null);
+        setScenarioError(data.detail || "Scenario analysis failed.");
+      }
+    } catch (e: any) {
+      setScenario(null);
+      setScenarioError(e?.message || "Scenario analysis failed.");
+    } finally {
+      setScenarioLoading(false);
+    }
+  }, [selectedTarget, scenarioPct]);
 
   const grid = isDark ? "#2A2A35" : "#E5E7EB";
   const axis = isDark ? "#8889A0" : "#9CA3AF";
@@ -414,6 +448,53 @@ export default function Predictive({ insightResult = null, goalResult = null }: 
           <p className="text-sm text-foreground leading-relaxed">{predictions.reason}</p>
         </div>
       )}
+
+      {/* Scenario Analysis — deterministic what-if on real aggregates */}
+      <div className="bg-card border border-border rounded-xl p-5 space-y-4">
+        <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Scenario Analysis</p>
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="space-y-1.5">
+            <p className="text-xs font-medium text-muted-foreground">Change to {selectedTarget.split(" (")[0] || "measure"} (%)</p>
+            <input
+              type="number" min={-95} max={95} step={1} value={scenarioPct}
+              onChange={(e) => setScenarioPct(Number(e.target.value))}
+              className="w-32 bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none focus:border-primary transition-colors"
+            />
+          </div>
+          <button
+            onClick={runScenario}
+            disabled={scenarioLoading}
+            className="bg-primary text-primary-foreground px-5 py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition-opacity disabled:opacity-50"
+          >
+            {scenarioLoading ? "Calculating..." : "Run Scenario"}
+          </button>
+          <p className="text-[11px] text-muted-foreground w-full">Estimate only — uniform change on trailing actuals, not a forecast.</p>
+        </div>
+        {scenarioError && <p className="text-sm text-negative font-medium">{scenarioError}</p>}
+        {scenario && (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="border border-border rounded-xl p-4 space-y-1">
+              <p className="text-xs text-muted-foreground">Baseline (trailing avg)</p>
+              <p className="text-xl font-bold text-foreground">{Number(scenario.baseline).toLocaleString()}</p>
+              <p className="text-xs text-muted-foreground">{scenario.periods_used} period(s) · {scenario.column}</p>
+            </div>
+            <div className="border border-primary/40 bg-primary/5 rounded-xl p-4 space-y-1">
+              <p className="text-xs text-muted-foreground">Scenario ({scenario.pct_change > 0 ? "+" : ""}{scenario.pct_change}%)</p>
+              <p className="text-xl font-bold text-foreground">{Number(scenario.scenario_value).toLocaleString()}</p>
+              <p className={`text-xs font-semibold ${scenario.delta >= 0 ? "text-positive" : "text-negative"}`}>
+                {scenario.delta >= 0 ? "+" : ""}{Number(scenario.delta).toLocaleString()} vs baseline
+              </p>
+            </div>
+            <div className="border border-border rounded-xl p-4 space-y-1">
+              <p className="text-xs text-muted-foreground">Assumptions</p>
+              {(scenario.assumptions || []).map((a: string, i: number) => (
+                <p key={i} className="text-xs text-foreground leading-relaxed">· {a}</p>
+              ))}
+              {scenario.limitations && <p className="text-[11px] text-muted-foreground pt-1">{scenario.limitations}</p>}
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* Prediction intervals section */}
       {hasPredictions && predictions?.validation && (

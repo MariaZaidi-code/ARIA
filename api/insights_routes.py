@@ -447,9 +447,41 @@ class InsightsEngine:
 
     # ── Opportunities ─────────────────────────────────────────────────────
 
+    def _usable_dimension(self, table: str) -> str | None:
+        """First text dimension that isn't near-unique (§13).
+
+        Segmenting by an ID-like column (one value per row) produces
+        meaningless 'opportunities'. Prefers compact breakdowns.
+        """
+        candidates = []
+        best = self.intel.find_best_dimension(table)
+        if best:
+            candidates.append(best)
+        for col in self.intel.get_text_cols(table):
+            if col not in candidates:
+                candidates.append(col)
+        ranked = []
+        for dim in candidates[:5]:
+            try:
+                cur = self.conn.cursor()
+                cur.execute(
+                    f"SELECT COUNT(*), COUNT(DISTINCT {_safe_name(dim)}) FROM {_safe_name(table)}"
+                )
+                row = cur.fetchone()
+                cur.close()
+                if not row or not row[0]:
+                    continue
+                if float(row[1] or 0) / float(row[0]) > 0.5:
+                    continue
+                ranked.append((row[1], dim))
+            except Exception:
+                continue
+        ranked.sort(key=lambda x: x[0])
+        return ranked[0][1] if ranked else None
+
     def _detect_opportunities(self, table: str):
         insights = []
-        dim = self.intel.find_best_dimension(table)
+        dim = self._usable_dimension(table)
         if not dim:
             return []
 
@@ -1088,6 +1120,7 @@ def ask_about_insight(insight_id: str, req: AskInsightRequest, request: Request,
     # Run through GoalAgent
     try:
         from goal_agent.agent import GoalAgent
+        from goal_agent.schema import load_user_overrides
         import time
 
         output_dir = Path("artifacts/processed_data") / f"user_{user['user_id']}"
@@ -1099,6 +1132,7 @@ def ask_about_insight(insight_id: str, req: AskInsightRequest, request: Request,
             db_uri=db_uri,
             provider=provider,
             dialect=dialect,
+            overrides=load_user_overrides(user["user_id"], session.get("db_name", "")),
         )
         result = agent.process_goal(question, output_path=str(output_path))
     except Exception as e:
