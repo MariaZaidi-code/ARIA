@@ -14,6 +14,7 @@ from core.validation import validate_goal_text
 from goal_agent import GoalAgent
 from goal_agent.schema import load_user_overrides
 from goal_agent.proactive_intelligence import analyze_result_intelligence
+from core.analytical_result import analyze_result
 from insight_agent import InsightAgent, sanitize_json
 
 router = APIRouter()
@@ -415,12 +416,27 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     processed = sanitize_json(processed)
     columns = list(processed.get("data", [{}])[0].keys()) if processed.get("data") else []
 
-    # Run proactive intelligence analysis on the result data
-    result_data = processed.get("data", [])
+    # ── Analytical validation / repair / answer synthesis (spec §5-§11) ──
+    analysis = analyze_result(
+        ir=processed.get("goal_ir") or {},
+        columns=columns,
+        rows=processed.get("data", []) or [],
+        goal=req.goal,
+        sql=processed.get("sql_used", ""),
+        row_count=processed.get("row_count", 0),
+    )
+    result_data = analysis["data"]
+    columns = analysis["columns"]
+    if analysis.get("repaired"):
+        processed["data"] = result_data
+        processed["row_count"] = len(result_data)
+        processed["columns"] = columns
+
+    # Run proactive intelligence analysis on the validated result data
     proactive = analyze_result_intelligence(
         data=result_data,
         goal=req.goal,
-        message=processed.get("message", ""),
+        message=analysis.get("answer") or processed.get("message", ""),
     )
 
     # ── Provenance ─────────────────────────────────────────────────────
@@ -558,22 +574,12 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         dialect=session.get("dialect"),
         processed=processed,
     )
-    # ── Why / story / chart-spec envelope (§20-24, deterministic) ─────────
-    why_block = _build_why(
-        goal=req.goal, tables=tables_used, columns=columns,
-        row_count=processed.get("row_count", 0),
-        sql=processed.get("sql_used", ""),
-        explanation=proactive.get("explanation"),
-        confidence=proactive.get("confidence", "high"),
-        warnings=processed.get("warnings", []),
-    )
-    story_text = _build_story(
-        goal=req.goal, tables=tables_used, columns=columns,
-        result_data=result_data, why_block=why_block,
-    )
-    chart_spec = _chart_spec_for_result(columns, result_data)
-    consistency = _check_consistency(chart_spec, result_data, why_block)
-    answer_message = processed.get("message") or _summarize_result(
+    # ── Why / story / chart-spec envelope (§20-24, intent-aware) ─────────
+    why_block = analysis["why"]
+    story_text = analysis["story"]
+    chart_spec = analysis["chart_spec"]
+    consistency = analysis["consistency"]
+    answer_message = analysis["answer"] or processed.get("message") or _summarize_result(
         req.goal, columns, result_data)
     # Cross-source: document evidence fused alongside the structured answer.
     doc_evidence = _document_evidence(user["user_id"], req.goal)
@@ -611,6 +617,9 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "story": story_text,
         "chart_spec": chart_spec,
         "consistency": consistency,
+        "analysis": analysis.get("analysis"),
+        "result_valid": analysis.get("valid", True),
+        "repaired": analysis.get("repaired", False),
         "document_evidence": doc_evidence,
         "history_id": session["pending_history_id"],
         "conversation_id": conv_id,

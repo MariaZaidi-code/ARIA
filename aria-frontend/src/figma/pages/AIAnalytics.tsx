@@ -3,6 +3,7 @@ import { Search, X, Clock, Copy, ChevronDown, ChevronUp, Sparkles, ArrowRight,
 CheckCircle, Loader2, Code2, Table2, AlertCircle, Database, GitBranch, HelpCircle, BookOpen } from "lucide-react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, LineChart, Line, PieChart, Pie, Cell, ScatterChart, Scatter } from "recharts";
 import { useTheme } from "../App";
+import { colorForName } from "../lib/charts";
 
 type AnalysisState = "idle" | "processing" | "done" | "clarification" | "error";
 
@@ -47,7 +48,7 @@ export default function AIAnalytics({
   const [query, setQuery] = useState(initialQuery);
   const [sqlExpanded, setSqlExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [showTable, setShowTable] = useState(true);
+  const [showTable, setShowTable] = useState(false);
   const [showWhy, setShowWhy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -82,8 +83,10 @@ export default function AIAnalytics({
   // Extract real data from results
   const sqlUsed = goalResult?.generatedSql || goalResult?.sql_used || "";
   const tableData = goalResult?.data || analysisResult?.data || [];
-  const chartData = tableData.slice(0, 12);
+  const chartData = tableData;
   const followUps = goalResult?.suggestedQuestions || goalResult?.suggested_questions || [];
+  const backendSpec = goalResult?.chartSpec || null;
+  const analysisMeta = goalResult?.analysis || null;
 
   // Feedback tracking (personalization layer — Section 62)
   const [insightRating, setInsightRating] = useState<"useful" | "not_useful" | null>(null);
@@ -379,8 +382,34 @@ export default function AIAnalytics({
                 {goalResult.message}
               </p>
               <div className="flex flex-wrap gap-4 pt-1 text-[11px] text-muted-foreground">
-                {tableData.length > 0 && <span>Rows: <span className="text-foreground font-medium">{tableData.length}</span></span>}
-                {goalResult.confidence && <span>Confidence: <span className="text-positive font-medium">{goalResult.confidence}</span></span>}
+                {analysisMeta?.based_on > 0 && (
+                  <span>
+                    Based on{" "}
+                    <span className="text-foreground font-medium">
+                      {analysisMeta.based_on.toLocaleString()}
+                    </span>{" "}
+                    records
+                  </span>
+                )}
+                {analysisMeta?.entity_count > 0 && (
+                  <span>
+                    <span className="text-foreground font-medium">
+                      {analysisMeta.entity_count}
+                    </span>{" "}
+                    {analysisMeta.entity
+                      ? (analysisMeta.entity_count === 1 ? analysisMeta.entity : `${analysisMeta.entity}s`)
+                      : "groups"}{" "}
+                    analyzed
+                  </span>
+                )}
+                {(goalResult.confidence || analysisMeta?.confidence) && (
+                  <span>
+                    Confidence:{" "}
+                    <span className="text-positive font-medium">
+                      {goalResult.confidence || analysisMeta.confidence}
+                    </span>
+                  </span>
+                )}
               </div>
               {/* Feedback buttons — personalization signal (Section 62) */}
               <div className="flex items-center gap-2 pt-2 border-t border-border">
@@ -460,7 +489,11 @@ export default function AIAnalytics({
                       contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
                       labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
                     />
-                    <Bar dataKey={yKey} fill="#4F46E5" radius={[0, 5, 5, 0]} />
+                    <Bar dataKey={yKey} radius={[0, 5, 5, 0]}>
+                      {chartRenderData.map((row: any, i: number) => (
+                        <Cell key={i} fill={colorForName(String(row?.[xKey] ?? i))} />
+                      ))}
+                    </Bar>
                   </BarChart>
                 ) : chartType === "stacked" ? (
                   <BarChart data={chartRenderData} barSize={28}>
@@ -504,9 +537,13 @@ export default function AIAnalytics({
                       contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
                       labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
                     />
-                    <Bar dataKey={yKey} fill="#4F46E5" radius={[5, 5, 0, 0]}>
-                      {chartType === "histogram" && chartRenderData.map((_, i) => (
-                        <Cell key={i} fill="#4F46E5" fillOpacity={0.55 + (0.45 * i) / Math.max(1, chartRenderData.length)} />
+                    <Bar dataKey={yKey} radius={[5, 5, 0, 0]}>
+                      {chartRenderData.map((row: any, i: number) => (
+                        <Cell
+                          key={i}
+                          fill={chartType === "histogram" ? "#4F46E5" : colorForName(String(row?.[xKey] ?? i))}
+                          fillOpacity={chartType === "histogram" ? 0.55 + (0.45 * i) / Math.max(1, chartRenderData.length) : 1}
+                        />
                       ))}
                     </Bar>
                   </BarChart>
