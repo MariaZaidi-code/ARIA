@@ -215,9 +215,14 @@ export const fetchSessionStatus = async () => {
   try {
     const data = await request("/session/status");
     return { success: true, data: data || {} };
-  } catch (e) {
+  } catch {
     return { success: false, data: {} };
   }
+};
+
+export const disconnectSource = async () => {
+  const data = await request("/disconnect", { method: "POST", body: JSON.stringify({}) });
+  return { success: true, data };
 };
 
 export const connectDatabase = async (databaseDetails = {}) => {
@@ -540,6 +545,8 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
     story: data?.story || "",
     chartSpec: data?.chart_spec || null,
     consistency: data?.consistency || null,
+    // Server-defined display metadata (t.txt-5): render as-is, never recompute.
+    display: data?.display || null,
   };
 
   return {

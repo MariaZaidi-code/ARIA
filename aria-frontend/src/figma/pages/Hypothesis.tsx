@@ -1,7 +1,9 @@
 import { useState, useEffect, useMemo, useRef } from "react";
-import { FlaskConical, Loader2, CheckCircle, XCircle, ArrowRight, Save, Trash2, Beaker, AlertTriangle, ChevronDown, ChevronUp, Sparkles, Database, ListChecks } from "lucide-react";
+import { Loader2, CheckCircle, XCircle, ArrowRight, Save, Trash2, Beaker, AlertTriangle, ChevronDown, ChevronUp, Sparkles, Database, ListChecks } from "lucide-react";
 import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line, BarChart, Bar, Cell } from "recharts";
 import { useTheme } from "../App";
+import Evidence from "../components/Evidence";
+import { confidenceWord } from "../lib/format";
 
 /* =====================================================================
    ARIA Hypothesis — evidence-based assumption testing (t.txt §§1–83).
@@ -83,7 +85,6 @@ export default function Hypothesis({ insightResult, onAskQuestion, connectionSta
   const [pickedMetric, setPickedMetric] = useState<string>("");
   const [pickedDriver, setPickedDriver] = useState<string>("");
   const [availFields, setAvailFields] = useState<any[]>([]);
-  const [showTech, setShowTech] = useState(false);
   const [prep, setPrep] = useState<any>(null);
   const prefillDone = useRef(false);
 
@@ -142,7 +143,7 @@ export default function Hypothesis({ insightResult, onAskQuestion, connectionSta
     setQuestion(text);
     setStatus("parsing");
     setError(""); setErrorCode("");
-    setResult(null); setPreview(null); setClarify(null); setShowTech(false);
+    setResult(null); setPreview(null); setClarify(null);
     try {
       const res = await fetch("/api/hypotheses/parse", {
         method: "POST",
@@ -208,7 +209,7 @@ export default function Hypothesis({ insightResult, onAskQuestion, connectionSta
     setStatus("running");
     setStage(0);
     setError(""); setErrorCode("");
-    setResult(null); setShowTech(false);
+    setResult(null);
     const timer = setInterval(() => setStage((s) => Math.min(s + 1, LOAD_STAGES.length - 1)), 1400);
     try {
       const res = await fetch("/api/hypothesis/analyze", {
@@ -613,7 +614,7 @@ export default function Hypothesis({ insightResult, onAskQuestion, connectionSta
                   </div>
                 </div>
                 <div className="space-y-4 md:border-l md:border-border md:pl-5">
-                  <Headline label={r.analysis === "correlation" ? "Correlation" : r.analysis === "trend" ? "Trend slope" : "Gap"} value={r.analysis === "correlation" ? `${Number(r.r) >= 0 ? "+" : ""}${Number(r.r).toFixed(2)}` : r.analysis === "trend" ? `${Number(r.slope_per_period) >= 0 ? "+" : ""}${r.slope_per_period}` : r.rel_pct !== undefined && r.rel_pct !== null ? `${Number(r.rel_pct) >= 0 ? "+" : ""}${r.rel_pct}%` : "—"} sub="headline result" />
+                  <Headline label={r.analysis === "correlation" ? "Correlation" : r.analysis === "trend" ? "Trend slope" : "Gap"} value={r.analysis === "correlation" ? `${Number(r.r) >= 0 ? "+" : ""}${Number(r.r).toFixed(2)}` : r.analysis === "trend" ? `${Number(r.slope_per_period) >= 0 ? "+" : ""}${(Math.round(Number(r.slope_per_period) * 100) / 100).toLocaleString()}` : r.rel_pct !== undefined && r.rel_pct !== null ? `${Number(r.rel_pct) >= 0 ? "+" : ""}${r.rel_pct}%` : "—"} sub="headline result" />
                   <Headline label="Confidence" value={Number(r.p_value) < 0.01 ? "High" : Number(r.p_value) < 0.05 ? "Moderate" : "Low"} sub={r.analysis === "correlation" ? `r² shares ${Math.round(Number(r.r) ** 2 * 100)}% movement` : `p = ${Number(r.p_value) < 0.001 ? "<0.001" : Number(r.p_value).toFixed(3)}`} />
                 </div>
               </div>
@@ -735,24 +736,16 @@ export default function Hypothesis({ insightResult, onAskQuestion, connectionSta
             </div>
           )}
 
-          {/* Technical details (§69): collapsible audit trail (§70) */}
-          <div className="bg-card border border-border rounded-xl overflow-hidden">
-            <button onClick={() => setShowTech((v) => !v)} className="w-full flex items-center gap-2 px-4 py-3 text-left hover:bg-secondary/40 transition-colors">
-              <FlaskConical size={13} className="text-muted-foreground" />
-              <span className="text-xs font-semibold text-foreground">Analysis details</span>
-              <span className="ml-auto text-muted-foreground">{showTech ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</span>
-            </button>
-            {showTech && (
-              <div className="border-t border-border px-4 py-3.5 grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                <div><p className="text-muted-foreground">Method</p><p className="text-foreground font-medium">{String(r.analysis || "").replace(/_/g, " ")}{r.analysis === "correlation" ? " (Pearson primary, Spearman robustness)" : r.analysis === "group_comparison" ? " (Welch t primary, Mann-Whitney robustness)" : ""}</p></div>
-                <div><p className="text-muted-foreground">Table</p><p className="text-foreground font-medium">{r.table}</p></div>
-                <div><p className="text-muted-foreground">Statistical values</p><p className="text-foreground font-medium font-mono">p = {Number(r.p_value) < 0.001 ? "<0.001" : Number(r.p_value).toFixed(4)} · n = {Number(r.n).toLocaleString()}{r.r !== undefined ? ` · r = ${Number(r.r).toFixed(3)}` : ""}{r.r_squared !== undefined ? ` · R² = ${Number(r.r_squared).toFixed(3)}` : ""}{r.cohens_d !== undefined ? ` · d = ${Number(r.cohens_d).toFixed(2)}` : ""}</p></div>
-                <div><p className="text-muted-foreground">Data preparation</p><p className="text-foreground font-medium">{prep ? `${Number(prep.rows_available || r.n).toLocaleString()} rows scanned, ${Number(prep.usable ?? r.n).toLocaleString()} valid observations on the tested columns.` : `${Number(r.n).toLocaleString()} valid observations on the tested columns.`} Missing values in other columns were left untouched.</p></div>
-                <div><p className="text-muted-foreground">Assumptions</p><p className="text-foreground font-medium">Outliers kept and reported; rank-based fallback used when extremes threaten Pearson. Association only — never causality.</p></div>
-                <div><p className="text-muted-foreground">Verdict rule</p><p className="text-foreground font-medium">p &lt; 0.05 + non-weak effect + expected direction → Supported; p ≥ 0.05 → Not Supported; weak effect → Inconclusive.</p></div>
-              </div>
-            )}
-          </div>
+          {/* Evidence (s.txt): shared disclosure, closed by default */}
+          <Evidence
+            sections={[
+              { title: "Data analyzed", body: `${prep ? `${Number(prep.rows_available || r.n).toLocaleString()} rows scanned, ${Number(prep.usable ?? r.n).toLocaleString()} valid observations on the tested columns` : `${Number(r.n).toLocaleString()} valid observations`} in ${r.table}. Missing values elsewhere were left untouched.` },
+              { title: "Key observation", body: result.explanation },
+              { title: "Analysis method", body: `${String(r.analysis || "").replace(/_/g, " ")}${r.analysis === "correlation" ? " (Pearson primary, Spearman robustness check)" : r.analysis === "group_comparison" ? " (Welch t primary, Mann-Whitney check)" : ""}. Confidence in the result: ${confidenceWord(r.p_value)}.` },
+              { title: "Confidence", body: `Statistical values (rounded): p ${Number(r.p_value) < 0.001 ? "<0.001" : `≈ ${Number(r.p_value).toFixed(3)}`} · n = ${Number(r.n).toLocaleString()}${r.r !== undefined ? ` · relationship ≈ ${Number(r.r).toFixed(2)}` : ""}${r.cohens_d !== undefined ? ` · group gap ≈ ${Number(r.cohens_d).toFixed(2)} standard deviations` : ""}.` },
+              { title: "Assumptions & limits", body: "Outliers kept and reported. Association only — never proof of cause. Verdict rule: clear effect + expected direction → Supported; otherwise Not Supported or Inconclusive." },
+            ]}
+          />
 
           {/* Next actions (§§43–45): structured context, not bare sentences */}
           <div className="bg-card border border-border rounded-xl p-4">

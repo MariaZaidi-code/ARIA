@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { Send, Plus, MoreHorizontal, Sparkles } from "lucide-react";
+import Evidence from "../components/Evidence";
 
 type Message = {
   id: string;
@@ -79,18 +80,31 @@ function renderChart(msg: Message) {
   );
 }
 
-export default function Copilot() {
+export default function Copilot({ initialQuestion = "" }: { initialQuestion?: string }) {
   const [conversations, setConversations] = useState(defaultConversations);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
+  const consumedPrefill = useRef("");
 
   const active = conversations.find((c) => c.id === activeId) || conversations[0] || null;
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [active?.messages.length, isTyping]);
+
+  // Handoff from other pages ("Ask ARIA" buttons): prefill once per
+  // distinct question and send it, so the conversation continues here.
+  useEffect(() => {
+    const q = (initialQuestion || "").trim();
+    if (q && consumedPrefill.current !== q) {
+      consumedPrefill.current = q;
+      setInput(q);
+      send(q);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialQuestion]);
 
   const send = async (text?: string) => {
     const content = text || input;
@@ -164,7 +178,17 @@ export default function Copilot() {
     const id = `c${Date.now()}`;
     setConversations((prev) => [{ id, title: "New conversation", subtitle: "Just now", date: "Today", messages: [] }, ...prev]);
     setActiveId(id);
+    setMenuOpen(false);
   };
+
+  const deleteActiveChat = () => {
+    if (!activeId) return;
+    setConversations((prev) => prev.filter((c) => c.id !== activeId));
+    setActiveId(null);
+    setMenuOpen(false);
+  };
+
+  const [menuOpen, setMenuOpen] = useState(false);
 
   return (
     <div className="flex h-full">
@@ -205,9 +229,31 @@ export default function Copilot() {
                   })()}
                 </p>
               </div>
-              <button className="p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors">
-                <MoreHorizontal size={14} />
-              </button>
+              <div className="relative">
+                <button
+                  onClick={() => setMenuOpen((o) => !o)}
+                  aria-label="Conversation options"
+                  className="p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  <MoreHorizontal size={14} />
+                </button>
+                {menuOpen && (
+                  <div className="absolute right-0 top-9 w-44 bg-card border border-border rounded-xl shadow-lg py-1 z-50">
+                    <button
+                      onClick={newChat}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-xs text-foreground hover:bg-secondary transition-colors"
+                    >
+                      <Plus size={13} /> New chat
+                    </button>
+                    <button
+                      onClick={deleteActiveChat}
+                      className="w-full flex items-center gap-2.5 px-3 py-2 text-xs text-negative hover:bg-secondary transition-colors"
+                    >
+                      Delete conversation
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4 custom-scroll">
@@ -232,12 +278,14 @@ export default function Copilot() {
                         <p className="text-[13px] text-foreground leading-relaxed">{msg.content}</p>
                         {renderChart(msg)}
                         {msg.sql && (
-                          <details className="mt-2 pt-2 border-t border-border">
-                            <summary className="text-[11px] text-muted-foreground cursor-pointer hover:text-foreground">
-                              Show SQL
-                            </summary>
-                            <pre className="mt-1.5 text-[10px] font-mono text-muted-foreground overflow-x-auto whitespace-pre-wrap">{msg.sql}</pre>
-                          </details>
+                          <div className="mt-2">
+                            <Evidence
+                              label="Query used"
+                              sections={[{ title: "SQL", body: (
+                                <pre className="text-[10px] font-mono text-muted-foreground overflow-x-auto whitespace-pre-wrap">{msg.sql}</pre>
+                              ) }]}
+                            />
+                          </div>
                         )}
                       </div>
                       <p className="text-[10px] text-muted-foreground px-1">{msg.timestamp}</p>

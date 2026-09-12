@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from "react";
-import { TrendingUp, Loader2, RefreshCw, AlertCircle, ChevronDown, SlidersHorizontal } from "lucide-react";
-import { ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { Loader2, RefreshCw, AlertCircle, Sparkles, Target, TrendingUp, TrendingDown, Crosshair, Lightbulb, Check } from "lucide-react";
+import { ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
 import { useTheme } from "../App";
+import Evidence from "../components/Evidence";
 
 interface PredictiveProps {
   insightResult?: any;
@@ -9,38 +10,133 @@ interface PredictiveProps {
   connectionStatus?: string;
 }
 
+type PeriodTab = "Monthly" | "Quarterly" | "Yearly";
+
+const plainName = (c: string) => (c || "").split(" (")[0].trim();
+
+const fmtNum = (v: any) => {
+  if (v === null || v === undefined || isNaN(Number(v))) return "—";
+  const n = Number(v);
+  if (Math.abs(n) >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (Math.abs(n) >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return n.toLocaleString(undefined, { maximumFractionDigits: 1 });
+};
+
+const shortLabel = (label: string) => {
+  const m = /^(\d{4})-(\d{2})(?:-(\d{2}))?$/.exec(String(label || ""));
+  if (m) {
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    return months[Number(m[2]) - 1] || label;
+  }
+  return String(label || "");
+};
+
+const monthKey = (label: string) => String(label || "").slice(0, 7);
+
+function rebin(rows: any[], tab: PeriodTab) {
+  if (tab === "Monthly") return rows;
+  const groups = new Map<string, any>();
+  for (const r of rows) {
+    const mk = monthKey(r.label);
+    if (!/^\d{4}-\d{2}$/.test(mk)) continue;
+    const [y, m] = mk.split("-").map(Number);
+    const key = tab === "Quarterly" ? `${y}-Q${Math.floor((m - 1) / 3) + 1}` : `${y}`;
+    if (!groups.has(key)) groups.set(key, { label: key, short: key, actual: 0, forecast: 0, _a: false, _f: false });
+    const g = groups.get(key);
+    if (r.actual !== null && r.actual !== undefined) { g.actual += Number(r.actual) || 0; g._a = true; }
+    if (r.forecast !== null && r.forecast !== undefined) { g.forecast += Number(r.forecast) || 0; g._f = true; }
+  }
+  return [...groups.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([, g]) => ({
+      label: g.label,
+      short: g.label,
+      actual: g._a ? Math.round(g.actual * 100) / 100 : null,
+      forecast: g._f ? Math.round(g.forecast * 100) / 100 : null,
+    }));
+}
+
+const LOAD_STAGES = [
+  "Analyzing time-series data…",
+  "Preparing historical observations…",
+  "Building forecast…",
+  "Calculating uncertainty…",
+  "Generating explanation…",
+];
+
 export default function Predictive({ insightResult = null, goalResult = null, connectionStatus = "not-connected" }: PredictiveProps) {
   const { isDark } = useTheme();
   const [forecast, setForecast] = useState<any>(null);
+  const [forecastInfo, setForecastInfo] = useState<any>(null);
+  const [selection, setSelection] = useState<any>(null);
   const [loading, setLoading] = useState(false);
+  const [loadStage, setLoadStage] = useState(0);
   const [error, setError] = useState("");
-  const [columns, setColumns] = useState<string[]>([]);
-  const [dateColumns, setDateColumns] = useState<string[]>([]);
+  const [elig, setElig] = useState<any>(null);
+  const [eligLoading, setEligLoading] = useState(false);
+  const [eligError, setEligError] = useState("");
   const [selectedTarget, setSelectedTarget] = useState<string>("");
+  const [selectedTable, setSelectedTable] = useState<string>("");
   const [selectedTime, setSelectedTime] = useState<string>("");
   const [horizon, setHorizon] = useState(6);
-  const [showControls, setShowControls] = useState(false);
-  // What-if scenario (spec §16): deterministic estimate, never a forecast.
+  const [tab, setTab] = useState<PeriodTab>("Monthly");
   const [scenarioPct, setScenarioPct] = useState(10);
   const [scenario, setScenario] = useState<any>(null);
   const [scenarioLoading, setScenarioLoading] = useState(false);
   const [scenarioError, setScenarioError] = useState("");
 
+  const authHeader = () => {
+    const token = localStorage.getItem("aria_auth_token");
+    return { Authorization: `Bearer ${token}` };
+  };
+
+  // ---- Eligibility: what can actually be forecast ----
+  const loadEligibility = useCallback(async () => {
+    setEligLoading(true);
+    setEligError("");
+    try {
+      const res = await fetch("/api/predictive/eligibility", { headers: authHeader() });
+      const data = await res.json();
+      if (data.ok) {
+        setElig(data);
+        const rec = data.recommended;
+        if (rec) {
+          setSelectedTarget((prev) => prev || rec.measure);
+          setSelectedTable((prev) => prev || rec.table);
+          setSelectedTime((prev) => prev || rec.time_dim);
+        }
+      } else {
+        setEligError(data.detail || "Couldn't inspect the data for forecasting.");
+      }
+    } catch (e: any) {
+      setEligError(e?.message || "Couldn't inspect the data for forecasting.");
+    } finally {
+      setEligLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (connectionStatus === "connected") loadEligibility();
+    else { setElig(null); setForecast(null); setError(""); }
+  }, [connectionStatus, loadEligibility]);
+
+  const tables: any[] = elig?.tables || [];
+  const activeTable = tables.find((t) => t.table === selectedTable) || tables.find((t) => (t.measures || []).includes(selectedTarget)) || null;
+  const activeMeasures: string[] = activeTable?.measures || [];
+  const activeTimes: any[] = activeTable?.time_dims || [];
+  const historyPoints = activeTable && selectedTime
+    ? (activeTimes.find((d) => d.column === selectedTime)?.distinct ?? null)
+    : (elig?.recommended?.history_points ?? null);
+
   const runScenario = useCallback(async () => {
     setScenarioLoading(true);
     setScenarioError("");
     try {
-      if (connectionStatus !== "connected") {
-        setScenario(null);
-        setScenarioError("Connect a data source to run a scenario.");
-        return;
-      }
-      const token = localStorage.getItem("aria_auth_token");
       const res = await fetch("/api/predictive/scenario", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        headers: { "Content-Type": "application/json", ...authHeader() },
         body: JSON.stringify({
-          column: (selectedTarget || "").split(" (")[0] || undefined,
+          column: plainName(selectedTarget) || undefined,
           pct_change: Number(scenarioPct) || 0,
           periods: 3,
         }),
@@ -50,491 +146,571 @@ export default function Predictive({ insightResult = null, goalResult = null, co
         setScenario(data);
       } else {
         setScenario(null);
-        setScenarioError(data.detail || "Scenario analysis failed.");
+        setScenarioError(data.detail || "Couldn't run that scenario. Try a different number.");
       }
     } catch (e: any) {
       setScenario(null);
-      setScenarioError(e?.message || "Scenario analysis failed.");
+      setScenarioError(e?.message || "Couldn't run that scenario.");
     } finally {
       setScenarioLoading(false);
     }
-  }, [selectedTarget, scenarioPct, connectionStatus]);
+  }, [selectedTarget, scenarioPct]);
 
   const grid = isDark ? "#2A2A35" : "#E5E7EB";
   const axis = isDark ? "#8889A0" : "#9CA3AF";
+  const actualColor = "#14B8A6";
+  const projectionColor = "#6366F1";
+  const avgColor = "#64748B";
 
-  // Try predictions from insightResult first
   const insightPredictions = insightResult?.predictions || {};
   const hasInsightPredictions = insightPredictions && (insightPredictions.valid || insightPredictions.points?.length > 0);
 
-  // Load available columns from schema/session when connected
-  const loadSchemaInfo = useCallback(async () => {
-    try {
-      const token = localStorage.getItem("aria_auth_token");
-      const res = await fetch("/api/session/status", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = await res.json();
-      if (data.db_name || data.connection_status === "connected") {
-        // Try to get schema info for column suggestions
-        try {
-          const schemaRes = await fetch("/api/schema", {
-            headers: { Authorization: `Bearer ${token}` },
-          });
-          const schemaData = await schemaRes.json();
-          if (schemaData.ok && schemaData.schema && schemaData.schema.tables) {
-            const tables = schemaData.schema.tables;
-            const allNumeric: string[] = [];
-            const allDates: string[] = [];
-            for (const [tname, tinfo] of Object.entries(tables as Record<string, any>)) {
-              const cols = tinfo.columns || [];
-              for (const c of cols) {
-                const cname = typeof c === "string" ? c : c.column || c.name || "";
-                const ctype = typeof c === "string" ? "" : c.data_type || c.type || "";
-                if (cname) {
-                  const lowType = String(ctype).toLowerCase();
-                  if (lowType.includes("date") || lowType.includes("time") || lowType.includes("timestamp")) {
-                    allDates.push(`${cname} (${tname})`);
-                  } else if (lowType.includes("numeric") || lowType.includes("int") || lowType.includes("float") || lowType.includes("decimal") || lowType.includes("real") || lowType.includes("double")) {
-                    allNumeric.push(`${cname} (${tname})`);
-                  }
-                }
-              }
-            }
-            setDateColumns(allDates.slice(0, 8));
-            setColumns(allNumeric.slice(0, 8));
-            // Prefer real measures over id/key/code columns (forecasting a
-            // synthetic key is meaningless; the backend refuses it too).
-            const isIdLike = (c: string) => {
-              const base = c.split(" (")[0].toLowerCase().trim();
-              return base.endsWith("_id") || base.endsWith("_key") || ["id", "key", "code"].includes(base);
-            };
-            const measures = allNumeric.filter((c) => !isIdLike(c));
-            if (allNumeric.length > 0 && !selectedTarget) {
-              setSelectedTarget(measures.length > 0 ? measures[0] : allNumeric[0]);
-            }
-            if (allDates.length > 0 && !selectedTime) {
-              setSelectedTime(allDates[0]);
-            }
-          }
-        } catch {
-          // Schema fetch optional
-        }
-      }
-    } catch {
-      // Session fetch optional
-    }
-  }, [selectedTarget, selectedTime]);
-
-  useEffect(() => {
-    loadSchemaInfo();
-  }, [loadSchemaInfo]);
-
   const fetchForecast = useCallback(async (target?: string, timeDim?: string, h?: number) => {
-    const t = target || selectedTarget || columns[0] || "main measure";
-    const d = timeDim || selectedTime || dateColumns[0] || "date";
+    const t = plainName(target || selectedTarget || "");
+    const td = plainName(timeDim || selectedTime || "");
     const hr = h !== undefined ? h : horizon;
+    if (!t) return;
 
     setLoading(true);
+    setLoadStage(0);
     setError("");
+    const stageTimer = setInterval(() => setLoadStage((s) => Math.min(s + 1, LOAD_STAGES.length - 1)), 2500);
     try {
-      const token = localStorage.getItem("aria_auth_token");
       const res = await fetch("/api/predictive/forecast", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { "Content-Type": "application/json", ...authHeader() },
         body: JSON.stringify({
-          question: `Forecast ${t.split(" (")[0]} over ${d.split(" (")[0] || "time"}`,
-          column: t.split(" (")[0],
+          question: td ? `Forecast ${t} by ${td} over time` : `Forecast ${t} over time`,
+          column: t,
+          time_dim: td || undefined,
           horizon: hr,
         }),
       });
       const data = await res.json();
       if (data.ok && data.forecast) {
         setForecast(data.forecast);
+        setForecastInfo(data.info || null);
+        setSelection(data.selection || null);
+        const f = data.forecast;
+        if (!f.valid && !(f.points?.length > 0)) {
+          if ((data.info?.rows_analyzed ?? 1) === 0) {
+            setError("There's no data to forecast yet. Connect a source with numbers tracked over time, then try again.");
+          } else {
+            setError(f.reason || "Couldn't build a reliable forecast from this data. Try a different number above.");
+          }
+        }
       } else {
-        setError(data.detail || "No forecast generated. Try selecting a different target or time dimension.");
+        setError(data.detail || "Couldn't build a forecast. Try a different number above.");
         setForecast(null);
       }
     } catch (e: any) {
-      setError(e.message || "Failed to generate forecast");
+      setError(e.message || "Couldn't build a forecast. Check your connection and try again.");
       setForecast(null);
     } finally {
+      clearInterval(stageTimer);
       setLoading(false);
     }
-  }, [selectedTarget, selectedTime, horizon, columns, dateColumns]);
+  }, [selectedTarget, selectedTime, horizon]);
 
-  // Auto-fetch on first load if no predictions from insightResult
+  // Auto-run once eligibility + a valid default exist.
   useEffect(() => {
-    if (connectionStatus !== "connected") return;
+    if (connectionStatus !== "connected" || !elig?.eligible || !selectedTarget) return;
     if (!hasInsightPredictions && (!forecast || forecast.points?.length === 0)) {
-      // Small delay to allow schema info to load first
       const timer = setTimeout(() => fetchForecast(), 500);
       return () => clearTimeout(timer);
     }
-  }, [connectionStatus, hasInsightPredictions, fetchForecast]);
+  }, [connectionStatus, elig, selectedTarget, hasInsightPredictions, fetchForecast]);
+
+  const useAutomatic = () => {
+    const rec = elig?.recommended;
+    if (!rec) return;
+    setSelectedTable(rec.table);
+    setSelectedTarget(rec.measure);
+    setSelectedTime(rec.time_dim);
+    setForecast(null);
+    setError("");
+    setTimeout(() => fetchForecast(rec.measure, rec.time_dim), 50);
+  };
 
   const predictions = forecast || insightPredictions;
   const hasPredictions = predictions && (predictions.valid || predictions.points?.length > 0);
-  const forecastData = predictions?.points || [];
-  const method = predictions?.method || "Auto-detected";
-  const accuracy = predictions?.accuracy_pct || null;
-  const reliability = predictions?.reliability || "medium";
+  const targetName = plainName(selection?.measure || predictions?.column || selectedTarget);
+  const timeName = plainName(selection?.time_dim || selectedTime);
+  const accuracy = predictions?.accuracy_pct ?? null;
 
-  if (loading) {
+  const chartRows = useMemo(() => {
+    const hist = Array.isArray(predictions?.history) ? predictions.history : [];
+    const pts: any[] = Array.isArray(predictions?.points) ? predictions.points : [];
+    const rows: any[] = [
+      ...hist.map((h: any) => ({ label: h.label, short: shortLabel(h.label), actual: h.actual, forecast: null, lower95: null, upper95: null })),
+      ...pts.map((p: any) => ({
+        label: p.label,
+        short: shortLabel(p.label),
+        actual: null,
+        forecast: p.forecast ?? p.value ?? null,
+        lower95: p.lower95 ?? null,
+        upper95: p.upper95 ?? null,
+      })),
+    ];
+    const rebinned = rebin(rows, tab);
+    return rebinned.map((r: any) => ({ ...r, short: r.short || shortLabel(r.label) }));
+  }, [predictions, tab]);
+
+  const historyVals: number[] = useMemo(() => {
+    const hist = Array.isArray(predictions?.history) ? predictions.history : [];
+    return hist.map((h: any) => Number(h.actual)).filter((v: number) => !isNaN(v));
+  }, [predictions]);
+
+  const lastActual = predictions?.last_actual?.value ?? (historyVals.length ? historyVals[historyVals.length - 1] : null);
+  const fwdPts: any[] = Array.isArray(predictions?.points) ? predictions.points : [];
+  const fwdVals = fwdPts.map((p: any) => Number(p.forecast ?? p.value)).filter((v: number) => !isNaN(v));
+  const projectedTotal = fwdVals.reduce((a, b) => a + b, 0);
+  const avgActual = historyVals.length ? historyVals.reduce((a, b) => a + b, 0) / historyVals.length : null;
+  const pctChange = predictions?.projected_pct_change ?? null;
+  const historyCount = forecastInfo?.rows_analyzed ?? historyVals.length;
+
+  const sumKey = (k: string) => fwdPts.reduce((a, p) => a + (Number(p[k]) || 0), 0);
+  const scenarios = useMemo(() => {
+    if (!fwdPts.length || lastActual === null) return null;
+    const base = (avgActual !== null ? avgActual * Math.max(1, fwdVals.length) : Math.abs(Number(lastActual)) * Math.max(1, fwdVals.length)) || 1;
+    const mk = (label: string, total: number, tone: string, note: string, sub: string) => {
+      const pct = ((total - base) / Math.abs(base)) * 100;
+      return { label, total, tone, note, sub, pct, ofTarget: base ? (total / base) * 100 : 100 };
+    };
+    return [
+      mk("Best Case", sumKey("upper95") || projectedTotal, "good", "Upper edge of the expected range", "If momentum holds"),
+      mk("Commit", projectedTotal, "base", "Central projection", "Based on recent trend"),
+      mk("Worst Case", sumKey("lower95") || projectedTotal, "bad", "Lower edge of the expected range", "If momentum slows"),
+    ];
+  }, [fwdPts, lastActual, avgActual, projectedTotal, fwdVals.length]);
+  const scenMax = scenarios ? Math.max(...scenarios.map((s) => s.total), 1) : 1;
+
+  const recentTop = useMemo(() => {
+    const hist = Array.isArray(predictions?.history) ? predictions.history : [];
+    const total = historyVals.reduce((a, b) => a + b, 0);
+    return [...hist]
+      .sort((a: any, b: any) => Number(b.actual) - Number(a.actual))
+      .slice(0, 3)
+      .map((h: any) => ({ label: shortLabel(h.label), value: Number(h.actual), share: total ? (Number(h.actual) / total) * 100 : 0 }));
+  }, [predictions, historyVals]);
+
+  const momDelta = historyVals.length >= 2 && historyVals[historyVals.length - 2]
+    ? ((historyVals[historyVals.length - 1] - historyVals[historyVals.length - 2]) / Math.abs(historyVals[historyVals.length - 2])) * 100
+    : null;
+
+  // Dynamic insights — only from calculated numbers, never invented.
+  const insights: string[] = useMemo(() => {
+    const out: string[] = [];
+    if (!hasPredictions || !targetName) return out;
+    if (pctChange !== null && pctChange > 1) out.push(`${targetName} is expected to keep rising over the next ${fwdVals.length} ${fwdVals.length === 1 ? "period" : "periods"} (about +${pctChange.toFixed(1)}%).`);
+    else if (pctChange !== null && pctChange < -1) out.push(`${targetName} is expected to decline over the next ${fwdVals.length} ${fwdVals.length === 1 ? "period" : "periods"} (about ${pctChange.toFixed(1)}%).`);
+    else if (pctChange !== null) out.push(`${targetName} is expected to hold roughly steady.`);
+    if (fwdPts.length >= 2) {
+      const w0 = Math.abs(Number(fwdPts[0].upper95 ?? 0) - Number(fwdPts[0].lower95 ?? 0));
+      const w1 = Math.abs(Number(fwdPts[fwdPts.length - 1].upper95 ?? 0) - Number(fwdPts[fwdPts.length - 1].lower95 ?? 0));
+      if (w1 > w0 * 1.2) out.push("Forecast uncertainty widens toward the end of the horizon — near-term points are the most trustworthy.");
+    }
+    if (avgActual !== null && historyVals.length >= 2) {
+      const recent = historyVals.slice(-3).reduce((a, b) => a + b, 0) / Math.min(3, historyVals.length);
+      if (recent > avgActual * 1.1) out.push("Recent values are running above the historical average, which lifts the projection.");
+      else if (recent < avgActual * 0.9) out.push("Recent values are running below the historical average, which drags the projection down.");
+    }
+    return out.slice(0, 3);
+  }, [hasPredictions, targetName, pctChange, fwdVals, fwdPts, avgActual, historyVals]);
+
+  const horizonWarning = historyPoints !== null && horizon > historyPoints
+    ? `Heads up: ${horizon} periods ahead from only ${historyPoints} past points — treat the far end as directional.`
+    : null;
+
+  if (connectionStatus !== "connected") {
     return (
       <div className="p-6 max-w-screen-xl mx-auto">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-xl font-semibold text-foreground tracking-tight">Predictive Analysis</h2>
-        </div>
-        <div className="mt-12 text-center py-12">
-          <Loader2 size={32} className="animate-spin text-primary mx-auto mb-4" />
-          <p className="text-sm text-muted-foreground">Analyzing time-series data and selecting forecasting model...</p>
+        <div className="text-center py-20">
+          <div className="w-16 h-16 rounded-2xl mx-auto mb-5 flex items-center justify-center bg-primary">
+            <TrendingUp size={24} className="text-primary-foreground" />
+          </div>
+          <h2 className="text-2xl font-semibold text-foreground tracking-tight mb-2">Forecast</h2>
+          <p className="text-sm text-muted-foreground mb-4 max-w-sm mx-auto">
+            Connect your data and ARIA will project your key numbers into the future.
+          </p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="p-6 max-w-screen-xl mx-auto space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
+    <div className="p-6 max-w-screen-xl mx-auto space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-xl font-semibold text-foreground tracking-tight">Predictive Analysis</h2>
-          <p className="text-sm text-muted-foreground mt-0.5">Understand what is likely to happen next.</p>
+          <h2 className="text-xl font-bold text-foreground tracking-tight">Forecast</h2>
+          <p className="text-sm text-muted-foreground mt-0.5">Project your key numbers into the future.</p>
         </div>
-        <button
-          onClick={() => setShowControls(!showControls)}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-secondary hover:bg-secondary/70 text-foreground text-xs font-medium border border-border transition-colors"
-        >
-          <SlidersHorizontal size={13} /> Controls
-        </button>
+        <div className="flex bg-card border border-border rounded-lg p-0.5 text-xs font-medium">
+          {(["Monthly", "Quarterly", "Yearly"] as PeriodTab[]).map((p) => (
+            <button
+              key={p}
+              onClick={() => setTab(p)}
+              className={`px-3 py-1.5 rounded-md transition-colors ${tab === p ? "bg-secondary text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+            >
+              {p}
+            </button>
+          ))}
+        </div>
       </div>
 
-      {/* Forecast Configuration */}
-      {showControls && (
-        <div className="bg-card border border-border rounded-xl p-5">
-          <div className="flex items-center gap-2 mb-4">
-            <SlidersHorizontal size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Forecast Configuration</p>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      {/* Eligibility / setup */}
+      {eligLoading && (
+        <div className="bg-card border border-border rounded-xl p-5 flex items-center gap-3">
+          <Loader2 size={18} className="animate-spin text-primary" />
+          <p className="text-sm text-muted-foreground">Inspecting your data for forecastable numbers and time…</p>
+        </div>
+      )}
+      {eligError && !eligLoading && (
+        <div className="bg-negative/10 border border-negative/20 rounded-xl p-4">
+          <p className="text-sm text-negative font-medium">{eligError}</p>
+          <button onClick={loadEligibility} className="text-xs text-primary hover:underline mt-1">Retry inspection</button>
+        </div>
+      )}
+
+      {elig && !elig.eligible && !eligLoading && (
+        <div className="bg-card border border-border rounded-xl p-5 space-y-2">
+          <p className="text-sm font-semibold text-foreground">Forecasting isn't available for this dataset yet.</p>
+          {(elig.reasons || []).map((r: string, i: number) => (
+            <p key={i} className="text-sm text-muted-foreground leading-relaxed">· {r}</p>
+          ))}
+          <p className="text-xs text-muted-foreground pt-1">ARIA needs a time dimension and a measurable number with enough history. Try connecting a dataset with dates and amounts.</p>
+        </div>
+      )}
+
+      {elig?.eligible && (
+        <div className="bg-card border border-border rounded-xl p-4">
+          <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-3">Forecast setup</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 items-end">
             <div className="space-y-1.5">
-              <p className="text-xs font-medium text-muted-foreground">Metric</p>
-              <div className="relative">
-                <select
-                  value={selectedTarget}
-                  onChange={(e) => { setSelectedTarget(e.target.value); setForecast(null); }}
-                  className="w-full appearance-none bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none transition-colors pr-8 cursor-pointer"
-                >
-                  <option value="">Select a measure...</option>
-                  {columns.map((c) => (
-                    <option key={c} value={c}>{c}</option>
-                  ))}
-                </select>
-                <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
-              </div>
+              <p className="text-xs font-medium text-muted-foreground">Target</p>
+              <select
+                value={selectedTarget}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setSelectedTarget(v);
+                  const owner = tables.find((t) => (t.measures || []).includes(v));
+                  if (owner) {
+                    setSelectedTable(owner.table);
+                    const td = (owner.time_dims || [])[0]?.column || "";
+                    setSelectedTime(td);
+                  }
+                  setForecast(null); setError("");
+                }}
+                className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none cursor-pointer"
+              >
+                {tables.filter((t) => (t.measures || []).length).map((t) => (
+                  <optgroup key={t.table} label={t.table}>
+                    {t.measures.map((m: string) => (
+                      <option key={`${t.table}.${m}`} value={m}>{m}</option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
             </div>
             <div className="space-y-1.5">
-              <p className="text-xs font-medium text-muted-foreground">Dataset</p>
-              <div className="relative">
-                <select
-                  value={selectedTime}
-                  onChange={(e) => { setSelectedTime(e.target.value); setForecast(null); }}
-                  className="w-full appearance-none bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none transition-colors pr-8 cursor-pointer"
-                >
-                  <option value="">Auto-detect...</option>
-                  {dateColumns.map((c) => (
-                    <option key={c} value={c}>{c}</option>
-                  ))}
-                </select>
-                <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
-              </div>
+              <p className="text-xs font-medium text-muted-foreground">Time dimension</p>
+              <select
+                value={selectedTime}
+                onChange={(e) => { setSelectedTime(e.target.value); setForecast(null); setError(""); }}
+                className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none cursor-pointer"
+              >
+                {activeTimes.length === 0 && <option value="">Auto-detect…</option>}
+                {activeTimes.map((d: any) => (
+                  <option key={d.column} value={d.column}>{d.column}{d.kind === "text" ? " (text)" : ""}</option>
+                ))}
+              </select>
             </div>
             <div className="space-y-1.5">
-              <p className="text-xs font-medium text-muted-foreground">Forecast Horizon</p>
-              <div className="relative">
-                <select
-                  value={horizon}
-                  onChange={(e) => { setHorizon(Number(e.target.value)); setForecast(null); }}
-                  className="w-full appearance-none bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none transition-colors pr-8 cursor-pointer"
-                >
-                  {[3, 6, 12, 24].map((h) => (
-                    <option key={h} value={h}>{h} periods</option>
-                  ))}
-                </select>
-                <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
-              </div>
+              <p className="text-xs font-medium text-muted-foreground">Forecast</p>
+              <select
+                value={horizon}
+                onChange={(e) => setHorizon(Number(e.target.value))}
+                className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none cursor-pointer"
+              >
+                {[3, 6, 12].map((h) => (
+                  <option key={h} value={h}>{h} periods</option>
+                ))}
+              </select>
             </div>
-            <div className="space-y-1.5">
-              <p className="text-xs font-medium text-muted-foreground">Granularity</p>
-              <div className="relative">
-                <select
-                  value="auto"
-                  onChange={() => {}}
-                  className="w-full appearance-none bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none transition-colors pr-8 cursor-pointer"
-                >
-                  <option value="auto">Auto-detect</option>
-                </select>
-                <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
-              </div>
-            </div>
-          </div>
-          <div className="flex gap-2 pt-4">
             <button
-              onClick={() => fetchForecast(selectedTarget || columns[0], selectedTime || dateColumns[0], horizon)}
-              disabled={loading || !columns.length}
+              onClick={() => fetchForecast()}
+              disabled={loading || !selectedTarget}
               className="bg-primary text-primary-foreground px-5 py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition-opacity disabled:opacity-50"
             >
-              {loading ? "Analyzing..." : "Run Forecast"}
-            </button>
-            <button
-              onClick={() => setForecast(null)}
-              className="px-4 py-2 rounded-lg text-xs font-medium bg-secondary text-foreground hover:bg-secondary/70 border border-border transition-colors"
-            >
-              Reset
+              {loading ? "Working…" : hasPredictions ? "Update" : "Build forecast"}
             </button>
           </div>
+          {timeName && <p className="text-[11px] text-muted-foreground mt-2">Time base: {timeName} · detected from your data, changeable above.</p>}
+          {horizonWarning && <p className="text-[11px] text-warning mt-1">{horizonWarning}</p>}
         </div>
       )}
 
-      {/* Refresh */}
-      <div className="flex items-center justify-between">
-        <span className="text-xs text-muted-foreground">
-          Target: <span className="font-medium text-foreground">{predictions?.column || selectedTarget || "Auto"}</span> ·
-          Method: <span className="font-medium text-foreground">{method}</span>
-        </span>
-        <button
-          onClick={() => fetchForecast(selectedTarget || columns[0], selectedTime || dateColumns[0], horizon)}
-          disabled={loading}
-          className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg bg-secondary hover:bg-secondary/70 text-foreground transition-colors border border-border disabled:opacity-50"
-          title="Refresh forecast"
-        >
-          <RefreshCw size={12} className={loading ? "animate-spin" : ""} /> Refresh
-        </button>
-      </div>
+      {loading && (
+        <div className="bg-card border border-border rounded-xl p-6 flex flex-col items-center gap-3">
+          <Loader2 size={22} className="animate-spin text-primary" />
+          <p className="text-sm text-muted-foreground">{LOAD_STAGES[loadStage]}</p>
+        </div>
+      )}
 
-      {/* Error */}
-      {error && !hasPredictions && (
-        <div className="bg-negative/10 border border-negative/20 rounded-xl p-5">
-          <div className="flex items-start gap-3">
-            <AlertCircle size={16} className="text-negative mt-0.5 flex-shrink-0" />
-            <div className="space-y-2">
-              <p className="text-sm text-negative font-medium">{error}</p>
-              <p className="text-xs text-muted-foreground">Try selecting a different target or ensuring your data has time-series information.</p>
-              <button onClick={() => fetchForecast()} className="text-xs text-primary hover:underline">Try automatic selection</button>
+      {error && !hasPredictions && !loading && (
+        <div className="bg-card border border-warning/40 rounded-xl p-4 space-y-2">
+          <p className="text-sm font-semibold text-foreground">Couldn't forecast that selection</p>
+          <p className="text-sm text-muted-foreground leading-relaxed">{error}</p>
+          <button onClick={useAutomatic} className="text-xs font-semibold text-primary hover:underline">Try automatic selection</button>
+        </div>
+      )}
+
+      {!hasPredictions && !loading && !error && elig?.eligible && (
+        <div className="text-center py-10 bg-card border border-border rounded-xl">
+          <TrendingUp size={28} className="text-muted-foreground mx-auto mb-2" />
+          <p className="text-sm text-muted-foreground">Your forecast will appear here.</p>
+        </div>
+      )}
+
+      {hasPredictions && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-2 space-y-4">
+            <div className="bg-card border border-border rounded-xl p-5">
+              <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+                <div className="flex flex-wrap items-center gap-4 text-[11px] text-muted-foreground">
+                  <span className="flex items-center gap-1.5"><span className="w-4 h-0.5 rounded inline-block" style={{ background: actualColor }} /> Actual</span>
+                  <span className="flex items-center gap-1.5"><span className="w-4 border-t-2 border-dashed inline-block" style={{ borderColor: projectionColor }} /> Forecast</span>
+                  {tab === "Monthly" && (
+                    <span className="flex items-center gap-1.5"><span className="w-4 h-2.5 rounded-sm inline-block" style={{ background: "rgba(99,102,241,0.18)" }} /> Likely range</span>
+                  )}
+                  {avgActual !== null && (
+                    <span className="flex items-center gap-1.5"><span className="w-4 border-t-2 border-dashed inline-block" style={{ borderColor: avgColor }} /> Average</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] font-bold px-2.5 py-1 rounded-full bg-secondary text-foreground">
+                    {fmtNum(projectedTotal)} total
+                  </span>
+                  <button
+                    onClick={() => fetchForecast()}
+                    disabled={loading}
+                    className="flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-lg bg-secondary hover:bg-secondary/70 text-foreground transition-colors border border-border disabled:opacity-50"
+                  >
+                    <RefreshCw size={11} className={loading ? "animate-spin" : ""} /> Refresh
+                  </button>
+                </div>
+              </div>
+              {chartRows.length > 0 ? (
+                <ResponsiveContainer width="100%" height={300}>
+                  <ComposedChart data={chartRows} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
+                    <XAxis dataKey="short" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} minTickGap={20} />
+                    <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={56} tickFormatter={(v: number) => fmtNum(v)} />
+                    <Tooltip
+                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
+                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
+                      formatter={(v: any, name: any) => [fmtNum(v), name === "actual" ? "Actual" : name === "forecast" ? "Forecast" : name]}
+                    />
+                    {tab === "Monthly" && (
+                      <Area type="monotone" dataKey="upper95" stroke="none" fill={projectionColor} fillOpacity={0.14} connectNulls />
+                    )}
+                    {tab === "Monthly" && (
+                      <Area type="monotone" dataKey="lower95" stroke="none" fill="var(--card)" fillOpacity={1} connectNulls />
+                    )}
+                    {avgActual !== null && (
+                      <ReferenceLine y={avgActual} stroke={avgColor} strokeWidth={1.5} strokeDasharray="4 4" />
+                    )}
+                    <Line type="monotone" dataKey="actual" stroke={actualColor} strokeWidth={2} dot={{ r: 2 }} connectNulls name=" " />
+                    <Line type="monotone" dataKey="forecast" stroke={projectionColor} strokeWidth={2} strokeDasharray="6 4" dot={{ r: 3 }} connectNulls name=" " />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              ) : (
+                <p className="text-sm text-muted-foreground py-8 text-center">Chart couldn't be drawn from this result — the numbers above still apply.</p>
+              )}
             </div>
-          </div>
-        </div>
-      )}
 
-      {/* Empty state when no predictions and no error */}
-      {!hasPredictions && !loading && !error && (
-        <div className="text-center py-12 bg-card border border-border rounded-xl">
-          <TrendingUp size={32} className="text-muted-foreground mx-auto mb-3" />
-          <p className="text-muted-foreground text-base">No predictions yet.</p>
-          <p className="text-xs text-muted-foreground mt-1">Select a target measure and generate a forecast.</p>
-          <button
-            onClick={() => setShowControls(true)}
-            className="mt-4 premium-btn btn-glow px-4 py-2 rounded-lg text-xs font-semibold text-white transition-all"
-            style={{ background: "var(--gradient-primary)" }}
-          >
-            Configure Forecast
-          </button>
-        </div>
-      )}
+            {scenarios && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {scenarios.map((s) => (
+                  <div key={s.label} className="bg-card border border-border rounded-xl p-4 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className="w-7 h-7 rounded-full flex items-center justify-center"
+                        style={{
+                          background: s.tone === "good" ? "rgba(5,150,105,0.12)" : s.tone === "bad" ? "rgba(239,68,68,0.12)" : "rgba(99,102,241,0.12)",
+                          color: s.tone === "good" ? "#059669" : s.tone === "bad" ? "#EF4444" : "#6366F1",
+                        }}
+                      >
+                        {s.tone === "good" ? <TrendingUp size={14} /> : s.tone === "bad" ? <TrendingDown size={14} /> : <Crosshair size={14} />}
+                      </span>
+                      <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">{s.label}</p>
+                      <span className={`ml-auto text-[11px] font-bold ${s.pct >= 0 ? "text-positive" : "text-negative"}`}>
+                        {s.pct >= 0 ? "+" : ""}{s.pct.toFixed(0)}%
+                      </span>
+                    </div>
+                    <p className="text-xl font-bold text-foreground leading-none">{fmtNum(s.total)}</p>
+                    <p className="text-[11px] text-muted-foreground">{s.ofTarget.toFixed(0)}% of average pace</p>
+                    <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
+                      <div
+                        className="h-full rounded-full"
+                        style={{
+                          width: `${scenMax ? Math.max(4, (s.total / scenMax) * 100) : 4}%`,
+                          background: s.tone === "good" ? "#059669" : s.tone === "bad" ? "#EF4444" : "#6366F1",
+                        }}
+                      />
+                    </div>
+                    <div className="space-y-0.5 pt-0.5">
+                      {[s.note, s.tone === "base" ? "Based on recent trend" : s.tone === "good" ? "If momentum holds" : "If momentum slows"].map((b) => (
+                        <p key={b} className="text-[11px] text-muted-foreground flex items-center gap-1.5">
+                          <Check size={11} className="text-positive flex-shrink-0" /> {b}
+                        </p>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
 
-      {/* Accuracy Badge */}
-      {hasPredictions && accuracy && (
-        <div className="premium-card bg-card border border-border rounded-xl p-5 cursor-default">
-          <div className="flex items-center justify-between flex-wrap gap-3">
-            <div className="flex items-center gap-4 flex-wrap">
-              <div>
-                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Forecast Quality</p>
-                <p className="text-sm font-semibold text-foreground">Backtest Accuracy</p>
-                <p className="text-lg font-bold text-positive">{accuracy.toFixed(1)}%</p>
+            {insights.length > 0 && (
+              <div className="bg-card border border-border rounded-xl p-4 space-y-1.5">
+                <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">What this means</p>
+                {insights.map((ins, i) => (
+                  <p key={i} className="text-sm text-foreground leading-relaxed">· {ins}</p>
+                ))}
               </div>
-              <div className="w-px h-10 bg-border hidden sm:block" />
-              <div>
-                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Model</p>
-                <p className="text-sm font-semibold text-foreground">{method}</p>
-              </div>
-              <div className="w-px h-10 bg-border hidden sm:block" />
-              <div>
-                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Reliability</p>
-                <p className={`text-sm font-bold capitalize ${
-                  reliability === "high" ? "text-positive" :
-                  reliability === "medium" ? "text-warning" : "text-muted-foreground"
-                }`}>{reliability}</p>
-              </div>
-            </div>
-            {predictions?.valid && (
-              <span className="text-xs font-semibold text-positive bg-positive/10 border border-positive/30 px-3 py-1 rounded-full whitespace-nowrap">
-                Validated Forecast
-              </span>
             )}
           </div>
-        </div>
-      )}
 
-      {/* Forecast summary card */}
-      {hasPredictions && (
-        <div className="bg-card border border-border rounded-xl p-5">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-sm font-semibold text-foreground">Forecast Summary</h3>
-            <span className="text-[10px] text-muted-foreground bg-muted px-2 py-0.5 rounded-full">{forecastData.length} points · Horizon: {horizon}</span>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div className="bg-secondary/40 rounded-lg p-3">
-              <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Target</p>
-              <p className="text-sm font-semibold text-foreground truncate">{predictions?.column || selectedTarget || "Auto-selected"}</p>
-            </div>
-            <div className="bg-secondary/40 rounded-lg p-3">
-              <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Method</p>
-              <p className="text-sm font-semibold text-foreground">{method}</p>
-            </div>
-            <div className="bg-secondary/40 rounded-lg p-3">
-              <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Last Actual</p>
-              <p className="text-sm font-semibold text-foreground">{predictions?.last_actual?.value ? predictions.last_actual.value.toFixed(2) : "N/A"}</p>
-            </div>
-            <div className="bg-secondary/40 rounded-lg p-3">
-              <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Projected Change</p>
-              <p className={`text-sm font-bold ${predictions?.projected_pct_change > 0 ? "text-positive" : predictions?.projected_pct_change < 0 ? "text-negative" : "text-foreground"}`}>
-                {predictions?.projected_pct_change !== null ? `${predictions.projected_pct_change > 0 ? "+" : ""}${predictions.projected_pct_change.toFixed(1)}%` : "N/A"}
+          <div className="space-y-4">
+            <div className="bg-primary/5 border border-primary/20 rounded-xl p-4 space-y-1.5">
+              <div className="flex items-center gap-2">
+                <Sparkles size={13} className="text-primary" />
+                <p className="text-[11px] font-semibold text-primary uppercase tracking-wider">Summary</p>
+              </div>
+              <p className="text-sm text-foreground leading-relaxed">
+                {targetName ? <><strong>{targetName}</strong> is </> : "Your number is "}
+                {pctChange !== null && pctChange > 1 && <>heading up about <strong>+{pctChange.toFixed(1)}%</strong></>}
+                {pctChange !== null && pctChange < -1 && <>heading down about <strong>{pctChange.toFixed(1)}%</strong></>}
+                {(pctChange === null || Math.abs(pctChange) <= 1) && <>holding roughly steady</>}
+                {historyCount > 0 && <> across {historyCount} past {historyCount === 1 ? "point" : "points"}</>}.
               </p>
             </div>
-          </div>
-        </div>
-      )}
 
-      {/* Main chart */}
-      {hasPredictions && forecastData.length > 0 && (
-        <div className="bg-card border border-border rounded-xl p-5">
-          <div className="flex items-center justify-between mb-5">
-            <div>
-              <p className="text-sm font-semibold text-foreground">{predictions?.column || "Forecast"} — Forecast</p>
-              <p className="text-xs text-muted-foreground mt-0.5">Historical data + forecast with confidence interval</p>
+            <div className="bg-card border border-border rounded-xl p-4 space-y-3">
+              <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Key factors</p>
+              {[
+                { icon: Target, label: "Period average", value: avgActual !== null ? fmtNum(avgActual) : "—", pill: momDelta !== null ? `${momDelta > 0 ? "+" : ""}${momDelta.toFixed(1)}%` : null, good: (momDelta ?? 0) >= 0 },
+                { icon: TrendingUp, label: "Last actual", value: lastActual !== null ? fmtNum(lastActual) : "—", pill: null as string | null, good: true },
+                { icon: Crosshair, label: "Past accuracy", value: accuracy !== null ? `${accuracy.toFixed(0)}%` : "—", pill: accuracy !== null ? (accuracy >= 70 ? "Reliable" : "Weak") : null, good: (accuracy ?? 0) >= 70 },
+                { icon: Sparkles, label: "History", value: historyCount > 0 ? `${historyCount} periods` : "—", pill: null as string | null, good: true },
+              ].map((f) => (
+                <div key={f.label} className="flex items-center gap-2.5">
+                  <span className="w-7 h-7 rounded-full bg-primary/10 text-primary flex items-center justify-center flex-shrink-0">
+                    <f.icon size={13} />
+                  </span>
+                  <span className="text-[13px] text-muted-foreground">{f.label}</span>
+                  <span className="ml-auto text-[13px] font-bold text-foreground">{f.value}</span>
+                  {f.pill && (
+                    <span
+                      className="text-[10px] font-bold px-1.5 py-0.5 rounded"
+                      style={f.good ? { background: "rgba(5,150,105,0.12)", color: "#059669" } : { background: "rgba(239,68,68,0.12)", color: "#EF4444" }}
+                    >
+                      {f.pill}
+                    </span>
+                  )}
+                </div>
+              ))}
             </div>
-            <div className="flex gap-4 text-xs text-muted-foreground items-center">
-              <span className="flex items-center gap-1.5"><span className="w-4 h-0.5 bg-foreground inline-block rounded" /> Actual</span>
-              <span className="flex items-center gap-1.5"><span className="w-4 h-0.5 border-t-2 border-dashed border-primary inline-block" /> Forecast</span>
-              <span className="flex items-center gap-1.5"><span className="w-3 h-3 bg-primary/15 inline-block rounded" /> Confidence</span>
+
+            {recentTop.length > 0 && (
+              <div className="bg-card border border-border rounded-xl p-4 space-y-2.5">
+                <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Largest periods</p>
+                {recentTop.map((r) => (
+                  <div key={r.label} className="space-y-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-foreground font-medium">{r.label}</span>
+                      <span className="text-muted-foreground">{fmtNum(r.value)} · {r.share.toFixed(0)}%</span>
+                    </div>
+                    <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
+                      <div className="h-full rounded-full bg-primary" style={{ width: `${Math.min(100, r.share)}%` }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="rounded-xl p-3.5 flex items-start gap-2.5 bg-secondary/60 border border-border">
+              <Lightbulb size={14} className="text-primary flex-shrink-0 mt-0.5" />
+              <p className="text-xs text-foreground leading-relaxed">
+                <strong>Tip:</strong>{" "}
+                {accuracy !== null && accuracy < 70
+                  ? "Accuracy is below 70% — treat this as directional and watch incoming actuals."
+                  : pctChange !== null && pctChange > 10
+                    ? "Strong upward momentum — make sure capacity can cover the projected peak."
+                    : pctChange !== null && pctChange < -10
+                      ? "A downward trend is ahead — consider actions to recover volume."
+                      : "The projection tracks your recent average — small moves compound over time."}
+              </p>
             </div>
-          </div>
-          <ResponsiveContainer width="100%" height={320}>
-            <ComposedChart data={forecastData}>
-              <defs>
-                <linearGradient id="confGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="var(--primary)" stopOpacity={0.1} />
-                  <stop offset="95%" stopColor="var(--primary)" stopOpacity={0.05} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
-              <XAxis dataKey={forecastData[0]?.label ? "label" : forecastData[0]?.date ? "date" : forecastData[0]?.period ? "period" : "label"} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
-              <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
-              <Tooltip
-                contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12, boxShadow: "var(--shadow-md)" }}
-                labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
-              />
-              <Legend wrapperStyle={{ fontSize: 11 }} />
-              {predictions?.lower95 && <Area type="monotone" dataKey="lower95" stroke="none" fill="url(#confGrad)" name="95% Range" />}
-              {predictions?.upper95 && <Area type="monotone" dataKey="upper95" stroke="none" fill="url(#confGrad)" />}
-              <Line type="monotone" dataKey={forecastData[0]?.actual ? "actual" : "value"} stroke="var(--foreground)" strokeWidth={2} dot={{ r: 3 }} name="Historical" />
-              <Line type="monotone" dataKey="forecast" stroke="var(--primary)" strokeWidth={2} strokeDasharray="5 5" dot={{ r: 3 }} name="Forecast" />
-            </ComposedChart>
-          </ResponsiveContainer>
-        </div>
-      )}
 
-      {/* ARIA Interpretation — only for validated forecasts; errors use the error block */}
-      {hasPredictions && predictions?.valid && predictions?.reason && (
-        <div className="bg-primary/5 border border-primary/20 rounded-xl p-5 space-y-2">
-          <p className="text-xs font-semibold text-primary uppercase tracking-wider">ARIA Interpretation</p>
-          <p className="text-sm text-foreground leading-relaxed">{predictions.reason}</p>
-        </div>
-      )}
-
-      {/* Scenario Analysis — deterministic what-if on real aggregates */}
-      <div className="bg-card border border-border rounded-xl p-5 space-y-4">
-        <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Scenario Analysis</p>
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="space-y-1.5">
-            <p className="text-xs font-medium text-muted-foreground">Change to {selectedTarget.split(" (")[0] || "measure"} (%)</p>
-            <input
-              type="number" min={-95} max={95} step={1} value={scenarioPct}
-              onChange={(e) => setScenarioPct(Number(e.target.value))}
-              className="w-32 bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none focus:border-primary transition-colors"
+            {/* Evidence (s.txt): method, inputs, confidence — closed by default */}
+            <Evidence
+              sections={[
+                { title: "Data analyzed", body: `${targetName || "The selected number"} over the last ${historyCount > 0 ? `${historyCount} periods` : "available history"}.` },
+                { title: "Key observation", body: pctChange !== null && Math.abs(pctChange) > 1 ? `Recent momentum points ${pctChange > 0 ? "up" : "down"} about ${Math.abs(Math.round(pctChange))}%.` : "Recent values sit close to their average — no strong direction." },
+                { title: "Analysis method", body: `Trend-based forecasting model${forecast?.method ? ` (${forecast.method})` : ""}, validated against past actuals before showing any projection.` },
+                { title: "Confidence", body: accuracy !== null ? `${accuracy >= 70 ? "Reliable" : "Weak"} in backtesting (${Math.round(accuracy)}% accuracy). Uncertainty grows further out — treat distant points as directional.` : "Backtesting could not score this series — treat the projection as directional." },
+                { title: "Assumptions", body: "Past patterns continue; no shocks, price changes, or seasonality shifts are modeled. A forecast is an estimate, not a promise." },
+              ]}
             />
           </div>
-          <button
-            onClick={runScenario}
-            disabled={scenarioLoading}
-            className="bg-primary text-primary-foreground px-5 py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition-opacity disabled:opacity-50"
-          >
-            {scenarioLoading ? "Calculating..." : "Run Scenario"}
-          </button>
-          <p className="text-[11px] text-muted-foreground w-full">Estimate only — uniform change on trailing actuals, not a forecast.</p>
         </div>
-        {scenarioError && <p className="text-sm text-negative font-medium">{scenarioError}</p>}
-        {scenario && (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="border border-border rounded-xl p-4 space-y-1">
-              <p className="text-xs text-muted-foreground">Baseline (trailing avg)</p>
-              <p className="text-xl font-bold text-foreground">{Number(scenario.baseline).toLocaleString()}</p>
-              <p className="text-xs text-muted-foreground">{scenario.periods_used} period(s) · {scenario.column}</p>
-            </div>
-            <div className="border border-primary/40 bg-primary/5 rounded-xl p-4 space-y-1">
-              <p className="text-xs text-muted-foreground">Scenario ({scenario.pct_change > 0 ? "+" : ""}{scenario.pct_change}%)</p>
-              <p className="text-xl font-bold text-foreground">{Number(scenario.scenario_value).toLocaleString()}</p>
-              <p className={`text-xs font-semibold ${scenario.delta >= 0 ? "text-positive" : "text-negative"}`}>
-                {scenario.delta >= 0 ? "+" : ""}{Number(scenario.delta).toLocaleString()} vs baseline
-              </p>
-            </div>
-            <div className="border border-border rounded-xl p-4 space-y-1">
-              <p className="text-xs text-muted-foreground">Assumptions</p>
-              {(scenario.assumptions || []).map((a: string, i: number) => (
-                <p key={i} className="text-xs text-foreground leading-relaxed">· {a}</p>
-              ))}
-              {scenario.limitations && <p className="text-[11px] text-muted-foreground pt-1">{scenario.limitations}</p>}
-            </div>
-          </div>
-        )}
-      </div>
+      )}
 
-      {/* Prediction intervals section */}
-      {hasPredictions && predictions?.validation && (
-        <div className="bg-card border border-border rounded-xl p-5">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Validation & Reliability</p>
-          <div className="space-y-2 text-sm">
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Validation method</span>
-              <span className="font-medium text-foreground">{predictions.validation?.method || "Walk-forward"}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Backtest MAPE</span>
-              <span className={`font-medium ${predictions.validation?.passed ? "text-positive" : "text-negative"}`}>
-                {predictions.mape_pct !== null ? `${predictions.mape_pct.toFixed(1)}%` : "N/A"}
-              </span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Accuracy (100 - MAPE)</span>
-              <span className="font-semibold text-foreground">{predictions.accuracy_pct !== null ? `${predictions.accuracy_pct.toFixed(1)}%` : "N/A"}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Threshold</span>
-              <span className="font-medium text-foreground">{predictions.validation?.threshold_pct || 70}%</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Passed</span>
-              <span className={`font-bold ${predictions.validation?.passed ? "text-positive" : "text-negative"}`}>
-                {predictions.validation?.passed ? "Yes" : "No"}
-              </span>
-            </div>
+      {hasPredictions && (
+        <div className="bg-card border border-border rounded-xl p-4 space-y-3">
+          <div>
+            <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">What-if estimate</p>
+            <p className="text-xs text-muted-foreground mt-0.5">Slide to see what happens if {targetName || "your number"} changes. An estimate, not a forecast.</p>
           </div>
-          {predictions?.model_notes?.note && (
-            <p className="text-xs text-muted-foreground mt-3 pt-3 border-t border-border">Note: {predictions.model_notes.note}</p>
+          <div className="flex flex-wrap items-center gap-4">
+            <input
+              type="range" min={-95} max={95} step={5} value={scenarioPct}
+              onChange={(e) => setScenarioPct(Number(e.target.value))}
+              className="flex-1 min-w-[160px] accent-[var(--primary)]"
+              aria-label="Percentage change"
+            />
+            <span className={`text-lg font-bold w-20 text-right ${scenarioPct >= 0 ? "text-positive" : "text-negative"}`}>
+              {scenarioPct >= 0 ? "+" : ""}{scenarioPct}%
+            </span>
+            <button
+              onClick={() => runScenario()}
+              disabled={scenarioLoading}
+              className="bg-primary text-primary-foreground px-5 py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition-opacity disabled:opacity-50"
+            >
+              {scenarioLoading ? "Calculating..." : "See result"}
+            </button>
+          </div>
+          {scenarioError && <p className="text-sm text-negative font-medium">{scenarioError}</p>}
+          {scenario && (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="border border-border rounded-xl p-4 space-y-1">
+                <p className="text-xs text-muted-foreground">Recent average</p>
+                <p className="text-xl font-bold text-foreground">{Number(scenario.baseline).toLocaleString()}</p>
+                <p className="text-xs text-muted-foreground">{scenario.periods_used} recent {scenario.periods_used === 1 ? "period" : "periods"}</p>
+              </div>
+              <div className="border border-primary/40 bg-primary/5 rounded-xl p-4 space-y-1">
+                <p className="text-xs text-muted-foreground">With {scenario.pct_change > 0 ? "+" : ""}{scenario.pct_change}%</p>
+                <p className="text-xl font-bold text-foreground">{Number(scenario.scenario_value).toLocaleString()}</p>
+                <p className={`text-xs font-semibold ${scenario.delta >= 0 ? "text-positive" : "text-negative"}`}>
+                  {scenario.delta >= 0 ? "+" : ""}{Number(scenario.delta).toLocaleString()} vs recent average
+                </p>
+              </div>
+              <div className="border border-border rounded-xl p-4 space-y-1">
+                <p className="text-xs text-muted-foreground">Keep in mind</p>
+                <p className="text-xs text-foreground leading-relaxed">Uniform change on recent months — sensitivity analysis, not a forecast.</p>
+              </div>
+            </div>
           )}
         </div>
       )}

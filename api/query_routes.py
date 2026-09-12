@@ -588,6 +588,37 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             {"document_id": d["document_id"], "page": d["page_number"],
              "excerpt": d["content"][:200]} for d in doc_evidence
         ]
+    # ── Explicit display metadata (t.txt-5): server-defined metric,
+    # aggregation, dimensions, chart recommendation and KPI values. The
+    # frontend renders these instead of recomputing them from raw rows.
+    _ainfo = analysis.get("analysis", {}) or {}
+    _cspec = analysis.get("chart_spec", {}) or {}
+    _kpis = {}
+    for _c in columns:
+        try:
+            _vals = [float(r.get(_c)) for r in result_data
+                     if r.get(_c) is not None and str(r.get(_c)).strip() != ""
+                     and float(r.get(_c)) == float(r.get(_c))]
+        except (TypeError, ValueError):
+            continue
+        if len(_vals) >= 1 and len(_vals) >= max(1, len(result_data) // 2):
+            _kpis[_c] = {
+                "sum": round(sum(_vals), 2),
+                "avg": round(sum(_vals) / len(_vals), 2),
+                "min": round(min(_vals), 2),
+                "max": round(max(_vals), 2),
+                "count": len(_vals),
+            }
+    display = {
+        "metric": _ainfo.get("measure_label"),
+        "measure_column": _ainfo.get("measure_column"),
+        "aggregation": _ainfo.get("aggregation"),
+        "dimensions": _ainfo.get("dimension_columns", []),
+        "chart": {"type": _cspec.get("chart_type"), "x": _cspec.get("x"),
+                  "y": _cspec.get("y"), "label": _cspec.get("label"),
+                  "reason": _cspec.get("reason")},
+        "kpis": _kpis,
+    }
     return {
         "ok": True,
         "provider": session["provider_name"],
@@ -616,6 +647,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "why": why_block,
         "story": story_text,
         "chart_spec": chart_spec,
+        "display": display,
         "consistency": consistency,
         "analysis": analysis.get("analysis"),
         "result_valid": analysis.get("valid", True),

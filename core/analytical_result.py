@@ -668,6 +668,8 @@ def analyze_result(ir, columns, rows, goal="", sql="", row_count=0) -> dict:
         "entity": entity_label,
         "entity_count": len(final_rows) if len(final_columns) >= 2 else None,
         "measure_label": measure_label,
+        "measure_column": measure_col,
+        "dimension_columns": [c for c in final_columns if c != measure_col],
         "aggregation": aggregation,
         "operation": op,
         "granularity": expected_granularity,

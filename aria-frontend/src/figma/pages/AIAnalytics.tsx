@@ -51,6 +51,40 @@ export default function AIAnalytics({
   const [showTable, setShowTable] = useState(false);
   const [showWhy, setShowWhy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Data-aware autocomplete (GET /api/autocomplete, same pattern as Dashboard).
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const debounceRef = useRef<any>(null);
+
+  const fetchAutocomplete = async (partial: string) => {
+    const token = localStorage.getItem("aria_auth_token") || "";
+    if (!token) { setSuggestions([]); return; }
+    try {
+      const res = await fetch(`/api/autocomplete?partial=${encodeURIComponent(partial)}&limit=6`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) { setSuggestions([]); return; }
+      const data = await res.json();
+      const list = Array.isArray(data?.suggestions)
+        ? data.suggestions.map((s: any) => typeof s === "string" ? s : s.text).filter(Boolean)
+        : [];
+      setSuggestions(list);
+      setActiveIndex(-1);
+    } catch {
+      setSuggestions([]);
+    }
+  };
+
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    const partial = query || "";
+    // Only hit the backend once the user typed something; empty query
+    // keeps the static "Try asking" chips below.
+    if (!partial.trim()) { setSuggestions([]); return; }
+    debounceRef.current = setTimeout(() => fetchAutocomplete(partial), 250);
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
+  }, [query]);
 
   const grid = isDark ? "#2A2A35" : "#E5E7EB";
   const axis = isDark ? "#8889A0" : "#9CA3AF";
@@ -150,7 +184,7 @@ export default function AIAnalytics({
     const catKeys = keys.filter(k => !dateKeys.includes(k) && !numKeys.includes(k));
     const pickNum = (exclude: string[] = []) =>
       numKeys.find(k => !exclude.includes(k)) || "";
-    const specType = goalResult?.chartSpec?.chart_type || "";
+    const specType = goalResult?.display?.chart?.type || goalResult?.chartSpec?.chart_type || "";
 
     // Two numerics → scatter (backend "relationship" shape).
     if (numKeys.length >= 2 && !dateKeys.length && !catKeys.length) {
@@ -251,31 +285,70 @@ export default function AIAnalytics({
 
       {/* Query Composer */}
       <div className="space-y-3">
-        <div className="flex items-center gap-3 bg-card border border-border rounded-xl px-4 py-3.5 focus-within:border-primary/50 focus-within:shadow-[0_0_0_3px_var(--primary-light)] transition-all duration-200" style={{ boxShadow: 'var(--shadow-sm)' }}>
-          <Sparkles size={16} className="text-primary flex-shrink-0" />
-            <input
-              ref={inputRef}
-              value={query}
-              aria-label="Ask ARIA a business question"
-              onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !loading && runAnalysis()}
-            placeholder="How many records? What is the total? Which categories rank highest? How has the metric changed over time?"
-            className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none"
-            disabled={loading}
-          />
-          {query && (
-            <button onClick={() => { setQuery(""); }} className="text-muted-foreground hover:text-foreground transition-colors">
-              <X size={15} />
+        <div className="relative">
+          <div className="flex items-center gap-3 bg-card border border-border rounded-xl px-4 py-3.5 focus-within:border-primary/50 focus-within:shadow-[0_0_0_3px_var(--primary-light)] transition-all duration-200" style={{ boxShadow: 'var(--shadow-sm)' }}>
+            <Sparkles size={16} className="text-primary flex-shrink-0" />
+              <input
+                ref={inputRef}
+                value={query}
+                aria-label="Ask ARIA a business question"
+                onChange={(e) => setQuery(e.target.value)}
+              onFocus={() => setShowSuggestions(true)}
+              onBlur={() => setTimeout(() => setShowSuggestions(false), 200)}
+              onKeyDown={(e) => {
+                if (e.key === "ArrowDown" && suggestions.length > 0) {
+                  e.preventDefault();
+                  setShowSuggestions(true);
+                  setActiveIndex((i) => (i + 1) % suggestions.length);
+                } else if (e.key === "ArrowUp" && suggestions.length > 0) {
+                  e.preventDefault();
+                  setActiveIndex((i) => (i - 1 + suggestions.length) % suggestions.length);
+                } else if (e.key === "Escape") {
+                  setShowSuggestions(false);
+                } else if (e.key === "Enter") {
+                  if (showSuggestions && activeIndex >= 0 && suggestions[activeIndex] && !loading) {
+                    e.preventDefault();
+                    runAnalysis(suggestions[activeIndex]);
+                    setShowSuggestions(false);
+                  } else if (!loading) {
+                    runAnalysis();
+                  }
+                }
+              }}
+              placeholder="How many records? What is the total? Which categories rank highest? How has the metric changed over time?"
+              className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none"
+              disabled={loading}
+            />
+            {query && (
+              <button onClick={() => { setQuery(""); }} className="text-muted-foreground hover:text-foreground transition-colors">
+                <X size={15} />
+              </button>
+            )}
+            <button
+              onClick={() => runAnalysis()}
+              disabled={loading || !query.trim()}
+              className="premium-btn btn-glow flex-shrink-0 px-4 py-1.5 rounded-lg text-xs font-semibold text-white transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              style={{ background: 'var(--gradient-primary)' }}
+            >
+              {loading ? "Analyzing..." : "Analyze"}
             </button>
+          </div>
+
+          {showSuggestions && query.trim().length > 0 && suggestions.length > 0 && (
+            <div className="absolute top-full left-0 right-0 mt-2 bg-card border border-border rounded-xl shadow-lg py-1.5 z-20 max-h-[260px] overflow-y-auto">
+              {suggestions.map((s: string, i: number) => (
+                <button
+                  key={s + i}
+                  onMouseDown={() => { runAnalysis(s); setShowSuggestions(false); }}
+                  onMouseEnter={() => setActiveIndex(i)}
+                  className={`w-full flex items-center gap-3 px-4 py-2.5 text-sm text-foreground hover:bg-secondary transition-colors text-left ${i === activeIndex ? "bg-secondary" : ""}`}
+                >
+                  <Search size={13} className="text-primary flex-shrink-0" />
+                  <span className="truncate">{s}</span>
+                </button>
+              ))}
+            </div>
           )}
-          <button
-            onClick={() => runAnalysis()}
-            disabled={loading || !query.trim()}
-            className="premium-btn btn-glow flex-shrink-0 px-4 py-1.5 rounded-lg text-xs font-semibold text-white transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-            style={{ background: 'var(--gradient-primary)' }}
-          >
-            {loading ? "Analyzing..." : "Analyze"}
-          </button>
         </div>
 
         {/* Suggested queries */}
@@ -411,6 +484,17 @@ export default function AIAnalytics({
                   </span>
                 )}
               </div>
+              {/* Server-defined KPIs (t.txt-5): rendered as-is, never recomputed */}
+              {goalResult?.display?.kpis && Object.keys(goalResult.display.kpis).length > 0 && (
+                <div className="flex flex-wrap gap-2 pt-1">
+                  {Object.entries(goalResult.display.kpis).slice(0, 3).map(([k, v]: any) => (
+                    <span key={k} className="text-[11px] px-2 py-1 rounded-md bg-secondary border border-border text-muted-foreground">
+                      {k}: <span className="text-foreground font-semibold">{Number(v.sum).toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>
+                      <span className="ml-1">avg {Number(v.avg).toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
               {/* Feedback buttons — personalization signal (Section 62) */}
               <div className="flex items-center gap-2 pt-2 border-t border-border">
                 <span className="text-[11px] text-muted-foreground">Was this helpful?</span>
