@@ -4,6 +4,7 @@ CheckCircle, Loader2, Code2, Table2, AlertCircle, Database, GitBranch, HelpCircl
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, LineChart, Line, PieChart, Pie, Cell, ScatterChart, Scatter } from "recharts";
 import { useTheme } from "../App";
 import { colorForName } from "../lib/charts";
+import { BizTooltip } from "../components/charts";
 
 type AnalysisState = "idle" | "processing" | "done" | "clarification" | "error";
 
@@ -547,10 +548,7 @@ export default function AIAnalytics({
                     <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
                     <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
-                    <Tooltip
-                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
-                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
-                    />
+                    <Tooltip content={<BizTooltip />} />
                     <Area type="monotone" dataKey={yKey} stroke="#4F46E5" fill="#4F46E5" fillOpacity={0.15} strokeWidth={2} />
                   </AreaChart>
                 ) : chartType === "scatter" ? (
@@ -559,7 +557,7 @@ export default function AIAnalytics({
                     <XAxis dataKey={xKey} name={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis dataKey={yKey} name={yKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
                     <Tooltip
-                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
+                      content={<BizTooltip />}
                       cursor={{ strokeDasharray: "3 3" }}
                     />
                     <Scatter data={chartRenderData} fill="#4F46E5" fillOpacity={0.6} />
@@ -569,10 +567,7 @@ export default function AIAnalytics({
                     <CartesianGrid strokeDasharray="3 3" stroke={grid} horizontal={false} />
                     <XAxis type="number" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis type="category" dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={110} />
-                    <Tooltip
-                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
-                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
-                    />
+                    <Tooltip content={<BizTooltip />} />
                     <Bar dataKey={yKey} radius={[0, 5, 5, 0]}>
                       {chartRenderData.map((row: any, i: number) => (
                         <Cell key={i} fill={colorForName(String(row?.[xKey] ?? i))} />
@@ -584,10 +579,7 @@ export default function AIAnalytics({
                     <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
                     <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
-                    <Tooltip
-                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
-                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
-                    />
+                    <Tooltip content={<BizTooltip />} />
                     {chartSeries.map((s, i) => (
                       <Bar key={s} dataKey={s} stackId="a" fill={CHART_COLORS[i % CHART_COLORS.length]} radius={i === chartSeries.length - 1 ? [5, 5, 0, 0] : [0, 0, 0, 0]} />
                     ))}
@@ -608,19 +600,14 @@ export default function AIAnalytics({
                         <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />
                       ))}
                     </Pie>
-                    <Tooltip
-                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
-                    />
+                    <Tooltip content={<BizTooltip />} />
                   </PieChart>
                 ) : (
                   <BarChart data={chartRenderData} barSize={36}>
                     <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
                     <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
-                    <Tooltip
-                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
-                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
-                    />
+                    <Tooltip content={<BizTooltip />} />
                     <Bar dataKey={yKey} radius={[5, 5, 0, 0]}>
                       {chartRenderData.map((row: any, i: number) => (
                         <Cell

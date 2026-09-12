@@ -4,6 +4,7 @@ import { AreaChart, Area, BarChart, Bar, Cell, ResponsiveContainer, Tooltip, Car
 import { useTheme } from "../App";
 import type { Page } from "../App";
 import { colorForName } from "../lib/charts";
+import { BizTooltip } from "../components/charts";
 
 interface DashboardProps {
   setPage: (p: Page) => void;
@@ -179,14 +180,14 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
 
   const handleSubmit = () => {
     const q = query.trim();
-    if (q) { onAsk?.(q); setPage("analytics"); }
+    // onAsk routes to Copilot (page isolation rule); no navigation here.
+    if (q) { onAsk?.(q); }
   };
 
   const askExample = (q: string) => {
     trackSuggestionClick(q);
     setQuery(q);
     onAsk?.(q);
-    setPage("analytics");
   };
 
   if (connectionStatus !== "connected") {
@@ -214,8 +215,14 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
   const charts: any[] = config?.visualizations || [];
   const recommendations: any[] = config?.recommendations || [];
   const summary = config?.summary || {};
-  const rawInsights: any[] = insightResult?.keyInsights || insightResult?.insights || [];
-  const anomalies: any[] = insightResult?.anomalies || analysisResult?.anomalies || [];
+  // Auto-computed insights/anomalies ship with the dashboard config, so this
+  // page is alive immediately after connect — no prior ask required.
+  const rawInsights: any[] = config?.insights?.length > 0
+    ? config.insights
+    : (insightResult?.keyInsights || insightResult?.insights || []);
+  const anomalies: any[] = config?.anomalies?.length > 0
+    ? config.anomalies
+    : (insightResult?.anomalies || analysisResult?.anomalies || []);
   const exampleQuestions = recommendations.length > 0
     ? recommendations.slice(0, 4).map((r: any) => typeof r === "string" ? r : r.question)
     : fallbackExamples;
@@ -358,7 +365,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
             ))}
           </div>
         ) : (
-          <div className="bg-card border border-border rounded-xl p-6 text-center text-muted-foreground text-sm">Insights will appear after analysis.</div>
+          <div className="bg-card border border-border rounded-xl p-6 text-center text-muted-foreground text-sm">No notable patterns detected in the current data yet.</div>
         )}
       </section>
 
@@ -386,11 +393,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                     <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
                     <XAxis dataKey={areaChart.xKey || "period"} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={48} />
-                    <Tooltip
-                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
-                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
-                      itemStyle={{ color: "var(--muted-foreground)" }}
-                    />
+                    <Tooltip content={<BizTooltip />} />
                     <Area type="monotone" dataKey={areaChart.dataKey || "value"} stroke="var(--primary)" strokeWidth={2} fill="url(#dashAreaGrad)" dot={false} />
                   </AreaChart>
                 </ResponsiveContainer>
@@ -409,11 +412,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                     <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
                     <XAxis dataKey={barChart.xKey || "name"} tick={{ fontSize: 10, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={52} />
-                    <Tooltip
-                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
-                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
-                      itemStyle={{ color: "var(--muted-foreground)" }}
-                    />
+                    <Tooltip content={<BizTooltip />} />
                     <Bar dataKey={barChart.dataKey || "value"} radius={[4, 4, 0, 0]}>
                       {(barChart.data || []).map((entry: any, i: number) => (
                         <Cell key={i} fill={entry?.fill || colorForName(String(entry?.[barChart.xKey || "name"] ?? i))} />
@@ -448,9 +447,9 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                 {anomalies.map((a: any, i: number) => (
                   <tr key={a.id || i} className={`${i < anomalies.length - 1 ? "border-b border-border" : ""} hover:bg-secondary/40 transition-colors`}>
                     <td className="px-5 py-3 font-medium text-foreground text-sm">{a.metric || a.column || "—"}</td>
-                    <td className="px-5 py-3 text-muted-foreground text-sm">{a.date || a.detected || "—"}</td>
+                    <td className="px-5 py-3 text-muted-foreground text-sm">{a.date || a.detected || a.affected_period || "—"}</td>
                     <td className="px-5 py-3">
-                      <span className="text-sm font-semibold text-foreground">{a.deviation || a.magnitude || `${a.z_score ?? ""}`}</span>
+                      <span className="text-sm font-semibold text-foreground">{a.deviation || a.magnitude || "—"}</span>
                     </td>
                     <td className="px-5 py-3 text-muted-foreground text-xs leading-relaxed hidden md:table-cell max-w-xs truncate">{a.explanation || a.description || ""}</td>
                     <td className="px-5 py-3">

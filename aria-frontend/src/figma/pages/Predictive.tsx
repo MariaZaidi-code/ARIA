@@ -3,6 +3,7 @@ import { Loader2, RefreshCw, AlertCircle, Sparkles, Target, TrendingUp, Trending
 import { ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
 import { useTheme } from "../App";
 import Evidence from "../components/Evidence";
+import { ChartFrame, BizTooltip, useSeriesToggle, ToggleLegend } from "../components/charts";
 
 interface PredictiveProps {
   insightResult?: any;
@@ -84,6 +85,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   const [scenario, setScenario] = useState<any>(null);
   const [scenarioLoading, setScenarioLoading] = useState(false);
   const [scenarioError, setScenarioError] = useState("");
+  const fcToggle = useSeriesToggle(["Actual", "Forecast", "Average", "Likely range"]);
 
   const authHeader = () => {
     const token = localStorage.getItem("aria_auth_token");
@@ -476,17 +478,20 @@ export default function Predictive({ insightResult = null, goalResult = null, co
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <div className="lg:col-span-2 space-y-4">
             <div className="bg-card border border-border rounded-xl p-5">
-              <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-                <div className="flex flex-wrap items-center gap-4 text-[11px] text-muted-foreground">
-                  <span className="flex items-center gap-1.5"><span className="w-4 h-0.5 rounded inline-block" style={{ background: actualColor }} /> Actual</span>
-                  <span className="flex items-center gap-1.5"><span className="w-4 border-t-2 border-dashed inline-block" style={{ borderColor: projectionColor }} /> Forecast</span>
-                  {tab === "Monthly" && (
-                    <span className="flex items-center gap-1.5"><span className="w-4 h-2.5 rounded-sm inline-block" style={{ background: "rgba(99,102,241,0.18)" }} /> Likely range</span>
-                  )}
-                  {avgActual !== null && (
-                    <span className="flex items-center gap-1.5"><span className="w-4 border-t-2 border-dashed inline-block" style={{ borderColor: avgColor }} /> Average</span>
-                  )}
-                </div>
+              <ChartFrame
+                title={`${plainName(selectedTarget) || "Metric"} forecast`}
+                explanation="Solid line: what actually happened. Dashed line: what the model expects next. Click legend items to toggle series."
+                empty={chartRows.length === 0}
+                emptyText="Chart couldn't be drawn from this result — the numbers above still apply."
+                height={300}
+              >
+              <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+                <ToggleLegend
+                  items={["Actual", "Forecast", ...(avgActual !== null ? ["Average"] : []), ...(tab === "Monthly" ? ["Likely range"] : [])]}
+                  isHidden={fcToggle.isHidden}
+                  onToggle={fcToggle.toggle}
+                  colors={{ Actual: actualColor, Forecast: projectionColor, Average: avgColor, "Likely range": projectionColor }}
+                />
                 <div className="flex items-center gap-2">
                   <span className="text-[11px] font-bold px-2.5 py-1 rounded-full bg-secondary text-foreground">
                     {fmtNum(projectedTotal)} total
@@ -501,32 +506,35 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 </div>
               </div>
               {chartRows.length > 0 ? (
-                <ResponsiveContainer width="100%" height={300}>
+                <ResponsiveContainer width="100%" height={248}>
                   <ComposedChart data={chartRows} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
                     <XAxis dataKey="short" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} minTickGap={20} />
                     <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={56} tickFormatter={(v: number) => fmtNum(v)} />
                     <Tooltip
-                      contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }}
-                      labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
-                      formatter={(v: any, name: any) => [fmtNum(v), name === "actual" ? "Actual" : name === "forecast" ? "Forecast" : name]}
+                      content={<BizTooltip metricNames={{ actual: "Actual", forecast: "Forecast", upper95: "Likely high", lower95: "Likely low" }} />}
                     />
-                    {tab === "Monthly" && (
-                      <Area type="monotone" dataKey="upper95" stroke="none" fill={projectionColor} fillOpacity={0.14} connectNulls />
+                    {tab === "Monthly" && !fcToggle.isHidden("Likely range") && (
+                      <Area type="monotone" dataKey="upper95" stroke="none" fill={projectionColor} fillOpacity={0.14} connectNulls name="Likely range" />
                     )}
-                    {tab === "Monthly" && (
-                      <Area type="monotone" dataKey="lower95" stroke="none" fill="var(--card)" fillOpacity={1} connectNulls />
+                    {tab === "Monthly" && !fcToggle.isHidden("Likely range") && (
+                      <Area type="monotone" dataKey="lower95" stroke="none" fill="var(--card)" fillOpacity={1} connectNulls name="Likely range" />
                     )}
-                    {avgActual !== null && (
+                    {avgActual !== null && !fcToggle.isHidden("Average") && (
                       <ReferenceLine y={avgActual} stroke={avgColor} strokeWidth={1.5} strokeDasharray="4 4" />
                     )}
-                    <Line type="monotone" dataKey="actual" stroke={actualColor} strokeWidth={2} dot={{ r: 2 }} connectNulls name=" " />
-                    <Line type="monotone" dataKey="forecast" stroke={projectionColor} strokeWidth={2} strokeDasharray="6 4" dot={{ r: 3 }} connectNulls name=" " />
+                    {!fcToggle.isHidden("Actual") && (
+                      <Line type="monotone" dataKey="actual" stroke={actualColor} strokeWidth={2} dot={{ r: 2 }} connectNulls name="Actual" />
+                    )}
+                    {!fcToggle.isHidden("Forecast") && (
+                      <Line type="monotone" dataKey="forecast" stroke={projectionColor} strokeWidth={2} strokeDasharray="6 4" dot={{ r: 3 }} connectNulls name="Forecast" />
+                    )}
                   </ComposedChart>
                 </ResponsiveContainer>
               ) : (
                 <p className="text-sm text-muted-foreground py-8 text-center">Chart couldn't be drawn from this result — the numbers above still apply.</p>
               )}
+              </ChartFrame>
             </div>
 
             {scenarios && (

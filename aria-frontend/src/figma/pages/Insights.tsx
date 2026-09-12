@@ -142,6 +142,26 @@ const fmtMoney = (v?: number | null) => {
   return `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
 };
 
+/* ---- Chart caption (§10): business title + what it shows ---- */
+function ChartCaption({ ins }: { ins: Insight }) {
+  const cat = primaryCategory(ins.type);
+  const map: Record<string, [string, string]> = {
+    trends: ["Movement over time", "Read left to right — the direction is the finding."],
+    anomalies: ["History with the unusual point marked", "Red marks sit outside the usual range."],
+    performance: ["Breakdown by group", "Tallest bar leads — hover for exact values."],
+    relationships: ["How the two numbers move together", "Each dot is one period."],
+    opportunities: ["Breakdown by group", "Tallest bar leads — hover for exact values."],
+    risks: ["History under watch", "Flat or falling stretches deserve attention."],
+  };
+  const [title, sub] = map[cat] || ["Evidence chart", "Hover any mark for its exact value."];
+  return (
+    <div className="mb-1.5">
+      <p className="text-[12px] font-semibold text-foreground">{title}</p>
+      <p className="text-[10px] text-muted-foreground">{sub}</p>
+    </div>
+  );
+}
+
 /* ================= Dynamic evidence chart (SVG, no dummy data) ===============
    Trend/Growth/Decline/Risk → line · Opportunity/Performance/Segment → bar
    Relationship/Correlation → scatter · Anomaly → line with highlighted point
@@ -683,6 +703,7 @@ export default function Insights({
                   <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-[0.08em]">Evidence</p>
                   <p className="mt-0.5 text-[11px] text-muted-foreground">Here is the proof behind ARIA's observation.</p>
                   <div className="mt-2 rounded-lg border border-border bg-background/60 p-3 text-foreground">
+                    <ChartCaption ins={selected} />
                     <EvidenceChart ins={selected} />
                     {(!selected.visualization?.data?.length) && (
                       <p className="text-xs text-muted-foreground">Chart unavailable for this insight — supporting values below still describe the evidence.</p>

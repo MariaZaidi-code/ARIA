@@ -63,14 +63,14 @@ function renderChart(msg: Message) {
           ))}
         </div>
       ) : (
-        <div className="space-y-1">
+        <div className="space-y-1" role="img" aria-label={`Comparison chart of ${y} by ${x}`}>
           {rows.slice(0, 8).map((r, i) => (
-            <div key={i} className="flex items-center gap-2">
+            <div key={i} className="flex items-center gap-2" title={`${String(r[x])}: ${Number(r[y]).toLocaleString()}`}>
               <span className="text-[10px] text-muted-foreground w-24 truncate">{String(r[x])}</span>
               <div className="flex-1 bg-primary/20 rounded" style={{ height: 8 }}>
                 <div className="bg-primary rounded" style={{ height: 8, width: `${(Number(r[y]) / maxVal) * 100}%` }} />
               </div>
-              <span className="text-[10px] text-foreground w-16 text-right">{Number(r[y]).toLocaleString()}</span>
+              <span className="text-[10px] text-foreground w-16 text-right">{Number(r[y]).toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>
             </div>
           ))}
         </div>

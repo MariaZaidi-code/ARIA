@@ -3,6 +3,7 @@ import { Loader2, CheckCircle, XCircle, ArrowRight, Save, Trash2, Beaker, AlertT
 import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line, BarChart, Bar, Cell } from "recharts";
 import { useTheme } from "../App";
 import Evidence from "../components/Evidence";
+import { ChartFrame, BizTooltip } from "../components/charts";
 import { confidenceWord } from "../lib/format";
 
 /* =====================================================================
@@ -621,16 +622,21 @@ export default function Hypothesis({ insightResult, onAskQuestion, connectionSta
             </div>
           </div>
 
-          {/* Visualization */}
+          {/* Visualization: title + explanation + business tooltips */}
           <div className="bg-card border border-border rounded-xl p-5">
-            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-4">Evidence chart</p>
+            <ChartFrame
+              title={viz?.type === "scatter" ? `${viz.x} vs ${viz.y}` : viz?.type === "line" ? `${viz.y} over time` : "Group comparison"}
+              explanation={viz?.type === "scatter" ? "Each dot is one record — hover to inspect values." : viz?.type === "line" ? "Hover any point for its period and value." : "Hover a bar for its exact value."}
+              empty={!viz}
+              height={260}
+            >
             {viz?.type === "scatter" && (
               <ResponsiveContainer width="100%" height={260}>
                 <ScatterChart>
                   <CartesianGrid strokeDasharray="3 3" stroke={grid} />
                   <XAxis dataKey="x" name={viz.x} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} label={{ value: viz.x, position: "insideBottom", offset: -5, fontSize: 11, fill: axis }} />
                   <YAxis dataKey="y" name={viz.y} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={52} />
-                  <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }} />
+                  <Tooltip content={<BizTooltip metricNames={{ x: viz.x, y: viz.y }} />} />
                   <Scatter data={viz.points} fill="var(--primary)" fillOpacity={0.6} />
                   {trendLine && <Line type="linear" data={trendLine} dataKey="y" stroke="var(--primary)" strokeWidth={2} dot={false} />}
                 </ScatterChart>
@@ -642,7 +648,7 @@ export default function Hypothesis({ insightResult, onAskQuestion, connectionSta
                   <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
                   <XAxis dataKey="label" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} minTickGap={24} />
                   <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={52} />
-                  <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }} />
+                  <Tooltip content={<BizTooltip metricNames={{ actual: viz.y }} />} />
                   <Line type="monotone" dataKey="actual" stroke="var(--primary)" strokeWidth={2} dot={false} name={viz.y} />
                 </LineChart>
               </ResponsiveContainer>
@@ -653,7 +659,7 @@ export default function Hypothesis({ insightResult, onAskQuestion, connectionSta
                   <CartesianGrid strokeDasharray="3 3" stroke={grid} horizontal={false} />
                   <XAxis type="number" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                   <YAxis type="category" dataKey="label" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={110} />
-                  <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }} />
+                  <Tooltip content={<BizTooltip />} />
                   <Bar dataKey="value" radius={[0, 5, 5, 0]}>
                     {barData.map((_: any, i: number) => (
                       <Cell key={i} fill="var(--primary)" fillOpacity={i === 0 ? 1 : 0.55} />
@@ -662,6 +668,7 @@ export default function Hypothesis({ insightResult, onAskQuestion, connectionSta
                 </BarChart>
               </ResponsiveContainer>
             )}
+            </ChartFrame>
           </div>
 
           {/* Segments */}

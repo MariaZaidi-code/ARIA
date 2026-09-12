@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { CheckCircle, Bookmark, MessageSquare, ChevronDown, ChevronUp, Loader2, RefreshCw, FlaskConical, TrendingUp, Database, AlertTriangle, Play } from "lucide-react";
 import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Line } from "recharts";
 import { useTheme } from "../App";
+import { ChartFrame, BizTooltip } from "../components/charts";
 
 /* =====================================================================
    ARIA Prescription — evidence-based decision/action workspace (pres.docx).
@@ -474,6 +475,12 @@ export default function Prescription({ insightResult = null, connectionStatus = 
                       <section className="border-t border-border pt-3">
                         <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">Evidence</p>
                         <div className="mt-2 rounded-lg border border-border bg-background/60 p-3">
+                          <ChartFrame
+                            title={rx.action_type === "investigate" ? `${rx.evidence?.metric?.replace(/_/g, " ")} by group` : `${analysis.evidence_viz?.x?.replace(/_/g, " ")} vs ${analysis.evidence_viz?.y?.replace(/_/g, " ")}`}
+                            explanation="Hover any mark for its exact value."
+                            empty={!((rx.action_type === "investigate" && rx.evidence?.groups?.length) || analysis.evidence_viz?.points?.length)}
+                            height={200}
+                          >
                           {rx.action_type === "investigate" && rx.evidence?.groups?.length ? (
                             <div className="space-y-2">
                               {(() => {
@@ -497,12 +504,13 @@ export default function Prescription({ insightResult = null, connectionStatus = 
                                 <CartesianGrid strokeDasharray="3 3" stroke={grid} />
                                 <XAxis dataKey="x" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} label={{ value: analysis.evidence_viz.x, position: "insideBottom", offset: -5, fontSize: 11, fill: axis }} />
                                 <YAxis dataKey="y" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={52} />
-                                <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 10, fontSize: 12 }} />
+                                <Tooltip content={<BizTooltip metricNames={{ x: analysis.evidence_viz.x, y: analysis.evidence_viz.y }} />} />
                                 <Scatter data={analysis.evidence_viz.points} fill="var(--primary)" fillOpacity={0.6} />
                                 {trendLine && <Line type="linear" data={trendLine} dataKey="y" stroke="var(--primary)" strokeWidth={2} dot={false} />}
                               </ScatterChart>
                             </ResponsiveContainer>
                           ) : <p className="text-xs text-muted-foreground">Chart unavailable — values below still describe the evidence.</p>}
+                          </ChartFrame>
                         </div>
                         {(rx.citations?.length > 0) && (
                           <div className="mt-2 space-y-1.5">
