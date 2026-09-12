@@ -10,6 +10,7 @@ endpoints (``/``, ``/api/providers``). Run with:
 import os
 import socket
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -19,14 +20,52 @@ from fastapi.staticfiles import StaticFiles
 
 # Make the project root importable regardless of the launching directory.
 # core.config loads .env centrally on first import.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core.config import STATIC_DIR, BASE_DIR  # noqa: E402
 from core.checks import run_checks  # noqa: E402
 from llm_provider import PROVIDERS  # noqa: E402
-from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, settings_routes, feedback_routes, autocomplete_routes, data_routes  # noqa: E402
+from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, settings_routes, feedback_routes, autocomplete_routes, data_routes, insight_rag_routes, insights_routes, predictive_routes, prescription_routes, rl_routes  # noqa: E402
+from core.ratelimit import limit, limit_heavy, limit_llm  # noqa: E402
+from fastapi import Depends as _Depends  # noqa: E402
 
-app = FastAPI(title="ARIA Testing UI")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run startup checks; failures stay visible but never crash import."""
+    import logging
+    report = run_checks()
+    critical = report["critical"]
+    if critical:
+        logging.getLogger("uvicorn.error").error(
+            "ARIA startup check: missing required packages -> %s", ", ".join(critical)
+        )
+    if not report["ollama"]["ok"]:
+        logging.getLogger("uvicorn.error").warning(
+            "ARIA startup check: %s", report["ollama"]["detail"]
+        )
+    logging.getLogger("uvicorn.error").info("ARIA startup checks complete.")
+    yield
+
+
+_enable_docs = os.getenv("ARIA_ENABLE_DOCS", "1").strip() not in {"0", "false", "no", "off"}
+app = FastAPI(
+    title="ARIA Testing UI",
+    lifespan=lifespan,
+    docs_url="/docs" if _enable_docs else None,
+    redoc_url="/redoc" if _enable_docs else None,
+    openapi_url="/openapi.json" if _enable_docs else None,
+)
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    return resp
 
 _cors_origins = os.getenv(
     "CORS_ORIGINS",
@@ -49,27 +88,23 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-app.include_router(auth_routes.router)
-app.include_router(connect_routes.router)
-app.include_router(schema_routes.router)
-app.include_router(query_routes.router)
-app.include_router(document_routes.router)
-app.include_router(kpi_routes.router)
-app.include_router(copilot_routes.router)
-app.include_router(hypothesis_routes.router)
-app.include_router(settings_routes.router)
-app.include_router(feedback_routes.router)
-app.include_router(autocomplete_routes.router)
-app.include_router(data_routes.router)
-
-from api import insights_routes
-app.include_router(insights_routes.router)
-
-from api import predictive_routes
-app.include_router(predictive_routes.router)
-
-from api import rl_routes
-app.include_router(rl_routes.router)
+app.include_router(auth_routes.router)  # has its own login/register limiter
+app.include_router(connect_routes.router, dependencies=[_Depends(limit_heavy())])
+app.include_router(schema_routes.router, dependencies=[_Depends(limit_heavy())])
+app.include_router(query_routes.router, dependencies=[_Depends(limit_llm())])
+app.include_router(document_routes.router, dependencies=[_Depends(limit_heavy())])
+app.include_router(kpi_routes.router, dependencies=[_Depends(limit_heavy())])
+app.include_router(copilot_routes.router, dependencies=[_Depends(limit_llm())])
+app.include_router(hypothesis_routes.router, dependencies=[_Depends(limit_heavy())])
+app.include_router(settings_routes.router, dependencies=[_Depends(limit_heavy())])
+app.include_router(feedback_routes.router, dependencies=[_Depends(limit("feedback", 60))])
+app.include_router(autocomplete_routes.router, dependencies=[_Depends(limit("autocomplete", 180))])
+app.include_router(data_routes.router, dependencies=[_Depends(limit_heavy())])
+app.include_router(insight_rag_routes.router, dependencies=[_Depends(limit_llm())])
+app.include_router(insights_routes.router, dependencies=[_Depends(limit_heavy())])
+app.include_router(predictive_routes.router, dependencies=[_Depends(limit_llm())])
+app.include_router(prescription_routes.router, dependencies=[_Depends(limit_heavy())])
+app.include_router(rl_routes.router, dependencies=[_Depends(limit("rl", 60))])
 
 
 @app.exception_handler(Exception)
@@ -89,26 +124,6 @@ async def unhandled_exception(request: Request, exc: Exception):
             "detail": "An internal error occurred. Check server logs for details."
         },
     )
-
-
-@app.on_event("startup")
-def startup_checks():
-    """Log a health report at startup; the app still starts on non-critical gaps."""
-    import logging
-
-    from core.checks import run_checks
-
-    report = run_checks()
-    critical = report["critical"]
-    if critical:
-        logging.getLogger("uvicorn.error").error(
-            "ARIA startup check: missing required packages -> %s", ", ".join(critical)
-        )
-    if not report["ollama"]["ok"]:
-        logging.getLogger("uvicorn.error").warning(
-            "ARIA startup check: %s", report["ollama"]["detail"]
-        )
-    logging.getLogger("uvicorn.error").info("ARIA startup checks complete.")
 
 
 @app.get("/api/health")
@@ -142,9 +157,12 @@ def index():
         return FileResponse(prod_index)
     return FileResponse(STATIC_DIR / "index.html")
 
-# Fallback: any unmatched route -> index.html (SPA routing)
+# Fallback: any unmatched non-API route -> index.html (SPA routing).
+# /api/* must never silently return HTML; unknown API paths return 404.
 @app.get("/{full_path:path}")
 def catch_all(full_path: str):
+    if full_path == "api" or full_path.startswith("api/"):
+        return JSONResponse(status_code=404, content={"detail": "Unknown API endpoint."})
     prod_index = DIST_DIR / "index.html"
     if prod_index.exists():
         return FileResponse(prod_index)

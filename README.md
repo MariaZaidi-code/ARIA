@@ -17,6 +17,15 @@ python app.py                 # serves API + built frontend on 127.0.0.1:8000
 cd aria-frontend && npm install && npm run dev   # optional: frontend dev server
 ```
 
+## Release / dev setup (one reproducible command)
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+cd aria-frontend && npm ci && npm run build && cd ..
+python app.py                 # always serves the freshly built frontend
+python -m pytest tests/ -q    # backend suite must stay green
+```
+
 ## Architecture
 
 | Layer | Location | Role |

@@ -20,6 +20,12 @@ ft_story_data_sample.jsonl
 
 # --- runtime outputs / artifacts (regenerated; keep the repo clean) ---
 data/
+artifacts/
+pro_images/
+test_embeddings_cache/
+test_processed/
+test_pdfs/
+test-results/
 *.docx
 *.log
 *_report.json

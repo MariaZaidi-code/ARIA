@@ -1,12 +1,15 @@
 """Data source connection routes: relational databases (PostgreSQL / MySQL) + CSV files + PDF documents."""
 
+import asyncio
 import json
 import os
 import re
 import time
 import types
+import secrets
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote_plus
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -24,6 +27,9 @@ from llm_provider import create_provider
 from document_processor import create_document_processor
 
 router = APIRouter()
+
+# Hosted providers run inference off-machine (need an API key, can serve vision).
+HOSTED_PROVIDERS = {"cloud", "deepseek", "omniroute"}
 
 # Upload bounds (§40): enforced while streaming so oversized bodies never
 # fill the disk. CSV cap matches the handler's 100 MB post-write check.
@@ -201,7 +207,6 @@ async def stream_upload_progress(user: dict = Depends(get_current_user)):
                 if prog.get("done") or prog.get("error"):
                     break
             await asyncio.sleep(1)
-    import asyncio
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
@@ -235,6 +240,17 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {exc}")
 
+    # Validate hosted keys with a no-cost ping so a bad key fails here,
+    # not pages later inside an analysis.
+    if request.provider != "local" and (request.api_key or request.provider in ("cloud", "deepseek", "omniroute")):
+        try:
+            llm.ping(timeout=25)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"The {request.provider} key was rejected or unreachable ({exc}). Check the key and try again.",
+            )
+
     session["provider"] = llm
     session["provider_name"] = request.provider
     if request.api_key:
@@ -257,6 +273,46 @@ class ConnectRequest(BaseModel):
     db_schema: str = "public"
 
 
+def _discover_table_schema(config, exclude="public"):
+    """Find the PostgreSQL schema that actually holds tables.
+
+    Returns (mapping, schema_name); ({}, None) when nothing is found.
+    Read-only introspection; used only when the requested schema is empty.
+    """
+    import logging as _logging
+    _log = _logging.getLogger("aria.connect")
+    try:
+        conn = schema_agent.get_connection(types.SimpleNamespace(**config))
+    except Exception:
+        return {}, None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT schema_name FROM information_schema.schemata "
+                "WHERE schema_name NOT IN ('pg_catalog', 'information_schema') "
+                "AND schema_name NOT LIKE 'pg\\_toast%' AND schema_name NOT LIKE 'pg\\_temp%' "
+                "ORDER BY (schema_name = 'public') DESC, schema_name;"
+            )
+            schemata = [r[0] for r in cur.fetchall() if r[0] != exclude]
+        for sch in schemata:
+            try:
+                mapping = schema_agent.build_schema_mapping(conn, sch, db_type="postgresql")
+            except Exception:
+                continue
+            if mapping.get("tables"):
+                _log.info("Schema auto-discovery: using '%s' (%d tables).",
+                          sch, len(mapping["tables"]))
+                return mapping, sch
+    except Exception:
+        _log.exception("Schema auto-discovery failed.")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return {}, None
+
+
 def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     """Shared connect logic. `db_type` is authoritative (set by the calling endpoint)."""
     uid = user["user_id"]
@@ -275,18 +331,15 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
             raise HTTPException(status_code=400, detail="Relational source requires db, user, and password.")
 
     # Use user's saved API key for hosted providers if available
-    user_key = session.get("api_keys", {}).get(request.provider) if request.provider == "cloud" else None
+    user_key = session.get("api_keys", {}).get(request.provider) if request.provider in HOSTED_PROVIDERS else None
     try:
         llm = create_provider(provider=request.provider, api_key=user_key or None)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {exc}")
 
-    # Preserve existing cloud provider if set — don't downgrade to local on reconnect.
-    existing = session.get("provider")
-    if existing and not isinstance(existing, str) and getattr(existing, "provider", None) == "cloud":
-        session["provider"] = existing
-    else:
-        session["provider"] = llm
+    # The provider in this connect request is an explicit user choice.
+    session["provider"] = llm
+    session["provider_name"] = request.provider
     session["source_type"] = request.source_type
     session["db"] = None
     session["db_type"] = db_type
@@ -318,13 +371,17 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid port number.")
     except Exception as exc:
-        detail = f"Connection failed: {exc}"
+        import logging as _logging
+        from core.errors import sanitize_error
+        _logging.getLogger("aria.connect").exception("Database connection failed")
+        safe = sanitize_error(exc)
         if db_type == "mysql":
-            detail += (" Hint: is the MySQL server running, and is pymysql installed "
-                       "(pip install pymysql)? Verify host/port, database, user, password.")
+            detail = (f"Connection failed: {safe} Hint: is the MySQL server running, "
+                      "and is pymysql installed (pip install pymysql)? "
+                      "Verify host/port, database, user, password.")
         else:
-            detail += (" Hint: is the PostgreSQL service running on that host/port? "
-                       "Verify the database name, user, and password are correct.")
+            detail = (f"Connection failed: {safe} Hint: is the PostgreSQL service running "
+                      "on that host/port? Verify the database name, user, and password are correct.")
         raise HTTPException(status_code=400, detail=detail)
     finally:
         if conn:
@@ -385,6 +442,14 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
             schema_filter = config.get("db_schema", "public") if db_type == "postgresql" else config.get("db", "")
             mapping = schema_agent.build_schema_mapping(conn, schema_filter, db_type=db_type)
             conn.close()
+            if not mapping.get("tables") and db_type == "postgresql":
+                # Requested schema is empty (e.g. tables live in a named
+                # schema like "hotel", not public): discover the schema that
+                # actually holds tables instead of connecting to nothing.
+                mapping, discovered = _discover_table_schema(config, exclude=schema_filter)
+                if discovered:
+                    session["db"]["db_schema"] = discovered
+                    current_db_schema = discovered
             if mapping.get("tables"):
                 user_schema_dir = SCHEMA_DIR / f"user_{user['user_id']}"
                 user_schema_dir.mkdir(parents=True, exist_ok=True)
@@ -480,9 +545,11 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
     uid = user["user_id"]
     _set_progress(uid, "uploading", 10, "Uploading file...")
 
-    upload_dir = DATA_DIR / "uploads"
+    # Isolate uploads by user and use an unpredictable suffix to prevent
+    # same-name uploads from overwriting one another.
+    upload_dir = DATA_DIR / "uploads" / f"user_{uid}"
     upload_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(8)}"
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
     file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
     _spool_limited(file.file, file_path, MAX_UPLOAD_BYTES_CSV, "CSV file")
@@ -524,11 +591,9 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
     _set_progress(uid, "understanding", 80, "Understanding data structure...")
 
     session = get_session(uid)
-    existing = session.get("provider")
-    if existing and not isinstance(existing, str) and getattr(existing, "provider", None) == "cloud":
-        session["provider"] = existing
-    else:
-        session["provider"] = llm
+    # A new file connection must honour the provider selected for this upload.
+    session["provider"] = llm
+    session["provider_name"] = provider
     session["source_type"] = "semi-structured"
     session["db"] = {".csv": str(file_path)}
     session["db_type"] = "sqlite"
@@ -600,14 +665,21 @@ def connect_pdf(
             detail="Only .pdf files are accepted for document sources.",
         )
     
+    session = get_session(user["user_id"])
+    saved_key = session.get("api_keys", {}).get(provider)
     try:
-        llm = create_provider(provider=provider, api_key=llm_api_key, base_url=llm_base_url)
+        llm = create_provider(
+            provider=provider,
+            api_key=llm_api_key or saved_key,
+            base_url=llm_base_url,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {exc}")
     
-    upload_dir = DATA_DIR / "uploads"
+    # Keep raw PDFs within the owning user's upload directory.
+    upload_dir = DATA_DIR / "uploads" / f"user_{user['user_id']}"
     upload_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(8)}"
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
     file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
     _spool_limited(file.file, file_path, MAX_UPLOAD_BYTES_PDF, "PDF file")
@@ -619,7 +691,7 @@ def connect_pdf(
     processor = create_document_processor(
         upload_dir=upload_dir,
         processed_dir=processed_dir,
-        llm_provider=llm if provider == "cloud" else None,
+        llm_provider=llm if provider in HOSTED_PROVIDERS else None,
     )
     
     # Process document (this runs synchronously - could be made async with background tasks)
@@ -637,11 +709,9 @@ def connect_pdf(
     
     # Update session to include document reference
     session = get_session(user["user_id"])
-    existing = session.get("provider")
-    if existing and not isinstance(existing, str) and getattr(existing, "provider", None) == "cloud":
-        session["provider"] = existing
-    else:
-        session["provider"] = llm
+    # A new document connection must honour the provider selected for this upload.
+    session["provider"] = llm
+    session["provider_name"] = provider
     session["source_type"] = "document"
     session["db"] = {".pdf": str(file_path)}
     session["db_type"] = "document"
@@ -722,6 +792,21 @@ def session_status(user: dict = Depends(get_current_user)):
         "db_uri": safe_uri,
     }
 
+
+@router.post("/api/disconnect")
+def disconnect_source(user: dict = Depends(require_writable)):
+    """Remove the active data source while retaining the user's LLM settings."""
+    session = get_session(user["user_id"])
+    for key in (
+        "source_type", "db", "db_uri", "db_name", "dialect", "schema_path",
+        "processed_path", "insights_path", "schema_status", "file_type",
+        "document_id", "document_type", "conversation_id", "conversation_history",
+        "pending_history_id",
+    ):
+        session.pop(key, None)
+    save_session(user["user_id"], session)
+    return {"ok": True, "message": "Data source disconnected"}
+
 class DatabaseTestRequest(BaseModel):
     host: str = "localhost"
     port: int = 5432
@@ -746,9 +831,9 @@ async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depen
                 pass
 
         if req.dbType == "mysql":
-            url = f"mysql+pymysql://{req.user}:{password}@{req.host}:{req.port}/{req.db}"
+            url = f"mysql+pymysql://{quote_plus(str(req.user))}:{quote_plus(str(password))}@{req.host}:{req.port}/{req.db}"
         else:
-            url = f"postgresql+psycopg2://{req.user}:{password}@{req.host}:{req.port}/{req.db}"
+            url = f"postgresql+psycopg2://{quote_plus(str(req.user))}:{quote_plus(str(password))}@{req.host}:{req.port}/{req.db}"
 
         engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
         with engine.connect() as conn:
@@ -756,7 +841,9 @@ async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depen
 
         return {"ok": True, "message": "Connection successful"}
     except Exception as e:
-        return {"ok": False, "message": f"Connection failed: {str(e)}"}
+        from core.errors import sanitize_error
+
+        return {"ok": False, "message": f"Connection failed: {sanitize_error(e)}"}
 
 
 

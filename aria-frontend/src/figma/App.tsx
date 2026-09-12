@@ -1,7 +1,9 @@
 import { createContext, useContext, useState, useEffect, useRef } from "react";
+import type { ReactNode } from "react";
 import "./index.css";
 import "../aria-enhance.css";
 import AppShell from "./components/AppShell";
+import ErrorBoundary from "./components/ErrorBoundary";
 import Login from "./pages/Login";
 import LLMSelection from "./pages/LLMSelection";
 import Dashboard from "./pages/Dashboard";
@@ -22,9 +24,11 @@ import {
   generateAnalyticsResult,
   generateInsights,
   fetchSessionStatus,
+  disconnectSource,
 } from "../services/api";
 import {
   clearAuthSession,
+  getAuthToken,
   getAuthUser,
 } from "../utils/authStorage";
 
@@ -159,6 +163,20 @@ export default function App() {
   const handleLLMSelect = (mode: string) => {
     setSelectedLLM(mode);
     localStorage.setItem("aria_llm_mode", mode);
+    // Materialize the choice server-side so the session provider matches
+    // the UI immediately (prevents "choose an LLM provider" right after).
+    (async () => {
+      try {
+        const token = localStorage.getItem("aria_auth_token");
+        await fetch("/api/provider/switch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token || ""}` },
+          body: JSON.stringify({ provider: mode }),
+        });
+      } catch {
+        // Non-fatal: connect flows also set the provider explicitly.
+      }
+    })();
     // Restore connection state from the stored session so the Dashboard
     // shows KPIs/charts without requiring a fresh connect.
     (async () => {
@@ -195,7 +213,18 @@ export default function App() {
     setAppStage("app");
   };
 
-  const handleSignOut = () => {
+  const handleSignOut = async () => {
+    const token = getAuthToken();
+    if (token) {
+      try {
+        await fetch("/api/auth/logout", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      } catch {
+        // Clear the local session even when the server is unavailable.
+      }
+    }
     clearAuthSession();
     setCurrentUser(null);
     setSelectedLLM("");
@@ -233,7 +262,13 @@ export default function App() {
     }
   };
 
-  const handleDisconnect = () => {
+  const handleDisconnect = async () => {
+    try {
+      await disconnectSource();
+    } catch (err: any) {
+      setConnectionError(err?.message || "Could not disconnect the data source");
+      return;
+    }
     setConnectionStatus("not-connected");
     setDbName("");
     setSchemaData(null);
@@ -361,64 +396,21 @@ export default function App() {
   };
 
   // =========================================================
-  // HISTORY HANDLER
+  // COPILOT HANDOFF (page isolation rule)
   // =========================================================
+  // Pages are isolated: the ONLY cross-page wiring allowed is Ask ARIA
+  // buttons → Copilot (question carried over), plus Dashboard View-all →
+  // Insights. Everything else happens in place.
+  const [copilotPrefill, setCopilotPrefill] = useState("");
 
-  // Reopen a history entry WITH its result/context (t.txt section 10),
-  // not just the question text. Falls back to question-only on failure.
-  const handleOpenHistory = async (session: any) => {
-    if (!session) return;
-    const questionText = session.goal || session.title || "";
-    setSubmittedQuestion(questionText);
-    setQuestion(questionText);
-    const id = session.id;
-    if (id) {
-      try {
-        const token = localStorage.getItem("aria_auth_token");
-        const res = await fetch(`/api/history/${id}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        const data = await res.json();
-        const rec = data?.record;
-        if (res.ok && rec) {
-          const proc = rec.processed || {};
-          setGoalResult({
-            interpretedGoal: rec.goal || questionText,
-            goalType: "analysis",
-            clarificationRequired: false,
-            clarificationMessage: "",
-            relevantTables: proc?.data_selection?.tables || [],
-            joinPlan: proc?.join_path || [],
-            generatedSql: rec.sql_used || proc?.sql_used || proc?.sql || "",
-            preprocessing: [],
-            processedDataSummary: {
-              rowCount: rec.row_count ?? 0,
-              columns: rec.columns || [],
-            },
-            nextAgent: "Insight Agent",
-            data: proc?.data || [],
-            message: proc?.message || "",
-            warnings: proc?.warnings || [],
-            proactiveInsights: [],
-            anomalies: [],
-            dataQualityWarnings: [],
-            explanation: null,
-            confidence: "high",
-            historyId: rec.id,
-            suggestedQuestions: proc?.suggested_questions || [],
-            provenance: null,
-            conversationId: null,
-            turnNumber: null,
-          });
-          setGoalStatus("success");
-          const analytics = await generateAnalyticsResult({ data: proc?.data || [] });
-          setAnalysisResult(analytics?.data || null);
-        }
-      } catch {
-        // question-only restore below
-      }
+  const goCopilot = (question: string) => {
+    const q = (question || "").trim();
+    if (!q) {
+      setPage("copilot");
+      return;
     }
-    setPage("analytics");
+    setCopilotPrefill(q);
+    setPage("copilot");
   };
 
   const handleDeleteHistory = (_id: string) => {
@@ -426,8 +418,14 @@ export default function App() {
   };
 
   // =========================================================
-  // SCREENS
+  // SCREENS (each wrapped so one bad page never blanks the app)
   // =========================================================
+
+  // Per-page boundary helper (defined below use to avoid TDZ issues
+  // with the page switch).
+  const wrapPage = (key: string, node: ReactNode) => (
+    <ErrorBoundary key={`${key}-${page}`} page={key}>{node}</ErrorBoundary>
+  );
 
   if (appStage === "login") {
     return <Login onLogin={handleLogin} />;
@@ -446,13 +444,13 @@ export default function App() {
         onChangeLLM={() => setAppStage("llm-selection")}
         onSignOut={handleSignOut}
       >
-        {(() => {
+        {wrapPage(page, (() => {
           switch (page) {
             case "dashboard":
               return (
                 <Dashboard
                   setPage={setPage}
-                  onAsk={handleAsk}
+                  onAsk={goCopilot}
                   user={currentUser}
                   connectionStatus={connectionStatus}
                   dbName={dbName}
@@ -479,23 +477,26 @@ export default function App() {
                   insightResult={insightResult}
                   insightStatus={insightStatus}
                   insightError={insightError}
-                  onAskQuestion={(q) => { handleAsk(q); setPage("analytics"); }}
+                  connectionStatus={connectionStatus}
+                  onAskQuestion={goCopilot}
                 />
               );
             case "predictive":
-              return <Predictive insightResult={insightResult} goalResult={goalResult} />;
+              return <Predictive insightResult={insightResult} goalResult={goalResult} connectionStatus={connectionStatus} />;
             case "prescription":
               return (
                 <Prescription
                   insightResult={insightResult}
-                  onAskQuestion={(q) => { handleAsk(q); setPage("analytics"); }}
+                  connectionStatus={connectionStatus}
+                  onAskQuestion={goCopilot}
                 />
               );
             case "hypothesis":
               return (
                 <Hypothesis
                   insightResult={insightResult}
-                  onAskQuestion={(q) => { handleAsk(q); setPage("analytics"); }}
+                  onAskQuestion={goCopilot}
+                  connectionStatus={connectionStatus}
                 />
               );
             case "data":
@@ -529,12 +530,11 @@ export default function App() {
             case "documents":
               return <Documents />;
             case "copilot":
-              return <Copilot analysisResult={analysisResult} goalResult={goalResult} />;
+              return <Copilot analysisResult={analysisResult} goalResult={goalResult} initialQuestion={copilotPrefill} />;
             case "history":
               return (
                 <History
                   historyRefreshKey={historyRefreshKey}
-                  onOpenHistory={handleOpenHistory}
                   onDeleteHistory={handleDeleteHistory}
                 />
               );
@@ -543,6 +543,10 @@ export default function App() {
                 <Settings
                   selectedLLM={selectedLLM}
                   onChangeLLM={() => setAppStage("llm-selection")}
+                  onProviderSwitched={(p) => {
+                    setSelectedLLM(p);
+                    localStorage.setItem("aria_llm_mode", p);
+                  }}
                   user={currentUser}
                   connectionStatus={connectionStatus}
                   dbName={dbName}
@@ -552,7 +556,7 @@ export default function App() {
             default:
               return null;
           }
-        })()}
+        })())}
       </AppShell>
     </ThemeContext.Provider>
   );

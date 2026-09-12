@@ -6,9 +6,10 @@ import { useTheme } from "../App";
 interface PredictiveProps {
   insightResult?: any;
   goalResult?: any;
+  connectionStatus?: string;
 }
 
-export default function Predictive({ insightResult = null, goalResult = null }: PredictiveProps) {
+export default function Predictive({ insightResult = null, goalResult = null, connectionStatus = "not-connected" }: PredictiveProps) {
   const { isDark } = useTheme();
   const [forecast, setForecast] = useState<any>(null);
   const [loading, setLoading] = useState(false);
@@ -29,6 +30,11 @@ export default function Predictive({ insightResult = null, goalResult = null }: 
     setScenarioLoading(true);
     setScenarioError("");
     try {
+      if (connectionStatus !== "connected") {
+        setScenario(null);
+        setScenarioError("Connect a data source to run a scenario.");
+        return;
+      }
       const token = localStorage.getItem("aria_auth_token");
       const res = await fetch("/api/predictive/scenario", {
         method: "POST",
@@ -52,7 +58,7 @@ export default function Predictive({ insightResult = null, goalResult = null }: 
     } finally {
       setScenarioLoading(false);
     }
-  }, [selectedTarget, scenarioPct]);
+  }, [selectedTarget, scenarioPct, connectionStatus]);
 
   const grid = isDark ? "#2A2A35" : "#E5E7EB";
   const axis = isDark ? "#8889A0" : "#9CA3AF";
@@ -162,12 +168,13 @@ export default function Predictive({ insightResult = null, goalResult = null }: 
 
   // Auto-fetch on first load if no predictions from insightResult
   useEffect(() => {
+    if (connectionStatus !== "connected") return;
     if (!hasInsightPredictions && (!forecast || forecast.points?.length === 0)) {
       // Small delay to allow schema info to load first
       const timer = setTimeout(() => fetchForecast(), 500);
       return () => clearTimeout(timer);
     }
-  }, [hasInsightPredictions, fetchForecast]);
+  }, [connectionStatus, hasInsightPredictions, fetchForecast]);
 
   const predictions = forecast || insightPredictions;
   const hasPredictions = predictions && (predictions.valid || predictions.points?.length > 0);

@@ -1,0 +1,47 @@
+name: aria-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install runtime + dev dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Import check (all routers load from a clean checkout)
+        run: python -c "import app; print('routers:', len(app.app.routes))"
+      - name: Start app and probe health (clean-checkout boot check)
+        run: |
+          python app.py > /tmp/aria_boot.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/api/health >/dev/null; then break; fi
+            sleep 5
+          done
+          curl -sf http://127.0.0.1:8000/api/health | head -c 300
+          kill $SRV
+      - name: Backend tests
+        run: python -m pytest tests/ -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: aria-frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: aria-frontend/package-lock.json
+      - name: Build release bundle (deployment must run this before FastAPI)
+        run: npm ci && npm run build

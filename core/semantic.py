@@ -29,6 +29,35 @@ def is_valid_identifier(name: str, max_len: int = 64) -> bool:
     return bool(name) and len(name) <= max_len and bool(IDENT_RE.match(name))
 
 
+def humanize(name: str) -> str:
+    """Turn a physical column/table name into natural language.
+
+    Generic formatting only (no business dictionary): underscores become
+    spaces, words are title-cased, trailing _id/_key/_code markers are
+    dropped. ``order_date`` → ``Order Date``.
+    """
+    text = re.sub(r"[_-]+", " ", str(name or "")).strip()
+    text = re.sub(r"\s+", " ", text)
+    words = [w for w in text.split(" ") if w]
+    drop_tail = {"id", "key", "code", "uuid", "guid", "pk", "fk"}
+    while len(words) > 1 and words[-1].lower() in drop_tail:
+        words.pop()
+    return " ".join(w[:1].upper() + w[1:] for w in words) or str(name or "")
+
+
+def kpi_label(agg: str, column: str) -> str:
+    """Natural-language KPI label from aggregation + column (no table names)."""
+    human = humanize(column)
+    agg = (agg or "").upper()
+    if agg == "AVG":
+        return f"Average {human}"
+    if agg == "DISTINCT":
+        return f"{human} Count"
+    if agg == "COUNT":
+        return "Total Records"
+    return f"Total {human}"
+
+
 def classify_semantic_type(column_name: str, db_type: str = "") -> str:
     """Classify a column into a semantic type without assuming fixed schemas.
 

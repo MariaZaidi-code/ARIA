@@ -155,6 +155,8 @@ def _looks_like_date(col_name, col_info):
 def _looks_like_numeric(col_name, col_info):
     if _looks_like_date(col_name, col_info):
         return False
+    if _is_id_like(col_name):
+        return False
     low = col_name.lower()
     if any(k in low for k in _NUMERIC_HINT):
         return True
@@ -339,6 +341,11 @@ def _partial_match(query, candidate):
     return False
 
 
+def _is_id_like(name: str) -> bool:
+    low = (name or "").lower()
+    return low == "id" or low.endswith("_id") or low.endswith("_key")
+
+
 def _rank_suggestions(index, partial, limit):
     """Build ranked list of suggestion dicts based on the partial input.
 
@@ -376,17 +383,22 @@ def _rank_suggestions(index, partial, limit):
                     continue
             col = v.get("column", "value")
             t = v.get("table", "data")
-            # Dimension columns (text values) get contextual suggestions
-            _add(f"Sales in {val}", "value", 0.95)
-            _add(f"Show {val} details", "value", 0.85)
+            # Dimension columns (text values) get contextual suggestions.
+            # Wording is neutral (no hardcoded business nouns like "Sales").
+            _add(f"Filter {col} to {val}", "value", 0.95)
+            _add(f"Show details for {val}", "value", 0.85)
 
     # 2) Template matches: build "Top {category} by {metric}" only if
     #    we actually have a category + a metric.  Triggered by typing
     #    intent words like "top", "best", "highest" (section 57).
     tokens = partial_n.split()
     intent_tokens = [t for t in tokens if t in _INTENT_WORDS]
-    if intent_tokens and (index["categories"] or index["metrics"]):
-        for cat in index.get("categories", [])[:5]:
+    # Prefer non-ID dimensions for breakdowns (grouping by an ID column
+    # is analytically weak). Fall back to all categories if needed.
+    _cats = [c for c in index.get("categories", []) if not _is_id_like(c.get("name", ""))]
+    _cats = _cats or index.get("categories", [])
+    if intent_tokens and (_cats or index["metrics"]):
+        for cat in _cats[:5]:
             for met in index.get("metrics", [])[:5]:
                 if "top" in intent_tokens or "best" in intent_tokens or "highest" in intent_tokens:
                     _add(f"Top {cat['name'].replace('_', ' ')} by {met['name'].replace('_', ' ')}",
@@ -405,9 +417,10 @@ def _rank_suggestions(index, partial, limit):
         for met in index.get("metrics", []):
             name = met["name"].replace("_", " ")
             if _partial_match(partial_n, name):
-                _add(f"Show {name} by {index['categories'][0]['name'].replace('_', ' ') if index['categories'] else 'category'}",
+                _first_cat = _cats[0]["name"].replace("_", " ") if _cats else "category"
+                _add(f"Show {name} by {_first_cat}",
                      "metric", 0.68)
-        for cat in index.get("categories", []):
+        for cat in _cats:
             name = cat["name"].replace("_", " ")
             if _partial_match(partial_n, name):
                 if index["metrics"]:

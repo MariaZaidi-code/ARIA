@@ -27,8 +27,195 @@ class HypothesisRequest(BaseModel):
     period: str = "Last 12 months"
 
 
+class AnalyzeRequest(BaseModel):
+    question: str
+    table: str | None = None
+    metric: str | None = None
+    driver: str | None = None
+
+
+class ParseRequest(BaseModel):
+    question: str
+    metric: str | None = None
+    driver: str | None = None
+
+
+def _engine_for_session(session):
+    """Build a bounded engine for any supported source (shared abstraction)."""
+    db_type = session.get("db_type", "postgresql")
+    if db_type in ("sqlite", "document"):
+        engine_url = session.get("db_uri")
+        if not engine_url:
+            return None, "No queryable database file for this source."
+        return create_engine(engine_url, pool_pre_ping=True), "sqlite"
+    db_config = session.get("db") or {}
+    driver = "mysql" if db_type == "mysql" else "postgresql"
+    dialect = "mysql" if driver == "mysql" else "postgresql"
+    host = db_config.get("host", "localhost")
+    port = db_config.get("port", 5432)
+    db = db_config.get("database", db_config.get("db", ""))
+    user_name = db_config.get("user", db_config.get("username", ""))
+    password = db_config.get("password", "")
+    if password:
+        try:
+            password = _decrypt_secret(password)
+        except Exception:
+            pass
+    if driver == "mysql":
+        engine_url = f"mysql+pymysql://{quote_plus(str(user_name))}:{quote_plus(str(password))}@{host}:{port}/{db}"
+    else:
+        engine_url = f"postgresql+psycopg2://{quote_plus(str(user_name))}:{quote_plus(str(password))}@{host}:{port}/{db}"
+    return create_engine(engine_url, pool_pre_ping=True,
+                         connect_args={"connect_timeout": 10}), dialect
+
+
+@router.get("/api/hypothesis/suggest")
+def suggest_hypotheses(user: dict = Depends(get_current_user)):
+    """Top data-backed hypothesis suggestions, ranked by measured effect.
+
+    Each card carries its evidence (computed live, pre-validated), so every
+    suggestion is guaranteed testable — never a dead end.
+    """
+    from api.schema_intel import SchemaIntelligence
+    from hypothesis_engine.engine import rank_prominent, suggest_hypotheses as _suggest
+    session = get_session(user["user_id"])
+    schema_path = session.get("schema_path")
+    if not schema_path:
+        return {"ok": True, "suggestions": [], "cards": []}
+    try:
+        from pathlib import Path as _P
+        import json as _j
+        mapping = _j.loads(_P(str(schema_path)).read_text(encoding="utf-8"))
+    except Exception:
+        return {"ok": True, "suggestions": [], "cards": []}
+    tables = list(mapping.get("tables", {}).keys())
+    if not tables:
+        return {"ok": True, "suggestions": [], "cards": []}
+    engine, dialect = _engine_for_session(session)
+    if engine is None:
+        return {"ok": True, "suggestions": [], "cards": []}
+    try:
+        intel = SchemaIntelligence(mapping)
+        try:
+            cards = rank_prominent(engine, dialect, intel, tables, limit=5)
+        except Exception:
+            cards = []
+        texts = [c["text"] for c in cards] or _suggest(engine, dialect, intel, tables)
+        return {"ok": True, "suggestions": texts, "cards": cards}
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+
+
+@router.post("/api/hypothesis/analyze")
+def analyze_hypothesis(req: AnalyzeRequest, request: Request, user: dict = Depends(require_writable)):
+    """Full Hypothesis Engine pipeline: intent -> adequacy -> analysis -> verdict."""
+    from api.schema_intel import SchemaIntelligence
+    from hypothesis_engine import analyze_question
+    from insight_agent import sanitize_json
+    require_data(request)
+    session = get_session(user["user_id"])
+    schema_path = session.get("schema_path")
+    if not schema_path:
+        return {"ok": False, "verdict": "NEEDS MORE DATA", "code": "NO_CONNECTION",
+                "detail": "No data source is connected yet."}
+    try:
+        from pathlib import Path as _P
+        import json as _j
+        mapping = _j.loads(_P(str(schema_path)).read_text(encoding="utf-8"))
+    except Exception:
+        return {"ok": False, "verdict": "NEEDS MORE DATA", "code": "INVALID_SOURCE",
+                "detail": "The schema description could not be read. Reconnect first."}
+    tables = list(mapping.get("tables", {}).keys())
+    if not tables:
+        return {"ok": False, "verdict": "NEEDS MORE DATA", "code": "INVALID_SOURCE",
+                "detail": "The connected source has no tables to analyze."}
+    engine, dialect = _engine_for_session(session)
+    if engine is None:
+        return {"ok": False, "verdict": "NEEDS MORE DATA", "code": "NO_CONNECTION",
+                "detail": dialect}
+    try:
+        out = analyze_question(engine, dialect, SchemaIntelligence(mapping), tables,
+                               req.question, table_hint=req.table,
+                               metric_override=req.metric, driver_override=req.driver)
+        return sanitize_json(out)
+    except Exception as exc:
+        return {"ok": False, "verdict": "NEEDS MORE DATA", "code": "ANALYSIS_FAILED",
+                "detail": f"The analysis could not run: {str(exc)[:200]}"}
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+
+
+def _hypothesis_setup(user):
+    """Shared loader: mapping + tables + engine for any supported source."""
+    from api.schema_intel import SchemaIntelligence
+    session = get_session(user["user_id"])
+    schema_path = session.get("schema_path")
+    if not schema_path:
+        return None, {"ok": False, "code": "NO_CONNECTION",
+                      "detail": "No data source is connected yet."}
+    try:
+        from pathlib import Path as _P
+        import json as _j
+        mapping = _j.loads(_P(str(schema_path)).read_text(encoding="utf-8"))
+    except Exception:
+        return None, {"ok": False, "code": "INVALID_SOURCE",
+                      "detail": "The schema description could not be read. Reconnect first."}
+    tables = list(mapping.get("tables", {}).keys())
+    if not tables:
+        return None, {"ok": False, "code": "INVALID_SOURCE",
+                      "detail": "The connected source has no tables to analyze."}
+    engine, dialect = _engine_for_session(session)
+    if engine is None:
+        return None, {"ok": False, "code": "NO_CONNECTION", "detail": dialect}
+    return (mapping, tables, engine, dialect, SchemaIntelligence(mapping)), None
+
+
+@router.get("/api/hypotheses/context")
+def hypothesis_context(user: dict = Depends(get_current_user)):
+    """Dynamic hypothesis context: metrics, drivers, dimensions, dates, ranges."""
+    from hypothesis_engine import data_context
+    from insight_agent import sanitize_json
+    setup, err = _hypothesis_setup(user)
+    if err:
+        return {"ok": False, **err}
+    mapping, tables, engine, dialect, intel = setup
+    try:
+        return sanitize_json({"ok": True, **data_context(engine, dialect, intel, tables)})
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+
+
+@router.post("/api/hypotheses/parse")
+def hypothesis_parse(req: ParseRequest, user: dict = Depends(get_current_user)):
+    """Preview a hypothesis before running statistics (never executes analysis)."""
+    from hypothesis_engine import preview_question
+    from insight_agent import sanitize_json
+    setup, err = _hypothesis_setup(user)
+    if err:
+        return {"ok": False, **err}
+    mapping, tables, engine, dialect, intel = setup
+    try:
+        return sanitize_json(preview_question(engine, dialect, intel, tables,
+                                              req.question, metric_hint=req.metric,
+                                              driver_hint=req.driver))
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+
+
 @router.post("/api/hypothesis")
-async def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depends(require_writable)):
+def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depends(require_writable)):
     require_data(request)
     session = get_session(user["user_id"])
     if not session or not session.get("db"):
@@ -49,6 +236,11 @@ async def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = 
             return _run_test(engine, dialect, req)
         except Exception as exc:
             return {"ok": False, "detail": f"Hypothesis test failed: {str(exc)[:200]}"}
+        finally:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
 
     driver = "mysql" if db_type == "mysql" else "postgresql"
     dialect = "mysql" if driver == "mysql" else "postgresql"
@@ -70,9 +262,16 @@ async def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = 
         else:
             engine_url = f"postgresql+psycopg2://{quote_plus(str(user_name))}:{quote_plus(str(password))}@{host}:{port}/{db}"
 
-        engine = create_engine(engine_url, pool_pre_ping=True)
+        engine = create_engine(engine_url, pool_pre_ping=True,
+                               connect_args={"connect_timeout": 10})
 
-        return _run_test(engine, dialect, req)
+        try:
+            return _run_test(engine, dialect, req)
+        finally:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
 
     except Exception as e:
         return {"ok": False, "detail": f"Hypothesis test failed: {str(e)}"}
@@ -113,18 +312,57 @@ def _run_test(engine, dialect, req):
             supported = stats["p_value"] < 0.05 and abs(stats["r"]) > 0.3
             interpretation = _build_interpretation(req.hypothesis, stats, supported, x_col, y_col)
 
+            # Context: same test for a few more candidate pairs so the UI can
+            # show a comparison view. All real computation, same gating.
+            comparisons = [{
+                "x": x_col, "y": y_col, "table": table_name,
+                "r": stats["r"], "p_value": stats["p_value"],
+                "n": len(x_vals), **_r_ci(stats["r"], len(x_vals)),
+            }]
+            seen_pairs = {(x_col, y_col, table_name)}
+            for px, py, pt in numeric_pairs:
+                if len(comparisons) >= 5:
+                    break
+                if (px, py, pt) in seen_pairs:
+                    continue
+                seen_pairs.add((px, py, pt))
+                try:
+                    s2 = _fetch_sample(conn, pt, px, py, dialect)
+                    xa = np.array([float(r[0]) for r in s2 if r[0] is not None and r[1] is not None])
+                    ya = np.array([float(r[1]) for r in s2 if r[0] is not None and r[1] is not None])
+                    if len(xa) < 10:
+                        continue
+                    st2 = _compute_correlation(xa, ya)
+                    comparisons.append({
+                        "x": px, "y": py, "table": pt,
+                        "r": st2["r"], "p_value": st2["p_value"],
+                        "n": len(xa), **_r_ci(st2["r"], len(xa)),
+                    })
+                except Exception:
+                    continue
+            comparisons.sort(key=lambda c: abs(c["r"]), reverse=True)
+
             return {
                 "ok": True,
                 "supported": supported,
                 "interpretation": interpretation,
                 "stats": {
-                    "Method": stats["method"],
-                    "Sample Size": f"{len(x_vals):,} observations",
-                    "Correlation (r)": f"{stats['r']:.3f}",
-                    "R² (variance explained)": f"{stats['r_squared']:.1%}",
-                    "p-value": f"{stats['p_value']:.4f}" if stats['p_value'] >= 0.0001 else "< 0.0001",
-                    "Confidence": f"{(1 - stats['p_value']) * 100:.1f}%",
+                    "Compared": f"{_plain_col(x_col)} vs {_plain_col(y_col)}",
+                    "Records studied": f"{len(x_vals):,} records",
+                    "Link found": ("Strong link" if abs(stats['r']) > 0.7
+                                   else "Moderate link" if abs(stats['r']) > 0.4
+                                   else "Weak or no link"),
+                    "Direction": ("Move together" if stats['r'] > 0 else "Move apart"),
+                    "Confidence": _confidence_word(stats['p_value']),
                 },
+                "data_quality": {
+                    "records": len(x_vals),
+                    "required": 10,
+                    "pair_valid": True,
+                    "variance_ok": bool(np.std(x_vals, ddof=1) > 0 and np.std(y_vals, ddof=1) > 0),
+                    "method": stats.get("method", "Pearson Correlation"),
+                },
+                "comparisons": comparisons,
                 "scatter_data": scatter_data,
                 "x_label": x_col,
                 "y_label": y_col,
@@ -291,6 +529,38 @@ def _beta_cf(a, b, x):
     return h
 
 
+def _r_ci(r: float, n: int) -> dict:
+    """95% confidence interval for a Pearson r via Fisher z-transform."""
+    try:
+        if n < 4 or abs(r) >= 1.0:
+            return {"ci_low": r, "ci_high": r}
+        z = 0.5 * math.log((1 + r) / (1 - r))
+        se = 1.0 / math.sqrt(n - 3)
+        lo = math.tanh(z - 1.96 * se)
+        hi = math.tanh(z + 1.96 * se)
+        return {"ci_low": round(lo, 3), "ci_high": round(hi, 3)}
+    except Exception:
+        return {"ci_low": r, "ci_high": r}
+
+
+def _plain_col(name: str) -> str:
+    """Human column label without touching the analytical logic."""
+    try:
+        from core.semantic import humanize
+
+        return humanize(name)
+    except Exception:
+        return str(name).replace("_", " ")
+
+
+def _confidence_word(p_value: float) -> str:
+    if p_value < 0.01:
+        return "High"
+    if p_value < 0.05:
+        return "Moderate"
+    return "Low"
+
+
 def _build_interpretation(hypothesis, stats, supported, x_col, y_col):
     r = stats["r"]
     direction = "positive" if r > 0 else "negative"
@@ -299,16 +569,20 @@ def _build_interpretation(hypothesis, stats, supported, x_col, y_col):
         else "moderate" if abs(r) > 0.4
         else "weak"
     )
+    xc, yc = _plain_col(x_col), _plain_col(y_col)
+    together = "tend to rise together" if direction == "positive" else (
+        "move in opposite directions: when one rises, the other tends to fall")
 
     if supported:
         return (
-            f"A {strength} {direction} correlation (r={r:.3f}) was found between {x_col} and {y_col}. "
-            f"The data supports the hypothesis with {stats['method']} (p={stats['p_value']:.4f}). "
-            f"{abs(r)**2:.1%} of the variance in {y_col} is explained by {x_col}."
+            f"The data backs this idea: {xc} and {yc} {together}, a {strength} "
+            f"link. In plain terms, knowing one gives a useful read on the other. "
+            f"This pattern is unlikely to be a fluke. It still does not prove "
+            f"that one causes the other."
         )
     else:
         return (
-            f"The analysis found a {strength} {direction} correlation (r={r:.3f}) between {x_col} and {y_col}, "
-            f"but this was not statistically significant (p={stats['p_value']:.4f}). "
-            f"The data does not support the hypothesis at the 95% confidence level."
+            f"The data does not back this idea: the link between {xc} and {yc} "
+            f"is {strength} at best, and could easily be chance. "
+            f"No business decision should rest on this relationship alone."
         )

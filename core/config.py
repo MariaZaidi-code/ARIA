@@ -49,7 +49,7 @@ INSIGHTS_PATH = INSIGHTS_DIR / "insights.json"
 SESSION_STORE_PATH = DATA_DIR / "session_store.json"
 
 SOURCE_TYPES = {"relational", "semi-structured", "document"}
-PROVIDER_NAMES = {"local", "cloud"}
+PROVIDER_NAMES = {"local", "cloud", "deepseek"}
 DB_TYPES = {"postgresql", "mysql"}
 
 DEFAULT_SESSION = {
@@ -109,7 +109,8 @@ def _ensure_provider(session):
         name = session.get("provider_name")
         if name:
             api_keys = session.get("api_keys", {})
-            api_key = api_keys.get(name) or os.getenv("GROQ_API_KEY") if name == "cloud" else None
+            env_key = os.getenv(f"{name.upper()}_API_KEY", os.getenv("GROQ_API_KEY"))
+            api_key = api_keys.get(name) or env_key
             try:
                 session["provider"] = create_provider(provider=name, api_key=api_key)
             except Exception:

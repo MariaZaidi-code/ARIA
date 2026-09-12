@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { ArrowRight, ArrowUpRight, ArrowDownRight, Zap, Search, AlertTriangle, ChevronRight, RefreshCw } from "lucide-react";
-import { AreaChart, Area, BarChart, Bar, ResponsiveContainer, Tooltip, CartesianGrid, XAxis, YAxis } from "recharts";
+import { AreaChart, Area, BarChart, Bar, Cell, ResponsiveContainer, Tooltip, CartesianGrid, XAxis, YAxis } from "recharts";
 import { useTheme } from "../App";
 import type { Page } from "../App";
+import { colorForName } from "../lib/charts";
 
 interface DashboardProps {
   setPage: (p: Page) => void;
@@ -413,7 +414,11 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                       labelStyle={{ color: "var(--foreground)", fontWeight: 600 }}
                       itemStyle={{ color: "var(--muted-foreground)" }}
                     />
-                    <Bar dataKey={barChart.dataKey || "value"} fill="var(--primary)" radius={[4, 4, 0, 0]} />
+                    <Bar dataKey={barChart.dataKey || "value"} radius={[4, 4, 0, 0]}>
+                      {(barChart.data || []).map((entry: any, i: number) => (
+                        <Cell key={i} fill={entry?.fill || colorForName(String(entry?.[barChart.xKey || "name"] ?? i))} />
+                      ))}
+                    </Bar>
                   </BarChart>
                 </ResponsiveContainer>
               </div>

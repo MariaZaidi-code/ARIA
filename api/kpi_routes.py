@@ -18,6 +18,7 @@ from sqlalchemy import create_engine, text
 from core.config import get_session, SCHEMA_DIR
 from core.deps import require_data, get_current_user
 from core.secret_box import decrypt as _decrypt_secret
+from core.semantic import humanize, kpi_label
 from api.schema_intel import SchemaIntelligence, _safe_name, _run_sql
 
 router = APIRouter()
@@ -1022,9 +1023,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                                 period = "vs prev period"
                         except Exception:
                             pass
-                    label = (f"{c['column']} ({c['tdesc'][:20]})" if c["agg"] == "SUM"
-                             else (f"Avg {c['column']}" if c["agg"] == "AVG"
-                                   else f"{c['column']} ({c['tdesc'][:20]})"))
+                    label = kpi_label(c["agg"], c["column"])
                     metrics.append({
                         "id": f"{c['agg'].lower()}_{c['table']}_{c['column']}",
                         "label": label,
@@ -1189,7 +1188,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     if c["kind"] == "time":
                         charts.append({
                             "id": f"ts_{c['table']}_{c['column']}",
-                            "title": f"{c['column']} over time ({tdesc[:15]})",
+                            "title": f"{humanize(c['column'])} Over Time",
                             "subtitle": f"{len(c['data'])} {c['grain']} periods",
                             "type": "area",
                             "data": c["data"],
@@ -1202,7 +1201,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     else:
                         charts.append({
                             "id": f"cat_{c['table']}_{c['column']}",
-                            "title": f"{c['column']} by {c['dim']} ({tdesc[:15]})",
+                            "title": f"{humanize(c['column'])} by {humanize(c['dim'])}",
                             "subtitle": f"Top {len(c['data'])}",
                             "type": "bar",
                             "data": c["data"],
@@ -1232,10 +1231,10 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     if total is not None:
                         sections.append({
                             "type": "analytics",
-                            "title": f"{measure} Overview",
+                            "title": f"{humanize(measure)} Overview",
                             "metric": _fmt(total, is_curr),
-                            "description": f"Total {measure} across {tdesc}: {_fmt(total, is_curr)}. Use AI Analytics to explore trends, breakdowns, and detailed analysis.",
-                            "query": f"What is the total {measure}?",
+                            "description": f"Total {humanize(measure)}: {_fmt(total, is_curr)}. Use AI Analytics to explore trends, breakdowns, and detailed analysis.",
+                            "query": f"What is the total {humanize(measure).lower()}?",
                         })
                         break
 
@@ -1269,10 +1268,10 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                                     direction = "increased" if change > 0 else "decreased"
                                     sections.append({
                                         "type": "insights",
-                                        "title": f"{measure} Trend Detected",
+                                        "title": f"{humanize(measure)} Trend Detected",
                                         "metric": f"{change:+.1f}%",
-                                        "description": f"{measure} in {tdesc} {direction} by {abs(change):.1f}% from {prev[0]} to {curr[0]}. Insights page has detailed analysis of all patterns.",
-                                        "query": f"What are the trends in {measure}?",
+                                        "description": f"{humanize(measure)} {direction} by {abs(change):.1f}% from {prev[0]} to {curr[0]}. Insights page has detailed analysis of all patterns.",
+                                        "query": f"What are the trends in {humanize(measure).lower()}?",
                                     })
                                     break
                     except Exception:
@@ -1296,10 +1295,10 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         if months >= 3:
                             sections.append({
                                 "type": "predictive",
-                                "title": f"{measure} Forecast Available",
+                                "title": f"{humanize(measure)} Forecast Available",
                                 "metric": f"{months} months of data",
-                                "description": f"Connected data has {months} months of {measure} history in {tdesc}. Predictive Analysis can generate forecasts with confidence intervals.",
-                                "query": f"Forecast {measure} over time",
+                                "description": f"Connected data has {months} months of {humanize(measure).lower()} history. Predictive Analysis can generate forecasts with confidence intervals.",
+                                "query": f"Forecast {humanize(measure).lower()} over time",
                             })
                             break
                     except Exception:
@@ -1324,10 +1323,10 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                             top = rows[0]
                             sections.append({
                                 "type": "prescription",
-                                "title": f"Top {dim}: {top[0]}",
+                                "title": f"Top {humanize(dim)}: {top[0]}",
                                 "metric": _fmt(float(top[1]), _is_currency_col(measure)),
-                                "description": f"The leading {dim} in {tdesc} is '{top[0]}'. Prescription page can generate evidence-based recommendations.",
-                                "query": f"What actions should I take based on {measure}?",
+                                "description": f"The leading {humanize(dim).lower()} is '{top[0]}'. Prescription page can generate evidence-based recommendations.",
+                                "query": f"What actions should I take based on {humanize(measure).lower()}?",
                             })
                             break
                     except Exception:
@@ -1354,11 +1353,11 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     dim = intel.find_best_dimension(tname)
                     dt = intel.find_best_datetime(tname)
                     if measure and dim:
-                        recommendations.append({"id": f"rec_{tname}_dim", "question": f"What are the top {dim} by {measure}?", "type": "dimension"})
+                        recommendations.append({"id": f"rec_{tname}_dim", "question": f"What are the top {humanize(dim).lower()} by {humanize(measure).lower()}?", "type": "dimension"})
                     if measure and dt:
-                        recommendations.append({"id": f"rec_{tname}_trend", "question": f"How has {measure} changed over time?", "type": "trend"})
+                        recommendations.append({"id": f"rec_{tname}_trend", "question": f"How has {humanize(measure).lower()} changed over time?", "type": "trend"})
                     if measure and dim and len(recommendations) < 6:
-                        recommendations.append({"id": f"rec_{tname}_breakdown", "question": f"Show {measure} breakdown by {dim}", "type": "breakdown"})
+                        recommendations.append({"id": f"rec_{tname}_breakdown", "question": f"Show {humanize(measure).lower()} breakdown by {humanize(dim).lower()}", "type": "breakdown"})
 
                 # ── Data quality ──
                 quality_score = 100
