@@ -383,7 +383,7 @@ def test_cross_document_request_abstains_if_one_pdf_has_no_evidence(make_rag, mo
 def test_http_chat_endpoint_uses_authenticated_user_and_complete_result(make_rag, monkeypatch):
     from app import app
     from api import insight_rag_routes
-    from core.deps import require_writable
+    from core.deps import get_current_user, require_writable
     from fastapi.testclient import TestClient
     rag = make_rag()
     captured = []
@@ -391,11 +391,16 @@ def test_http_chat_endpoint_uses_authenticated_user_and_complete_result(make_rag
         captured.append(user_id)
         return rag
     monkeypatch.setattr(insight_rag_routes, "_capability", capability)
-    app.dependency_overrides[require_writable] = lambda: {"user_id": "authenticated-user"}
+    fake_user = {"user_id": "authenticated-user"}
+    # Router-level rate limiting authenticates via get_current_user, so both
+    # auth dependencies must be overridden in tests.
+    app.dependency_overrides[require_writable] = lambda: fake_user
+    app.dependency_overrides[get_current_user] = lambda: fake_user
     try:
         response = TestClient(app).post("/api/insight/pdf/chat", json={"question": "What was revenue?"})
     finally:
         app.dependency_overrides.pop(require_writable, None)
+        app.dependency_overrides.pop(get_current_user, None)
     assert response.status_code == 200
     assert captured == ["authenticated-user"]
     assert response.json()["grounding"]["used_pdf_evidence"] is True

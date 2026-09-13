@@ -108,9 +108,9 @@ export default function Documents() {
     <div className="p-8 max-w-7xl mx-auto space-y-6">
       <div className="flex items-end justify-between gap-4 flex-wrap">
         <div>
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-gradient-to-r from-violet-500/10 to-fuchsia-500/10 border border-violet-500/20 mb-3">
-            <span className="w-1.5 h-1.5 rounded-full bg-violet-500" />
-            <span className="text-[10px] font-bold uppercase tracking-widest text-violet-600 dark:text-violet-400">Knowledge Base</span>
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-primary/10 border border-primary/20 mb-3">
+            <span className="w-1.5 h-1.5 rounded-full bg-primary" />
+            <span className="text-[10px] font-bold uppercase tracking-widest text-primary">Knowledge Base</span>
           </div>
           <h1 className="text-3xl font-bold tracking-tight">Documents</h1>
           <p className="text-sm text-muted-foreground mt-1">Manage and search your uploaded PDF documents</p>
@@ -129,7 +129,7 @@ export default function Documents() {
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && onSearch()}
               placeholder="Search across all documents…"
-              className="w-full px-4 py-2.5 rounded-xl bg-white/40 dark:bg-slate-900/40 border border-white/20 dark:border-slate-700/30 focus:outline-none focus:ring-2 focus:ring-violet-500/30 text-sm"
+              className="w-full px-4 py-2.5 rounded-xl bg-white/40 dark:bg-slate-900/40 border border-white/20 dark:border-slate-700/30 focus:outline-none focus:ring-2 focus:ring-primary/30 text-sm"
             />
           </div>
           <button

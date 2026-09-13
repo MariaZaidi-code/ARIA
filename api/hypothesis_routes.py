@@ -2,14 +2,14 @@
 
 import re
 import math
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from urllib.parse import quote_plus
 import numpy as np
 
 from core.config import get_session
-from core.deps import require_data, require_writable, get_current_user
+from core.deps import require_data, require_writable, get_current_user, reject_document_sql
 from core.secret_box import decrypt as _decrypt_secret
 
 router = APIRouter()
@@ -24,7 +24,142 @@ def _quote_identifier(name, dialect="postgresql"):
 class HypothesisRequest(BaseModel):
     hypothesis: str
     dataset: str = "Sales Database"
-    period: str = "Last 12 months"
+
+
+class InvestigateRequest(BaseModel):
+    question: str
+
+
+def _session_documents(user_id) -> list[dict]:
+    """Chunk texts for the session's connected document (best-effort)."""
+    try:
+        session = get_session(user_id)
+        doc_id = session.get("document_id")
+        if not doc_id:
+            return []
+        from insight_rag.storage import RAGMetadataStore
+        store = RAGMetadataStore(user_id)
+        meta = store.get_document(doc_id) or {}
+        chunks = store.load_chunks(doc_id)
+        fname = str(meta.get("filename") or meta.get("original_filename") or doc_id)
+        out = []
+        for ch in chunks[:40]:
+            text = getattr(ch, "page_content", "") or ""
+            if text.strip():
+                out.append({"filename": fname,
+                            "page": (getattr(ch, "metadata", {}) or {}).get("page"),
+                            "text": text})
+        return out
+    except Exception:
+        return []
+
+
+def _linked_hypothesis_setup(session):
+    """Build investigation context from a stashed linked database (§7).
+
+    Returns (setup_tuple, None) or (None, err_dict). Never raises.
+    """
+    try:
+        from api.copilot_routes import _linked_context
+        from api.schema_intel import SchemaIntelligence
+        linked = _linked_context(session)
+        mapping = linked.get("mapping") or {}
+        tables = list(mapping.get("tables", {}).keys())
+        if not linked.get("db_uri") or not tables:
+            return None, {"ok": False, "code": "NO_CONNECTION",
+                          "detail": "No queryable data is connected yet."}
+        engine = create_engine(linked["db_uri"], pool_pre_ping=True)
+        return (mapping, tables, engine, linked.get("dialect", "postgresql"),
+                SchemaIntelligence(mapping)), None
+    except Exception as exc:
+        return None, {"ok": False, "code": "INVALID_SOURCE",
+                      "detail": f"The linked data could not be read: {str(exc)[:150]}"}
+
+
+@router.post("/api/hypotheses/investigate")
+def investigate_hypotheses(req: InvestigateRequest, request: Request,
+                           user: dict = Depends(require_writable)):
+    """Evidence-based investigation workspace (t.txt): observe -> break down
+    -> anomalies -> document evidence -> ranked candidate hypotheses."""
+    from hypothesis_engine.investigate import investigate_question
+    from insight_agent import sanitize_json
+    require_data(request)
+    session = get_session(user["user_id"])
+    try:
+        setup, err = _hypothesis_setup(user)
+    except Exception:
+        # Document-primary sessions raise inside the shared setup;
+        # fall through to the linked-database path below.
+        setup, err = None, {"rejected": True}
+    if err:
+        # Multi-source (§7): a document-primary session may still carry a
+        # linked database — investigate that instead of refusing outright.
+        setup, err = _linked_hypothesis_setup(session)
+    if err:
+        if "rejected" in err:
+            raise HTTPException(status_code=400, detail=(
+                "This source is a text document — use Document Chat (Copilot) "
+                "instead of SQL analytics."))
+        return {"ok": False, **err}
+    mapping, tables, engine, dialect, intel = setup
+    try:
+        llm = session.get("provider")
+        if not isinstance(llm, str) and llm is not None and not hasattr(llm, "complete"):
+            llm = None
+        out = investigate_question(engine, dialect, intel, tables, req.question,
+                                   documents=_session_documents(user["user_id"]),
+                                   llm=llm)
+        return sanitize_json({"ok": True, **out})
+    except Exception as exc:
+        return {"ok": False, "code": "ANALYSIS_FAILED",
+                "detail": f"The investigation could not run: {str(exc)[:200]}"}
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+
+
+@router.get("/api/hypotheses/auto")
+def auto_hypotheses(request: Request, user: dict = Depends(get_current_user)):
+    """Automatic detection (t.txt §§13, 28): scan data, investigate the top
+    event — no question required. Results cached briefly per schema."""
+    import time as _time
+    from hypothesis_engine.investigate import auto_investigate
+    from insight_agent import sanitize_json
+    session = get_session(user["user_id"])
+    try:
+        setup, err = _hypothesis_setup(user)
+    except Exception:
+        setup, err = None, {"rejected": True}
+    if err:
+        setup, err = _linked_hypothesis_setup(session)
+    if err:
+        return {"ok": True, "events": [], "insufficient": True,
+                "detail": ("Connect a database or upload a file and ARIA will "
+                           "scan it for changes worth investigating."),
+                "needed_data": []}
+    mapping, tables, engine, dialect, intel = setup
+    try:
+        llm = session.get("provider")
+        if not isinstance(llm, str) and llm is not None and not hasattr(llm, "complete"):
+            llm = None
+        out = auto_investigate(engine, dialect, intel, tables,
+                               documents=_session_documents(user["user_id"]),
+                               llm=llm)
+        try:
+            out["analyzed_at"] = _time.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+        return sanitize_json({"ok": True, **out})
+    except Exception as exc:
+        return {"ok": False, "code": "ANALYSIS_FAILED",
+                "detail": f"Automatic detection could not run: {str(exc)[:200]}"}
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
 
 
 class AnalyzeRequest(BaseModel):
@@ -79,6 +214,7 @@ def suggest_hypotheses(user: dict = Depends(get_current_user)):
     from api.schema_intel import SchemaIntelligence
     from hypothesis_engine.engine import rank_prominent, suggest_hypotheses as _suggest
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     schema_path = session.get("schema_path")
     if not schema_path:
         return {"ok": True, "suggestions": [], "cards": []}
@@ -117,6 +253,7 @@ def analyze_hypothesis(req: AnalyzeRequest, request: Request, user: dict = Depen
     from insight_agent import sanitize_json
     require_data(request)
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     schema_path = session.get("schema_path")
     if not schema_path:
         return {"ok": False, "verdict": "NEEDS MORE DATA", "code": "NO_CONNECTION",
@@ -155,6 +292,7 @@ def _hypothesis_setup(user):
     """Shared loader: mapping + tables + engine for any supported source."""
     from api.schema_intel import SchemaIntelligence
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     schema_path = session.get("schema_path")
     if not schema_path:
         return None, {"ok": False, "code": "NO_CONNECTION",
@@ -218,6 +356,7 @@ def hypothesis_parse(req: ParseRequest, user: dict = Depends(get_current_user)):
 def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depends(require_writable)):
     require_data(request)
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     if not session or not session.get("db"):
         return {"ok": False, "detail": "No data source connected"}
 

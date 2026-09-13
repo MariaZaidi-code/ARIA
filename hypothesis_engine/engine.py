@@ -953,11 +953,11 @@ def rank_prominent(engine, dialect, intel, tables, limit=5):
                         "score": r2,
                         "text": f"Is {m0.replace('_', ' ')} {direction} over time?",
                         "kind": "trend",
-                        "evidence": f"{direction.title()} pattern (R²={r2:.2f}) across {ok.sum():,} dated rows",
+                        "evidence": f"{direction.title()} pattern across {ok.sum():,} dated rows",
                         "metric": m0, "time_col": dts[0],
                     }
                     if p < 0.05 and r2 >= 0.3:
-                        entry["evidence"] = f"{direction.title()} trend (R²={r2:.2f}) across {ok.sum():,} dated rows"
+                        entry["evidence"] = f"{direction.title()} trend across {ok.sum():,} dated rows"
                         cands.append(entry)
                     else:
                         reserve.append(entry)

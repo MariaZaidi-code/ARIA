@@ -23,7 +23,7 @@ JWT_ALGO = "HS256"
 
 def _token_ttl_days() -> int:
     try:
-        return max(1, int(os.getenv("TOKEN_TTL_DAYS", "7")))
+        return min(30, max(1, int(os.getenv("TOKEN_TTL_DAYS", "7"))))
     except (TypeError, ValueError):
         return 7
 
@@ -79,6 +79,12 @@ def _get_db() -> sqlite3.Connection:
             created_at TEXT NOT NULL
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS revoked_tokens (
+            token_hash TEXT PRIMARY KEY,
+            expires_at TEXT NOT NULL
+        )"""
+    )
     conn.commit()
     return conn
 
@@ -106,8 +112,8 @@ def register(username: str, password: str) -> int:
     username = (username or "").strip()
     if len(username) < 3 or not _USERNAME_RE.fullmatch(username):
         raise ValueError("Username must be at least 3 characters using letters, digits, . _ -.")
-    if len(password) < 8:
-        raise ValueError("Password must be at least 8 characters.")
+    if len(password) < 8 or len(password) > 128:
+        raise ValueError("Password must be 8-128 characters.")
     conn = _get_db()
     try:
         conn.execute(
@@ -128,6 +134,8 @@ def register(username: str, password: str) -> int:
 def authenticate(username: str, password: str) -> int | None:
     if not username or not isinstance(username, str):
         return None
+    if not isinstance(password, str) or len(password) > 128:
+        return None
     conn = _get_db()
     try:
         row = conn.execute(
@@ -137,6 +145,8 @@ def authenticate(username: str, password: str) -> int | None:
         conn.close()
     if row and _verify_password(password, row["password_hash"]):
         return row["id"]
+    # Dummy hash to reduce user-enumeration timing oracle.
+    _verify_password("dummy-password-for-timing", "pbkdf2_sha256$120000$" + "00" * 16 + "$" + "00" * 32)
     return None
 
 
@@ -154,9 +164,39 @@ def issue_token(user_id: int, username: str) -> str:
 def verify_token(token: str) -> dict | None:
     try:
         payload = jwt.decode(token, SECRET, algorithms=[JWT_ALGO])
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        conn = _get_db()
+        try:
+            revoked = conn.execute(
+                "SELECT 1 FROM revoked_tokens WHERE token_hash = ?", (token_hash,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if revoked:
+            return None
         return {"user_id": int(payload["sub"]), "username": payload.get("username")}
     except jwt.PyJWTError:
         return None
+
+
+def revoke_token(token: str) -> None:
+    """Invalidate this JWT until its own expiry without storing the token itself."""
+    try:
+        payload = jwt.decode(token, SECRET, algorithms=[JWT_ALGO], options={"verify_exp": False})
+        expires_at = datetime.fromtimestamp(int(payload["exp"]), timezone.utc).isoformat()
+    except (jwt.PyJWTError, KeyError, TypeError, ValueError):
+        return
+    conn = _get_db()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("DELETE FROM revoked_tokens WHERE expires_at <= ?", (now,))
+        conn.execute(
+            "INSERT OR REPLACE INTO revoked_tokens (token_hash, expires_at) VALUES (?, ?)",
+            (hashlib.sha256(token.encode("utf-8")).hexdigest(), expires_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def add_history(user_id: int, *, goal: str, sql_used=None, row_count=None,

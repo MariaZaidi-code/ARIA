@@ -22,6 +22,10 @@ export default function Login({ onLogin }: LoginProps) {
       setError("Please enter your email and password.");
       return;
     }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      setError("Please enter a valid email address.");
+      return;
+    }
 
     setLoading(true);
     try {
@@ -31,12 +35,17 @@ export default function Login({ onLogin }: LoginProps) {
           setLoading(false);
           return;
         }
-        if (password.length < 6) {
-          setError("Password must be at least 6 characters");
+        if (password.length < 8) {
+          setError("Password must be at least 8 characters");
           setLoading(false);
           return;
         }
-        await registerLocalUser(email, password);
+        const reg = await registerLocalUser(email, password);
+        if (!reg.success) {
+          setError(reg.message || "Could not create your account.");
+          setLoading(false);
+          return;
+        }
         setMode("login");
         setLoading(false);
         return;

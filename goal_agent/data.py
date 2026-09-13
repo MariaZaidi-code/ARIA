@@ -290,7 +290,8 @@ Broken SQL:
 Return only the corrected SQL query using real FK relationships. No explanations, no markdown.
 """
                 try:
-                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500)
+                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500,
+                                            timeout=self._REPAIR_TIMEOUT)
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
@@ -331,7 +332,8 @@ Broken SQL:
 Return only the corrected SQL query. No explanations, no markdown.
 """
                 try:
-                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500)
+                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500,
+                                            timeout=self._REPAIR_TIMEOUT)
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
@@ -392,7 +394,8 @@ Return only the corrected SQL query that satisfies the goal plan.
 No explanations, no markdown.
 """
                     try:
-                        raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500)
+                        raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500,
+                                                timeout=self._REPAIR_TIMEOUT)
                         current_sql = self._clean_sql(raw)
                         continue
                     except Exception:
@@ -510,7 +513,8 @@ Broken SQL:
 Fix it and return only the corrected SQL query. No explanations, no markdown.
 """
                 try:
-                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500)
+                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1, num_predict=500,
+                                            timeout=self._REPAIR_TIMEOUT)
                     current_sql = self._clean_sql(raw)
                 except Exception:
                     continue

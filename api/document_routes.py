@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import List, Optional
 
-from core.config import PROCESSED_DIR, get_session
+from core.config import DATA_DIR, PROCESSED_DIR, get_session
 from core.deps import require_writable, get_current_user
 from document_processor import create_document_processor
 
@@ -125,7 +125,7 @@ def search_document(
     
     # Create processor for search
     processor = create_document_processor(
-        upload_dir="data/uploads",
+        upload_dir=DATA_DIR / "uploads" / f"user_{user['user_id']}",
         processed_dir=PROCESSED_DIR / f"user_{user['user_id']}" / "documents",
     )
     
@@ -158,7 +158,7 @@ def search_all_documents(
 ):
     """Search across all user's documents using RAG."""
     processor = create_document_processor(
-        upload_dir="data/uploads",
+        upload_dir=DATA_DIR / "uploads" / f"user_{user['user_id']}",
         processed_dir=PROCESSED_DIR / f"user_{user['user_id']}" / "documents",
     )
     
@@ -207,7 +207,7 @@ def delete_document(
     
     # Create processor for deletion
     processor = create_document_processor(
-        upload_dir="data/uploads",
+        upload_dir=DATA_DIR / "uploads" / f"user_{user['user_id']}",
         processed_dir=processed_dir,
     )
     
@@ -216,11 +216,20 @@ def delete_document(
     if not success:
         raise HTTPException(status_code=500, detail="Failed to delete document")
     
-    # Also delete the uploaded file if it exists
-    upload_dir = Path("data/uploads")
-    for upload_file in upload_dir.glob(f"*{document_id}*"):
-        upload_file.unlink(missing_ok=True)
-    
+    # Also delete the exact stored upload file (no glob on user-controlled names).
+    try:
+        upload_dir = (DATA_DIR / "uploads" / f"user_{user['user_id']}").resolve()
+        stored = doc_data.get("file_path")
+        if stored:
+            candidate = Path(stored)
+            if not candidate.is_absolute():
+                candidate = upload_dir / candidate.name
+            candidate = candidate.resolve()
+            if candidate.parent == upload_dir and candidate.suffix.lower() == ".pdf":
+                candidate.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     return {"ok": True, "message": "Document deleted"}
 
 
@@ -246,13 +255,22 @@ def retry_document(
     if doc_data.get("status") not in ("failed", "partial"):
         raise HTTPException(status_code=400, detail="Document is not in a failed state")
     
-    # Get the original file
-    upload_dir = Path("data/uploads")
+    # Get the original file via the exact stored path (no glob on
+    # user-controlled original_name).
+    upload_dir = DATA_DIR / "uploads" / f"user_{user['user_id']}"
     file_path = None
-    for f in upload_dir.glob(f"*{doc_data.get('original_name', '')}*"):
-        if f.suffix.lower() == ".pdf":
-            file_path = f
-            break
+    try:
+        resolved_upload = upload_dir.resolve()
+        stored = doc_data.get("file_path")
+        if stored:
+            candidate = Path(stored)
+            if not candidate.is_absolute():
+                candidate = resolved_upload / Path(stored).name
+            candidate = candidate.resolve()
+            if candidate.parent == resolved_upload and candidate.suffix.lower() == ".pdf" and candidate.exists():
+                file_path = candidate
+    except Exception:
+        file_path = None
     
     if not file_path or not file_path.exists():
         raise HTTPException(status_code=404, detail="Original file not found for retry")

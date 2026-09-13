@@ -39,12 +39,15 @@ const severityDot: Record<string, string> = {
   low: "bg-positive",
 };
 
-const fmt = (n: number, prefix = "") =>
-  n >= 1_000_000
-    ? `${prefix}${(n / 1_000_000).toFixed(2)}M`
-    : n >= 1_000
-    ? `${prefix}${(n / 1_000).toFixed(1)}K`
-    : `${prefix}${Number(n).toLocaleString()}`;
+const fmt = (n: number, prefix = "") => {
+  if (n === null || n === undefined || isNaN(Number(n))) return "—";
+  const v = Number(n);
+  return v >= 1_000_000
+    ? `${prefix}${(v / 1_000_000).toFixed(2)}M`
+    : v >= 1_000
+    ? `${prefix}${(v / 1_000).toFixed(1)}K`
+    : `${prefix}${v.toLocaleString()}`;
+};
 
 function MetricCard({ kpi }: { kpi: any }) {
   const rawValue = typeof kpi.rawValue === "number"

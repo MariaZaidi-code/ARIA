@@ -31,13 +31,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import schema_agent
 
-ADMIN = "postgresql://{user}:{password}@{host}:{port}/{dbname}".format(
-    user=os.getenv("DB_USER", "postgres"),
-    password=os.getenv("DB_PASSWORD", "postgres"),
-    host=os.getenv("DB_HOST", "localhost"),
-    port=os.getenv("DB_PORT", "5432"),
-    dbname=os.getenv("DB_NAME", "postgres"),
-)
+def _admin_dsn(dbname=None):
+    """Build an admin DSN targeting `dbname` (defaults to DB_NAME/postgres).
+
+    Kept as a function so every connection targets the intended database.
+    The previous module-level ADMIN string was already formatted, making
+    `ADMIN.format(dbname=...)` a silent no-op that always hit `postgres`.
+    Requires explicit ARIA_ALLOW_BENCHMARK=1 to avoid accidental destructive runs.
+    """
+    if os.getenv("ARIA_ALLOW_BENCHMARK", "0") not in ("1", "true", "yes"):
+        raise RuntimeError("Refusing to run: set ARIA_ALLOW_BENCHMARK=1 to allow DROP/CREATE DATABASE.")
+    from urllib.parse import quote_plus
+    return "postgresql://{user}:{password}@{host}:{port}/{dbname}".format(
+        user=quote_plus(os.getenv("DB_USER", "postgres")),
+        password=quote_plus(os.getenv("DB_PASSWORD") or ""),
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "5432"),
+        dbname=dbname or os.getenv("DB_NAME", "postgres"),
+    )
+
+
+ADMIN = None  # built lazily via _admin_dsn() after ARIA_ALLOW_BENCHMARK=1 check
 
 DEFAULT_DBS = ["northwind", "chinook", "olist_ecommerce", "retail_fraud", "adventureworks"]
 
@@ -50,7 +64,7 @@ def make_cfg(db):
         "port": int(os.getenv("DB_PORT", "5432")),
         "db": db,
         "user": os.getenv("DB_USER", "postgres"),
-        "password": os.getenv("DB_PASSWORD", "postgres"),
+        "password": os.getenv("DB_PASSWORD") or "",
         "db_type": "postgresql",
         "db_schema": os.getenv("DB_SCHEMA", "public"),
     }
@@ -97,68 +111,101 @@ def clone_and_strip(src, messy=False):
     name-based heuristics cannot fire; only data evidence remains. Returns
     (dst, fks, col_renames) where col_renames maps (schema, table, old_col)
     -> new_col for the messy case (empty otherwise)."""
+    import logging
     import psycopg2
-    admin = psycopg2.connect(ADMIN)
+    from psycopg2 import sql
+    log = logging.getLogger("aria.benchmark")
+    admin = psycopg2.connect(_admin_dsn())
     admin.autocommit = True
-    cur = admin.cursor()
-    cur.execute("SELECT 1 FROM pg_database WHERE datname=%s", (src,))
-    if not cur.fetchone():
-        admin.close()
-        return None
-    dst = f"{src}_bench"
-    cur.execute("SELECT 1 FROM pg_database WHERE datname=%s", (dst,))
-    if cur.fetchone():
-        cur.execute(f'DROP DATABASE "{dst}"')
-    cur.execute(f'CREATE DATABASE "{dst}" TEMPLATE "{src}"')
-    admin.close()
-
-    conn = psycopg2.connect(ADMIN.format(dbname=dst))
-    conn.autocommit = True
-    cur = conn.cursor()
-    fks = list_fks(conn)
-
-    col_renames = {}
-    if messy and fks:
-        seen = set()
-        idx = 0
-        for t, col, ft, fc, sch, fsch in fks:
-            key = (sch, t, col)
-            if key in seen:
-                continue
-            seen.add(key)
-            idx += 1
-            new_col = f"fk_c{idx}"
-            # Avoid colliding with an existing column name in the table.
+    try:
+        cur = admin.cursor()
+        try:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname=%s", (src,))
+            if not cur.fetchone():
+                return None
+            dst = f"{src}_bench"
+            cur.execute("SELECT 1 FROM pg_database WHERE datname=%s", (dst,))
+            if cur.fetchone():
+                cur.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(dst)))
             cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema=%s AND table_name=%s AND column_name=%s",
-                (sch, t, new_col),
-            )
-            while cur.fetchone():
-                idx += 1
-                new_col = f"fk_c{idx}"
-            try:
-                cur.execute(
-                    f'ALTER TABLE "{sch}"."{t}" RENAME COLUMN "{col}" TO "{new_col}"'
+                sql.SQL("CREATE DATABASE {} TEMPLATE {}").format(
+                    sql.Identifier(dst), sql.Identifier(src)
                 )
-                col_renames[(sch, t, col)] = new_col
+            )
+        finally:
+            try:
+                cur.close()
             except Exception:
                 pass
-
-    cur.execute(
-        """
-        SELECT tc.table_schema, tc.table_name, tc.constraint_name
-        FROM information_schema.table_constraints tc
-        WHERE tc.constraint_type = 'FOREIGN KEY'
-        """,
-    )
-    for sch, t, name in cur.fetchall():
+    finally:
         try:
-            cur.execute(f'ALTER TABLE "{sch}"."{t}" DROP CONSTRAINT "{name}"')
+            admin.close()
         except Exception:
             pass
-    conn.close()
-    return dst, fks, col_renames
+
+    conn = psycopg2.connect(_admin_dsn(dst))
+    conn.autocommit = True
+    cur = conn.cursor()
+    try:
+        fks = list_fks(conn)
+
+        col_renames = {}
+        if messy and fks:
+            seen = set()
+            idx = 0
+            for t, col, ft, fc, sch, fsch in fks:
+                key = (sch, t, col)
+                if key in seen:
+                    continue
+                seen.add(key)
+                idx += 1
+                new_col = f"fk_c{idx}"
+                # Avoid colliding with an existing column name in the table.
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema=%s AND table_name=%s AND column_name=%s",
+                    (sch, t, new_col),
+                )
+                while cur.fetchone():
+                    idx += 1
+                    new_col = f"fk_c{idx}"
+                try:
+                    cur.execute(
+                        sql.SQL("ALTER TABLE {}.{} RENAME COLUMN {} TO {}").format(
+                            sql.Identifier(sch), sql.Identifier(t),
+                            sql.Identifier(col), sql.Identifier(new_col),
+                        )
+                    )
+                    col_renames[(sch, t, col)] = new_col
+                except Exception:
+                    log.exception("Benchmark messy rename failed for %s.%s.%s", sch, t, col)
+
+        cur.execute(
+            """
+            SELECT tc.table_schema, tc.table_name, tc.constraint_name
+            FROM information_schema.table_constraints tc
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+            """,
+        )
+        for sch, t, name in cur.fetchall():
+            try:
+                cur.execute(
+                    sql.SQL("ALTER TABLE {}.{} DROP CONSTRAINT {}").format(
+                        sql.Identifier(sch), sql.Identifier(t), sql.Identifier(name)
+                    )
+                )
+            except Exception:
+                log.exception("Benchmark FK drop failed for %s.%s (%s)", sch, t, name)
+        return dst, fks, col_renames
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def edge_set(mapping, col_renames=None):

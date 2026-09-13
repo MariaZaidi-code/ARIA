@@ -323,6 +323,65 @@ class TestUploadCapsAndRedaction(unittest.TestCase):
         self.assertNotIn("s3cr3t", safe)
 
 
+class TestRateLimitAndErrors(unittest.TestCase):
+    def test_ratelimit_trips(self):
+        from fastapi import HTTPException
+        from core import ratelimit as rl
+
+        rl._hits.clear()
+        for _ in range(3):
+            rl.check_limit("t", "k", 3, 60)
+        with self.assertRaises(HTTPException) as ctx:
+            rl.check_limit("t", "k", 3, 60)
+        self.assertEqual(ctx.exception.status_code, 429)
+
+    def test_ratelimit_disabled(self):
+        import os
+        from core import ratelimit as rl
+
+        rl._hits.clear()
+        os.environ["ARIA_RATE_LIMIT"] = "off"
+        try:
+            for _ in range(10):
+                rl.check_limit("t2", "k", 1, 60)
+        finally:
+            del os.environ["ARIA_RATE_LIMIT"]
+
+    def test_sanitize_error(self):
+        from core.errors import sanitize_error
+
+        out = sanitize_error("postgresql://admin:s3cr3t@db:5432/sales password='hunter2'")
+        self.assertNotIn("s3cr3t", out)
+        self.assertNotIn("hunter2", out)
+        self.assertIn("***", out)
+        out = sanitize_error(Exception("no tables in C:\\data\\x\\f.db"))
+        self.assertNotIn("C:\\data", out)
+
+    def test_humanize_labels(self):
+        from core.semantic import humanize, kpi_label, is_valid_identifier
+
+        self.assertEqual(humanize("order_date"), "Order Date")
+        self.assertEqual(humanize("customer_id"), "Customer")
+        self.assertEqual(kpi_label("SUM", "amount"), "Total Amount")
+        self.assertEqual(kpi_label("AVG", "order_value"), "Average Order Value")
+        self.assertEqual(kpi_label("DISTINCT", "customer"), "Customer Count")
+        self.assertTrue(is_valid_identifier("sales"))
+        self.assertFalse(is_valid_identifier("a; DROP TABLE x"))
+
+    def test_rl_event_capped(self):
+        import json
+        from pathlib import Path
+        import tempfile
+        from core.rl import record_event
+
+        with tempfile.TemporaryDirectory() as tmp:
+            record_event("u", event="e", state={"big": "x" * 20000},
+                         base_dir=Path(tmp))
+            lines = (Path(tmp) / "user_u" / "rl_events.jsonl").read_text().splitlines()
+            rec = json.loads(lines[0])
+            self.assertLessEqual(len(json.dumps(rec)), 8192)
+
+
 class TestSecretBoxKeepalive(unittest.TestCase):
     def test_roundtrip(self):
         from core.secret_box import encrypt, decrypt, PREFIX

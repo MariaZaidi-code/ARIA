@@ -131,7 +131,7 @@ function severityAccent(sev: string): string {
   const s = (sev || "").toLowerCase();
   if (s === "high") return "#DC2626";
   if (s === "medium") return "#D97706";
-  return "#4F46E5";
+  return "#2F6FAD";
 }
 
 const fmtMoney = (v?: number | null) => {
@@ -191,11 +191,14 @@ function EvidenceChart({ ins }: { ins: Insight }) {
         {[0.25, 0.5, 0.75].map((f) => (
           <line key={f} x1={PL} x2={W - PR} y1={PT + ih * f} y2={PT + ih * f} stroke="currentColor" strokeOpacity={0.1} />
         ))}
-        <line x1={sx(x0)} y1={sy(y0)} x2={sx(x1)} y2={sy(y1)} stroke="#4F46E5" strokeOpacity={0.35} strokeDasharray="4 4" />
+        <line x1={sx(x0)} y1={sy(y0)} x2={sx(x1)} y2={sy(y1)} stroke="#2F6FAD" strokeOpacity={0.35} strokeDasharray="4 4" />
         {pts.map((p: any, i: number) => (
-          <circle key={i} cx={sx(p.x)} cy={sy(p.y)} r={4.5} fill="#4F46E5" fillOpacity={0.75}>
-            <title>{`${p.l}: ${p.x.toLocaleString()} / ${p.y.toLocaleString()}`}</title>
-          </circle>
+          <g key={i}>
+            <circle cx={sx(p.x)} cy={sy(p.y)} r={11} fill="transparent">
+              <title>{`${p.l}: ${p.x.toLocaleString()} / ${p.y.toLocaleString()}`}</title>
+            </circle>
+            <circle cx={sx(p.x)} cy={sy(p.y)} r={4.5} fill="#2F6FAD" fillOpacity={0.75} pointerEvents="none" />
+          </g>
         ))}
         <text x={PL} y={H - 6} fontSize={10} fill="currentColor" opacity={0.55}>{xs[0].toLocaleString()}</text>
         <text x={W - PR} y={H - 6} fontSize={10} fill="currentColor" opacity={0.55} textAnchor="end">{xs[xs.length - 1].toLocaleString()}</text>
@@ -261,10 +264,10 @@ function EvidenceChart({ ins }: { ins: Insight }) {
           const top = i === 0;
           return (
             <g key={i}>
-              <rect x={x} y={PT + ih - h} width={bw * 0.64} height={h} rx={3} fill={top ? "#4F46E5" : "#C7D2FE"} opacity={top ? 1 : 0.85}>
+              <rect x={x} y={PT + ih - h} width={bw * 0.64} height={h} rx={3} fill={top ? "#2F6FAD" : "#C9D9E8"} opacity={top ? 1 : 0.85}>
                 <title>{`${r.name}: ${fmtMoney(r.value)}`}</title>
               </rect>
-              <text x={x + bw * 0.32} y={PT + ih - h - 4} fontSize={9.5} fontWeight={700} textAnchor="middle" fill={top ? "#312E81" : "#64748B"}>
+              <text x={x + bw * 0.32} y={PT + ih - h - 4} fontSize={9.5} fontWeight={700} textAnchor="middle" fill={top ? "#1E3A5F" : "#64748B"}>
                 {fmtMoney(r.value)}
               </text>
               <text x={x + bw * 0.32} y={H - 6} fontSize={9.5} textAnchor="middle" fill="currentColor" opacity={0.6}>
@@ -293,12 +296,15 @@ function EvidenceChart({ ins }: { ins: Insight }) {
       {[0.25, 0.5, 0.75, 1].map((f) => (
         <line key={f} x1={PL} x2={W - PR} y1={PT + ih * (1 - f)} y2={PT + ih * (1 - f)} stroke="currentColor" strokeOpacity={0.1} />
       ))}
-      <polygon points={area} fill="#4F46E5" opacity={0.08} />
-      <polyline points={line} fill="none" stroke="#4F46E5" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+      <polygon points={area} fill="#2F6FAD" opacity={0.08} />
+      <polyline points={line} fill="none" stroke="#2F6FAD" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
       {rows.map((r: any, i: number) => (
-        <circle key={i} cx={X(i)} cy={Y(r.value)} r={r.anomaly ? 5 : 3} fill={r.anomaly ? "#DC2626" : "#4F46E5"} stroke="#fff" strokeWidth={1.5}>
-          <title>{`${r.label}: ${fmtMoney(r.value)}${r.anomaly ? " (unusual)" : ""}`}</title>
-        </circle>
+        <g key={i}>
+          <circle cx={X(i)} cy={Y(r.value)} r={12} fill="transparent">
+            <title>{`${r.label}: ${fmtMoney(r.value)}${r.anomaly ? " (unusual)" : ""}`}</title>
+          </circle>
+          <circle cx={X(i)} cy={Y(r.value)} r={r.anomaly ? 5 : 3} fill={r.anomaly ? "#DC2626" : "#2F6FAD"} stroke="#fff" strokeWidth={1.5} pointerEvents="none" />
+        </g>
       ))}
       {anoms.length > 0 && (
         <text x={X(anoms[0].i)} y={Math.max(10, Y(anoms[0].value) - 10)} fontSize={10} fontWeight={700} fill="#DC2626" textAnchor="middle">unusual</text>

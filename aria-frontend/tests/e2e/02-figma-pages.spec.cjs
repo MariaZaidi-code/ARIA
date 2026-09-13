@@ -2,25 +2,23 @@
 // Requires user to be logged in (seed auth token in localStorage before running,
 // or skip if already authenticated).
 const { test, expect } = require('@playwright/test');
+const { seedAuth } = require('./auth-helper');
 
-const BASE = 'http://localhost:5174';
-
-/** Seed a fake auth token so figma pages render (real auth tested separately). */
-async function seedAuth(page) {
-  await page.goto(BASE);
-  await page.evaluate(() => {
-    localStorage.setItem('aria_auth_token', 'test_token_playwright_2024');
-    localStorage.setItem('aria_auth_user', JSON.stringify({ email: 'test@aria.ai', username: 'TestUser' }));
-    localStorage.setItem('aria_llm_mode', 'local');
-  });
-}
+const BASE = 'http://localhost:8000';
 
 test.describe('Figma pages - all load', () => {
+  // One login per file (serial worker): the auth rate limiter is 30/5min.
+  let page;
+  test.beforeAll(async ({ browser }) => {
+    page = await browser.newPage();
+    await seedAuth(page, BASE);
+  });
+  test.afterAll(async () => { await page.close(); });
   for (const { name, nav, heading, selector } of [
     { name: 'Dashboard',    nav: 'Dashboard',     heading: 'Dashboard',         selector: 'text=Welcome' },
     { name: 'AIAnalytics', nav: 'AI Analytics', heading: 'AI Analytics',     selector: 'text=Ask' },
     { name: 'Insights',     nav: 'Insights',      heading: 'Insights',         selector: 'text=Insight' },
-    { name: 'Predictive',  nav: 'Predictive',    heading: 'Predictive',        selector: 'text=Predictive' },
+    { name: 'Predictive', nav: 'Forecast', heading: 'Forecast',         selector: 'text=Forecast' },
     { name: 'Prescription',nav: 'Prescription',  heading: 'Prescription',      selector: 'text=Prescription' },
     { name: 'Hypothesis',  nav: 'Hypothesis',    heading: 'Hypothesis',       selector: 'text=Hypothesis' },
     { name: 'Data',        nav: 'Data',           heading: 'Data',             selector: 'text=Connect' },
@@ -29,9 +27,7 @@ test.describe('Figma pages - all load', () => {
     { name: 'History',     nav: 'History',       heading: 'History',          selector: 'text=History' },
     { name: 'Settings',    nav: 'Settings',      heading: 'Settings',         selector: '.nav-item' },
   ]) {
-    test(`${name} page loads`, async ({ page }) => {
-      await seedAuth(page);
-      await page.reload();
+    test(`${name} page loads`, async () => {
       await page.waitForLoadState('networkidle');
       // Navigate to page via sidebar
       await page.getByRole('button', { name: new RegExp(nav, 'i') }).click();

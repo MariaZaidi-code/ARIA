@@ -1,6 +1,11 @@
 import { useState, useRef, useEffect } from "react";
 import { Send, Plus, MoreHorizontal, Sparkles } from "lucide-react";
+import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, LineChart, Line, PieChart, Pie, Cell } from "recharts";
+import { useTheme } from "../App";
 import Evidence from "../components/Evidence";
+import { BizTooltip } from "../components/charts";
+import { colorForName } from "../lib/charts";
+import { fmtBiz } from "../lib/format";
 
 type Message = {
   id: string;
@@ -21,67 +26,127 @@ interface Conversation {
   messages: Message[];
 }
 
-const defaultConversations: Conversation[] = [];
-
-const suggestions = [
+const FALLBACK_SUGGESTIONS = [
   "What are the main metrics in this dataset?",
   "Show me a summary of the data",
   "Which categories have the most records?",
   "What trends do you see in the data?",
 ];
 
-// Render the chart-ready payload returned by the backend. The type is chosen
-// dynamically from the question + returned data (bar/line/pie/scatter); this
-// only lays out whatever the backend decided — no hardcoded chart mapping.
-function renderChart(msg: Message) {
+// Render the chart-ready payload returned by the backend as a fully
+// interactive chart (hover tooltips, axis formatting). The type is chosen
+// dynamically from the question + returned data (bar/line/pie/scatter).
+function renderChart(msg: Message, isDark?: boolean) {
   const rows = msg.rows || [];
   const spec = msg.chart;
   if (!spec || !rows.length) return null;
   const x = spec.x;
   const y = spec.y;
-  const values = rows.map((r) => Number(r[y])).filter((v) => !isNaN(v));
-  if (!values.length) return null;
-  const maxVal = Math.max(...values, 1);
-  const isLine = spec.type === "line" || spec.type === "area";
+  const data = rows.slice(0, 24).map((r) => ({ [x]: String(r[x] ?? ""), [y]: Number(r[y]) || 0 }));
+  if (!data.length) return null;
+  const grid = isDark ? "#2A2A35" : "#E5E7EB";
+  const axis = isDark ? "#8889A0" : "#9CA3AF";
+  const tick = { fontSize: 11, fill: axis };
   const isPie = spec.type === "pie" || spec.type === "doughnut";
+  const isLine = spec.type === "line" || spec.type === "area";
+  const horizontal = spec.type === "bar_horizontal" || (!isLine && !isPie && data.length > 8);
   return (
     <div className="mt-2 pt-2 border-t border-border">
       {isPie ? (
-        <div className="flex flex-wrap gap-2">
-          {rows.slice(0, 8).map((r, i) => (
-            <span key={i} className="text-[10px] text-muted-foreground">
-              {String(r[x])}: {Number(r[y]).toLocaleString()}
-            </span>
-          ))}
-        </div>
+        <ResponsiveContainer width="100%" height={180}>
+          <PieChart>
+            <Tooltip content={<BizTooltip metricNames={{ value: y }} />} />
+            <Pie data={data} dataKey={y} nameKey={x} outerRadius={70} paddingAngle={2}>
+              {data.map((d, i) => (
+                <Cell key={i} fill={colorForName(String(d[x]))} />
+              ))}
+            </Pie>
+          </PieChart>
+        </ResponsiveContainer>
       ) : isLine ? (
-        <div className="flex items-end gap-0.5 h-12">
-          {rows.slice(0, 40).map((r, i) => (
-            <div key={i} className="flex-1 bg-primary/30 rounded-t"
-                 style={{ height: `${(Number(r[y]) / maxVal) * 100}%` }}
-                 title={`${String(r[x])}: ${Number(r[y]).toLocaleString()}`} />
-          ))}
-        </div>
+        <ResponsiveContainer width="100%" height={180}>
+          <LineChart data={data}>
+            <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
+            <XAxis dataKey={x} tick={tick} axisLine={false} tickLine={false} minTickGap={24} />
+            <YAxis tick={tick} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => fmtBiz(v)} />
+            <Tooltip content={<BizTooltip metricNames={{ [y]: y }} />} />
+            <Line type="monotone" dataKey={y} stroke="var(--primary)" strokeWidth={2} dot={{ r: 3 }} activeDot={{ r: 5 }} name={y} />
+          </LineChart>
+        </ResponsiveContainer>
+      ) : horizontal ? (
+        <ResponsiveContainer width="100%" height={Math.max(160, data.length * 32)}>
+          <BarChart data={data} layout="vertical">
+            <CartesianGrid strokeDasharray="3 3" stroke={grid} horizontal={false} />
+            <XAxis type="number" tick={tick} axisLine={false} tickLine={false} tickFormatter={(v: number) => fmtBiz(v)} />
+            <YAxis type="category" dataKey={x} tick={tick} axisLine={false} tickLine={false} width={110} />
+            <Tooltip content={<BizTooltip metricNames={{ [y]: y }} />} cursor={{ fill: "var(--secondary)" }} />
+            <Bar dataKey={y} radius={[0, 5, 5, 0]} name={y}>
+              {data.map((d, i) => (
+                <Cell key={i} fill={colorForName(String(d[x]))} fillOpacity={i === 0 ? 1 : 0.7} />
+              ))}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
       ) : (
-        <div className="space-y-1" role="img" aria-label={`Comparison chart of ${y} by ${x}`}>
-          {rows.slice(0, 8).map((r, i) => (
-            <div key={i} className="flex items-center gap-2" title={`${String(r[x])}: ${Number(r[y]).toLocaleString()}`}>
-              <span className="text-[10px] text-muted-foreground w-24 truncate">{String(r[x])}</span>
-              <div className="flex-1 bg-primary/20 rounded" style={{ height: 8 }}>
-                <div className="bg-primary rounded" style={{ height: 8, width: `${(Number(r[y]) / maxVal) * 100}%` }} />
-              </div>
-              <span className="text-[10px] text-foreground w-16 text-right">{Number(r[y]).toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>
-            </div>
-          ))}
-        </div>
+        <ResponsiveContainer width="100%" height={180}>
+          <BarChart data={data}>
+            <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
+            <XAxis dataKey={x} tick={tick} axisLine={false} tickLine={false} interval={data.length > 12 ? Math.floor(data.length / 12) : 0} />
+            <YAxis tick={tick} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => fmtBiz(v)} />
+            <Tooltip content={<BizTooltip metricNames={{ [y]: y }} />} cursor={{ fill: "var(--secondary)" }} />
+            <Bar dataKey={y} radius={[5, 5, 0, 0]} name={y}>
+              {data.map((d, i) => (
+                <Cell key={i} fill={colorForName(String(d[x]))} fillOpacity={i === 0 ? 1 : 0.7} />
+              ))}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
       )}
       <p className="text-[10px] text-muted-foreground mt-1.5">{spec.reason || spec.type}</p>
     </div>
   );
 }
 
-export default function Copilot({ initialQuestion = "" }: { initialQuestion?: string }) {
-  const [conversations, setConversations] = useState(defaultConversations);
+export default function Copilot({ initialQuestion = "", analysisResult = null, goalResult = null }: { initialQuestion?: string; analysisResult?: any; goalResult?: any }) {
+  void analysisResult; void goalResult;
+  const { isDark } = useTheme();
+  // Data-driven starter questions (4, from the connected schema).
+  // Refreshed on mount and whenever a new chat starts (source may change).
+  const [suggestions, setSuggestions] = useState<string[]>(FALLBACK_SUGGESTIONS);
+  const refreshSuggestions = async () => {
+    try {
+      const token = localStorage.getItem("aria_auth_token");
+      const res = await fetch("/api/copilot/suggestions", {
+        headers: { Authorization: `Bearer ${token || ""}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && Array.isArray(data.suggestions) && data.suggestions.length) {
+        setSuggestions(data.suggestions.slice(0, 4));
+      }
+    } catch { /* fallback list stays */ }
+  };
+  useEffect(() => { refreshSuggestions(); }, []);
+  // Per-user persistence (§13): conversations survive refresh. Rows are
+  // trimmed on save so one chat cannot exhaust localStorage quota.
+  const chatsKey = (() => {
+    try {
+      const u = JSON.parse(localStorage.getItem("aria_auth_user") || "null");
+      return `aria_copilot_chats_${u?.username || u?.email || "anon"}`;
+    } catch {
+      return "aria_copilot_chats_anon";
+    }
+  })();
+  const loadChats = (): Conversation[] => {
+    try {
+      const raw = localStorage.getItem(chatsKey);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.slice(0, 10) : [];
+    } catch {
+      return [];
+    }
+  };
+  const [conversations, setConversations] = useState<Conversation[]>(loadChats);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
@@ -89,6 +154,23 @@ export default function Copilot({ initialQuestion = "" }: { initialQuestion?: st
   const consumedPrefill = useRef("");
 
   const active = conversations.find((c) => c.id === activeId) || conversations[0] || null;
+
+  // Persist on every change (trimmed: 10 chats, 30 messages each, 24 rows).
+  useEffect(() => {
+    try {
+      const trimmed = conversations.slice(0, 10).map((c) => ({
+        ...c,
+        messages: c.messages.slice(-30).map((m) => ({
+          ...m,
+          rows: Array.isArray(m.rows) ? m.rows.slice(0, 24) : m.rows,
+        })),
+      }));
+      localStorage.setItem(chatsKey, JSON.stringify(trimmed));
+    } catch {
+      // Quota or private mode: chats simply stay session-only.
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversations]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -145,7 +227,10 @@ export default function Copilot({ initialQuestion = "" }: { initialQuestion?: st
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ question: content }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.detail || `Request failed (${res.status}).`);
+      }
       const reply: Message = {
         id: (Date.now() + 1).toString(),
         role: "assistant",
@@ -179,6 +264,7 @@ export default function Copilot({ initialQuestion = "" }: { initialQuestion?: st
     setConversations((prev) => [{ id, title: "New conversation", subtitle: "Just now", date: "Today", messages: [] }, ...prev]);
     setActiveId(id);
     setMenuOpen(false);
+    refreshSuggestions();
   };
 
   const deleteActiveChat = () => {
@@ -276,14 +362,18 @@ export default function Copilot({ initialQuestion = "" }: { initialQuestion?: st
                     <div className="flex-1 space-y-1.5">
                       <div className="bg-card/90 border border-border/80 rounded-2xl rounded-tl-md px-4 py-3 shadow-sm backdrop-blur-sm">
                         <p className="text-[13px] text-foreground leading-relaxed">{msg.content}</p>
-                        {renderChart(msg)}
+                        {renderChart(msg, isDark)}
                         {msg.sql && (
                           <div className="mt-2">
                             <Evidence
-                              label="Query used"
-                              sections={[{ title: "SQL", body: (
-                                <pre className="text-[10px] font-mono text-muted-foreground overflow-x-auto whitespace-pre-wrap">{msg.sql}</pre>
-                              ) }]}
+                              label="Evidence"
+                              sections={[
+                                { title: "Data analyzed", body: `Connected data${Array.isArray(msg.rows) ? ` — ${msg.rows.length} row${msg.rows.length === 1 ? "" : "s"} returned` : ""}.` },
+                                { title: "How ARIA answered", body: "Ran a read-only query against the connected source and summarized the result in plain language." },
+                              ]}
+                              technical={(
+                                <pre className="text-[10px] font-mono overflow-x-auto whitespace-pre-wrap">{msg.sql}</pre>
+                              )}
                             />
                           </div>
                         )}

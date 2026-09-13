@@ -33,3 +33,23 @@ export function confidenceWord(p: number | null | undefined): string {
   if (n < 0.05) return "Moderate";
   return "Low";
 }
+
+/** Correlation |r| becomes words; exact value only inside Evidence. */
+export function relationshipWord(r: number | null | undefined): string {
+  if (r === null || r === undefined || isNaN(Number(r))) return "Unclear";
+  const a = Math.abs(Number(r));
+  if (a >= 0.7) return "Strong";
+  if (a >= 0.4) return "Moderate";
+  if (a >= 0.2) return "Weak";
+  return "Very weak";
+}
+
+/** R² becomes words; exact value only inside Evidence technical details. */
+export function patternWord(r2: number | null | undefined): string {
+  if (r2 === null || r2 === undefined || isNaN(Number(r2))) return "Unclear";
+  const n = Number(r2);
+  if (n >= 0.7) return "Strong";
+  if (n >= 0.4) return "Clear";
+  if (n >= 0.2) return "Weak";
+  return "Very weak";
+}

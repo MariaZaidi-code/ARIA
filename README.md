@@ -30,7 +30,7 @@ python -m pytest tests/ -q    # backend suite must stay green
 
 | Layer | Location | Role |
 |---|---|---|
-| API | `app.py`, `api/` (16 routers) | FastAPI routes, auth, CORS, static serving |
+| API | `app.py`, `api/` (17 routers) | FastAPI routes, auth, CORS, static serving |
 | Auth | `auth.py`, `api/auth_routes.py` | PBKDF2 passwords, HS256 JWT, per-user history |
 | Shared | `core/` | config+DPAPI secrets, session store, guards, semantic helpers (`semantic.py`), RL (`rl.py`) |
 | NL→SQL | `goal_agent/` | intent → semantic grounding → SQL contract → execution + validation |
@@ -41,7 +41,7 @@ python -m pytest tests/ -q    # backend suite must stay green
 | Hypothesis | `api/hypothesis_routes.py` | real Pearson tests, PG/MySQL/SQLite |
 | Documents | `document_processor/` | PDF text/table/OCR → chunks → embeddings (faiss) → RAG |
 | CSV | `csv_handler.py`, `csv_orchestrator.py` | validated ingestion → per-upload SQLite |
-| Frontend | `aria-frontend/src/figma/` | React 19 + Vite; `mock.ts` is a test fixture, never imported by pages |
+| Frontend | `aria-frontend/src/figma/` | React 19 + Vite; hash-persisted pages (`#/<page>`); no mock data path (offline shows empty state) |
 | Tests | `tests/` (pytest) | unit + contract tests; run `python -m pytest tests/ -q` |
 
 ## Secrets
@@ -54,8 +54,9 @@ python -c "import sys; sys.path.insert(0,'.'); from core.secret_box import encry
 ```
 
 Never commit `.env`, `data/.jwt_secret`, `*.db`, or token files (all gitignored).
-`TOKEN_TTL_DAYS` (default 7) and login rate limits live in `auth.py` /
-`api/auth_routes.py`. Rotate provider keys in their dashboards if ever exposed.
+`TOKEN_TTL_DAYS` (default 7, capped at 30) and login rate limits live in `auth.py` /
+`api/auth_routes.py`. Relational `db_uri` is never written to disk (rebuilt from
+encrypted `db` config on restart). Rotate provider keys in their dashboards if ever exposed.
 
 ## Key API contracts
 

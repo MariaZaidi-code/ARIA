@@ -281,12 +281,19 @@ class PredictionAgent:
             {
                 "label": fwd_labels[i],
                 "value": round(float(points[i]), 2),
+                "forecast": round(float(points[i]), 2),
                 "lower80": round(float(points[i] - 1.28 * sigma), 2),
                 "upper80": round(float(points[i] + 1.28 * sigma), 2),
                 "lower95": round(float(points[i] - 1.96 * sigma), 2),
                 "upper95": round(float(points[i] + 1.96 * sigma), 2),
             }
             for i in range(steps)
+        ]
+        # Trailing actuals so the UI can draw one continuous
+        # history + projection chart (last 24 periods max).
+        history = [
+            {"label": lab, "actual": round(float(v), 2)}
+            for lab, v in zip(labels[-24:], values[-24:])
         ]
 
         return {
@@ -304,13 +311,14 @@ class PredictionAgent:
             "last_actual": {"label": labels[-1], "value": round(last_actual, 2)},
             "projected_pct_change": projected_pct,
             "points": forecast_points,
+            "history": history,
         }
 
     def _empty(self, reason, reliability):
         return {
             "column": None, "period": None, "horizon": 0,
             "method": "none", "accuracy_pct": None, "mape_pct": None,
-            "reliability": reliability, "reason": reason, "points": [],
+            "reliability": reliability, "reason": reason, "points": [], "history": [],
             "valid": False,
             "validation": {
                 "method": None, "metric": "MAPE",

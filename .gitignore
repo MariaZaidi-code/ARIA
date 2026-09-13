@@ -15,6 +15,7 @@ __pycache__/
 wandb/
 outputs/
 aria-story-mistral-7b-lora/
+models/
 ft_story_data.jsonl
 ft_story_data_sample.jsonl
 
@@ -47,3 +48,13 @@ auth_tok.tmp
 _archive/
 server_e2e_live*.log
 e2e_*_out.log
+# pytest / playwright outputs (local only)
+.pytest_cache/
+playwright-report/
+playwright/.auth/
+test-results/
+# private keys / service accounts (never commit)
+*.pem
+*.key
+*.p12
+service-account*.json

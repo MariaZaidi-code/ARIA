@@ -26,6 +26,11 @@ class PrescriptionAgent:
     def prescribe(self, processed_data, kpis, trends, anomalies, hypotheses,
                   predictions=None, max_actions=5):
         """Return a dict with 'actions' (list of strings) and 'source'."""
+        processed_data = processed_data or {}
+        kpis = kpis or []
+        trends = trends or []
+        anomalies = anomalies or []
+        hypotheses = hypotheses or []
         context = {
             "user_goal": processed_data.get("user_goal", "Unknown goal"),
             "row_count": processed_data.get("row_count", 0),
@@ -67,7 +72,7 @@ Rules:
                     "impact_note": "Impact could not be reliably estimated from the available data.",
                 }
         except Exception as exc:
-            logging.warning("Prescription LLM failed: %s. Using template actions.", exc)
+            logging.getLogger("aria.prescription").exception("Prescription LLM failed; using template actions")
 
         return {
             "actions": self._template_actions(kpis, trends, anomalies, hypotheses,
@@ -133,8 +138,8 @@ Rules:
         if anomalies:
             a = anomalies[0]
             actions.append(
-                f"Investigate the anomaly in {a.get('column', 'unknown')} "
-                f"(value {a.get('value', 'N/A')}, z-score {a.get('z_score', 'N/A')})."
+                f"Investigate the unusual {a.get('column', 'reading')} "
+                f"(observed {a.get('value', 'N/A')}, well outside its usual range)."
             )
         if predictions and predictions.get("valid") and predictions.get("points"):
             period_word = predictions.get("period") or "periods"

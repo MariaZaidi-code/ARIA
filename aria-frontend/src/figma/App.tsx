@@ -73,7 +73,28 @@ export default function App() {
   const [isDark, setIsDark] = useState(() => {
     return localStorage.getItem("aria_theme") === "dark";
   });
-  const [page, setPage] = useState<Page>("dashboard");
+  const [page, setPageState] = useState<Page>(() => {
+    const h = (window.location.hash || "").replace(/^#\/?/, "") as Page;
+    const valid: Page[] = ["dashboard","analytics","insights","predictive","prescription","hypothesis","data","documents","copilot","history","settings"];
+    return valid.includes(h) ? h : "dashboard";
+  });
+
+  const setPage = (p: Page) => {
+    setPageState(p);
+    try {
+      window.location.hash = `#/${p}`;
+    } catch { /* ignore */ }
+  };
+
+  useEffect(() => {
+    const onHash = () => {
+      const h = (window.location.hash || "").replace(/^#\/?/, "") as Page;
+      const valid: Page[] = ["dashboard","analytics","insights","predictive","prescription","hypothesis","data","documents","copilot","history","settings"];
+      if (valid.includes(h)) setPageState(h);
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", isDark);
@@ -81,7 +102,8 @@ export default function App() {
   }, [isDark]);
 
   // Validate any stored session on mount: a stale localStorage token must not
-  // skip login (audit BUG_REPORT 2026-09-07). Force login stage on 401.
+  // skip login (audit BUG_REPORT 2026-09-07). Force login stage on 401/expired.
+  // Transient network errors keep the cached session (retry) instead of wiping it.
   useEffect(() => {
     (async () => {
       const token = localStorage.getItem("aria_auth_token");
@@ -90,19 +112,33 @@ export default function App() {
         return;
       }
       try {
+        const parts = token.split(".");
+        if (parts.length === 3) {
+          const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+          if (payload.exp && Date.now() / 1000 > payload.exp) {
+            clearAuthSession();
+            setCurrentUser(null);
+            setAppStage("login");
+            return;
+          }
+        }
+      } catch { /* fall through to server probe */ }
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 10000);
         const res = await fetch("/api/session/status", {
           headers: { Authorization: `Bearer ${token}` },
+          signal: ctrl.signal,
         });
+        clearTimeout(t);
         if (res.status === 401) {
           clearAuthSession();
           setCurrentUser(null);
           setAppStage("login");
         }
       } catch {
-        // Offline/backend down: stay on login; do not trust the stored user.
-        clearAuthSession();
-        setCurrentUser(null);
-        setAppStage("login");
+        // Backend blip/offline: keep cached session so a flaky network
+        // does not log the user out. Pages will surface retry states.
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -160,23 +196,28 @@ export default function App() {
     setAppStage("llm-selection");
   };
 
-  const handleLLMSelect = (mode: string) => {
+  const handleLLMSelect = async (mode: string, apiKey?: string) => {
     setSelectedLLM(mode);
     localStorage.setItem("aria_llm_mode", mode);
     // Materialize the choice server-side so the session provider matches
     // the UI immediately (prevents "choose an LLM provider" right after).
-    (async () => {
-      try {
-        const token = localStorage.getItem("aria_auth_token");
-        await fetch("/api/provider/switch", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token || ""}` },
-          body: JSON.stringify({ provider: mode }),
-        });
-      } catch {
-        // Non-fatal: connect flows also set the provider explicitly.
+    // Provider isolation: the Groq key is sent ONLY when Cloud is selected;
+    // Local AI switches keyless and never touches stored keys.
+    try {
+      const token = localStorage.getItem("aria_auth_token");
+      const res = await fetch("/api/provider/switch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token || ""}` },
+        body: JSON.stringify(mode === "cloud" && apiKey ? { provider: mode, api_key: apiKey } : { provider: mode }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.detail || `Could not switch to ${mode}.`);
       }
-    })();
+    } catch (err: any) {
+      // Surface the failure so the user knows the switch did not happen.
+      throw new Error(err?.message || `Could not switch to ${mode}.`);
+    }
     // Restore connection state from the stored session so the Dashboard
     // shows KPIs/charts without requiring a fresh connect.
     (async () => {

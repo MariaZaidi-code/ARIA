@@ -425,7 +425,9 @@ class CsvSchemaExtractor:
             return "UNKNOWN", "No non-missing values are available for inference."
 
         lowered = {value.casefold() for value in cleaned}
-        bool_tokens = {"true", "false", "yes", "no", "y", "n"}
+        # Canonical boolean policy (shared with csv_orchestrator._TRUE/_FALSE_TOKENS):
+        # true/yes/y/1 and false/no/n/0. Keeps handler/orchestrator consistent.
+        bool_tokens = {"true", "false", "yes", "no", "y", "n", "1", "0"}
         if lowered.issubset(bool_tokens) and len(lowered) >= 1:
             return "BOOLEAN", None
 

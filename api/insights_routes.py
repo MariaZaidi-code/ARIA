@@ -15,9 +15,10 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from core.deps import require_writable
+from core.deps import require_writable, reject_document_sql
 from core.config import get_session, save_session
 from api.schema_intel import SchemaIntelligence, _safe_name, _run_sql, AMOUNT_HINTS
+from core.semantic import humanize
 
 router = APIRouter(tags=["insights"])
 
@@ -111,6 +112,13 @@ class InsightsEngine:
         self.llm = llm
         self.intel = SchemaIntelligence(mapping)
 
+    def _rollback(self) -> None:
+        """Reset a poisoned transaction so later detectors keep working."""
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
+
     def generate_all_insights(self, max_insights: int = 20):
         """Run all detectors, return ranked insights."""
         insights = []
@@ -125,27 +133,36 @@ class InsightsEngine:
             measure = self.intel.find_best_measure(tname)
             if not measure:
                 continue
+            # Weak mappings can label text columns as measures; only real
+            # numerics reach SQL aggregates (a text SUM would poison the
+            # shared transaction for every later detector).
+            if measure not in self.intel.get_numeric_cols(tname):
+                continue
 
             try:
                 insights.extend(self._detect_growth_decline(tname))
             except Exception:
-                pass
+                self._rollback()
             try:
                 insights.extend(self._detect_trends(tname))
             except Exception:
-                pass
+                self._rollback()
+            try:
+                insights.extend(self._detect_trend_leaderboard(tname))
+            except Exception:
+                self._rollback()
             try:
                 insights.extend(self._detect_anomalies(tname))
             except Exception:
-                pass
+                self._rollback()
             try:
                 insights.extend(self._detect_opportunities(tname))
             except Exception:
-                pass
+                self._rollback()
             try:
                 insights.extend(self._detect_risks(tname))
             except Exception:
-                pass
+                self._rollback()
 
         # Cross-table correlation
         try:
@@ -206,22 +223,22 @@ class InsightsEngine:
         viz_data = [{"period": str(v[0])[:7], "value": v[1]} for v in values]
 
         observations = [
-            f"{measure} was {_fmt_currency(previous_val)} in the previous period.",
-            f"{measure} is {_fmt_currency(current_val)} in the current period.",
-            f"This represents a {_fmt_pct(change_pct)} change.",
+            f"{humanize(measure)} was {_fmt_currency(previous_val)} in the previous period.",
+            f"{humanize(measure)} is {_fmt_currency(current_val)} in the current period.",
+            f"This is a {_fmt_pct(change_pct)} change.",
         ]
         if len(values) >= 4:
             avg = statistics.mean([v[1] for v in values])
-            observations.append(f"Average over the last {len(values)} periods: {_fmt_currency(avg)}.")
+            observations.append(f"Typical level across the last {len(values)} periods: {_fmt_currency(avg)}.")
 
         if change_pct > 5:
             insight_type = "Growth"
             severity = self._compute_severity(change_pct, confidence, current_val)
-            title = f"{tdesc or table}: {measure} grew {_fmt_pct(change_pct)} to {_fmt_currency(current_val)}"
+            title = f"{humanize(measure)} grew {_fmt_pct(change_pct)} to {_fmt_currency(current_val)}"
         elif change_pct < -5:
             insight_type = "Decline"
             severity = self._compute_severity(abs(change_pct), confidence, current_val)
-            title = f"{tdesc or table}: {measure} declined {_fmt_pct(change_pct)} to {_fmt_currency(current_val)}"
+            title = f"{humanize(measure)} fell {_fmt_pct(change_pct)} to {_fmt_currency(current_val)}"
         else:
             return []
 
@@ -233,7 +250,7 @@ class InsightsEngine:
             insight_type=insight_type,
             severity=severity,
             title=title,
-            description=f"{measure} in {tdesc or table} changed from {_fmt_currency(previous_val)} to {_fmt_currency(current_val)} ({_fmt_pct(change_pct)}) from {period_label}.",
+            description=f"{humanize(measure)} moved from {_fmt_currency(previous_val)} to {_fmt_currency(current_val)} ({_fmt_pct(change_pct)}) between {period_label}.",
             metric=metric_label,
             metric_value=current_val,
             previous_value=previous_val,
@@ -249,8 +266,8 @@ class InsightsEngine:
             change_pct=change_pct,
             impact_value=impact_value,
             impact_direction="positive" if impact_value > 0 else "negative",
-            impact_explanation=f"The {_fmt_pct(change_pct)} change in {measure} represents a {'gain' if impact_value > 0 else 'loss'} of {_fmt_currency(abs(impact_value))}.",
-            next_question=f"What caused the {_fmt_pct(change_pct)} {'increase' if change_pct > 0 else 'decrease'} in {measure} in {tdesc or table}?",
+            impact_explanation=f"The {_fmt_pct(change_pct)} move in {humanize(measure).lower()} means {'a gain' if impact_value > 0 else 'a drop'} of {_fmt_currency(abs(impact_value))}.",
+            next_question=f"What caused the {_fmt_pct(change_pct)} {'rise' if change_pct > 0 else 'fall'} in {humanize(measure).lower()}?",
             next_dims=dims,
             viz_type="area",
             viz_data=viz_data,
@@ -318,16 +335,32 @@ class InsightsEngine:
         period_months = self._period_label(values[-1][0], values[0][0])
         tdesc = self.intel.tables[table].get("description", table)
         severity = self._compute_severity(abs(slope_pct) * len(nums), confidence, nums[-1])
-        viz_data = [{"period": str(v[0])[:7], "value": v[1]} for v in values]
+        # Idea 7: flag unusual periods on the trend line itself (same IQR +
+        # z-score rules as the anomaly detector, computed on this series).
+        # The frontend renders flagged points in red with an "unusual" label.
+        s_sorted = sorted(nums)
+        _q1 = s_sorted[n // 4]
+        _q3 = s_sorted[3 * n // 4]
+        _iqr = _q3 - _q1
+        _lo, _hi = _q1 - 1.5 * _iqr, _q3 + 1.5 * _iqr
+        _mean = statistics.mean(nums)
+        _std = statistics.stdev(nums) if len(nums) > 1 else 0
+        def _is_unusual(v):
+            if v < _lo or v > _hi:
+                return True
+            if _std > 0 and abs((v - _mean) / _std) > 2.0:
+                return True
+            return False
+        viz_data = [{"period": str(v[0])[:7], "value": v[1], "anomaly": _is_unusual(v[1])} for v in values]
         dims = self.intel.get_text_cols(table)[:3]
 
         insights.append(self._build_insight(
             insight_id=f"tr_{table}_{measure}",
             insight_type="Trend",
             severity=severity,
-            title=f"{tdesc or table}: {measure} shows {direction} trend ({_fmt_pct(slope_pct)}/period)",
-            description=f"{measure} in {tdesc or table} has been {direction} consistently over {len(values)} periods ({period_months}). The average rate of change is {_fmt_pct(slope_pct)} per period with {consistency*100:.0f}% consistency.",
-            metric=f"{measure} ({tdesc or table})",
+            title=f"{humanize(measure)} is {direction} ({_fmt_pct(slope_pct)} a period)",
+            description=f"{humanize(measure)} has been {direction} steadily over {len(values)} periods ({period_months}), changing by {_fmt_pct(slope_pct)} a period on average.",
+            metric=f"{humanize(measure)}",
             metric_value=nums[-1],
             previous_value=nums[0],
             magnitude=_fmt_pct(slope_pct * len(nums)),
@@ -335,18 +368,20 @@ class InsightsEngine:
             affected_period=period_months,
             tags=[table, measure, "trend", direction],
             observations=[
-                f"{measure} started at {_fmt_currency(nums[0])} and ended at {_fmt_currency(nums[-1])} over {len(values)} periods.",
-                f"Linear trend slope: {_fmt_pct(slope_pct)} per period. R-squared: {r_squared:.3f}. Consistency: {consistency*100:.0f}%.",
-            ],
-            support_metrics=[f"Trend slope: {_fmt_pct(slope_pct)}/period", f"R²: {r_squared:.3f}"],
+                f"{humanize(measure)} moved from {_fmt_currency(nums[0])} to {_fmt_currency(nums[-1])} over {len(values)} periods.",
+                f"It moved in the same direction in {consistency*100:.0f}% of those periods.",
+            ] + ([
+                f"{sum(1 for v in values if _is_unusual(v[1]))} of those periods sit outside the usual range and are highlighted on the chart."
+            ] if any(_is_unusual(v[1]) for v in values) else []),
+            support_metrics=[f"Steady {_fmt_pct(slope_pct)} change a period"],
             sample_size=len(values),
             baseline=nums[0],
             current_value=nums[-1],
             change_pct=((nums[-1] - nums[0]) / abs(nums[0])) * 100 if nums[0] != 0 else 0,
             impact_value=nums[-1] - nums[0],
             impact_direction="positive" if slope > 0 else "negative",
-            impact_explanation=f"Sustained {direction} trend in {measure} over {len(values)} periods suggests a {'positive' if slope > 0 else 'negative'} trajectory.",
-            next_question=f"What factors are driving the {direction} trend in {measure}?",
+            impact_explanation=f"A sustained {direction} pattern in {humanize(measure).lower()} over {len(values)} periods points to a {'healthy' if slope > 0 else 'worrying'} trajectory.",
+            next_question=f"What is driving the {direction} pattern in {humanize(measure).lower()}?",
             next_dims=dims,
             viz_type="area",
             viz_data=viz_data,
@@ -355,6 +390,121 @@ class InsightsEngine:
         ))
 
         return insights
+
+    # ── Trend leaderboard (idea 8) ──────────────────────────────────────
+
+    def _detect_trend_leaderboard(self, table: str):
+        """Rank every usable measure in one table by trend speed.
+
+        Dynamic: uses whatever numeric measures the schema actually has
+        (via find_all_measures — never assumed names). Needs a date column
+        and 2+ measures with enough history each. Returns one insight whose
+        chart is a diverging bar of per-period % change, or [] when the
+        data cannot support a fair ranking.
+        """
+        date_col = self.intel.find_best_datetime(table)
+        if not date_col:
+            return []
+        measures = self.intel.find_all_measures(table)
+        if len(measures) < 2:
+            return []
+
+        ranked = []
+        period_label = ""
+        n_periods = 0
+        for measure in measures[:8]:
+            sql = f"""
+                SELECT date_trunc('month', {_safe_name(date_col)}) AS period,
+                       SUM({_safe_name(measure)}) AS val
+                FROM {_safe_name(table)}
+                WHERE {_safe_name(date_col)} IS NOT NULL
+                GROUP BY period
+                ORDER BY period
+                LIMIT 24
+            """
+            _, rows = _run_sql(self.conn, sql, limit=24)
+            if len(rows) < 6:
+                continue
+            values = [_safe_float(r["val"]) for r in rows if _safe_float(r["val"]) is not None]
+            if len(values) < 6:
+                continue
+            nums = values
+            n = len(nums)
+            x_mean = (n - 1) / 2
+            y_mean = statistics.mean(nums)
+            if y_mean == 0:
+                continue
+            numerator = sum((i - x_mean) * (y - y_mean) for i, y in enumerate(nums))
+            denominator = sum((i - x_mean) ** 2 for i in range(n))
+            if denominator == 0:
+                continue
+            slope = numerator / denominator
+            slope_pct = (slope / abs(y_mean)) * 100
+            consecutive = sum(1 for i in range(1, n) if (nums[i] > nums[i - 1]) == (slope > 0))
+            consistency = consecutive / (n - 1)
+            if abs(slope_pct) < 1 or consistency < 0.6:
+                continue
+            ss_res = sum((y - (y_mean + slope * (i - x_mean))) ** 2 for i, y in enumerate(nums))
+            ss_tot = sum((y - y_mean) ** 2 for y in nums)
+            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+            ranked.append({
+                "measure": measure,
+                "slope_pct": round(slope_pct, 1),
+                "consistency": round(consistency, 2),
+                "r_squared": round(r_squared, 2),
+                "score": abs(slope_pct) * consistency,
+                "periods": n,
+            })
+            period_label = self._period_label(rows[-1]["period"], rows[0]["period"])
+            n_periods = max(n_periods, n)
+
+        if len(ranked) < 2:
+            return []
+        ranked.sort(key=lambda r: r["score"], reverse=True)
+        top = ranked[0]
+        bottom = ranked[-1]
+        tdesc = self.intel.tables[table].get("description", table)
+        top_dir = "rising" if top["slope_pct"] > 0 else "falling"
+        confidence = min(90, max(35, int(top["r_squared"] * 100 * top["consistency"])))
+        severity = self._compute_severity(abs(top["slope_pct"]) * top["periods"], confidence, abs(top["slope_pct"]))
+        board_lines = ", ".join(
+            f"{humanize(r['measure'])} {r['slope_pct']:+.1f}%/period" for r in ranked
+        )
+        viz_data = [{"name": humanize(r["measure"]), "value": r["slope_pct"]} for r in ranked]
+        dims = self.intel.get_text_cols(table)[:3]
+
+        return [self._build_insight(
+            insight_id=f"tl_{table}",
+            insight_type="Trend",
+            severity=severity,
+            title=f"Fastest {top_dir} measure: {humanize(top['measure'])} ({top['slope_pct']:+.1f}% a period)",
+            description=f"Across {len(ranked)} comparable measures in {period_label}, {humanize(top['measure'])} moves fastest ({top['slope_pct']:+.1f}% a period), while {humanize(bottom['measure'])} moves slowest ({bottom['slope_pct']:+.1f}% a period). Ranking: {board_lines}.",
+            metric=f"{tdesc or table} · measure ranking",
+            magnitude=f"{top['slope_pct']:+.1f}%/period",
+            confidence=confidence,
+            affected_period=period_label or f"{n_periods} periods",
+            tags=[table, "trend", "leaderboard", top_dir],
+            observations=[
+                f"Ranked {len(ranked)} measures by sustained per-period change over {n_periods} periods.",
+                f"Fastest: {humanize(top['measure'])} at {top['slope_pct']:+.1f}% a period "
+                f"(same direction in {top['consistency']*100:.0f}% of periods).",
+                f"Slowest: {humanize(bottom['measure'])} at {bottom['slope_pct']:+.1f}% a period.",
+            ],
+            support_metrics=[f"{humanize(r['measure'])}: {r['slope_pct']:+.1f}%/period" for r in ranked[:5]],
+            sample_size=n_periods,
+            impact_direction="positive" if top["slope_pct"] > 0 else "negative",
+            impact_explanation=(
+                f"{humanize(top['measure'])} is pulling hardest in "
+                f"{'an upward' if top['slope_pct'] > 0 else 'a downward'} direction; "
+                f"the available data does not contain enough information to estimate its financial impact."
+            ),
+            next_question=f"What is driving the {top_dir} movement in {humanize(top['measure']).lower()}?",
+            next_dims=dims,
+            viz_type="leaderboard",
+            viz_data=viz_data,
+            source_tables=[table],
+            source_columns=[date_col] + [r["measure"] for r in ranked],
+        )]
 
     # ── Anomalies ─────────────────────────────────────────────────────────
 
@@ -413,29 +563,29 @@ class InsightsEngine:
                     insight_id=f"an_{table}_{measure}_{period_str.replace(' ', '_')}",
                     insight_type="Anomaly",
                     severity=severity,
-                    title=f"{tdesc or table}: {measure} anomaly at {_fmt_currency(val)} in {period_str} ({direction} normal range)",
-                    description=f"{measure} reached {_fmt_currency(val)} in {period_str}, which is {direction} the expected range of {_fmt_currency(lower_bound)} to {_fmt_currency(upper_bound)}. Z-score: {z_score:.2f}.",
-                    metric=f"{measure} ({tdesc or table})",
+                    title=f"{humanize(measure)} was unusually {direction} normal in {period_str}",
+                    description=f"{humanize(measure)} reached {_fmt_currency(val)} in {period_str}, which is {direction} the usual range of {_fmt_currency(lower_bound)} to {_fmt_currency(upper_bound)} seen in past periods.",
+                    metric=f"{humanize(measure)}",
                     metric_value=val,
                     previous_value=mean_val,
-                    magnitude=f"{_fmt_currency(val)} (z={z_score:.1f})",
+                    magnitude=f"{_fmt_currency(val)} ({direction} usual)",
                     confidence=confidence,
                     affected_period=period_str,
                     tags=[table, measure, "anomaly", direction],
                     observations=[
                         f"Observed value: {_fmt_currency(val)} in {period_str}.",
-                        f"Expected range: {_fmt_currency(lower_bound)} to {_fmt_currency(upper_bound)} (IQR method).",
-                        f"Mean: {_fmt_currency(mean_val)}, Std Dev: {_fmt_currency(std_val)}. Z-score: {z_score:.2f}.",
+                        f"Usual range based on past periods: {_fmt_currency(lower_bound)} to {_fmt_currency(upper_bound)}.",
+                        f"Typical level: around {_fmt_currency(mean_val)}.",
                     ],
-                    support_metrics=[f"Z-score: {z_score:.2f}", f"IQR bounds: [{_fmt_currency(lower_bound)}, {_fmt_currency(upper_bound)}]"],
+                    support_metrics=[f"Outside the usual range by {_fmt_currency(abs(val - mean_val))}"],
                     sample_size=len(values),
                     baseline=mean_val,
                     current_value=val,
                     change_pct=((val - mean_val) / abs(mean_val) * 100) if mean_val != 0 else 0,
                     impact_value=val - mean_val,
                     impact_direction="positive" if val > mean_val else "negative",
-                    impact_explanation=f"The {direction} normal {measure} of {_fmt_currency(val)} in {period_str} may indicate {'an exceptional opportunity' if val > mean_val else 'a potential issue requiring investigation'}.",
-                    next_question=f"What caused {measure} to be {direction} normal in {period_str}?",
+                    impact_explanation=f"The {direction} normal {humanize(measure).lower()} of {_fmt_currency(val)} in {period_str} may indicate {'an exceptional opportunity' if val > mean_val else 'a potential issue worth investigating'}.",
+                    next_question=f"What caused {humanize(measure).lower()} to be {direction} normal in {period_str}?",
                     next_dims=dims,
                     viz_type="area",
                     viz_data=viz_data,
@@ -714,24 +864,23 @@ class InsightsEngine:
                         insight_id=f"rks_{table}_{measure}",
                         insight_type="Risk",
                         severity="low",
-                        title=f"{tdesc or table}: Stagnation — {measure} flat for {len(values)} periods",
-                        description=f"{measure} in {tdesc or table} has been flat at ~{_fmt_currency(mean_val)} with {cv:.1f}% coefficient of variation over {len(values)} periods.",
-                        metric=f"{measure} ({tdesc or table})",
+                        title=f"{humanize(measure)} is standing still for {len(values)} periods",
+                        description=f"{humanize(measure)} has barely moved for {len(values)} periods, holding near {_fmt_currency(mean_val)}.",
+                        metric=f"{humanize(measure)}",
                         metric_value=nums[-1],
-                        magnitude=f"CV: {cv:.1f}%",
+                        magnitude="Flat",
                         confidence=confidence,
                         affected_period=period_label,
                         tags=[table, measure, "risk", "stagnation"],
                         observations=[
-                            f"{measure} average: {_fmt_currency(mean_val)} over {len(values)} periods.",
-                            f"Coefficient of variation: {cv:.1f}% (very stable).",
+                            f"{humanize(measure)} averaged {_fmt_currency(mean_val)} over {len(values)} periods with almost no movement.",
                         ],
-                        support_metrics=[f"CV: {cv:.1f}%", f"Mean: {_fmt_currency(mean_val)}"],
+                        support_metrics=[f"Nearly flat for {len(values)} periods"],
                         sample_size=len(values),
                         impact_value=0,
                         impact_direction="neutral",
-                        impact_explanation=f"Flat {measure} may indicate market saturation or lack of growth initiatives.",
-                        next_question=f"What factors could break the stagnation in {measure}?",
+                        impact_explanation=f"Flat {humanize(measure).lower()} may point to a saturated market or missing growth effort.",
+                        next_question=f"What could get {humanize(measure).lower()} moving again?",
                         next_dims=dims,
                         viz_type="line",
                         viz_data=viz_data,
@@ -807,23 +956,25 @@ class InsightsEngine:
                         insight_id=f"corr_{t1}_{t2}",
                         insight_type="Correlation",
                         severity="medium",
-                        title=f"{strength.title()} {direction} correlation between {tdesc1} and {tdesc2} (r={corr:.2f})",
-                        description=f"There is a {strength} {direction} correlation (r={corr:.2f}) between {tdesc1} and {tdesc2} over {n} common periods.",
-                        metric=f"{tdesc1} vs {tdesc2}",
-                        magnitude=f"r={corr:.2f}",
+                        title=(f"{humanize(tdesc1)} and {humanize(tdesc2)} move together ({strength})"
+                               if direction == "positive" else
+                               f"{humanize(tdesc1)} and {humanize(tdesc2)} move in opposite directions ({strength})"),
+                        description=f"There is a {strength} {direction} relationship between {humanize(tdesc1).lower()} and {humanize(tdesc2).lower()} over {n} shared periods: when one rises, the other tends to {'rise' if direction == 'positive' else 'fall'}.",
+                        metric=f"{humanize(tdesc1)} vs {humanize(tdesc2)}",
+                        magnitude=f"{strength} {direction} link",
                         confidence=confidence,
                         affected_period=f"{periods[0]} to {periods[-1]}",
                         tags=[t1, t2, "correlation", direction],
                         observations=[
-                            f"Pearson r={corr:.2f} ({strength} {direction}). Based on {n} paired observations.",
-                            f"Note: Correlation does not imply causation.",
+                            f"{strength.title()} {direction} relationship across {n} shared periods.",
+                            "Note: moving together does not prove one causes the other.",
                         ],
-                        support_metrics=[f"r={corr:.2f}", f"n={n}"],
+                        support_metrics=[f"{strength} {direction} link over {n} periods"],
                         sample_size=n,
                         impact_value=0,
                         impact_direction="neutral",
-                        impact_explanation=f"The {strength} correlation may indicate shared underlying drivers. This does not imply causation.",
-                        next_question=f"What common factors drive the relationship between {tdesc1} and {tdesc2}?",
+                        impact_explanation=f"The {strength} link may reflect shared underlying drivers. This does not prove causation.",
+                        next_question=f"What shared factors could explain the link between {humanize(tdesc1).lower()} and {humanize(tdesc2).lower()}?",
                         next_dims=[t1, t2],
                         viz_type="scatter",
                         viz_data=viz_data,
@@ -941,6 +1092,7 @@ def get_insights(request: Request, user: dict = Depends(require_writable)):
     """Generate real insights from the connected database."""
     import json as _json
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     schema_path = session.get("schema_path")
     if not schema_path or not schema_path.exists():
         raise HTTPException(status_code=400, detail="No database connected. Please connect first.")
@@ -1069,6 +1221,7 @@ def ask_about_insight(insight_id: str, req: AskInsightRequest, request: Request,
     from core.secret_box import decrypt as _decrypt_secret
 
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     schema_path = session.get("schema_path")
     if not schema_path or not Path(str(schema_path)).exists():
         raise HTTPException(status_code=400, detail="No database connected.")

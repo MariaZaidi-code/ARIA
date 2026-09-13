@@ -300,7 +300,8 @@ class InsightPDFRAG:
             return []
         with stage("dense_retrieval"):
             try:
-                dense = UserPGVectorStore(self.user_id).search(
+                from .storage import get_user_vector_store
+                dense = get_user_vector_store(self.user_id).search(
                     question, k=RETRIEVAL_FETCH_K, document_ids=document_ids,
                 )
             except Exception as exc:

@@ -442,7 +442,7 @@ export default function Prescription({ insightResult = null, connectionStatus = 
                     )}
                     <div className="text-[11px] text-muted-foreground leading-relaxed space-y-0.5">
                       {rx.action_type !== "qualitative" && rx.evidence?.driver && (
-                      <p>· {rx.evidence?.driver?.replace(/_/g, " ")} ↔ {rx.evidence?.metric?.replace(/_/g, " ")}: r={rx.evidence?.effect_r}, n={Number(rx.evidence?.n).toLocaleString()}</p>
+                      <p>· {rx.evidence?.driver?.replace(/_/g, " ")} ↔ {rx.evidence?.metric?.replace(/_/g, " ")}: {(() => { const r = Number(rx.evidence?.effect_r); const a = isNaN(r) ? -1 : Math.abs(r); return a >= 0.7 ? "strongly" : a >= 0.4 ? "moderately" : a >= 0.2 ? "weakly" : a >= 0 ? "slightly" : "possibly"; })()} related{(() => { const n = Number(rx.evidence?.n); return isNaN(n) ? "" : `, based on ${n.toLocaleString()} records`; })()}</p>
                       )}
                       <p>· {rx.summary}</p>
                     </div>
@@ -523,11 +523,15 @@ export default function Prescription({ insightResult = null, connectionStatus = 
                           </div>
                         )}
                         <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
-                          <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Effect (r)</p><p className="font-semibold text-foreground">{rx.evidence?.effect_r}</p></div>
-                          <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Sample</p><p className="font-semibold text-foreground">{Number(rx.evidence?.n).toLocaleString()}</p></div>
-                          <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">p-value</p><p className="font-semibold text-foreground">{rx.evidence?.p_value ?? analysis.fit?.p_value}</p></div>
+                          <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Relationship</p><p className="font-semibold text-foreground">{(() => { const r = Number(rx.evidence?.effect_r); const a = isNaN(r) ? -1 : Math.abs(r); return a >= 0.7 ? "Strong" : a >= 0.4 ? "Moderate" : a >= 0.2 ? "Weak" : a >= 0 ? "Very weak" : "Unknown"; })()}</p></div>
+                          <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Records studied</p><p className="font-semibold text-foreground">{(() => { const n = Number(rx.evidence?.n); return isNaN(n) ? "—" : n.toLocaleString(); })()}</p></div>
+                          <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Reliability</p><p className="font-semibold text-foreground">{Number(rx.evidence?.p_value ?? analysis.fit?.p_value) < 0.01 ? "High" : Number(rx.evidence?.p_value ?? analysis.fit?.p_value) < 0.05 ? "Moderate" : "Low"}</p></div>
                           <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Driver control</p><p className="font-semibold text-foreground capitalize">{analysis.control?.level?.replace(/_/g, " ")}</p></div>
                         </div>
+                        <details className="mt-2 rounded-md border border-border/60 bg-background/50 px-2.5 py-2">
+                          <summary className="cursor-pointer text-[11px] font-semibold text-muted-foreground hover:text-foreground">Technical details</summary>
+                          <p className="mt-1.5 text-[11px] text-muted-foreground">Correlation r = {rx.evidence?.effect_r ?? "—"}, p ≈ {rx.evidence?.p_value ?? analysis.fit?.p_value ?? "—"}, n = {(() => { const n = Number(rx.evidence?.n); return isNaN(n) ? "—" : n.toLocaleString(); })()}. Exact values for analyst review.</p>
+                        </details>
                       </section>
                       {/* EXPECTED IMPACT */}
                       {rx.action_type === "qualitative" ? (

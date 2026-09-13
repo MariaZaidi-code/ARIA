@@ -1,5 +1,6 @@
 // CommonJS // Playwright: full journey through all ARIA pages (Figma layer + main)
 const { test, expect } = require('@playwright/test');
+const { seedAuth } = require('./auth-helper');
 
 const PAGES = [
   { name: 'Dashboard', navText: 'Dashboard', check: () => expect(page.locator('h2')).toContainText('Dashboard') },
@@ -17,7 +18,7 @@ const PAGES = [
 
 test.describe('Full journey - every page loads', () => {
   let page;
-  test.beforeAll(async ({ browser }) => { page = await browser.newPage(); await page.goto('http://localhost:5174'); await page.waitForLoadState('networkidle'); });
+  test.beforeAll(async ({ browser }) => { page = await browser.newPage(); await seedAuth(page, 'http://localhost:8000'); });
 
   for (const p of PAGES) {
     test(`navigate to ${p.name}`, async () => {

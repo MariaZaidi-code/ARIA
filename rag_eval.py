@@ -17,6 +17,8 @@ from insight_rag.evaluation import aggregate_scores, score_case
 
 
 def load_cases(path: Path) -> list[dict]:
+    if not path.exists():
+        raise SystemExit(f"Benchmark file not found: {path}")
     rows = []
     for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         raw = raw.strip()

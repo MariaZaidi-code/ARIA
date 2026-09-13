@@ -104,11 +104,20 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
     def _build_engine(self, db_uri):
         """Build the SQLAlchemy engine. For non-public PostgreSQL schemas the
         search_path is applied via connect_args (survives pool resets), so bare
-        table names from the schema mapping resolve correctly."""
+        table names from the schema mapping resolve correctly.
+
+        connect_timeout + pool_pre_ping bound the initial connect so a
+        slow/unreachable database fails fast instead of hanging the request.
+        """
         uri = db_uri or DEFAULT_DB_URI
-        if self.dialect == "postgresql" and self.schema and self.schema != "public":
-            return create_engine(uri, connect_args={"options": f"-csearch_path={self.schema}"})
-        return create_engine(uri)
+        if self.dialect == "postgresql":
+            args: dict = {"connect_timeout": 10}
+            if self.schema and self.schema != "public":
+                args["options"] = f"-csearch_path={self.schema}"
+            return create_engine(uri, connect_args=args, pool_pre_ping=True)
+        if self.dialect == "mysql":
+            return create_engine(uri, connect_args={"connect_timeout": 10}, pool_pre_ping=True)
+        return create_engine(uri, pool_pre_ping=True)
 
     # ---- process_goal (process_goal) ----
 

@@ -19,10 +19,12 @@ export default function Evidence({
   sections,
   defaultOpen = false,
   label = "Evidence",
+  technical,
 }: {
   sections: EvidenceSection[];
   defaultOpen?: boolean;
   label?: string;
+  technical?: ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   if (!sections.length) return null;
@@ -54,6 +56,16 @@ export default function Evidence({
               </div>
             </div>
           ))}
+          {technical && (
+            <details className="rounded-md border border-border/60 bg-background/50 px-2.5 py-2">
+              <summary className="cursor-pointer text-[11px] font-semibold text-muted-foreground hover:text-foreground">
+                Technical details
+              </summary>
+              <div className="mt-2 text-[11px] text-muted-foreground leading-relaxed">
+                {technical}
+              </div>
+            </details>
+          )}
         </div>
       )}
     </div>

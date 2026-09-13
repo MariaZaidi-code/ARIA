@@ -66,10 +66,13 @@ class ConstantsMixin:
     _DESTRUCTIVE_RE = re.compile(
         r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM"
         r"|DROP\s+(?:TABLE|DATABASE|VIEW|INDEX|SCHEMA|TRIGGER|FUNCTION|PROCEDURE)"
-        r"|ALTER\s+(?:TABLE|DATABASE|VIEW|SCHEMA)"
+        r"|ALTER\s+(?:TABLE|DATABASE|VIEW|SCHEMA|SYSTEM)"
         r"|CREATE\s+(?:TABLE|DATABASE|INDEX|VIEW|SCHEMA|TRIGGER|FUNCTION|PROCEDURE)"
         r"|TRUNCATE\s+(?:TABLE\s+)?|GRANT|REVOKE|CALL|EXEC(?:UTE)?\b|MERGE\s+INTO"
-        r"|COMMENT\s+ON)\b",
+        r"|COMMENT\s+ON|COPY\s+(?:\(?[A-Z_][\w$]*\)?\s+)?(?:TO|FROM)\b"
+        r"|\bVACUUM\b|\bANALYZE\b|\bEXPLAIN\b|\bSET\b|\bSHOW\b"
+        r"|\bLISTEN\b|\bNOTIFY\b|\bLOAD\b|\bIMPORT\b"
+        r"|pg_sleep\s*\(|pg_read_file\s*\(|dblink\s*\()",
         re.IGNORECASE,
     )
 

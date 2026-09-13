@@ -1,59 +1,49 @@
-import { useState, useEffect, useMemo, useRef } from "react";
-import { Loader2, CheckCircle, XCircle, ArrowRight, Save, Trash2, Beaker, AlertTriangle, ChevronDown, ChevronUp, Sparkles, Database, ListChecks } from "lucide-react";
-import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line, BarChart, Bar, Cell } from "recharts";
+import { useState, useEffect, useRef, useMemo } from "react";
+import {
+  Loader2, Database, Search, AlertTriangle,
+  ArrowRight, ArrowLeft, RefreshCw, TrendingDown, TrendingUp,
+  Minus, Layers, AlertCircle, FileText, CheckCircle2,
+} from "lucide-react";
+import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line, BarChart, Bar, Cell, Brush } from "recharts";
 import { useTheme } from "../App";
 import Evidence from "../components/Evidence";
 import { ChartFrame, BizTooltip } from "../components/charts";
-import { confidenceWord } from "../lib/format";
 
 /* =====================================================================
-   ARIA Hypothesis — evidence-based assumption testing (t.txt §§1–83).
-   LLM understands/explains; deterministic engine tests. States (§73):
-   NO_SOURCE READY PARSING PREVIEW CLARIFY ANALYZING COMPLETED
-   NOT_TESTABLE NEEDS_MORE_DATA FAILED. A failed analysis is a verdict
-   card, never a broken page (§72).
+   ARIA Hypothesis — automatic investigation workspace (t.txt).
+   Page loads WITH analysis: detected changes -> ranked explanations ->
+   evidence -> deep investigation. Manual input uses the same engine.
+   No orange, no chat bubbles, motion restrained, dark-mode native.
    ===================================================================== */
 
-type HypStatus = "idle" | "parsing" | "preview" | "clarify" | "running" | "done" | "error";
-
 const FALLBACK_IDEAS = [
-  "Do higher values of one number relate to another?",
-  "Does the main number differ across categories?",
-  "Has the main number changed over time?",
-  "Are weekend values higher?",
+  "Why did sales decline?",
+  "What caused the change in orders?",
+  "Why is one category underperforming?",
+  "What explains the recent change?",
 ];
 
-const LOAD_STAGES = [
-  "Understanding hypothesis…",
-  "Checking available data…",
-  "Validating variables…",
-  "Selecting analytical method…",
-  "Testing evidence…",
-  "Checking robustness…",
-  "Building visualization…",
-  "Generating explanation…",
-];
-
-/* ---- Centralized error map (§50): one place, never per-component ---- */
 const ERROR_MAP: Record<string, { title: string; hint: string }> = {
-  NO_CONNECTION: { title: "No data source connected", hint: "Connect PostgreSQL, MySQL, or upload a CSV to test hypotheses against real data." },
+  NO_CONNECTION: { title: "No data source connected", hint: "Connect PostgreSQL, MySQL, or upload a CSV to investigate real data." },
   INVALID_SOURCE: { title: "Couldn't read this source", hint: "Reconnect your data source, then try again." },
-  PARSING_FAILED: { title: "ARIA couldn't parse that", hint: "Phrase it as a testable question, e.g. does price affect sales?" },
-  COLUMN_NOT_FOUND: { title: "This hypothesis can't be tested with the current data", hint: "ARIA couldn't identify a suitable field. Pick from the available fields or try another hypothesis." },
-  AMBIGUOUS_COLUMN: { title: "ARIA needs a little clarification", hint: "Choose which fields to test — ARIA won't guess when confidence is low." },
-  INCOMPATIBLE_DATA_TYPE: { title: "These fields aren't compatible with this analysis", hint: "Relationship tests need numbers; group tests need a category. Try different fields." },
-  INSUFFICIENT_DATA: { title: "This hypothesis needs more reliable observations", hint: "ARIA cannot produce a reliable result from this sample." },
-  INSUFFICIENT_HISTORY: { title: "Not enough history for this test", hint: "Time-based tests need a longer dated series." },
-  INVALID_GROUPING: { title: "The groups can't be compared", hint: "Each group needs enough observations. Try a dimension with fewer, larger groups." },
-  INVALID_DATE_RANGE: { title: "The date range doesn't support this test", hint: "Before/after tests need observations on both sides of the split." },
-  UNSUPPORTED_ANALYSIS: { title: "ARIA can't run that analysis yet", hint: "Try a relationship, group comparison, or trend question." },
-  ANALYSIS_FAILED: { title: "The analysis could not be completed", hint: "Your data was not changed. Try again or rephrase the question." },
-  STATISTICAL_TEST_FAILED: { title: "The statistical test failed", hint: "The data didn't meet the test's requirements. Try a different framing." },
-  CHART_FAILED: { title: "Visualization unavailable", hint: "The verdict and numbers below are still valid." },
-  LLM_FAILED: { title: "Explanation unavailable", hint: "The analysis completed — only ARIA's wording service is down. The statistical evidence still stands." },
-  TIMEOUT: { title: "The analysis timed out", hint: "Try a narrower question or reconnect, then run again." },
+  ANALYSIS_FAILED: { title: "We couldn't complete this investigation", hint: "ARIA couldn't analyze the current data. Your connection is still available." },
+  TIMEOUT: { title: "The investigation timed out", hint: "Try a narrower question or reconnect, then run again." },
   INTERNAL_ERROR: { title: "Something went wrong", hint: "Your data was not changed. Try again." },
 };
+
+const STRENGTH_STYLE: Record<string, { background: string; color: string; dot: string }> = {
+  "Strong evidence": { background: "rgba(5,150,105,0.10)", color: "#047857", dot: "#059669" },
+  "Moderate evidence": { background: "rgba(47,111,173,0.10)", color: "#1E5AA8", dot: "#2F6FAD" },
+  "Limited evidence": { background: "var(--secondary)", color: "var(--secondary-foreground)", dot: "var(--muted-foreground)" },
+  "Insufficient evidence": { background: "var(--secondary)", color: "var(--muted-foreground)", dot: "var(--muted-foreground)" },
+};
+
+const LOAD_STAGES = [
+  "Understanding your data",
+  "Finding important changes",
+  "Comparing business segments",
+  "Evaluating possible explanations",
+];
 
 interface Props {
   insightResult?: any;
@@ -61,32 +51,26 @@ interface Props {
   connectionStatus?: string;
 }
 
-const SAVED_KEY = "aria_saved_hypotheses";
-
-export default function Hypothesis({ insightResult, onAskQuestion, connectionStatus = "not-connected" }: Props) {
+export default function Hypothesis({ onAskQuestion, connectionStatus = "not-connected" }: Props) {
   const { isDark, setPage } = useTheme() as any;
   const [question, setQuestion] = useState("");
-  const [hypText, setHypText] = useState("");
-  const [hypEdited, setHypEdited] = useState(false);
-  const [status, setStatus] = useState<HypStatus>("idle");
-  const [stage, setStage] = useState(0);
-  const [result, setResult] = useState<any>(null);
+  const [investigating, setInvestigating] = useState(false);
+  const [loadStage, setLoadStage] = useState(0);
+  const [investigation, setInvestigation] = useState<any>(null);
+  const [autoEvents, setAutoEvents] = useState<any[]>([]);
+  const [analyzedAt, setAnalyzedAt] = useState("");
+  const [autoLoading, setAutoLoading] = useState(false);
+  const [deepDive, setDeepDive] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [errorCode, setErrorCode] = useState("");
   const [ideas, setIdeas] = useState<string[]>(FALLBACK_IDEAS);
-  const [ideaCards, setIdeaCards] = useState<any[]>([]);
-  const [openIdea, setOpenIdea] = useState<number | null>(0);
   const [dbName, setDbName] = useState("Connected Data");
-  const [segDim, setSegDim] = useState(0);
-  const [simPct, setSimPct] = useState(10);
-  const [saved, setSaved] = useState<any[]>([]);
-  // Preview (§33) + ambiguity (§62) + context (§47)
-  const [preview, setPreview] = useState<any>(null);
-  const [clarify, setClarify] = useState<any>(null);
-  const [pickedMetric, setPickedMetric] = useState<string>("");
-  const [pickedDriver, setPickedDriver] = useState<string>("");
-  const [availFields, setAvailFields] = useState<any[]>([]);
-  const [prep, setPrep] = useState<any>(null);
+  const [sourceLabel, setSourceLabel] = useState("");
+  // Autocomplete
+  const [acOpen, setAcOpen] = useState(false);
+  const [acIndex, setAcIndex] = useState(0);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const acRef = useRef<HTMLDivElement>(null);
   const prefillDone = useRef(false);
 
   const authHeader = () => {
@@ -94,26 +78,37 @@ export default function Hypothesis({ insightResult, onAskQuestion, connectionSta
     return { Authorization: `Bearer ${token}` };
   };
 
+  // Auto-run on page load: the page opens WITH analysis, not an empty box.
   useEffect(() => {
-    try {
-      setSaved(JSON.parse(localStorage.getItem(SAVED_KEY) || "[]"));
-    } catch { setSaved([]); }
     const token = localStorage.getItem("aria_auth_token");
     if (token) {
       fetch("/api/session/status", { headers: { Authorization: `Bearer ${token}` } })
         .then(r => r.json())
-        .then(d => { if (d.db_name) setDbName(d.db_name); })
+        .then(d => {
+          if (d.db_name) setDbName(d.db_name);
+          const parts: string[] = [];
+          if (d.source_type === "document" && d.document_name) parts.push(`PDF · ${d.document_name}`);
+          else if (d.db_name && !String(d.db_name).match(/^[0-9a-f-]{36}$/)) parts.push(d.db_name);
+          if (d.linked_db_name) parts.push(`+ ${d.linked_db_name}`);
+          setSourceLabel(parts.length > 1 ? "2 data sources connected" : parts.join(" "));
+        })
         .catch(() => {});
       fetch("/api/hypothesis/suggest", { headers: { Authorization: `Bearer ${token}` } })
         .then(r => r.json())
         .then(d => {
-          if (d.ok && Array.isArray(d.suggestions) && d.suggestions.length) setIdeas(d.suggestions);
-          if (d.ok && Array.isArray(d.cards) && d.cards.length) setIdeaCards(d.cards);
+          const texts: string[] = [];
+          if (d.ok && Array.isArray(d.cards)) {
+            for (const c of d.cards) {
+              if (c?.text) texts.push(c.text);
+              if (c?.evidence && texts.length < 8) texts.push(c.evidence);
+            }
+          }
+          if (d.ok && Array.isArray(d.suggestions)) texts.push(...d.suggestions);
+          if (texts.length) setIdeas(texts.slice(0, 10));
         })
         .catch(() => {});
+      if (connectionStatus === "connected") loadAuto();
     }
-    // Cross-module handoff (§42): Insights "Test Hypothesis" lands here
-    // with metric/driver/segment/period already populated.
     if (!prefillDone.current) {
       prefillDone.current = true;
       try {
@@ -121,725 +116,623 @@ export default function Hypothesis({ insightResult, onAskQuestion, connectionSta
         if (raw) {
           const h = JSON.parse(raw);
           sessionStorage.removeItem("aria_hypothesis_prefill");
-          const q = h.question || (h.metric ? `Does ${h.driver || "the main driver"} affect ${h.metric}?` : "");
+          const q = h.question || (h.metric ? `Why did ${h.metric} change?` : "");
           if (q) {
             setQuestion(q);
-            if (h.metric) setPickedMetric(h.metric);
-            if (h.driver) setPickedDriver(h.driver);
-            setTimeout(() => parseHypothesis(q, h.metric || "", h.driver || ""), 350);
+            setTimeout(() => runInvestigation(q), 350);
           }
         }
-      } catch { /* prefill is best-effort */ }
+      } catch { /* best-effort */ }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectionStatus]);
+
+  useEffect(() => {
+    const close = (e: MouseEvent) => {
+      if (acRef.current && !acRef.current.contains(e.target as Node)) setAcOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
   }, []);
 
   const grid = isDark ? "#2A2A35" : "#E5E7EB";
   const axis = isDark ? "#8889A0" : "#9CA3AF";
 
-  /* ---- Parse (§12): preview first, never straight to statistics ---- */
-  const parseHypothesis = async (q?: string, metric = "", driver = "") => {
-    const text = (q ?? question).trim();
-    if (!text) return;
-    setQuestion(text);
-    setStatus("parsing");
-    setError(""); setErrorCode("");
-    setResult(null); setPreview(null); setClarify(null);
+  const loadAuto = async () => {
+    setAutoLoading(true);
+    setLoadStage(0);
+    const timer = setInterval(() => setLoadStage((s) => Math.min(s + 1, LOAD_STAGES.length - 1)), 1600);
     try {
-      const res = await fetch("/api/hypotheses/parse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeader() },
-        body: JSON.stringify({ question: text, metric: metric || undefined, driver: driver || undefined }),
-      });
-      const data = await res.json();
-      if (data.ok && data.preview) {
-        setPreview(data.preview);
-        setPickedMetric(data.preview.metric || "");
-        setPickedDriver(data.preview.driver || "");
-        setPrep({ rows_available: data.preview.rows_available, usable: data.preview.usable_observations });
-        setStatus("preview");
-        return;
-      }
-      if (data.code === "AMBIGUOUS_COLUMN" && data.options) {
-        setClarify({ message: data.detail, options: data.options, hypothesis: data.hypothesis });
-        if (data.options.metrics?.length === 1) setPickedMetric(data.options.metrics[0].column);
-        setStatus("clarify");
-        return;
-      }
-      failWith(data);
-    } catch (err: any) {
-      failWith({ code: "ANALYSIS_FAILED", detail: err?.message });
-    }
-  };
-
-  const failWith = (data: any) => {
-    const code = data?.code || "ANALYSIS_FAILED";
-    // Analytical outcomes, not crashes (§72): route verdicts to states.
-    if (data?.verdict === "NEEDS MORE DATA" || code === "INSUFFICIENT_DATA") {
-      setResult({ needMore: true, detail: data.detail, hypothesis: data.hypothesis, code });
-      setErrorCode(code);
-      setStatus("done");
-      return;
-    }
-    if (data?.verdict === "NOT TESTABLE" || code === "COLUMN_NOT_FOUND") {
-      setErrorCode(code);
-      setError(data.detail || "");
-      loadAvailFields();
-      setStatus("done");
-      setResult({ notTestable: true, detail: data.detail, hypothesis: data.hypothesis, code, options: data.options });
-      return;
-    }
-    setErrorCode(code);
-    setError(data?.detail || data?.message || "The analysis could not run.");
-    setStatus("error");
-  };
-
-  const loadAvailFields = async () => {
-    try {
-      const res = await fetch("/api/hypotheses/context", { headers: authHeader() });
-      const data = await res.json();
-      if (data.ok) setAvailFields([...(data.metrics || []), ...(data.dimensions || []).slice(0, 8)]);
-    } catch { /* optional panel */ }
-  };
-
-  /* ---- Run (§20–§29): statistics already validated by preview ---- */
-  const analyze = async (q?: string) => {
-    const text = (q ?? (hypEdited ? hypText : question)).trim();
-    if (!text) return;
-    setQuestion(text);
-    setStatus("running");
-    setStage(0);
-    setError(""); setErrorCode("");
-    setResult(null);
-    const timer = setInterval(() => setStage((s) => Math.min(s + 1, LOAD_STAGES.length - 1)), 1400);
-    try {
-      const res = await fetch("/api/hypothesis/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeader() },
-        body: JSON.stringify({ question: text, metric: pickedMetric || undefined, driver: pickedDriver || undefined }),
-      });
-      const data = await res.json();
+      const token = localStorage.getItem("aria_auth_token");
+      const res = await fetch("/api/hypotheses/auto", { headers: { Authorization: `Bearer ${token || ""}` } });
+      const data = await res.json().catch(() => ({}));
       clearInterval(timer);
-      if (data.ok === false) {
-        failWith(data);
+      if (res.ok && data.ok) {
+        setInvestigation(data);
+        setAutoEvents(data.events || []);
+        setAnalyzedAt(data.analyzed_at || "just now");
+        setErrorCode(""); setError("");
+      }
+    } catch { /* auto is best-effort; manual input remains */ }
+    finally {
+      clearInterval(timer);
+      setAutoLoading(false);
+    }
+  };
+
+  const runInvestigation = async (q?: string) => {
+    const text = (q ?? question).trim();
+    if (!text || investigating) return;
+    setQuestion(text);
+    setAcOpen(false);
+    setInvestigating(true);
+    setLoadStage(0);
+    setInvestigation(null);
+    setAutoEvents([]);
+    setDeepDive(null);
+    setError(""); setErrorCode("");
+    const timer = setInterval(() => setLoadStage((s) => Math.min(s + 1, LOAD_STAGES.length - 1)), 1600);
+    try {
+      const res = await fetch("/api/hypotheses/investigate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeader() },
+        body: JSON.stringify({ question: text }),
+      });
+      const data = await res.json().catch(() => ({}));
+      clearInterval(timer);
+      if (!res.ok || data.ok === false) {
+        const code = data?.code || "ANALYSIS_FAILED";
+        setErrorCode(code);
+        setError(data?.detail || "");
         return;
       }
-      setHypText(data.hypothesis || "");
-      setHypEdited(false);
-      setSegDim(0);
-      setSimPct(10);
-      setPrep((p: any) => p || { usable: data.result?.n });
-      setResult(data);
-      setStatus("done");
+      setInvestigation(data);
+      setAnalyzedAt("just now");
     } catch (err: any) {
       clearInterval(timer);
       setErrorCode("ANALYSIS_FAILED");
-      setError(err?.message || "The analysis could not run. Check your connection and try again.");
-      setStatus("error");
+      setError(err?.message || "");
+    } finally {
+      clearInterval(timer);
+      setInvestigating(false);
     }
   };
 
-  const saveCurrent = () => {
-    if (!result || result.needMore || result.notTestable) return;
-    const entry = {
-      id: Date.now(), question, hypothesis: hypText || result.hypothesis,
-      verdict: result.verdict, analysis: result.result?.analysis,
-      metric: result.intent?.metric, driver: result.intent?.driver,
-      ts: new Date().toISOString(), db: dbName,
-    };
-    const next = [entry, ...saved].slice(0, 20);
-    setSaved(next);
-    try { localStorage.setItem(SAVED_KEY, JSON.stringify(next)); } catch {}
+  // ---- Data-driven autocomplete (t.txt §autocomplete) ----
+  const acPool = useMemo(() => {
+    const pool: { text: string; kind: string; group: string }[] = [];
+    // Recovery questions from the last run come first: the backend built
+    // them from resolved schema roles, so each one is guaranteed runnable.
+    for (const s of (investigation?.suggestions || []).slice(0, 3)) {
+      if (typeof s === "string" && s) pool.push({ text: s, kind: "search", group: "Try instead" });
+    }
+    for (const ev of autoEvents.slice(0, 4)) {
+      const m = String(ev.metric || "").replace(/_/g, " ");
+      const dir = (ev.change_pct || 0) < 0 ? "decline" : "change";
+      pool.push({ text: `Why did ${m} ${dir}?`, kind: "trend", group: "Detected changes" });
+      if (ev.table) pool.push({ text: `Which segment drove the ${m} ${dir}?`, kind: "segment", group: "Explore a driver" });
+    }
+    const dims = new Set<string>();
+    for (const h of (investigation?.hypotheses || [])) {
+      const m = h?.chart?.dimension;
+      if (m && !dims.has(m) && dims.size < 3) {
+        dims.add(m);
+        pool.push({ text: `Why did ${String(m).replace(/_/g, " ")} perform poorly?`, kind: "segment", group: "Investigate a segment" });
+      }
+    }
+    for (const s of ideas.slice(0, 3)) {
+      if (!pool.some((p) => p.text === s)) pool.push({ text: s, kind: "trend", group: "Suggested" });
+    }
+    return pool.slice(0, 10);
+  }, [autoEvents, investigation, ideas]);
+
+  const acFiltered = useMemo(() => {
+    const q = question.trim().toLowerCase();
+    if (!q) return acPool.slice(0, 5);
+    const words = q.split(/\s+/).filter(Boolean);
+    const scored = acPool.map((p) => {
+      const t = p.text.toLowerCase();
+      let s = 0;
+      if (t.startsWith(q)) s += 3;
+      else if (t.includes(q)) s += 2;
+      for (const w of words) if (w.length > 2 && t.includes(w)) s += 1;
+      return { p, s };
+    }).filter((x) => x.s > 0).sort((a, b) => b.s - a.s);
+    return scored.slice(0, 5).map((x) => x.p);
+  }, [question, acPool]);
+
+  const acGroups = useMemo(() => {
+    const out: { group: string; items: typeof acFiltered }[] = [];
+    for (const item of acFiltered) {
+      const g = out.find((x) => x.group === item.group);
+      if (g) g.items.push(item);
+      else out.push({ group: item.group, items: [item] });
+    }
+    return out;
+  }, [acFiltered]);
+
+  const flatAc = acFiltered;
+  const KIND_ICON: Record<string, any> = { trend: TrendingDown, segment: Layers, alert: AlertCircle, doc: FileText, search: Search };
+
+  const onInputKey = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown" && acOpen && flatAc.length) { e.preventDefault(); setAcIndex((i) => (i + 1) % flatAc.length); }
+    else if (e.key === "ArrowUp" && acOpen && flatAc.length) { e.preventDefault(); setAcIndex((i) => (i - 1 + flatAc.length) % flatAc.length); }
+    else if (e.key === "Escape") { setAcOpen(false); }
+    else if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (acOpen && flatAc[acIndex]) runInvestigation(flatAc[acIndex].text);
+      else runInvestigation();
+    }
   };
 
-  const r = result?.result || null;
-  const verdict = result?.verdict || null;
-  const needMore = !!result?.needMore;
-  const notTestable = !!result?.notTestable;
-  const significant = verdict === "SUPPORTED";
-  const segments: any[] = result?.segments || [];
-  const activeSeg = segments[Math.min(segDim, Math.max(0, segments.length - 1))] || null;
-  const whatif = result?.whatif || null;
-  const showWhatIf = !!r && !!whatif && (r.analysis === "correlation");
-
-  const simOutcome = useMemo(() => {
-    if (!showWhatIf || !r) return null;
-    const base = Number(r.metric_mean);
-    const delta = Number(r.slope) * Number(r.driver_mean) * (simPct / 100);
-    return { base, scenario: base + delta, delta };
-  }, [showWhatIf, r, simPct]);
-
-  const viz = r?.viz || null;
-  const trendLine = useMemo(() => {
-    if (!viz || viz.type !== "scatter" || r?.slope === undefined) return null;
-    const pts: any[] = viz.points || [];
-    if (pts.length < 2) return null;
-    const xs = pts.map((p: any) => Number(p.x)).filter((v: number) => !isNaN(v));
-    if (!xs.length) return null;
-    const lo = Math.min(...xs), hi = Math.max(...xs);
-    return [{ x: lo, y: r.slope * lo + Number(r.intercept || 0) }, { x: hi, y: r.slope * hi + Number(r.intercept || 0) }];
-  }, [viz, r]);
-
-  const barData = useMemo(() => {
-    if (!viz) return [];
-    if (viz.type === "bar" || viz.type === "comparison") return viz.groups || [];
-    if (viz.type === "grouped") return (viz.groups || []).map((g: any) => ({ label: g.label, value: g.value }));
-    return [];
-  }, [viz]);
-
-  const lineData = useMemo(() => {
-    if (!viz || viz.type !== "line") return [];
-    return viz.points || [];
-  }, [viz]);
-
-  const dqChecks = useMemo(() => {
-    if (!r) return [];
-    return [
-      { label: "Records studied", sub: `${Number(r.n || 0).toLocaleString()} rows (min 10)`, done: Number(r.n || 0) >= 10 },
-      { label: "Tested pair", sub: `${r.driver} → ${r.metric}`, done: true },
-      { label: "Method", sub: r.analysis === "correlation" ? "Pearson + Spearman" : r.analysis === "trend" ? "Trend regression" : r.analysis === "segment" ? "Kruskal-Wallis + group means" : "Welch t + Mann-Whitney", done: true },
-      { label: "Significance", sub: `p = ${Number(r.p_value) < 0.001 ? "<0.001" : Number(r.p_value).toFixed(3)}`, done: Number(r.p_value) < 0.05 },
-    ];
-  }, [r]);
+  const renderCompletion = (full: string) => {
+    const q = question.trim();
+    if (!q || !full.toLowerCase().startsWith(q.toLowerCase())) return <span>{full}</span>;
+    return <span>{full.slice(0, q.length)}<strong className="text-foreground">{full.slice(q.length)}</strong></span>;
+  };
 
   const errInfo = ERROR_MAP[errorCode] || ERROR_MAP.ANALYSIS_FAILED;
+  const obs = investigation?.observation || {};
+  const hyps = investigation?.hypotheses || [];
+  const busy = investigating || autoLoading;
+  const deepHyp = deepDive !== null ? hyps[deepDive] : null;
 
-  /* ---- NO_SOURCE (§60): never fake hypotheses ---- */
+  const followUps = (h: any) => {
+    const out: string[] = [];
+    if (h?.chart?.dimension) out.push(`Which ${String(h.chart.dimension).replace(/_/g, " ")} contributed most?`);
+    out.push(`Did the change affect all regions?`);
+    if (obs.metric) out.push(`Did order volume or average value change for ${String(obs.metric).replace(/_/g, " ")}?`);
+    return out.slice(0, 3);
+  };
+
   if (connectionStatus !== "connected") {
     return (
-      <div className="p-6 max-w-screen-xl mx-auto space-y-4">
-        <h2 className="text-xl font-bold text-foreground tracking-tight">Hypothesis</h2>
-        <p className="text-sm text-muted-foreground mt-0.5">Test assumptions against your actual business data.</p>
-        <div className="text-center py-12 bg-card border border-border rounded-xl">
+      <div className="p-6 md:p-8 max-w-screen-xl mx-auto">
+        <p className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground">Workspace</p>
+        <h2 className="mt-1 text-2xl font-bold text-foreground tracking-tight">Hypothesis</h2>
+        <p className="mt-1 text-sm text-muted-foreground max-w-xl">Explore what may be driving important changes in your business.</p>
+        <div className="mt-6 text-center py-14 bg-card border border-border rounded-2xl shadow-sm">
           <Database size={22} className="mx-auto text-muted-foreground mb-3" />
-          <p className="text-sm font-medium text-foreground">Connect a data source to test hypotheses against real data</p>
-          <button onClick={() => (setPage as any)?.("data")} className="mt-3 text-xs font-semibold text-primary hover:underline">Go to Data Sources</button>
+          <p className="text-sm font-semibold text-foreground">Connect your data to investigate</p>
+          <p className="text-xs text-muted-foreground mt-1 max-w-md mx-auto">ARIA needs a connected data source before it can detect business patterns and possible explanations.</p>
+          <div className="mt-4 flex items-center justify-center gap-3">
+            <button onClick={() => (setPage as any)?.("data")} className="text-xs font-semibold px-4 py-2 rounded-lg bg-primary text-primary-foreground hover:opacity-90">Connect data</button>
+            <button onClick={() => (setPage as any)?.("dashboard")} className="text-xs font-medium text-muted-foreground hover:text-foreground">Explore how it works</button>
+          </div>
         </div>
       </div>
     );
   }
 
-  return (
-    <div className="p-6 max-w-screen-xl mx-auto space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+  // ---- Deep investigation view ----
+  if (deepHyp) {
+    const i = deepDive as number;
+    return (
+      <div className="p-6 md:p-8 max-w-screen-xl mx-auto space-y-5">
+        <button onClick={() => setDeepDive(null)} className="inline-flex items-center gap-1.5 text-xs font-semibold text-muted-foreground hover:text-foreground">
+          <ArrowLeft size={13} /> Back to hypotheses
+        </button>
         <div>
-          <h2 className="text-xl font-bold text-foreground tracking-tight">Hypothesis</h2>
-          <p className="text-sm text-muted-foreground mt-0.5">Test assumptions against your actual business data.</p>
+          <p className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground">Investigating</p>
+          <h2 className="mt-1 text-xl font-bold text-foreground tracking-tight">{deepHyp.title}</h2>
+          <span className="mt-2 inline-flex px-2.5 py-1 rounded-full text-[11px] font-bold"
+            style={(STRENGTH_STYLE[deepHyp.strength] || STRENGTH_STYLE["Limited evidence"]) as React.CSSProperties}>
+            {deepHyp.strength}
+          </span>
         </div>
-        {status === "done" && verdict && !needMore && !notTestable && (
-          <div className="flex flex-wrap items-center gap-2 text-[11px] font-bold">
-            <span className="px-2.5 py-1 rounded-full" style={significant ? { background: "rgba(5,150,105,0.12)", color: "#059669" } : verdict === "NOT SUPPORTED" ? { background: "rgba(239,68,68,0.12)", color: "#EF4444" } : { background: "rgba(245,158,11,0.15)", color: "#B45309" }}>
-              {verdict.replace(/_/g, " ")}
-            </span>
-            {r?.strength && <span className="px-2.5 py-1 rounded-full bg-secondary text-foreground">{String(r.strength).toUpperCase()} EVIDENCE</span>}
-          </div>
-        )}
-      </div>
-
-      {/* Question composer (Path B) */}
-      <div className="bg-card border border-border rounded-xl p-5 space-y-4">
-        <div className="flex items-start gap-3">
-          <Beaker size={16} className="text-primary mt-0.5 flex-shrink-0" />
-          <textarea
-            value={question}
-            onChange={(e) => { setQuestion(e.target.value); setHypEdited(false); }}
-            placeholder="What would you like to test? e.g. Did the price increase reduce sales?"
-            rows={2}
-            className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none resize-none"
-          />
-        </div>
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span className="font-medium">Dataset:</span>
-          <span className="px-2 py-0.5 bg-secondary border border-border rounded-md text-foreground">{dbName}</span>
-        </div>
-        <div className="flex gap-2">
-          <button onClick={() => parseHypothesis()} disabled={status === "running" || status === "parsing" || !question.trim()}
-            className="bg-primary text-primary-foreground px-5 py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition-opacity disabled:opacity-50">
-            {status === "parsing" ? "Understanding…" : "Test it"}
-          </button>
-          <button onClick={() => { setQuestion(""); setHypText(""); setHypEdited(false); setStatus("idle"); setResult(null); setError(""); setPreview(null); setClarify(null); setPickedMetric(""); setPickedDriver(""); }}
-            className="bg-secondary text-secondary-foreground px-4 py-2 rounded-lg text-sm font-medium hover:opacity-80 transition-opacity border border-border">
-            Clear
-          </button>
-        </div>
-
-        {/* Suggestions (Path A): untested candidates, never facts (§5) */}
-        {status === "idle" && (
-          <div className="space-y-2.5">
-            <div className="flex items-center gap-2">
-              <Sparkles size={12} className="text-primary" />
-              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-                {ideaCards.length > 0 ? `Suggested hypotheses — untested (${ideaCards.length})` : "Try an example"}
-              </p>
-            </div>
-            {ideaCards.length > 0 ? (
-              <div className="space-y-2">
-                {ideaCards.map((card: any, i: number) => {
-                  const open = openIdea === i;
-                  return (
-                    <div key={`${card.text}-${i}`} className="bg-card border border-border rounded-xl overflow-hidden">
-                      <button
-                        onClick={() => setOpenIdea(open ? null : i)}
-                        className="w-full flex items-center gap-3 px-4 py-3 hover:bg-secondary/40 transition-colors text-left"
-                      >
-                        <span className="w-6 h-6 rounded-full bg-primary/10 text-primary text-[11px] font-bold flex items-center justify-center flex-shrink-0">
-                          {i + 1}
-                        </span>
-                        <span className="flex-1">
-                          <span className="block text-sm font-medium text-foreground">{card.text}</span>
-                          <span className="block text-[11px] text-muted-foreground mt-0.5 truncate">{card.evidence}</span>
-                        </span>
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-secondary text-muted-foreground uppercase tracking-wide flex-shrink-0">
-                          {card.kind}
-                        </span>
-                        {open ? <ChevronUp size={15} className="text-muted-foreground flex-shrink-0" /> : <ChevronDown size={15} className="text-muted-foreground flex-shrink-0" />}
-                      </button>
-                      {open && (
-                        <div className="border-t border-border px-4 py-3.5 space-y-3 bg-secondary/20">
-                          <div className="text-xs text-muted-foreground leading-relaxed">
-                            <p className="font-semibold text-foreground mb-1">Suggested hypothesis — not yet tested</p>
-                            <p>{card.evidence}</p>
-                            {(card.metric || card.driver || card.dimension || card.time_col) && (
-                              <p className="mt-1.5">
-                                {[
-                                  card.metric && `Metric: ${card.metric}`,
-                                  card.driver && `Driver: ${card.driver}`,
-                                  card.dimension && `Across: ${card.dimension}`,
-                                  card.time_col && `Over: ${card.time_col}`,
-                                ].filter(Boolean).join(" · ")}
-                              </p>
-                            )}
-                          </div>
-                          <button
-                            onClick={() => parseHypothesis(card.text)}
-                            className="bg-primary text-primary-foreground px-4 py-1.5 rounded-lg text-xs font-semibold hover:opacity-90 transition-opacity"
-                          >
-                            Test this hypothesis
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="flex flex-wrap gap-2">
-                {(ideas.length > 0 ? ideas : FALLBACK_IDEAS).map((h) => (
-                  <button key={h} onClick={() => parseHypothesis(h)}
-                    className="text-xs px-3 py-1.5 bg-card border border-border rounded-full text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors">
-                    {h}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Preview (§33): ARIA understood → Run Test */}
-      {status === "preview" && preview && (
-        <div className="bg-card border border-primary/30 rounded-xl p-5 space-y-3 animate-fade-in">
-          <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">ARIA understood your hypothesis as</p>
-          <p className="text-[15px] font-semibold text-foreground">{preview.statement}</p>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
-            <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Target metric</p><p className="font-semibold text-foreground">{String(preview.metric).replace(/_/g, " ")}</p></div>
-            <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Potential driver</p><p className="font-semibold text-foreground">{preview.driver ? String(preview.driver).replace(/_/g, " ") : "Auto (best available)"}</p></div>
-            <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Analysis</p><p className="font-semibold text-foreground">{String(preview.analysis).replace(/_/g, " ")}</p></div>
-            <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Data</p><p className="font-semibold text-foreground">{Number(preview.usable_observations).toLocaleString()} usable</p></div>
-          </div>
-          {preview.needs_more_data && (
-            <p className="text-xs text-warning">Only {preview.usable_observations} usable observations (min {preview.min_required}) — the test may return Needs More Data.</p>
-          )}
-          <div className="flex gap-2">
-            <button onClick={() => analyze()} className="bg-primary text-primary-foreground px-5 py-2 rounded-lg text-sm font-semibold hover:opacity-90">Run Test</button>
-            <button onClick={() => { setStatus("idle"); setPreview(null); }} className="text-xs text-muted-foreground hover:text-foreground px-2">Edit question</button>
-          </div>
-        </div>
-      )}
-
-      {/* Ambiguity (§62): inline pickers, not an error */}
-      {status === "clarify" && clarify && (
-        <div className="bg-card border border-border rounded-xl p-5 space-y-3 animate-fade-in">
-          <p className="text-sm font-semibold text-foreground">{clarify.message}</p>
-          {(clarify.options?.metrics?.length > 0) && (
-            <div>
-              <p className="text-xs text-muted-foreground mb-1.5">Which metric should represent it?</p>
-              <div className="flex flex-wrap gap-2">
-                {clarify.options.metrics.map((m: any) => (
-                  <button key={`${m.table}.${m.column}`} onClick={() => setPickedMetric(m.column)}
-                    className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${pickedMetric === m.column ? "bg-primary text-primary-foreground border-primary font-semibold" : "bg-secondary text-foreground border-border hover:border-primary/40"}`}>
-                    {String(m.column).replace(/_/g, " ")}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-          {(clarify.options?.drivers?.length > 0) && (
-            <div>
-              <p className="text-xs text-muted-foreground mb-1.5">Which driver do you mean?</p>
-              <div className="flex flex-wrap gap-2">
-                {clarify.options.drivers.map((d: any) => (
-                  <button key={`${d.table}.${d.column}`} onClick={() => setPickedDriver(d.column)}
-                    className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${pickedDriver === d.column ? "bg-primary text-primary-foreground border-primary font-semibold" : "bg-secondary text-foreground border-border hover:border-primary/40"}`}>
-                    {String(d.column).replace(/_/g, " ")}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-          <button onClick={() => parseHypothesis(question, pickedMetric, pickedDriver)} disabled={!pickedMetric}
-            className="bg-primary text-primary-foreground px-5 py-2 rounded-lg text-sm font-semibold hover:opacity-90 disabled:opacity-50">
-            Continue
-          </button>
-        </div>
-      )}
-
-      {/* Loading stages (§34) */}
-      {(status === "running" || status === "parsing") && status === "running" && (
-        <div className="bg-card border border-border rounded-xl p-6 flex flex-col items-center gap-3">
-          <Loader2 size={22} className="animate-spin text-primary" />
-          <p className="text-sm text-muted-foreground">{LOAD_STAGES[stage]}</p>
-        </div>
-      )}
-
-      {status === "error" && (
-        <div className="bg-card border border-warning/40 rounded-xl p-4 space-y-1.5">
-          <p className="text-sm font-semibold text-foreground">{errInfo.title}</p>
-          <p className="text-sm text-muted-foreground">{error || errInfo.hint}</p>
-          <div className="flex gap-2 pt-1">
-            <button onClick={() => (preview ? analyze() : parseHypothesis())} className="text-xs font-semibold text-primary hover:underline">Try again</button>
-            <button onClick={() => { setStatus("idle"); setError(""); }} className="text-xs text-muted-foreground hover:text-foreground">Try another hypothesis</button>
-          </div>
-        </div>
-      )}
-
-      {/* NEEDS_MORE_DATA (§61) */}
-      {status === "done" && needMore && (
-        <div className="bg-card border border-border rounded-xl p-5 space-y-2">
-          <div className="flex items-center gap-2">
-            <AlertTriangle size={15} className="text-warning" />
-            <p className="text-sm font-semibold text-foreground">{result.hypothesis ? `Not enough to test yet: ${result.hypothesis}` : "Not enough to test yet"}</p>
-          </div>
-          <p className="text-sm text-muted-foreground leading-relaxed">{result.detail}</p>
-          <div className="flex gap-2 pt-1">
-            <button onClick={() => { setStatus("idle"); }} className="text-xs font-semibold text-primary hover:underline">Try Another Hypothesis</button>
-            <button onClick={() => (setPage as any)?.("data")} className="text-xs text-muted-foreground hover:text-foreground">Change Time Range</button>
-          </div>
-        </div>
-      )}
-
-      {/* NOT_TESTABLE (§63/§14) with available fields */}
-      {status === "done" && notTestable && (
-        <div className="bg-card border border-border rounded-xl p-5 space-y-3">
-          <p className="text-sm font-semibold text-foreground">This hypothesis can't be tested with the current data</p>
-          <p className="text-sm text-muted-foreground leading-relaxed">{result.detail}</p>
-          {availFields.length > 0 && (
-            <div>
-              <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5">Available related fields</p>
-              <div className="flex flex-wrap gap-1.5">
-                {availFields.slice(0, 12).map((f: any, i: number) => (
-                  <span key={i} className="text-[11px] px-2 py-1 rounded-md bg-secondary border border-border text-foreground">{String(f.column).replace(/_/g, " ")}</span>
-                ))}
-              </div>
-            </div>
-          )}
-          <div className="flex gap-2">
-            <button onClick={() => { setStatus("idle"); setResult(null); }} className="text-xs font-semibold text-primary hover:underline">Try Another Hypothesis</button>
-            <button onClick={loadAvailFields} className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-1"><ListChecks size={12} /> View Available Fields</button>
-          </div>
-        </div>
-      )}
-
-      {status === "done" && !needMore && !notTestable && r && (
-        <>
-          {/* Editable hypothesis */}
-          <div className="bg-card border border-border rounded-xl p-4 space-y-2">
-            <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Tested hypothesis (editable)</p>
-            <div className="flex flex-col sm:flex-row gap-2">
-              <input
-                value={hypEdited ? hypText : (result.hypothesis || "")}
-                onChange={(e) => { setHypText(e.target.value); setHypEdited(true); }}
-                className="flex-1 bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none focus:border-primary"
-              />
-              {hypEdited && (
-                <button onClick={() => parseHypothesis(hypText)} className="bg-primary text-primary-foreground px-4 py-2 rounded-lg text-xs font-semibold hover:opacity-90 whitespace-nowrap">
-                  Test this version
-                </button>
-              )}
-            </div>
-            <p className="text-[11px] text-muted-foreground">Method: {String(r.analysis || "").replace(/_/g, " ")} · {Number(r.n || 0).toLocaleString()} records · {r.table}</p>
-          </div>
-
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            {/* Data quality */}
-            <div className="bg-card border border-border rounded-xl p-5 space-y-4">
-              <div className="flex items-center justify-between">
-                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Data Quality</p>
-                <span className="text-[11px] text-muted-foreground">{dqChecks.filter((c) => c.done).length} of {dqChecks.length}</span>
-              </div>
-              {dqChecks.map((c) => (
-                <div key={c.label} className="space-y-1.5">
-                  <div className="flex items-center gap-2">
-                    {c.done ? <CheckCircle size={14} className="text-positive flex-shrink-0" /> : <XCircle size={14} className="text-negative flex-shrink-0" />}
-                    <p className="text-[13px] font-medium text-foreground">{c.label}</p>
-                  </div>
-                  <p className="text-[11px] text-muted-foreground pl-6">{c.sub}</p>
-                  <div className="h-1 bg-secondary rounded-full overflow-hidden ml-6">
-                    <div className={`h-full rounded-full ${c.done ? "bg-positive" : "bg-negative"}`} style={{ width: c.done ? "100%" : "8%" }} />
-                  </div>
-                </div>
-              ))}
-              {prep && (
-                <p className="text-[11px] text-muted-foreground pl-0 pt-1">
-                  {Number(prep.rows_available || r.n || 0).toLocaleString()} rows available · {Number(prep.usable ?? r.n ?? 0).toLocaleString()} valid observations used.
-                </p>
-              )}
-            </div>
-
-            {/* Summary */}
-            <div className="lg:col-span-2 bg-card border border-border rounded-xl p-5">
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-                <div className="md:col-span-2 space-y-3">
-                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Summary</p>
-                  <p className="text-sm text-foreground leading-relaxed">{result.explanation}</p>
-                  <div className="flex flex-wrap gap-2 pt-1">
-                    <button onClick={saveCurrent} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-secondary border border-border text-foreground hover:bg-secondary/70">
-                      <Save size={12} /> Save
-                    </button>
-                    {onAskQuestion && (
-                      <button onClick={() => onAskQuestion(`Investigate: ${result.hypothesis} (${r.driver} vs ${r.metric}, ${r.analysis})`)}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-primary text-primary-foreground hover:opacity-90">
-                        Ask ARIA <ArrowRight size={12} />
-                      </button>
-                    )}
-                  </div>
-                </div>
-                <div className="space-y-4 md:border-l md:border-border md:pl-5">
-                  <Headline label={r.analysis === "correlation" ? "Correlation" : r.analysis === "trend" ? "Trend slope" : "Gap"} value={r.analysis === "correlation" ? `${Number(r.r) >= 0 ? "+" : ""}${Number(r.r).toFixed(2)}` : r.analysis === "trend" ? `${Number(r.slope_per_period) >= 0 ? "+" : ""}${(Math.round(Number(r.slope_per_period) * 100) / 100).toLocaleString()}` : r.rel_pct !== undefined && r.rel_pct !== null ? `${Number(r.rel_pct) >= 0 ? "+" : ""}${r.rel_pct}%` : "—"} sub="headline result" />
-                  <Headline label="Confidence" value={Number(r.p_value) < 0.01 ? "High" : Number(r.p_value) < 0.05 ? "Moderate" : "Low"} sub={r.analysis === "correlation" ? `r² shares ${Math.round(Number(r.r) ** 2 * 100)}% movement` : `p = ${Number(r.p_value) < 0.001 ? "<0.001" : Number(r.p_value).toFixed(3)}`} />
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Visualization: title + explanation + business tooltips */}
-          <div className="bg-card border border-border rounded-xl p-5">
-            <ChartFrame
-              title={viz?.type === "scatter" ? `${viz.x} vs ${viz.y}` : viz?.type === "line" ? `${viz.y} over time` : "Group comparison"}
-              explanation={viz?.type === "scatter" ? "Each dot is one record — hover to inspect values." : viz?.type === "line" ? "Hover any point for its period and value." : "Hover a bar for its exact value."}
-              empty={!viz}
-              height={260}
-            >
-            {viz?.type === "scatter" && (
-              <ResponsiveContainer width="100%" height={260}>
-                <ScatterChart>
-                  <CartesianGrid strokeDasharray="3 3" stroke={grid} />
-                  <XAxis dataKey="x" name={viz.x} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} label={{ value: viz.x, position: "insideBottom", offset: -5, fontSize: 11, fill: axis }} />
-                  <YAxis dataKey="y" name={viz.y} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={52} />
-                  <Tooltip content={<BizTooltip metricNames={{ x: viz.x, y: viz.y }} />} />
-                  <Scatter data={viz.points} fill="var(--primary)" fillOpacity={0.6} />
-                  {trendLine && <Line type="linear" data={trendLine} dataKey="y" stroke="var(--primary)" strokeWidth={2} dot={false} />}
-                </ScatterChart>
-              </ResponsiveContainer>
-            )}
-            {viz?.type === "line" && (
-              <ResponsiveContainer width="100%" height={260}>
-                <LineChart data={lineData}>
-                  <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
-                  <XAxis dataKey="label" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} minTickGap={24} />
-                  <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={52} />
-                  <Tooltip content={<BizTooltip metricNames={{ actual: viz.y }} />} />
-                  <Line type="monotone" dataKey="actual" stroke="var(--primary)" strokeWidth={2} dot={false} name={viz.y} />
-                </LineChart>
-              </ResponsiveContainer>
-            )}
-            {(viz?.type === "bar" || viz?.type === "comparison" || viz?.type === "grouped") && barData.length > 0 && (
-              <ResponsiveContainer width="100%" height={Math.max(180, barData.length * 44)}>
-                <BarChart data={barData} layout="vertical">
+        <section className="bg-card border border-border rounded-2xl shadow-sm p-5 md:p-6">
+          <p className="text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">What ARIA found</p>
+          <p className="mt-2 text-sm text-foreground leading-relaxed">{deepHyp.explanation}</p>
+        </section>
+        {deepHyp.chart?.type === "hbar" && (deepHyp.chart?.groups || []).length > 0 && (
+          <section className="bg-card border border-border rounded-2xl shadow-sm p-5 md:p-6">
+            <p className="text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">Contribution</p>
+            <div className="mt-3">
+              <ResponsiveContainer width="100%" height={Math.max(180, (deepHyp.chart.groups || []).length * 42)}>
+                <BarChart data={deepHyp.chart.groups} layout="vertical">
                   <CartesianGrid strokeDasharray="3 3" stroke={grid} horizontal={false} />
                   <XAxis type="number" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
-                  <YAxis type="category" dataKey="label" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={110} />
-                  <Tooltip content={<BizTooltip />} />
-                  <Bar dataKey="value" radius={[0, 5, 5, 0]}>
-                    {barData.map((_: any, i: number) => (
-                      <Cell key={i} fill="var(--primary)" fillOpacity={i === 0 ? 1 : 0.55} />
+                  <YAxis type="category" dataKey="label" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={120} />
+                  <Tooltip content={<BizTooltip />} cursor={{ fill: "var(--secondary)" }} />
+                  <Bar dataKey="value" radius={[0, 5, 5, 0]} name="Value">
+                    {(deepHyp.chart.groups || []).map((_: any, k: number) => (
+                      <Cell key={k} fill="var(--primary)" fillOpacity={k === 0 ? 1 : 0.6} />
                     ))}
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
-            )}
-            </ChartFrame>
+            </div>
+          </section>
+        )}
+        <div className="grid gap-4 md:grid-cols-2">
+          <section className="bg-card border border-border rounded-2xl shadow-sm p-5">
+            <p className="text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">Supporting evidence</p>
+            {(deepHyp.supporting || []).map((s: string, j: number) => (
+              <p key={j} className="mt-1.5 text-[13px] text-foreground leading-relaxed">· {s}</p>
+            ))}
+          </section>
+          <section className="bg-card border border-border rounded-2xl shadow-sm p-5">
+            <p className="text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">What weakens this explanation</p>
+            {((deepHyp.contradictory || []).length > 0 ? deepHyp.contradictory : ["No contradictory evidence found in the available data."]).map((s: string, j: number) => (
+              <p key={j} className="mt-1.5 text-[13px] text-foreground leading-relaxed">· {s}</p>
+            ))}
+          </section>
+        </div>
+        <section className="bg-card border border-border rounded-2xl shadow-sm p-5">
+          <p className="text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">What remains unknown</p>
+          {(deepHyp.limitations || ["Whether this pattern holds outside the observed period."]).map((s: string, j: number) => (
+            <p key={j} className="mt-1.5 text-[13px] text-muted-foreground leading-relaxed">· {s}</p>
+          ))}
+          <div className="mt-3">
+            <Evidence
+              sections={[
+                { title: "Data analyzed", body: `${(obs.n || 0).toLocaleString()} observations of ${String(obs.metric || "the metric").replace(/_/g, " ")}${obs.table ? ` in ${obs.table}` : ""}.` },
+                { title: "Key observation", body: obs.text || "See the investigation summary." },
+                { title: "Assumptions & limits", body: ((deepHyp.limitations || []).join(" ") || "Association only — never proof of cause.") },
+              ]}
+              technical={`Ranked ${i + 1} of ${hyps.length} by measured support. Metrics: ${JSON.stringify(deepHyp.metrics || {})}. For analyst review.`}
+            />
           </div>
+        </section>
+        <section className="bg-card border border-border rounded-2xl shadow-sm p-5">
+          <p className="text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">Continue investigating</p>
+          <div className="mt-2.5 flex flex-wrap gap-2">
+            {followUps(deepHyp).map((q) => (
+              <button key={q} onClick={() => { setDeepDive(null); runInvestigation(q); }}
+                className="text-xs font-medium px-3.5 py-2 bg-secondary border border-border rounded-full text-foreground hover:border-primary/50 transition-colors">
+                {q}
+              </button>
+            ))}
+          </div>
+        </section>
+      </div>
+    );
+  }
 
-          {/* Segments */}
-          {segments.length > 0 && (
-            <div className="bg-card border border-border rounded-xl p-5 space-y-3">
-              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Where is the effect strongest?</p>
-              <div className="flex flex-wrap gap-2">
-                {segments.map((s: any, i: number) => (
-                  <button key={s.dimension} onClick={() => setSegDim(i)}
-                    className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${i === Math.min(segDim, segments.length - 1) ? "bg-primary text-primary-foreground border-primary font-semibold" : "bg-secondary text-muted-foreground border-border hover:text-foreground"}`}>
-                    {s.dimension.replace(/_/g, " ")}
-                  </button>
-                ))}
-              </div>
-              {activeSeg && (
-                <div className="space-y-2.5">
-                  {activeSeg.groups.map((g: any) => {
-                    const max = Math.max(...activeSeg.groups.map((x: any) => x.value), 1);
-                    return (
-                      <div key={g.label} className="space-y-1">
-                        <div className="flex items-center justify-between text-xs">
-                          <span className="text-foreground font-medium">{g.label} <span className="text-muted-foreground">· n={g.n}</span></span>
-                          <span className="text-foreground font-semibold">{Number(g.value).toLocaleString()}</span>
-                        </div>
-                        <div className="h-2 bg-secondary rounded-full overflow-hidden">
-                          <div className="h-full rounded-full bg-primary" style={{ width: `${Math.max(3, (g.value / max) * 100)}%` }} />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
+  return (
+    <div className="p-6 md:p-8 max-w-screen-xl mx-auto space-y-5">
+      {/* Compact header: title + source + analyzed + refresh */}
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-xl font-bold text-foreground tracking-tight">Hypothesis</h2>
+          <p className="mt-0.5 text-[13px] text-muted-foreground">Explore what may be driving important changes in your business.</p>
+        </div>
+        <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+          {sourceLabel && (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-secondary border border-border text-foreground font-medium">
+              <span className="w-1.5 h-1.5 rounded-full bg-positive inline-block" />
+              {sourceLabel}
+            </span>
           )}
+          {analyzedAt && <span>Analysis updated {analyzedAt}</span>}
+          <button onClick={() => loadAuto()} disabled={autoLoading}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-border text-foreground font-medium hover:bg-secondary transition-colors disabled:opacity-50"
+            title="Re-scan the data">
+            <RefreshCw size={11} className={autoLoading ? "animate-spin" : ""} /> Refresh
+          </button>
+        </div>
+      </div>
 
-          {/* What-if simulation */}
-          {showWhatIf && (
-            <div id="hyp-whatif" className="bg-card border border-border rounded-xl p-5 space-y-3">
-              <div className="flex items-center gap-2">
-                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">What-if simulation</p>
-                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-secondary text-muted-foreground">SIMULATION</span>
-              </div>
-              <p className="text-xs text-muted-foreground">Slide to see what happens if {r.driver.replace(/_/g, " ")} changes. Assumes the measured link holds.</p>
-              <div className="flex flex-wrap items-center gap-4">
-                <input type="range" min={-50} max={50} step={5} value={simPct}
-                  onChange={(e) => setSimPct(Number(e.target.value))}
-                  className="flex-1 min-w-[160px] accent-[var(--primary)]" aria-label="Driver change percent" />
-                <span className={`text-lg font-bold w-20 text-right ${simPct >= 0 ? "text-positive" : "text-negative"}`}>
-                  {simPct >= 0 ? "+" : ""}{simPct}%
-                </span>
-              </div>
-              {simOutcome && (
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  <SimCard label="Baseline" value={simOutcome.base} sub={`avg ${r.metric.replace(/_/g, " ")}`} />
-                  <SimCard label={`With ${simPct >= 0 ? "+" : ""}${simPct}% ${r.driver.replace(/_/g, " ")}`} value={simOutcome.scenario} sub={`${simOutcome.delta >= 0 ? "+" : ""}${simOutcome.delta.toFixed(1)} vs baseline`} hot />
-                  <div className="border border-border rounded-xl p-3.5 space-y-1">
-                    <p className="text-xs text-muted-foreground">Keep in mind</p>
-                    <p className="text-xs text-foreground leading-relaxed">Linear projection from the measured slope — a what-if, not a forecast.</p>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Limitations */}
-          {(result.limitations || []).length > 0 && (
-            <div className="bg-secondary/50 border border-border rounded-xl p-4 space-y-1.5">
-              <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Limitations</p>
-              {(result.limitations || []).map((l: string, i: number) => (
-                <p key={i} className="text-xs text-muted-foreground leading-relaxed">· {l}</p>
-              ))}
-            </div>
-          )}
-
-          {/* Evidence (s.txt): shared disclosure, closed by default */}
-          <Evidence
-            sections={[
-              { title: "Data analyzed", body: `${prep ? `${Number(prep.rows_available || r.n).toLocaleString()} rows scanned, ${Number(prep.usable ?? r.n).toLocaleString()} valid observations on the tested columns` : `${Number(r.n).toLocaleString()} valid observations`} in ${r.table}. Missing values elsewhere were left untouched.` },
-              { title: "Key observation", body: result.explanation },
-              { title: "Analysis method", body: `${String(r.analysis || "").replace(/_/g, " ")}${r.analysis === "correlation" ? " (Pearson primary, Spearman robustness check)" : r.analysis === "group_comparison" ? " (Welch t primary, Mann-Whitney check)" : ""}. Confidence in the result: ${confidenceWord(r.p_value)}.` },
-              { title: "Confidence", body: `Statistical values (rounded): p ${Number(r.p_value) < 0.001 ? "<0.001" : `≈ ${Number(r.p_value).toFixed(3)}`} · n = ${Number(r.n).toLocaleString()}${r.r !== undefined ? ` · relationship ≈ ${Number(r.r).toFixed(2)}` : ""}${r.cohens_d !== undefined ? ` · group gap ≈ ${Number(r.cohens_d).toFixed(2)} standard deviations` : ""}.` },
-              { title: "Assumptions & limits", body: "Outliers kept and reported. Association only — never proof of cause. Verdict rule: clear effect + expected direction → Supported; otherwise Not Supported or Inconclusive." },
-            ]}
+      {/* Investigation command bar + autocomplete */}
+      <div className="bg-card border border-border rounded-2xl shadow-sm p-4 md:p-5" ref={acRef}>
+        <div className="flex items-center gap-3 rounded-xl border border-border bg-secondary/40 px-4 py-3 focus-within:border-primary/60 transition-colors">
+          <Search size={15} className="text-muted-foreground flex-shrink-0" />
+          <textarea
+            ref={inputRef}
+            value={question}
+            onChange={(e) => { setQuestion(e.target.value); setAcOpen(true); setAcIndex(0); }}
+            onFocus={() => setAcOpen(true)}
+            onKeyDown={onInputKey}
+            placeholder="Ask ARIA why something changed..."
+            rows={1}
+            aria-expanded={acOpen}
+            aria-label="Investigation question"
+            className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none resize-none"
           />
-
-          {/* Next actions (§§43–45): structured context, not bare sentences */}
-          <div className="bg-card border border-border rounded-xl p-4">
-            <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-2.5">Next actions</p>
-            <div className="flex flex-wrap gap-2">
-              {activeSeg && (
-                <ActionBtn label={`Explore: ${activeSeg.dimension}`} onClick={() => document.getElementById("hyp-segments")?.scrollIntoView({ behavior: "smooth" })} />
-              )}
-              {showWhatIf && (
-                <ActionBtn label="Run what-if" onClick={() => document.getElementById("hyp-whatif")?.scrollIntoView({ behavior: "smooth" })} />
-              )}
-              <ActionBtn label="Forecast impact" onClick={() => {
-                try { sessionStorage.setItem("aria_forecast_prefill", JSON.stringify({ metric: r.metric, driver: r.driver, source: { tables: [r.table] } })); } catch {}
-                (setPage as any)?.("predictive");
-              }} />
-              <ActionBtn label="Create prescription" onClick={() => {
-                try { sessionStorage.setItem("aria_insight_handoff", JSON.stringify({ metric: r.metric, dimensions: [r.driver], question: result.hypothesis, source: { tables: [r.table] } })); } catch {}
-                (setPage as any)?.("prescription");
-              }} />
-              {onAskQuestion && (
-                <>
-                  <ActionBtn label="Investigate driver" onClick={() => onAskQuestion(`What drives ${r.metric}? Focus on ${r.driver}.`)} />
-                  <ActionBtn label="Ask ARIA" onClick={() => onAskQuestion(`Explain this finding: ${result.hypothesis}`)} />
-                </>
-              )}
-            </div>
-            <span id="hyp-segments" />
-          </div>
-
-          {/* Saved */}
-          <div className="bg-card border border-border rounded-xl p-4 space-y-2">
-            <div className="flex items-center justify-between">
-              <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Saved hypotheses ({saved.length})</p>
-              {result && !needMore && !notTestable && (
-                <button onClick={saveCurrent} className="flex items-center gap-1.5 text-xs font-semibold text-primary hover:underline">
-                  <Save size={12} /> Save this one
-                </button>
-              )}
-            </div>
-            {saved.length === 0 && <p className="text-xs text-muted-foreground">Nothing saved yet — results you save will live here.</p>}
-            {saved.map((s) => (
-              <div key={s.id} className="flex items-center gap-2 text-xs border border-border rounded-lg px-3 py-2">
-                <span className={`font-bold ${s.verdict === "SUPPORTED" ? "text-positive" : s.verdict === "NOT SUPPORTED" ? "text-negative" : "text-warning"}`}>
-                  {String(s.verdict).replace(/_/g, " ")}
-                </span>
-                <span className="text-foreground truncate flex-1">{s.hypothesis}</span>
-                <button onClick={() => parseHypothesis(s.question)} className="text-primary hover:underline whitespace-nowrap">Re-run</button>
-                <button onClick={() => {
-                  const next = saved.filter((x) => x.id !== s.id);
-                  setSaved(next);
-                  try { localStorage.setItem(SAVED_KEY, JSON.stringify(next)); } catch {}
-                }} className="text-muted-foreground hover:text-negative" aria-label="Delete saved">
-                  <Trash2 size={12} />
-                </button>
+          <button onClick={() => runInvestigation()} disabled={investigating || !question.trim()}
+            className="bg-primary text-primary-foreground px-5 py-2 rounded-lg text-[13px] font-semibold hover:opacity-90 disabled:opacity-40 flex-shrink-0">
+            Investigate
+          </button>
+        </div>
+        {acOpen && flatAc.length > 0 && (
+          <div className="mt-2 rounded-xl border border-border bg-card shadow-lg overflow-hidden">
+            {acGroups.map((g) => (
+              <div key={g.group}>
+                {acGroups.length > 1 && (
+                  <p className="px-4 pt-2.5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">{g.group}</p>
+                )}
+                {g.items.map((s) => {
+                  const Icon = KIND_ICON[s.kind] || Search;
+                  const active = flatAc.indexOf(s) === acIndex;
+                  return (
+                    <button key={s.text}
+                      onMouseEnter={() => setAcIndex(flatAc.indexOf(s))}
+                      onClick={() => runInvestigation(s.text)}
+                      className={`w-full flex items-center gap-2.5 px-4 py-2 text-left text-[13px] transition-colors ${active ? "bg-secondary text-foreground" : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground"}`}>
+                      <Icon size={13} className="flex-shrink-0" />
+                      <span className="truncate">{renderCompletion(s.text)}</span>
+                    </button>
+                  );
+                })}
               </div>
             ))}
           </div>
-        </>
+        )}
+        {acOpen && acFiltered.length === 0 && question.trim() && (
+          <div className="mt-2 rounded-xl border border-border bg-card shadow-lg px-4 py-3 flex items-center justify-between gap-3">
+            <span className="text-[13px] text-muted-foreground truncate">Investigate your question: “{question.trim()}”</span>
+            <button onClick={() => runInvestigation()}
+              className="text-xs font-semibold px-3.5 py-1.5 rounded-lg bg-primary text-primary-foreground hover:opacity-90 flex-shrink-0">
+              Investigate →
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Staged loader */}
+      {busy && (
+        <div className="bg-card border border-border rounded-2xl shadow-sm p-6 md:p-8">
+          <p className="text-sm font-semibold text-foreground text-center">Analyzing your business data</p>
+          <div className="mt-4 max-w-sm mx-auto space-y-2.5">
+            {LOAD_STAGES.map((s, i) => (
+              <div key={s} className="flex items-center gap-2.5 text-[13px]">
+                {i < loadStage ? (
+                  <CheckCircle2 size={14} className="text-positive flex-shrink-0" />
+                ) : i === loadStage ? (
+                  <Loader2 size={14} className="animate-spin text-primary flex-shrink-0" />
+                ) : (
+                  <span className="w-3.5 h-3.5 rounded-full border border-border flex-shrink-0" />
+                )}
+                <span className={i <= loadStage ? "text-foreground" : "text-muted-foreground"}>{s}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {errorCode && !busy && (
+        <div className="bg-card border border-negative/30 rounded-2xl shadow-sm p-5">
+          <p className="text-sm font-semibold text-foreground">{errInfo.title}</p>
+          <p className="mt-1 text-sm text-muted-foreground">{error || errInfo.hint}</p>
+          <div className="flex gap-2 mt-3">
+            <button onClick={() => runInvestigation()} className="text-xs font-semibold px-4 py-2 rounded-lg bg-primary text-primary-foreground hover:opacity-90">Try again</button>
+            <button onClick={() => (setPage as any)?.("data")} className="text-xs font-medium px-4 py-2 rounded-lg border border-border text-foreground hover:bg-secondary">View data source</button>
+          </div>
+        </div>
+      )}
+
+      {/* ARIA detected strip */}
+      {!busy && !errorCode && autoEvents.length > 0 && !investigation && (
+        <section>
+          <h3 className="text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">ARIA detected</h3>
+          <p className="text-xs text-muted-foreground mt-0.5 mb-2.5">Important changes and patterns found in your data.</p>
+          <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
+            {autoEvents.slice(0, 4).map((ev: any, i: number) => {
+              const down = (ev.change_pct || 0) < 0;
+              const flat = Math.abs(ev.change_pct || 0) <= 1;
+              return (
+                <button key={i} onClick={() => runInvestigation(`Why did ${String(ev.metric).replace(/_/g, " ")} change?`)}
+                  className="text-left bg-card border border-border rounded-xl shadow-sm p-4 hover:border-primary/40 hover:shadow-md transition-all">
+                  <p className="text-xs font-medium text-muted-foreground capitalize truncate">{String(ev.metric).replace(/_/g, " ")}</p>
+                  <p className={`mt-1 text-xl font-bold tabular-nums flex items-center gap-1.5 ${flat ? "text-foreground" : down ? "text-negative" : "text-positive"}`}>
+                    {flat ? <Minus size={15} /> : down ? <TrendingDown size={15} /> : <TrendingUp size={15} />}
+                    {down ? "↓" : flat ? "→" : "↑"} {Math.abs(ev.change_pct || 0).toFixed(0)}%
+                  </p>
+                  <p className="mt-1 text-[11px] text-muted-foreground">{ev.periods || ""} periods{ev.anomaly ? " · unusual latest" : ""}</p>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {/* Observation overview */}
+      {!busy && !errorCode && investigation?.ok && !investigation?.insufficient && obs.text && (
+        <section className="bg-card border border-border rounded-2xl shadow-sm p-5 md:p-6">
+          <p className="text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">Investigation</p>
+          <p className="mt-2 text-lg font-semibold text-foreground tracking-tight leading-snug">{obs.text}</p>
+          <div className="mt-4 grid grid-cols-3 gap-3 max-w-lg">
+            <div className="rounded-xl bg-secondary/60 border border-border/60 px-3 py-2.5">
+              <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Records</p>
+              <p className="mt-0.5 text-base font-bold text-foreground tabular-nums">{(obs.n || 0).toLocaleString()}</p>
+            </div>
+            <div className="rounded-xl bg-secondary/60 border border-border/60 px-3 py-2.5">
+              <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Metric</p>
+              <p className="mt-0.5 text-base font-bold text-foreground truncate">{String(obs.metric || "—").replace(/_/g, " ")}</p>
+            </div>
+            <div className="rounded-xl bg-secondary/60 border border-border/60 px-3 py-2.5">
+              <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Explanations</p>
+              <p className="mt-0.5 text-base font-bold text-foreground tabular-nums">{hyps.length}</p>
+            </div>
+          </div>
+          {obs.chart?.points?.length > 0 && (
+            <div className="mt-4 rounded-xl border border-border/70 p-4">
+              <ChartFrame
+                title={`${String(obs.chart.y || obs.metric || "Metric").replace(/_/g, " ")} over time`}
+                explanation="Hover any point for its period and value. Drag the slider to zoom."
+                height={220}
+              >
+                <ResponsiveContainer width="100%" height={220}>
+                  <LineChart data={obs.chart.points}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
+                    <XAxis dataKey="label" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} minTickGap={28} />
+                    <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={52} />
+                    <Tooltip content={<BizTooltip metricNames={{ actual: obs.chart.y }} />} />
+                    <Line type="monotone" dataKey="actual" stroke="var(--primary)" strokeWidth={2} dot={false} name={obs.chart.y} />
+                    {obs.chart.points.length > 12 && (
+                      <Brush dataKey="label" height={24} stroke="var(--primary)" travellerWidth={10} />
+                    )}
+                  </LineChart>
+                </ResponsiveContainer>
+              </ChartFrame>
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Possible explanations */}
+      {!busy && !errorCode && hyps.length > 0 && (
+        <section className="space-y-3">
+          <div>
+            <h3 className="text-[15px] font-bold text-foreground tracking-tight">Possible explanations</h3>
+            <p className="text-xs text-muted-foreground mt-0.5">ARIA ranked the strongest patterns associated with the changes above.</p>
+          </div>
+          {hyps.map((h: any, i: number) => {
+            const tone = STRENGTH_STYLE[h.strength] || STRENGTH_STYLE["Limited evidence"];
+            const m = h.metrics || {};
+            const metricChips = [
+              m.contribution_share !== undefined ? `≈${Math.round(m.contribution_share * 100)}% of move` : null,
+              m.change_pct !== undefined && m.change_pct !== null ? `${m.change_pct >= 0 ? "+" : ""}${Math.round(m.change_pct)}%` : null,
+              m.volume_change_pct !== undefined ? `vol ${m.volume_change_pct >= 0 ? "+" : ""}${Math.round(m.volume_change_pct)}%` : null,
+            ].filter(Boolean).slice(0, 3);
+            return (
+              <article key={i} className="bg-card border border-border rounded-2xl shadow-sm p-5 animate-fade-in">
+                <div className="flex gap-4">
+                  <span className="hidden sm:flex w-9 h-9 rounded-xl bg-secondary border border-border items-center justify-center text-xs font-bold text-muted-foreground flex-shrink-0">
+                    {String(i + 1).padStart(2, "0")}
+                  </span>
+                  <div className="flex-1 min-w-0 space-y-2.5">
+                    <div className="flex items-start justify-between gap-3 flex-wrap">
+                      <h4 className="text-[15px] font-semibold text-foreground tracking-tight">{h.title || "Possible explanation"}</h4>
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold flex-shrink-0" style={{ background: tone.background, color: tone.color }}>
+                        <span className="w-1.5 h-1.5 rounded-full" style={{ background: tone.dot }} />
+                        {h.strength || "Limited evidence"}
+                      </span>
+                    </div>
+                    <p className="text-[13px] text-foreground leading-relaxed">
+                      {(h.explanation || "ARIA found a pattern worth a closer look.").split(/(?<=[.!?])\s+/).slice(0, 2).join(" ")}
+                    </p>
+                    {metricChips.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5">
+                        {metricChips.map((chip: string, j: number) => (
+                          <span key={j} className="text-[11px] font-semibold px-2.5 py-1 rounded-lg bg-secondary border border-border/60 text-foreground tabular-nums">{chip}</span>
+                        ))}
+                      </div>
+                    )}
+                    {h.chart?.type === "hbar" && (h.chart?.groups || []).length > 0 && (
+                      <div className="rounded-xl border border-border/70 p-3">
+                        <ResponsiveContainer width="100%" height={Math.max(120, Math.min(200, (h.chart.groups || []).length * 34))}>
+                          <BarChart data={h.chart.groups.slice(0, 6)} layout="vertical">
+                            <CartesianGrid strokeDasharray="3 3" stroke={grid} horizontal={false} />
+                            <XAxis type="number" hide />
+                            <YAxis type="category" dataKey="label" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={100} />
+                            <Tooltip content={<BizTooltip />} cursor={{ fill: "var(--secondary)" }} />
+                            <Bar dataKey="value" radius={[0, 4, 4, 0]} name="Value">
+                              {(h.chart.groups || []).slice(0, 6).map((_: any, k: number) => (
+                                <Cell key={k} fill="var(--primary)" fillOpacity={k === 0 ? 1 : 0.6} />
+                              ))}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
+                    <div className="flex items-center gap-2 pt-0.5">
+                      <button onClick={() => setDeepDive(deepDive === i ? null : i)}
+                        className="text-[11px] font-semibold text-muted-foreground hover:text-foreground transition-colors">
+                        {deepDive === i ? "Hide evidence" : "View evidence"}
+                      </button>
+                      <span className="text-border">·</span>
+                      <button onClick={() => setDeepDive(i)}
+                        className="text-[11px] font-semibold text-primary hover:underline inline-flex items-center gap-0.5">
+                        Investigate <ArrowRight size={11} />
+                      </button>
+                    </div>
+                    {deepDive === i && (
+                      <div className="border-t border-border pt-3 space-y-3 animate-fade-in">
+                        <div>
+                          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">Why ARIA is considering this</p>
+                          <p className="mt-1 text-xs text-foreground leading-relaxed">{h.explanation}</p>
+                        </div>
+                        {(h.supporting || []).length > 0 && (
+                          <div>
+                            <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">Supporting evidence</p>
+                            {(h.supporting || []).slice(0, 4).map((s: string, j: number) => (
+                              <p key={j} className="mt-1 text-xs text-foreground leading-relaxed">· {s}</p>
+                            ))}
+                          </div>
+                        )}
+                        {((h.contradictory || []).length > 0) && (
+                          <div>
+                            <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">Evidence against</p>
+                            {(h.contradictory || []).map((s: string, j: number) => (
+                              <p key={j} className="mt-1 text-xs text-foreground leading-relaxed">· {s}</p>
+                            ))}
+                          </div>
+                        )}
+                        <div>
+                          <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">What ARIA cannot determine</p>
+                          <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                            {((h.limitations || []).join(" ") || "Whether this pattern holds outside the observed period, or what external factors may be involved.")}
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {onAskQuestion && (
+                            <button onClick={() => onAskQuestion(`Explain this finding: ${h.title}`)}
+                              className="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-secondary border border-border text-foreground hover:bg-secondary/70">Ask ARIA</button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+          {(investigation?.needed_data || []).length > 0 && (
+            <details className="rounded-xl border border-border bg-secondary/40 px-4 py-3">
+              <summary className="cursor-pointer text-xs font-semibold text-muted-foreground hover:text-foreground">What would confirm this?</summary>
+              <div className="mt-2 space-y-1">
+                {(investigation.needed_data || []).map((n: string, j: number) => (
+                  <p key={j} className="text-xs text-foreground">· {n}</p>
+                ))}
+              </div>
+            </details>
+          )}
+        </section>
+      )}
+
+      {/* No strong hypotheses */}
+      {!busy && !errorCode && investigation?.ok && (investigation?.insufficient || hyps.length === 0) && (
+        <div className="bg-card border border-border rounded-2xl shadow-sm p-6 md:p-8">
+          <p className="text-[15px] font-semibold text-foreground">No strong explanations detected</p>
+          <p className="mt-1.5 text-sm text-muted-foreground leading-relaxed max-w-lg">
+            {investigation.detail || "ARIA found changes in your data, but there isn't enough evidence to confidently identify a likely driver."}
+          </p>
+          <p className="mt-3 text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">What ARIA found</p>
+          <p className="mt-1 text-[13px] text-foreground">{investigation.observation?.text || "The data was scanned."}</p>
+          {(investigation.needed_data || []).length > 0 && (
+            <>
+              <p className="mt-3 text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">What is missing</p>
+              {(investigation.needed_data || []).map((n: string, j: number) => (
+                <p key={j} className="mt-1 text-[13px] text-muted-foreground">· {n}</p>
+              ))}
+            </>
+          )}
+          <p className="mt-4 text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">Explore manually</p>
+          <p className="text-xs text-muted-foreground mt-1">Type a question above — ARIA will investigate it against the same evidence.</p>
+          {(investigation.suggestions || []).length > 0 && (
+            <>
+              <p className="mt-4 text-[11px] font-bold uppercase tracking-[0.12em] text-muted-foreground">These will run against your data</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {(investigation.suggestions || []).map((s: string) => (
+                  <button key={s} onClick={() => runInvestigation(s)}
+                    className="text-xs font-medium px-3.5 py-2 bg-secondary border border-border rounded-full text-foreground hover:border-primary/50 transition-colors">
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {!investigation && !busy && !errorCode && (
+        <div className="text-center py-12 bg-card border border-dashed border-border rounded-2xl">
+          <Search size={20} className="mx-auto text-muted-foreground mb-3" />
+          <p className="text-sm font-semibold text-foreground">Ask ARIA why something changed.</p>
+          <p className="text-xs text-muted-foreground mt-1 max-w-md mx-auto">Type a question above, or pick a suggested investigation built from your data.</p>
+        </div>
       )}
     </div>
-  );
-}
-
-function Headline({ label, value, sub }: { label: string; value: string; sub: string }) {
-  return (
-    <div>
-      <p className="text-[11px] text-muted-foreground">{label}</p>
-      <p className="text-2xl font-bold text-foreground">{value}</p>
-      <p className="text-[11px] text-muted-foreground">{sub}</p>
-    </div>
-  );
-}
-
-function SimCard({ label, value, sub, hot }: { label: string; value: number; sub: string; hot?: boolean }) {
-  return (
-    <div className={`border rounded-xl p-3.5 space-y-1 ${hot ? "border-primary/40 bg-primary/5" : "border-border"}`}>
-      <p className="text-xs text-muted-foreground">{label}</p>
-      <p className="text-xl font-bold text-foreground">{value.toLocaleString(undefined, { maximumFractionDigits: 1 })}</p>
-      <p className="text-xs text-muted-foreground">{sub}</p>
-    </div>
-  );
-}
-
-function ActionBtn({ label, onClick }: { label: string; onClick: () => void }) {
-  return (
-    <button onClick={onClick} className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-secondary border border-border text-foreground hover:bg-secondary/70 transition-colors">
-      {label}
-    </button>
   );
 }

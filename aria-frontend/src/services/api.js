@@ -17,7 +17,9 @@
 
 import { getAuthToken } from "../utils/authStorage";
 
-const API_BASE = "/api";
+const API_BASE = (import.meta?.env?.VITE_API_BASE || "/api").replace(/\/$/, "");
+
+const REQUEST_TIMEOUT_MS = Number(import.meta?.env?.VITE_API_TIMEOUT_MS || 30000);
 
 // =========================================================
 // LLM MODE (chosen on the LLM Selection screen)
@@ -55,11 +57,24 @@ const request = async (path, options = {}) => {
     headers["Content-Type"] = "application/json";
   }
 
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...options,
 
-    headers,
-  });
+      headers,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timeout);
+    if (err?.name === "AbortError") {
+      throw new Error(`Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`);
+    }
+    throw new Error("Network error: backend unreachable.");
+  }
+  clearTimeout(timeout);
 
   let data;
 
@@ -1028,6 +1043,6 @@ export const submitFeedback = async (feedbackData = {}) => {
     return { success: true, message: data?.message || "Thanks for your feedback.", data };
   } catch (error) {
     console.warn("Feedback submit failed (non-blocking):", error?.message);
-    return { success: true, message: "Thanks for your feedback." };
+    return { success: false, message: error?.message || "Feedback could not be sent." };
   }
 };

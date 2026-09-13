@@ -53,6 +53,84 @@ if DEEPSEEK_THINKING not in {"enabled", "disabled"}:
 _CONTROL_ROLES = {"rag_scope", "rag_verify", "rag_rewrite", "rag_plan"}
 _RETRY_AFTER_RE = re.compile(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
 
+# OmniRoute gateway (OpenAI-compatible routing to many models).
+OMNIROUTE_BASE_URL = os.getenv("OMNIROUTE_BASE_URL", "http://localhost:20128/v1").rstrip("/")
+
+# Cloud privacy controls (P1-11). Selecting a hosted provider is explicit
+# user consent for that request; ARIA_CLOUD_ALLOWED=0 disables all hosted
+# inference so Local Ollama remains fully usable offline.
+def _cloud_allowed() -> bool:
+    return os.getenv("ARIA_CLOUD_ALLOWED", "1").strip() not in {"0", "false", "no", "off"}
+
+
+def _require_cloud_consent(provider: str):
+    if provider != "local" and not _cloud_allowed():
+        raise RuntimeError(
+            "Cloud processing is disabled by configuration (ARIA_CLOUD_ALLOWED=0). "
+            "Switch to Local Ollama or enable cloud consent."
+        )
+
+
+_SECRET_PATTERNS = [
+    re.compile(r"(gsk_[A-Za-z0-9]{8,})"),
+    re.compile(r"(sk-[A-Za-z0-9\-_]{8,})"),
+    re.compile(r"(hf_[A-Za-z0-9]{8,})"),
+    re.compile(r"(?i)(password\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(secret\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(bearer\s+)([A-Za-z0-9\-._~+/=]+)"),
+    re.compile(r"(postgresql|mysql)://[^\s'\";]+"),
+]
+
+
+def _redact_secrets(text: str) -> str:
+    """Remove credentials/tokens/connection strings before cloud transmission."""
+    if not isinstance(text, str):
+        return text
+    out = text
+    for pat in _SECRET_PATTERNS:
+        try:
+            if pat.groups >= 2:
+                out = pat.sub(lambda m: (m.group(1) + "[REDACTED]"), out)
+            else:
+                out = pat.sub("[REDACTED]", out)
+        except Exception:
+            continue
+    return out
+
+
+def _minimize_for_cloud(messages, max_chars: int = 6000):
+    """Data-minimize cloud payloads: redact secrets, bound size.
+
+    Keeps schema metadata and the tail (usually the actual question) while
+    truncating over-long middle content. Local provider path never calls this.
+    """
+    if isinstance(messages, str):
+        return _redact_secrets(messages)[:max_chars]
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            red = _redact_secrets(content)
+            if len(red) > max_chars:
+                red = red[:max_chars] + "\n…[truncated for cloud minimization]"
+            out.append({**m, "content": red})
+        elif isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict) and isinstance(p.get("text"), str):
+                    t = _redact_secrets(p["text"])
+                    parts.append({**p, "text": t[:max_chars]})
+                else:
+                    parts.append(p)
+            out.append({**m, "content": parts})
+        else:
+            out.append(m)
+    return out
+
 # ---------------------------------------------------------------------------
 # Provider metadata
 # ---------------------------------------------------------------------------
@@ -145,6 +223,14 @@ class LLMProvider:
             )
             if not self._cloud_client.api_key:
                 raise RuntimeError("Missing DEEPSEEK_API_KEY. Set it in .env or pass api_key.")
+        elif provider == "omniroute":
+            from openai import OpenAI
+            self._cloud_client = OpenAI(
+                api_key=api_key or os.getenv("OMNIROUTE_API_KEY"),
+                base_url=base_url or OMNIROUTE_BASE_URL,
+            )
+            if not self._cloud_client.api_key:
+                raise RuntimeError("Missing OMNIROUTE_API_KEY. Set it in .env or pass api_key.")
 
     # -- model lookup ---------------------------------------------------
 
@@ -165,6 +251,30 @@ class LLMProvider:
             return {}
         thinking = "disabled" if role in _CONTROL_ROLES else DEEPSEEK_THINKING
         return {"thinking": {"type": thinking}}
+
+    def ping(self, timeout: int = 20) -> bool:
+        """Validate credentials/connectivity without spending generation budget.
+
+        Hosted providers: list models (proves key + reachability even when a
+        model returns empty content for tiny probes). Local: tiny chat.
+        Raises on failure with the underlying reason.
+        """
+        if self.provider == "local":
+            out = self.chat("suggest",
+                            messages=[{"role": "user", "content": "Reply with: OK"}],
+                            temperature=0, num_predict=5, timeout=timeout)
+            if not out or not str(out).strip():
+                raise RuntimeError("local model returned no content")
+            return True
+        client = self._cloud_client
+        if client is None:
+            raise RuntimeError(f"No client initialised for provider '{self.provider}'")
+        try:
+            client.with_options(timeout=timeout).models.list()
+        except TypeError:
+            # Older SDKs without with_options/timeout override.
+            client.models.list()
+        return True
 
     def chat_structured(
         self,
@@ -189,6 +299,7 @@ class LLMProvider:
         del reasoning_effort  # accepted for interface compatibility
         if self.provider == "local":
             raise RuntimeError("Structured output is available only on a hosted provider.")
+        _require_cloud_consent(self.provider)
         if timeout is None:
             timeout = 20
         model = self.model_for(role)
@@ -211,6 +322,7 @@ class LLMProvider:
             *messages,
         ]
         extra_body = self._thinking_body(role)
+        structured_messages = _minimize_for_cloud(structured_messages)
         try:
             def _request():
                 kwargs = {
@@ -288,6 +400,8 @@ class LLMProvider:
         try:
             if self.provider == "local":
                 return self._complete_local(model, prompt, temperature, num_predict, timeout)
+            _require_cloud_consent(self.provider)
+            prompt = _minimize_for_cloud(prompt)
             extra_body = self._thinking_body(role)
             def _request():
                 kwargs = {
@@ -303,6 +417,23 @@ class LLMProvider:
 
             completion = self._cloud_with_retry(_request)
             content = completion.choices[0].message.content
+            if not (content or "").strip():
+                # Reasoning models intermittently return empty content at
+                # temperature 0. One bounded retry with light sampling.
+                def _retry_request():
+                    kwargs = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": max(temperature, 0.3),
+                        "max_tokens": num_predict,
+                        "timeout": timeout,
+                    }
+                    if extra_body:
+                        kwargs["extra_body"] = extra_body
+                    return self._cloud_client.chat.completions.create(**kwargs)
+
+                completion = self._cloud_with_retry(_retry_request)
+                content = completion.choices[0].message.content
             return (content or "").strip()
         except TimeoutError:
             raise
@@ -340,6 +471,8 @@ class LLMProvider:
         return response["message"]["content"].strip()
 
     def _chat_cloud(self, role, model, messages, temperature, num_predict, timeout):
+        _require_cloud_consent(self.provider)
+        messages = _minimize_for_cloud(messages)
         extra_body = self._thinking_body(role)
         def _request():
             kwargs = {
@@ -355,6 +488,23 @@ class LLMProvider:
 
         completion = self._cloud_with_retry(_request)
         content = completion.choices[0].message.content
+        if not (content or "").strip():
+            # Same bounded empty-content retry as complete(): reasoning models
+            # intermittently return nothing at temperature 0.
+            def _retry_request():
+                retry_kwargs = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": max(temperature, 0.3),
+                    "max_tokens": num_predict,
+                    "timeout": timeout,
+                }
+                if extra_body:
+                    retry_kwargs["extra_body"] = extra_body
+                return self._cloud_client.chat.completions.create(**retry_kwargs)
+
+            completion = self._cloud_with_retry(_retry_request)
+            content = completion.choices[0].message.content
         if not content:
             raise RuntimeError("Cloud LLM response was empty.")
         return content.strip()
@@ -389,6 +539,8 @@ class LLMProvider:
         blocks on the SDK's own long retry-after backoff. Here we wait only a
         short, capped delay and give up after a few attempts, raising the last
         error so callers fall back to templates instead of hanging on the request.
+        NOTE: blocking sleep is intentional here; async routes offload the
+        whole pipeline via asyncio.to_thread so the event loop never blocks.
         """
         last_exc = None
         for attempt in range(attempts):
@@ -425,6 +577,8 @@ class LLMProvider:
                 "Handwritten/scanned PDF extraction requires a hosted provider "
                 "with a vision model. Switch backend and retry."
             )
+        _require_cloud_consent(self.provider)
+        prompt = _minimize_for_cloud(prompt)
         content = [{"type": "text", "text": prompt}]
         for b64 in images:
             content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
@@ -468,9 +622,9 @@ class LLMProvider:
 def create_provider(provider="local", api_key=None, models=None, base_url=None):
     """Build an LLMProvider.
 
-    Policy: never silently switch backend. If a hosted provider ('cloud' or
-    'deepseek') is requested but its dependencies/key are missing, raise so the
-    caller/user decides (no silent downgrade to local). Switching provider
+    Policy: never silently switch backend. If a hosted provider ('cloud',
+    'deepseek' or 'omniroute') is requested but its dependencies/key are
+    missing, raise so the caller/user decides (no silent downgrade to local). Switching provider
     mid-session only happens through an explicit user action (see
     /api/provider/switch) — never automatically.
     """
@@ -495,5 +649,17 @@ def create_provider(provider="local", api_key=None, models=None, base_url=None):
         llm = LLMProvider("deepseek", api_key=api_key or os.getenv("DEEPSEEK_API_KEY"), models=models, base_url=base_url)
         if not llm._cloud_client.api_key:
             raise RuntimeError("Missing DEEPSEEK_API_KEY. Set it in .env or pass api_key.")
+        return llm
+    if provider == "omniroute":
+        try:
+            from openai import OpenAI  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "The OmniRoute provider is unavailable because the 'openai' package is not "
+                "installed (pip install openai). Choose another provider."
+            )
+        llm = LLMProvider("omniroute", api_key=api_key or os.getenv("OMNIROUTE_API_KEY"), models=models, base_url=base_url)
+        if not llm._cloud_client.api_key:
+            raise RuntimeError("Missing OMNIROUTE_API_KEY. Set it in .env or pass api_key.")
         return llm
     return LLMProvider("local", models=models)

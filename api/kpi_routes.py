@@ -16,7 +16,7 @@ from urllib.parse import quote_plus
 from sqlalchemy import create_engine, text
 
 from core.config import get_session, SCHEMA_DIR
-from core.deps import require_data, get_current_user
+from core.deps import require_data, get_current_user, reject_document_sql
 from core.secret_box import decrypt as _decrypt_secret
 from core.semantic import humanize, kpi_label
 from api.schema_intel import SchemaIntelligence, _safe_name, _run_sql
@@ -53,12 +53,15 @@ def _build_engine(session):
     if db_type == "mysql":
         uri = (f"mysql+pymysql://{quote_plus(str(db_config['user']))}:{quote_plus(str(db_config['password']))}"
                f"@{db_config['host']}:{db_config.get('port', 3306)}/{db_config['db']}")
+        return create_engine(uri, pool_pre_ping=True,
+                             connect_args={"connect_timeout": 10}), db_type, db_type
     else:
         uri = (f"postgresql://{quote_plus(str(db_config['user']))}:{quote_plus(str(db_config['password']))}"
                f"@{db_config['host']}:{db_config.get('port', 5432)}/{db_config['db']}"
                f"?options=-c%20search_path%3D{schema}")
 
-    return create_engine(uri, pool_pre_ping=True), db_type, db_type
+    return create_engine(uri, pool_pre_ping=True,
+                         connect_args={"connect_timeout": 10}), db_type, db_type
 
 
 def _fmt(v, is_currency=False):
@@ -213,7 +216,21 @@ def _profile_numeric(conn, tname: str, col: str, dialect: str) -> dict | None:
         return {"n": n, "nn": float(row[1] or 0), "distinct": float(row[2] or 0),
                 "sum": row[3], "avg": row[4], "min": row[5], "max": row[6]}
     except Exception:
+        _rollback(conn)
         return None
+
+
+def _rollback(conn) -> None:
+    """Reset a poisoned transaction so later queries on the same connection work.
+
+    PostgreSQL aborts the whole transaction on one failed statement (e.g. SUM
+    over a text column); without an explicit rollback every subsequent query
+    on that connection fails too — which once blanked the entire dashboard.
+    """
+    try:
+        conn.rollback()
+    except Exception:
+        pass
 
 
 def _variation(mean, lo, hi) -> float:
@@ -409,6 +426,7 @@ def _load_schema(session, user_id=None):
 def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user)):
     """Return real KPI metrics from any connected database."""
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     intel = _load_schema(session, user["user_id"])
     if not intel or not intel.tables:
         return {"ok": True, "kpis": [], "charts": [], "summary": {}}
@@ -624,6 +642,7 @@ def get_real_kpis(request: Request, user: dict = Depends(get_current_user)):
 def get_dashboard_summary(request: Request, user: dict = Depends(get_current_user)):
     """Return KPI summary with smart recommendations."""
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     intel = _load_schema(session, user["user_id"])
     if not intel or not intel.tables:
         return {"ok": True, "kpis": [], "charts": [], "recommendations": []}
@@ -667,6 +686,7 @@ def get_dashboard_summaries(request: Request, user: dict = Depends(get_current_u
     Insights, Predictive, Prescription, Hypothesis). Each summary is generated
     from the actual connected data using schema intelligence + quick queries."""
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     intel = _load_schema(session, user["user_id"])
     if not intel or not intel.tables:
         return {"ok": True, "sections": []}
@@ -845,6 +865,8 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                 "metrics": [],
                 "visualizations": [],
                 "sections": [],
+                "insights": [],
+                "anomalies": [],
                 "quality": {"score": 0, "issues": []},
                 "recommendations": [],
             },
@@ -890,6 +912,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         if row:
                             total_rows += row[0]
                     except Exception:
+                        _rollback(conn)
                         continue
 
                 if total_rows > 0:
@@ -901,7 +924,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         "format": "number",
                         "period": "All data",
                         "icon": "database",
-                        "color": "#4F46E5",
+                        "color": "#2F6FAD",
                     })
 
                 # ── Scored KPI candidates (spec §2-4, §13-15, §17) ──
@@ -912,6 +935,11 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     if intel.tables[tname].get("empty"):
                         continue
                     _m = intel.find_best_measure(tname)
+                    # Weak mappings can label text columns as measures; only
+                    # profile real numerics so one bad column cannot poison
+                    # the shared connection for every later query.
+                    if _m and _m not in intel.get_numeric_cols(tname):
+                        continue
                     if _m:
                         tables_with_measures.append((tname, _m))
                 for tname, measure in tables_with_measures[:5]:
@@ -967,6 +995,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                                         "is_currency": False, "date_col": dt_col, "tdesc": tdesc,
                                     })
                         except Exception:
+                            _rollback(conn)
                             pass
 
                 # Diversity pass: best of each kind first, then fill by score.
@@ -1022,6 +1051,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                                 change = round(((vals[0] - vals[1]) / abs(vals[1])) * 100, 1)
                                 period = "vs prev period"
                         except Exception:
+                            _rollback(conn)
                             pass
                     label = kpi_label(c["agg"], c["column"])
                     metrics.append({
@@ -1032,7 +1062,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         "format": "currency" if is_curr else "number",
                         "period": period,
                         "icon": "trending-up" if c["agg"] == "SUM" else "bar-chart",
-                        "color": "#059669" if is_curr else "#4F46E5",
+                        "color": "#059669" if is_curr else "#2F6FAD",
                         "score": c["score"],
                         "reason": f"Selected ({c['kind']}, score {c['score']}): {c['reason']}.",
                     })
@@ -1057,6 +1087,8 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     dt_col = intel.find_best_datetime(tname)
                     measure = intel.find_best_measure(tname)
                     if not dt_col or not measure:
+                        continue
+                    if measure not in intel.get_numeric_cols(tname):
                         continue
                     try:
                         srow = conn.execute(text(
@@ -1101,6 +1133,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                                            f"{'strong' if var > 0.5 else 'moderate' if var > 0.15 else 'low'} variation."),
                             })
                     except Exception:
+                        _rollback(conn)
                         continue
 
                 if True:
@@ -1109,6 +1142,8 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                             continue
                         measure = intel.find_best_measure(tname)
                         if not measure:
+                            continue
+                        if measure not in intel.get_numeric_cols(tname):
                             continue
                         # Candidate dimensions: best first, then other text cols.
                         # Skip near-unique ones (§13) instead of charting IDs.
@@ -1137,6 +1172,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                                     continue
                                 ranked_dims.append((crow[1], dim))
                             except Exception:
+                                _rollback(conn)
                                 continue
                         ranked_dims.sort(key=lambda x: x[0])
                         for _, dim in ranked_dims[:2]:
@@ -1170,6 +1206,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                                         })
                                         chart_done = True
                             except Exception:
+                                _rollback(conn)
                                 continue
 
                 # Diversity: one time + one category per measure first, then fill.
@@ -1218,6 +1255,8 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     measure = intel.find_best_measure(tname)
                     if not measure:
                         continue
+                    if measure not in intel.get_numeric_cols(tname):
+                        continue
                     tdesc = intel.tables[tname].get("description", tname)
                     is_curr = _is_currency_col(measure)
                     try:
@@ -1227,6 +1266,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         row = result.fetchone()
                         total = float(row[0]) if row and row[0] is not None else None
                     except Exception:
+                        _rollback(conn)
                         total = None
                     if total is not None:
                         sections.append({
@@ -1243,6 +1283,8 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     measure = intel.find_best_measure(tname)
                     dt = intel.find_best_datetime(tname)
                     if not measure or not dt:
+                        continue
+                    if measure not in intel.get_numeric_cols(tname):
                         continue
                     tdesc = intel.tables[tname].get("description", tname)
                     try:
@@ -1273,8 +1315,9 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                                         "description": f"{humanize(measure)} {direction} by {abs(change):.1f}% from {prev[0]} to {curr[0]}. Insights page has detailed analysis of all patterns.",
                                         "query": f"What are the trends in {humanize(measure).lower()}?",
                                     })
-                                    break
+                            break
                     except Exception:
+                        _rollback(conn)
                         continue
 
                 # Predictive
@@ -1283,10 +1326,18 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     dt = intel.find_best_datetime(tname)
                     if not measure or not dt:
                         continue
+                    if measure not in intel.get_numeric_cols(tname):
+                        continue
                     tdesc = intel.tables[tname].get("description", tname)
                     try:
+                        if dialect == "sqlite":
+                            _mexpr = f"strftime('%Y-%m', {_safe_name(dt, dialect)})"
+                        elif dialect == "mysql":
+                            _mexpr = f"DATE_FORMAT({_safe_name(dt, dialect)}, '%Y-%m')"
+                        else:
+                            _mexpr = f"TO_CHAR({_safe_name(dt, dialect)}, 'YYYY-MM')"
                         result = conn.execute(text(
-                            f"SELECT COUNT(DISTINCT strftime('%Y-%m', {_safe_name(dt, dialect)})) "
+                            f"SELECT COUNT(DISTINCT {_mexpr}) "
                             f"FROM {_safe_name(tname, dialect)} "
                             f"WHERE {_safe_name(dt, dialect)} IS NOT NULL"
                         ))
@@ -1302,6 +1353,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                             })
                             break
                     except Exception:
+                        _rollback(conn)
                         continue
 
                 # Prescription
@@ -1309,6 +1361,8 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     measure = intel.find_best_measure(tname)
                     dim = intel.find_best_dimension(tname)
                     if not measure or not dim:
+                        continue
+                    if measure not in intel.get_numeric_cols(tname):
                         continue
                     tdesc = intel.tables[tname].get("description", tname)
                     try:
@@ -1330,6 +1384,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                             })
                             break
                     except Exception:
+                        _rollback(conn)
                         continue
 
                 # Hypothesis
@@ -1383,10 +1438,54 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                                     })
                                     quality_score -= min(10, int(pct))
                     except Exception:
+                        _rollback(conn)
                         continue
 
         except Exception:
             pass
+
+    # ── Auto insights + anomalies (no prior ask needed) ──
+    # Runs the same detectors as /api/insights so the dashboard is alive
+    # immediately after connect. Best-effort: failures leave empty lists.
+    auto_insights: list[dict] = []
+    auto_anomalies: list[dict] = []
+    try:
+        from api.insights_routes import InsightsEngine, _SQLiteCompatConnection
+
+        _mapping = None
+        try:
+            _sp = Path(str(session.get("schema_path", "")))
+            if _sp.exists():
+                _mapping = json.loads(_sp.read_text(encoding="utf-8"))
+        except Exception:
+            _mapping = None
+        _iconn = None
+        if _mapping and _mapping.get("tables"):
+            try:
+                if dialect == "sqlite":
+                    import sqlite3 as _sqlite3
+
+                    _db_uri = session.get("db_uri", "") or ""
+                    _path = _db_uri[len("sqlite:///"):] if _db_uri.startswith("sqlite:///") else _db_uri
+                    _iconn = _SQLiteCompatConnection(_sqlite3.connect(_path))
+                elif engine is not None:
+                    _iconn = engine.raw_connection()
+                if _iconn is not None:
+                    _auto = InsightsEngine(_iconn, _mapping).generate_all_insights(max_insights=8)
+                    for _ins in _auto:
+                        if str(_ins.get("type", "")).lower() == "anomaly":
+                            if len(auto_anomalies) < 3:
+                                auto_anomalies.append(_ins)
+                        elif len(auto_insights) < 4:
+                            auto_insights.append(_ins)
+            finally:
+                try:
+                    if _iconn is not None:
+                        _iconn.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     config = {
         "summary": {
@@ -1399,6 +1498,8 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
         "metrics": metrics[:6],
         "visualizations": charts[:4],
         "sections": sections[:5],
+        "insights": auto_insights,
+        "anomalies": auto_anomalies,
         "quality": {"score": max(0, quality_score), "issues": quality_issues[:10]},
         "recommendations": recommendations[:6],
     }
@@ -1418,6 +1519,7 @@ def recommend_chart(request: Request, columns: str = "", user: dict = Depends(ge
     Returns recommended chart type and compatible alternatives.
     """
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     cols = [c.strip() for c in columns.split(",") if c.strip()]
 
     # Column types from the schema mapping (always available — no dependence

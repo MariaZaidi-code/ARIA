@@ -48,10 +48,11 @@ def classify_type(data_type: str) -> str:
 
 
 def _safe_name(name: str, dialect: str = "postgresql") -> str:
-    """Quote an identifier for the given dialect."""
+    """Quote an identifier for the given dialect (escapes embedded quotes)."""
+    safe = str(name or "")
     if dialect == "mysql":
-        return f"`{name}`"
-    return f'"{name}"'
+        return f"`{safe.replace('`', '``')}`"
+    return f'"{safe.replace(chr(34), chr(34) + chr(34))}"'
 
 
 def _run_sql(conn, sql: str, limit: int = 500):
@@ -64,6 +65,10 @@ def _run_sql(conn, sql: str, limit: int = 500):
         cur.close()
         return cols, [dict(zip(cols, row)) for row in rows]
     except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return [], []
 
 

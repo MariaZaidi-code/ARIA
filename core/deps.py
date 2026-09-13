@@ -42,23 +42,31 @@ def require_data(request: Request):
     return provider
 
 
+def reject_document_sql(session) -> None:
+    """Block SQL analytics on text-only document sources (t.txt-4).
+
+    Text PDFs stay `document` sources with a document:// URI and no tabular
+    session. SQL engines must refuse them with a pointer to Document Chat
+    instead of failing obscurely downstream.
+    """
+    if session.get("source_type") == "document" and str(
+            session.get("db_uri") or "").startswith("document://"):
+        raise HTTPException(
+            status_code=400,
+            detail="This source is a text document — use Document Chat "
+                   "(Copilot) instead of SQL analytics.",
+        )
+
+
 def get_current_user(request: Request, authorization: str | None = Header(default=None)) -> dict:
     """Resolve the Bearer token into a {user_id, username} dict or 401.
 
-    Header auth is preferred; ?token= is deprecated (leaks into logs/history)
-    but still accepted for backwards compatibility with existing clients.
+    Header-only: the legacy ?token= query fallback was removed because
+    tokens in URLs leak into server logs, proxy logs and browser history.
     """
-    import logging
-
     token = None
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
-    elif request.query_params.get("token"):
-        logging.getLogger("uvicorn.error").warning(
-            "Deprecated ?token= query auth used on %s; switch to Authorization header.",
-            request.url.path,
-        )
-        token = request.query_params.get("token")
     user = auth.verify_token(token) if token else None
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated. Provide a valid Bearer token.")

@@ -65,6 +65,28 @@ async def _security_headers(request: Request, call_next):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    # CSP is report-only friendly: allow same-origin + data/blob for charts/exports.
+    if request.url.path.startswith("/docs") or request.url.path.startswith("/redoc"):
+        pass
+    else:
+        resp.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:",
+        )
+    return resp
+
+
+@app.middleware("http")
+async def _request_id(request: Request, call_next):
+    """Attach a stable request ID (t.txt-7): full tracebacks are logged
+    server-side against it; clients only ever see the ID."""
+    import uuid as _uuid
+
+    rid = request.headers.get("X-Request-ID") or _uuid.uuid4().hex[:12]
+    request.state.request_id = rid
+    resp = await call_next(request)
+    resp.headers["X-Request-ID"] = rid
     return resp
 
 _cors_origins = os.getenv(
@@ -113,15 +135,17 @@ async def unhandled_exception(request: Request, exc: Exception):
     import logging
     import traceback
 
+    rid = getattr(request.state, "request_id", "unknown")
     logger = logging.getLogger("uvicorn.error")
-    logger.exception("Unhandled error on %s", request.url.path)
+    logger.exception("Unhandled error on %s [rid=%s]", request.url.path, rid)
     tb = traceback.format_exc()
-    logger.error("Full traceback:\n%s", tb)
+    logger.error("Full traceback [rid=%s]:\n%s", rid, tb)
     # Generic message to the client (detail is logged server-side only).
     return JSONResponse(
         status_code=500,
         content={
-            "detail": "An internal error occurred. Check server logs for details."
+            "detail": "Something went wrong. Reference ID: " + rid,
+            "request_id": rid,
         },
     )
 

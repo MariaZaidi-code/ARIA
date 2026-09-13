@@ -3,13 +3,13 @@ const { test, expect } = require('@playwright/test');
 
 test.describe('Auth flow (fixed)', () => {
   test('login page loads with inputs', async ({ page }) => {
-    await page.goto('http://localhost:5174');
+    await page.goto('http://localhost:8000');
     await page.waitForLoadState('networkidle');
     const inputs = await page.locator('input').count();
     expect(inputs).toBeGreaterThan(0);
   });
   test('seeded auth lands on dashboard with sidebar', async ({ page }) => {
-    await page.goto('http://localhost:5174');
+    await page.goto('http://localhost:8000');
     await page.waitForLoadState('networkidle');
     await page.evaluate(() => {
       localStorage.setItem('aria_auth_token', 'test_token_playwright_2024');

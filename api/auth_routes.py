@@ -34,12 +34,13 @@ class AuthRequest(BaseModel):
 
 @router.post("/api/auth/register")
 def register(auth_req: AuthRequest, request: Request):
-    """Create a user account and return a JWT."""
+    """Create a user account and return a JWT (generic error avoids enumeration)."""
     _check_login_rate_limit(request)
     try:
         user_id = auth.register(auth_req.username, auth_req.password)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError:
+        # Generic message: don't reveal whether the username is taken.
+        raise HTTPException(status_code=400, detail="Could not create account. Try a different username.")
     username = auth_req.username.strip()
     return {"ok": True, "token": auth.issue_token(user_id, username), "username": username}
 
@@ -61,8 +62,11 @@ def me(user: dict = Depends(get_current_user)):
 
 
 @router.post("/api/auth/logout")
-def logout(user: dict = Depends(get_current_user)):
-    """JWT is stateless; the client simply discards the token."""
+def logout(request: Request, user: dict = Depends(get_current_user)):
+    """Revoke the presented JWT and acknowledge logout."""
+    authorization = request.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        auth.revoke_token(authorization[7:].strip())
     return {"ok": True, "username": user["username"]}
 
 

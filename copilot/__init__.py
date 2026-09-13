@@ -10,6 +10,7 @@ from .schema_index import SchemaIndex, build_schema_index
 from .retriever import SchemaRetriever, RetrievedContext
 from .embeddings import create_embedder, Embedder
 from .conversation import ConversationMemory
+from .intent import classify, IntentResult
 from .sql_engine import SqlEngine, SqlResult
 from .pipeline import CopilotPipeline, CopilotAnswer, create_pipeline
 
@@ -21,6 +22,8 @@ __all__ = [
     "create_embedder",
     "Embedder",
     "ConversationMemory",
+    "classify",
+    "IntentResult",
     "SqlEngine",
     "SqlResult",
     "CopilotPipeline",

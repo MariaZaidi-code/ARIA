@@ -5,14 +5,16 @@ import re
 import time
 import types
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy import create_engine, text
 
 import schema_agent
 from core.config import SCHEMA_DIR, get_session, save_session
-from core.deps import get_current_user, require_data, require_writable
+from core.errors import sanitize_error
+from core.deps import get_current_user, require_data, require_writable, reject_document_sql
 from core.secret_box import decrypt as _decrypt_secret
 
 router = APIRouter()
@@ -35,9 +37,9 @@ def _get_db_config(session):
     driver = "mysql" if db_type == "mysql" else "postgresql"
     dialect = "mysql" if driver == "mysql" else "postgresql"
     if driver == "mysql":
-        engine_url = f"mysql+pymysql://{config.get('user', '')}:{config.get('password', '')}@{config.get('host', 'localhost')}:{config.get('port', 3306)}/{config.get('db', '')}"
+        engine_url = f"mysql+pymysql://{quote_plus(str(config.get('user', '')))}:{quote_plus(str(config.get('password', '')))}@{config.get('host', 'localhost')}:{config.get('port', 3306)}/{config.get('db', '')}"
     else:
-        engine_url = f"postgresql+psycopg2://{config.get('user', '')}:{config.get('password', '')}@{config.get('host', 'localhost')}:{config.get('port', 5432)}/{config.get('db', '')}"
+        engine_url = f"postgresql+psycopg2://{quote_plus(str(config.get('user', '')))}:{quote_plus(str(config.get('password', '')))}@{config.get('host', 'localhost')}:{config.get('port', 5432)}/{config.get('db', '')}"
     return config, db_type, engine_url
 
 
@@ -50,7 +52,8 @@ def _get_schema_mapping(session, user_id):
 
 
 def _get_user_overrides_path(user_id, db_name):
-    return SCHEMA_DIR / f"user_{user_id}" / f"overrides_{db_name}.json"
+    safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(db_name or "db"))[:64] or "db"
+    return SCHEMA_DIR / f"user_{user_id}" / f"overrides_{safe}.json"
 
 
 def _load_user_overrides(user_id, db_name):
@@ -99,7 +102,7 @@ def get_connection_health(request: Request, user: dict = Depends(get_current_use
                     result = conn.execute(text("SELECT 1"))
             status = "connected"
         except Exception as e:
-            status = f"error: {str(e)[:200]}"
+            status = f"error: {sanitize_error(e, 200)}"
     elif source_type in ("semi-structured", "document"):
         status = "connected"
     else:
@@ -154,7 +157,7 @@ def refresh_connection(request: Request, user: dict = Depends(require_writable))
             conn.execute(text("SELECT 1"))
         return {"ok": True, "status": "connected", "message": "Connection validated successfully."}
     except Exception as e:
-        return {"ok": False, "detail": f"Connection refresh failed: {str(e)[:300]}"}
+        return {"ok": False, "detail": f"Connection refresh failed: {sanitize_error(e)}"}
 
 
 # =============================================================
@@ -180,7 +183,7 @@ def get_data_summary(request: Request, user: dict = Depends(get_current_user)):
             with engine.connect() as conn:
                 for name in mapping.get("tables", {}):
                     try:
-                        result = conn.execute(text(f'SELECT COUNT(*) FROM "{name}"'))
+                        result = conn.execute(text(f"SELECT COUNT(*) FROM {_quote(name, db_type)}"))
                         row_counts[name] = result.scalar() or 0
                     except Exception:
                         row_counts[name] = 0
@@ -224,11 +227,17 @@ class PreviewRequest(BaseModel):
     sort_column: str = ""
     sort_direction: str = "ASC"
 
+    @field_validator("offset")
+    @classmethod
+    def _non_negative_offset(cls, v):
+        return max(0, int(v or 0))
+
 
 @router.post("/api/data/preview")
 def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(get_current_user)):
     """Return paginated rows from a table in the connected database."""
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     mapping = _get_schema_mapping(session, user["user_id"])
     if not mapping:
         raise HTTPException(status_code=400, detail="No schema extracted. Run schema extraction first.")
@@ -259,15 +268,24 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
     try:
         engine = create_engine(engine_url, pool_pre_ping=True)
         q_t = _quote(req.table, dialect)
+        # ILIKE is PostgreSQL-only; use portable LOWER(...) LIKE on others.
+        like_op = "ILIKE" if dialect == "postgresql" else "LIKE"
+
+        def _search_cond(columns):
+            if like_op == "ILIKE":
+                return " OR ".join(
+                    f"CAST({_quote(c, dialect)} AS TEXT) ILIKE :search" for c in columns[:20]
+                )
+            return " OR ".join(
+                f"LOWER(CAST({_quote(c, dialect)} AS TEXT)) LIKE LOWER(:search))"
+                for c in columns[:20]
+            )
 
         # Count total
         count_sql = f"SELECT COUNT(*) FROM {q_t}"
         params = {}
         if req.search and columns:
-            search_conditions = " OR ".join(
-                f"CAST({_quote(c, dialect)} AS TEXT) ILIKE :search" for c in columns[:20]
-            )
-            count_sql += f" WHERE {search_conditions}"
+            count_sql += f" WHERE {_search_cond(columns)}"
             params["search"] = f"%{req.search}%"
 
         with engine.connect() as conn:
@@ -278,10 +296,7 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
         query = f"SELECT {col_list} FROM {q_t}"
 
         if req.search and columns:
-            search_conditions = " OR ".join(
-                f"CAST({_quote(c, dialect)} AS TEXT) ILIKE :search" for c in columns[:20]
-            )
-            query += f" WHERE {search_conditions}"
+            query += f" WHERE {_search_cond(columns)}"
             params["search"] = f"%{req.search}%"
 
         if req.sort_column and req.sort_column in columns:
@@ -306,7 +321,7 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
             "offset": req.offset,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Preview failed: {str(e)[:300]}")
+        raise HTTPException(status_code=500, detail=f"Preview failed: {sanitize_error(e)}")
 
 
 # =============================================================
@@ -317,6 +332,7 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
 def get_column_profile(request: Request, table: str = "", user: dict = Depends(get_current_user)):
     """Return detailed column metadata and profiling for a table."""
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     mapping = _get_schema_mapping(session, user["user_id"])
     if not mapping:
         raise HTTPException(status_code=400, detail="No schema extracted.")
@@ -439,6 +455,7 @@ def get_column_profile(request: Request, table: str = "", user: dict = Depends(g
 def get_data_quality(request: Request, user: dict = Depends(get_current_user)):
     """Return data quality analysis for the connected database."""
     session = get_session(user["user_id"])
+    reject_document_sql(session)
     mapping = _get_schema_mapping(session, user["user_id"])
     if not mapping:
         return {"ok": True, "quality": {"overall": 0, "issues": [], "metrics": {}}}

@@ -17,13 +17,14 @@ const tabs: { id: Tab; label: string; icon: React.ElementType }[] = [
 interface SettingsProps {
   selectedLLM?: string;
   onChangeLLM?: () => void;
+  onProviderSwitched?: (provider: string) => void;
   user?: { email?: string; username?: string } | null;
   connectionStatus?: string;
   dbName?: string;
   selectedSourceType?: string;
 }
 
-export default function Settings({ selectedLLM, onChangeLLM, user, connectionStatus, dbName, selectedSourceType }: SettingsProps) {
+export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched, user, connectionStatus, dbName, selectedSourceType }: SettingsProps) {
   const { isDark, toggleTheme } = useTheme();
   const [tab, setTab] = useState<Tab>("profile");
   const [displayName, setDisplayName] = useState(user?.username || "User");
@@ -31,7 +32,7 @@ export default function Settings({ selectedLLM, onChangeLLM, user, connectionSta
   const [role, setRole] = useState("Business Analyst");
   const [providers, setProviders] = useState<any[]>([]);
   const [apiKey, setApiKey] = useState("");
-  const [selectedProvider, setSelectedProvider] = useState("groq");
+  const [selectedProvider, setSelectedProvider] = useState("cloud");
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
   const [notifAnalysis, setNotifAnalysis] = useState(true);
@@ -66,18 +67,21 @@ export default function Settings({ selectedLLM, onChangeLLM, user, connectionSta
   };
 
   const saveProvider = async () => {
-    if (!apiKey.trim()) return;
+    if (selectedProvider !== "local" && !apiKey.trim()) return;
     setSaving(true);
     try {
       const token = localStorage.getItem("aria_auth_token");
-      await fetch("/api/settings/providers", {
+      const res = await fetch("/api/settings/providers", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ provider: selectedProvider, api_key: apiKey, is_default: true }),
       });
-      setSaveMsg("Provider saved"); setApiKey(""); fetchProviders();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.detail || "Failed to save provider");
+      onProviderSwitched?.(data.provider || selectedProvider);
+      setSaveMsg(data.message || "Provider saved"); setApiKey(""); fetchProviders();
       setTimeout(() => setSaveMsg(""), 3000);
-    } catch { setSaveMsg("Failed"); } finally { setSaving(false); }
+    } catch (e: any) { setSaveMsg(e?.message || "Failed"); } finally { setSaving(false); }
   };
 
   return (
@@ -192,17 +196,19 @@ export default function Settings({ selectedLLM, onChangeLLM, user, connectionSta
               <p className="text-sm font-medium text-foreground">Add API Key</p>
               <div className="flex gap-2">
                 <select value={selectedProvider} onChange={(e) => setSelectedProvider(e.target.value)}
-                  className="bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none w-36">
-                  <option value="groq">Groq</option>
-                  <option value="openai">OpenAI</option>
-                  <option value="anthropic">Anthropic</option>
-                  <option value="ollama">Ollama (local)</option>
+                  className="bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none w-40">
+                  <option value="cloud">Cloud (Groq)</option>
+                  <option value="deepseek">DeepSeek</option>
+                  <option value="omniroute">Universal (OmniRoute)</option>
+                  <option value="local">Local (Ollama)</option>
                 </select>
-                <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="Paste your API key..." className="flex-1 bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-primary transition-colors" />
-                <button onClick={saveProvider} disabled={!apiKey.trim() || saving}
+                {selectedProvider !== "local" && (
+                  <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)}
+                    placeholder="Paste your API key..." className="flex-1 bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:border-primary transition-colors" />
+                )}
+                <button onClick={saveProvider} disabled={(selectedProvider !== "local" && !apiKey.trim()) || saving}
                   className="bg-primary text-primary-foreground px-3 py-2 rounded-lg text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50">
-                  {saving ? "Saving..." : "Save"}
+                  {saving ? "Verifying..." : "Save & Activate"}
                 </button>
               </div>
             </div>
@@ -221,7 +227,7 @@ export default function Settings({ selectedLLM, onChangeLLM, user, connectionSta
               <div className="pt-3 border-t border-border">
                 <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-2">Current AI Mode</p>
                 <div className="flex items-center justify-between py-2 px-3 bg-primary/5 border border-primary/20 rounded-lg">
-                  <span className="text-sm font-medium text-primary capitalize">{selectedLLM === "local" ? "Local LLM (Ollama)" : selectedLLM === "cloud" ? "Cloud LLM (Groq)" : selectedLLM}</span>
+                  <span className="text-sm font-medium text-primary capitalize">{selectedLLM === "local" ? "Local LLM (Ollama)" : selectedLLM === "cloud" ? "Cloud LLM (Groq)" : selectedLLM === "deepseek" ? "DeepSeek" : selectedLLM === "omniroute" ? "Universal (OmniRoute)" : selectedLLM}</span>
                   {onChangeLLM && (
                     <button onClick={onChangeLLM} className="text-[11px] text-primary hover:underline">Change</button>
                   )}

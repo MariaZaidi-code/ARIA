@@ -84,18 +84,22 @@ def clean_sql(raw: str) -> str:
 def _dialect_rules(dialect: str) -> str:
     if dialect == "mysql":
         return (
-            "MySQL syntax: quote identifiers with backticks, use DATE_FORMAT(col, '%Y-%m') "
-            "for month grouping and CURDATE()/NOW() for current time. "
-            "There is no ILIKE; use LIKE. Use LIMIT for row caps."
+            "MySQL syntax: quote identifiers with backticks (always quote names "
+            "containing spaces or special characters, e.g. `Order Date`), use "
+            "DATE_FORMAT(col, '%Y-%m') for month grouping and CURDATE()/NOW() "
+            "for current time. There is no ILIKE; use LIKE. Use LIMIT for row caps."
         )
     if dialect == "sqlite":
         return (
             "SQLite syntax: use strftime('%Y-%m', col) for month grouping and "
-            "date('now') for current date. Use LIMIT for row caps."
+            "date('now') for current date. Column names may contain spaces — "
+            "always wrap such names in double quotes (e.g. \"Order Date\"). "
+            "Use LIMIT for row caps."
         )
     return (
         "PostgreSQL syntax: use date_trunc('month', col) for month grouping and "
-        "CURRENT_DATE for today. You may use ILIKE for case-insensitive match. Use LIMIT."
+        "CURRENT_DATE for today. You may use ILIKE for case-insensitive match. "
+        "Always double-quote identifiers containing spaces or mixed case. Use LIMIT."
     )
 
 
@@ -119,6 +123,8 @@ def build_sql_prompt(question: str, ctx, dialect: str, feedback: str | None = No
         "(one row per group, month, product, customer, etc.).\n"
         "- Use only SELECT (never modify data).\n"
         "- Reference only the tables/columns provided; join via the relationships shown.\n"
+        "- Lines starting with 'Previous ' are conversation context from an earlier "
+        "question, never schema: FROM/JOIN only tables named under SCHEMA CONTEXT.\n"
         "- Add a LIMIT (<= 1000) unless the question is a single summary value.\n"
         "- Output ONLY the SQL statement, no explanation, no markdown fences.\n"
     )
@@ -128,7 +134,7 @@ class SqlEngine:
     """Runs validated read-only SQL against a SQLAlchemy URI."""
 
     def __init__(self, db_uri: str, dialect: str = "postgresql",
-                 max_rows: int = 1000, max_attempts: int = 2):
+                 max_rows: int = 1000, max_attempts: int = 3):
         self.db_uri = db_uri
         self.dialect = dialect or "postgresql"
         self.max_rows = int(max_rows)
@@ -195,8 +201,12 @@ class SqlEngine:
         for attempt in range(1, self.max_attempts + 1):
             prompt = build_sql_prompt(question, ctx, self.dialect, feedback)
             try:
-                raw = llm.complete(model_role, prompt, temperature=0.0,
-                                   num_predict=700, timeout=30)
+                # SQL answers are short: cap tokens so CPU inference finishes
+                # well inside the timeout instead of timing out mid-generation.
+                # Repair attempts use light sampling so an empty first pass
+                # does not repeat identically.
+                raw = llm.complete(model_role, prompt, temperature=0.0 if attempt == 1 else 0.2,
+                                   num_predict=300, timeout=180)
             except Exception as exc:
                 return SqlResult(ok=False, error=f"LLM SQL generation failed: {exc}",
                                  attempts=attempt, dialect=self.dialect)
@@ -207,5 +217,9 @@ class SqlEngine:
                 return result
             last = result
             feedback = result.error
+            # Point the repair at the valid tables so a hallucinated table
+            # name gets replaced instead of repeated.
+            if tables and "Unknown table" in (result.error or ""):
+                feedback += f" Valid tables: {', '.join(sorted(tables.keys()))}."
             log.info("Copilot SQL attempt %d failed: %s", attempt, result.error)
         return last

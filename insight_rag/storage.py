@@ -17,6 +17,7 @@ from .config import RAG_COLLECTION_PREFIX, RAG_DATABASE_URL, user_dir, user_key
 from .embeddings import FastBGEEmbeddings
 
 _LOCK = threading.RLock()
+_VECTOR_STORE_CACHE: dict[str, object] = {}
 
 
 def _utc_now() -> str:
@@ -190,6 +191,23 @@ class ConversationStore:
             )
             payload["updated_at"] = _utc_now()
             _atomic_write(self._path(conversation_id), payload)
+
+
+def get_user_vector_store(user_id: str | int):
+    """Return a cached per-user PGVector store (isolation key = user_id).
+
+    Reuse avoids reconstructing PGVector + connection overhead on every
+    query. Cache key includes only the user so one user's vectors never
+    leak into another user's retrieval.
+    """
+    key = str(user_id)
+    with _LOCK:
+        cached = _VECTOR_STORE_CACHE.get(key)
+        if cached is not None:
+            return cached
+        store = UserPGVectorStore(user_id)
+        _VECTOR_STORE_CACHE[key] = store
+        return store
 
 
 class UserPGVectorStore:

@@ -14,8 +14,10 @@ ARIA without modifying the Schema Agent or Goal Agent:
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
+import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -105,6 +107,8 @@ def _normalize_date_columns(df, column_logical_types: dict) -> dict[str, str]:
     Only touches STRING columns with date-like names whose slash format is
     provably resolved. Ambiguous columns are left untouched (values preserved).
     Returns {column: note} for observability.
+    Sampling is stratified (head/middle/tail, up to 1000) so mixed-format
+    files are not misclassified from the first 200 rows alone.
     """
     notes: dict[str, str] = {}
     for name, logical in column_logical_types.items():
@@ -113,7 +117,17 @@ def _normalize_date_columns(df, column_logical_types: dict) -> dict[str, str]:
         low = str(name).lower()
         if not any(h in low for h in _DATE_NAME_HINTS):
             continue
-        samples = [v for v in df[name].dropna().astype(str).tolist() if v.strip()][:200]
+        try:
+            series = df[name].dropna().astype(str)
+            n = len(series)
+            if n > 1000:
+                idx = sorted(set(list(range(0, min(400, n))) + list(range(max(0, n - 300), n)) + list(range(n // 3, min(n, n // 3 + 300)))))
+                vals = [series.iloc[i] for i in idx]
+            else:
+                vals = series.tolist()
+            samples = [v for v in vals if str(v).strip()][:1000]
+        except Exception:
+            samples = [v for v in df[name].dropna().astype(str).tolist() if v.strip()][:1000]
         if not samples or any("-" in s and "/" not in s for s in samples[:5]):
             continue  # already ISO-like or empty
         fmt = _resolve_slash_date_format(samples)
@@ -198,7 +212,7 @@ def build_csv_schema_mapping(csv_path: str | Path, table_name: str | None = None
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "snapshot_id": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),
+        "snapshot_id": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + _uuid.uuid4().hex[:8],
         "database": _safe_db_name(Path(csv_path).stem),
         "schema": "file",
         "tables": tables_mapping,
@@ -258,6 +272,10 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
     identifiers with leading zeros are preserved); missing tokens are NULL.
 
     Returns (db_uri, table_name, row_count).
+
+    Large frames use a chunked insert path (bounded batches via iloc slices)
+    so a 100MB CSV does not duplicate the full frame via to_dict at once.
+    Small frames keep the original single-pass behavior.
     """
     extractor = CsvSchemaExtractor(csv_path)
     profile = extractor.extract()
@@ -280,6 +298,7 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
     try:
         _date_notes = _normalize_date_columns(df, column_logical_types)
     except Exception:
+        logging.getLogger("aria.csv").exception("Date normalization failed; continuing with raw values")
         _date_notes = {}
     column_types = {
         name: _SQLITE_TYPE.get(logical, "TEXT")
@@ -287,6 +306,8 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
     }
     col_names = list(column_types)
 
+    if not col_names:
+        raise ValueError("CSV has no columns; refusing to create an empty SQLite table.")
     ddl_cols = ", ".join(f'{_quote_ident(name)} {column_types[name]}' for name in col_names)
     col_sql = ", ".join(_quote_ident(name) for name in col_names)
     placeholders = ", ".join("?" for _ in col_names)
@@ -294,20 +315,30 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
     conn = sqlite3.connect(str(sqlite_path))
     try:
         conn.execute(f'CREATE TABLE {_quote_ident(table)} ({ddl_cols})')
-        batch: list[list[Any]] = []
-        for record in df.to_dict(orient="records"):
-            batch.append([_coerce_value(record.get(name), column_logical_types[name]) for name in col_names])
-            if len(batch) >= _INSERT_BATCH:
-                conn.executemany(
-                    f'INSERT INTO {_quote_ident(table)} ({col_sql}) VALUES ({placeholders})',
-                    batch,
-                )
-                batch = []
-        if batch:
-            conn.executemany(
-                f'INSERT INTO {_quote_ident(table)} ({col_sql}) VALUES ({placeholders})',
-                batch,
-            )
+        insert_sql = f'INSERT INTO {_quote_ident(table)} ({col_sql}) VALUES ({placeholders})'
+        try:
+            if len(df) > _INSERT_BATCH * 2:
+                # Chunked path: bounded iloc slices, no full-frame to_dict.
+                for start in range(0, len(df), _INSERT_BATCH):
+                    chunk = df.iloc[start:start + _INSERT_BATCH]
+                    batch = [
+                        [_coerce_value(rec.get(name), column_logical_types[name]) for name in col_names]
+                        for rec in chunk.to_dict(orient="records")
+                    ]
+                    if batch:
+                        conn.executemany(insert_sql, batch)
+            else:
+                batch: list[list[Any]] = []
+                for record in df.to_dict(orient="records"):
+                    batch.append([_coerce_value(record.get(name), column_logical_types[name]) for name in col_names])
+                    if len(batch) >= _INSERT_BATCH:
+                        conn.executemany(insert_sql, batch)
+                        batch = []
+                if batch:
+                    conn.executemany(insert_sql, batch)
+        except Exception:
+            logging.getLogger("aria.csv").exception("CSV SQLite ingestion failed")
+            raise
         conn.commit()
     finally:
         conn.close()

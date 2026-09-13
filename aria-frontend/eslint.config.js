@@ -14,8 +14,12 @@ export default defineConfig([
       reactRefresh.configs.vite,
     ],
     languageOptions: {
-      globals: globals.browser,
+      globals: { ...globals.browser, process: "readonly" },
       parserOptions: { ecmaFeatures: { jsx: true } },
+    },
+    rules: {
+      // Backend-error propagation pattern: intentional re-throw with new message.
+      "preserve-caught-error": "off",
     },
   },
 ])

@@ -30,9 +30,26 @@ const USER_KEY = "aria_auth_user";
 // =========================================================
 
 const toBackendUsername = (email) => {
-  const cleaned = normalizeEmail(email).replace(/[^a-z0-9_.-]/g, "");
+  // Collision-safe: "@" -> "_at_", "+" -> "_plus_", "." preserved.
+  // "a.b@gmail.com" and "ab@gmail.com" now map to distinct usernames.
+  const cleaned = normalizeEmail(email)
+    .replace(/@/g, "_at_")
+    .replace(/\+/g, "_plus_")
+    .replace(/[^a-z0-9_.-]/g, "");
 
-  return cleaned.length >= 3 ? cleaned : `user${cleaned}`;
+  return cleaned.length >= 3 ? cleaned : `user_${cleaned}`;
+};
+
+export const isTokenExpired = (token) => {
+  try {
+    const parts = (token || "").split(".");
+    if (parts.length !== 3) return false;
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (!payload.exp) return false;
+    return Date.now() / 1000 > payload.exp;
+  } catch {
+    return false;
+  }
 };
 
 // =========================================================
@@ -62,6 +79,7 @@ export const getAuthUser = () => {
 };
 
 export const setAuthSession = (token, username, email) => {
+  if (!token) return;
   localStorage.setItem(TOKEN_KEY, token || "");
 
   localStorage.setItem(

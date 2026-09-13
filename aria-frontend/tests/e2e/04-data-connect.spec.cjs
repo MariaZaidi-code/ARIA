@@ -1,27 +1,28 @@
 // CommonJS // Playwright e2e: Data source connection flow (all 4 types)
+// Single host: http://localhost:8000. One login per file (auth limiter).
 const { test, expect } = require('@playwright/test');
+const { seedAuth } = require('./auth-helper');
 
-const BASE = 'http://localhost:5174';
-
-async function seedAuth(page, llmMode = 'local') {
-  await page.goto(BASE);
-  await page.evaluate((mode) => {
-    localStorage.setItem('aria_auth_token', 'test_token_playwright_2024');
-    localStorage.setItem('aria_auth_user', JSON.stringify({ email: 'test@aria.ai', username: 'TestUser' }));
-    localStorage.setItem('aria_llm_mode', mode);
-    localStorage.setItem('aria_db_configured', 'false');
-  }, llmMode);
-}
+const BASE = 'http://localhost:8000';
 
 test.describe('Data source connection flow', () => {
-  test('Data page shows 4 source type cards', async ({ page }) => {
-    await seedAuth(page);
+  let page;
+  test.beforeAll(async ({ browser }) => {
+    page = await browser.newPage();
+    await seedAuth(page, BASE);
+  });
+  test.afterAll(async () => { await page.close(); });
+
+  async function gotoData() {
     await page.goto(BASE);
     await page.waitForLoadState('networkidle');
-    // Navigate to Data page
     const dataBtn = page.getByRole('button', { name: /Data/i }).first();
     if (await dataBtn.count() > 0) await dataBtn.click();
     await page.waitForTimeout(1000);
+  }
+
+  test('Data page shows 4 source type cards', async () => {
+    await gotoData();
     // Should show cards for PostgreSQL, MySQL, CSV, PDF
     const pageContent = await page.content();
     const hasPostgres = /PostgreSQL|postgresql|postgres/i.test(pageContent);
@@ -31,13 +32,8 @@ test.describe('Data source connection flow', () => {
     expect(hasPostgres || hasMySQL || hasCSV || hasPDF).toBeTruthy();
   });
 
-  test('PostgreSQL card is clickable', async ({ page }) => {
-    await seedAuth(page);
-    await page.goto(BASE);
-    await page.waitForLoadState('networkidle');
-    const dataBtn = page.getByRole('button', { name: /Data/i }).first();
-    if (await dataBtn.count() > 0) await dataBtn.click();
-    await page.waitForTimeout(1000);
+  test('PostgreSQL card is clickable', async () => {
+    await gotoData();
     // Click PostgreSQL card or source type button
     const pgBtn = page.getByRole('button', { name: /PostgreSQL|postgres/i }).first();
     if (await pgBtn.count() > 0) {
@@ -49,13 +45,8 @@ test.describe('Data source connection flow', () => {
     }
   });
 
-  test('CSV card shows file picker', async ({ page }) => {
-    await seedAuth(page);
-    await page.goto(BASE);
-    await page.waitForLoadState('networkidle');
-    const dataBtn = page.getByRole('button', { name: /Data/i }).first();
-    if (await dataBtn.count() > 0) await dataBtn.click();
-    await page.waitForTimeout(1000);
+  test('CSV card shows file picker', async () => {
+    await gotoData();
     const csvBtn = page.getByRole('button', { name: /CSV|csv/i }).first();
     if (await csvBtn.count() > 0) {
       await csvBtn.click();
@@ -65,13 +56,15 @@ test.describe('Data source connection flow', () => {
     }
   });
 
-  test('Cloud LLM selection shows Groq info', async ({ page }) => {
-    await seedAuth(page, 'cloud');
-    await page.goto(BASE);
-    await page.waitForLoadState('networkidle');
-    // Dashboard or AppShell should show "Cloud" indicator
-    const content = await page.content();
-    const hasCloud = /Cloud|cloud|Groq|groq/i.test(content);
-    expect(hasCloud).toBeTruthy();
+  test('Cloud LLM selection shows Groq info', async ({ browser }) => {
+    const cloudPage = await browser.newPage();
+    try {
+      await seedAuth(cloudPage, BASE, 'Cloud AI');
+      const content = await cloudPage.content();
+      const hasCloud = /Cloud|cloud|Groq|groq/i.test(content);
+      expect(hasCloud).toBeTruthy();
+    } finally {
+      await cloudPage.close();
+    }
   });
 });

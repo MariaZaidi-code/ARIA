@@ -18,7 +18,7 @@ interface AIAnalyticsProps {
   loading?: boolean;
 }
 
-const CHART_COLORS = ["#4F46E5", "#059669", "#F59E0B", "#EC4899", "#06B6D4", "#8B5CF6", "#EF4444", "#14B8A6"];
+const CHART_COLORS = ["#2F6FAD", "#2E9B6B", "#C98A1B", "#B85C4D", "#5B7C99", "#7A9E43", "#C65D3A", "#4C9A9A"];
 
 // Dynamic suggestions from the actual analysis result — fully database-independent.
 function getDynamicSuggestions(goalResult: any): string[] {
@@ -488,12 +488,16 @@ export default function AIAnalytics({
               {/* Server-defined KPIs (t.txt-5): rendered as-is, never recomputed */}
               {goalResult?.display?.kpis && Object.keys(goalResult.display.kpis).length > 0 && (
                 <div className="flex flex-wrap gap-2 pt-1">
-                  {Object.entries(goalResult.display.kpis).slice(0, 3).map(([k, v]: any) => (
-                    <span key={k} className="text-[11px] px-2 py-1 rounded-md bg-secondary border border-border text-muted-foreground">
-                      {k}: <span className="text-foreground font-semibold">{Number(v.sum).toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>
-                      <span className="ml-1">avg {Number(v.avg).toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>
-                    </span>
-                  ))}
+                  {Object.entries(goalResult.display.kpis).slice(0, 3).map(([k, v]: any) => {
+                    const sum = Number(v?.sum);
+                    const avg = Number(v?.avg);
+                    return (
+                      <span key={k} className="text-[11px] px-2 py-1 rounded-md bg-secondary border border-border text-muted-foreground">
+                        {k}: <span className="text-foreground font-semibold">{isNaN(sum) ? "—" : sum.toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>
+                        <span className="ml-1">avg {isNaN(avg) ? "—" : avg.toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>
+                      </span>
+                    );
+                  })}
                 </div>
               )}
               {/* Feedback buttons — personalization signal (Section 62) */}
@@ -549,7 +553,7 @@ export default function AIAnalytics({
                     <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
                     <Tooltip content={<BizTooltip />} />
-                    <Area type="monotone" dataKey={yKey} stroke="#4F46E5" fill="#4F46E5" fillOpacity={0.15} strokeWidth={2} />
+                    <Area type="monotone" dataKey={yKey} stroke="#2F6FAD" fill="#2F6FAD" fillOpacity={0.15} strokeWidth={2} />
                   </AreaChart>
                 ) : chartType === "scatter" ? (
                   <ScatterChart>
@@ -560,7 +564,7 @@ export default function AIAnalytics({
                       content={<BizTooltip />}
                       cursor={{ strokeDasharray: "3 3" }}
                     />
-                    <Scatter data={chartRenderData} fill="#4F46E5" fillOpacity={0.6} />
+                    <Scatter data={chartRenderData} fill="#2F6FAD" fillOpacity={0.6} />
                   </ScatterChart>
                 ) : chartType === "hbar" ? (
                   <BarChart data={chartRenderData} layout="vertical" barSize={22}>
@@ -612,7 +616,7 @@ export default function AIAnalytics({
                       {chartRenderData.map((row: any, i: number) => (
                         <Cell
                           key={i}
-                          fill={chartType === "histogram" ? "#4F46E5" : colorForName(String(row?.[xKey] ?? i))}
+                          fill={chartType === "histogram" ? "#2F6FAD" : colorForName(String(row?.[xKey] ?? i))}
                           fillOpacity={chartType === "histogram" ? 0.55 + (0.45 * i) / Math.max(1, chartRenderData.length) : 1}
                         />
                       ))}

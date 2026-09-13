@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Search, Trash2, Bookmark, ExternalLink, ChevronDown, Clock } from "lucide-react";
+import { Search, Trash2, Bookmark, ChevronDown, Clock } from "lucide-react";
 
 type Category = "All" | "Analytics" | "Insight" | "Prediction" | "Prescription" | "Hypothesis";
 
@@ -25,11 +25,10 @@ interface HistoryItem {
 
 interface Props {
   historyRefreshKey?: number;
-  onOpenHistory?: (session: any) => void;
   onDeleteHistory?: (id: string) => void;
 }
 
-export default function History({ historyRefreshKey = 0, onOpenHistory, onDeleteHistory }: Props) {
+export default function History({ historyRefreshKey = 0, onDeleteHistory }: Props) {
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState<Category>("All");
   const [sort, setSort] = useState("newest");
@@ -37,6 +36,34 @@ export default function History({ historyRefreshKey = 0, onOpenHistory, onDelete
   const [saved, setSaved] = useState<string[]>([]);
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(false);
+  // Inline detail stays on this page (pages are isolated — no navigation).
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [details, setDetails] = useState<Record<string, any>>({});
+  const [detailLoading, setDetailLoading] = useState<string | null>(null);
+
+  const toggleDetail = async (id: string) => {
+    if (expandedId === id) {
+      setExpandedId(null);
+      return;
+    }
+    setExpandedId(id);
+    if (details[id]) return;
+    setDetailLoading(id);
+    try {
+      const token = localStorage.getItem("aria_auth_token");
+      const res = await fetch(`/api/history/${id}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (res.ok && data?.record) {
+        setDetails((d) => ({ ...d, [id]: data.record }));
+      }
+    } catch (err) {
+      console.debug("[ARIA] history detail failed:", err);
+    } finally {
+      setDetailLoading(null);
+    }
+  };
 
   useEffect(() => {
     fetchHistory();
@@ -155,7 +182,8 @@ export default function History({ historyRefreshKey = 0, onOpenHistory, onDelete
           {sorted.map((item) => {
             const isSaved = saved.includes(item.id);
             return (
-              <div key={item.id} className="premium-card bg-card border border-border rounded-xl p-4 flex items-center gap-4 group cursor-default">
+              <div key={item.id} className="premium-card bg-card border border-border rounded-xl p-4 group cursor-default">
+                <div className="flex items-center gap-4">
                 <div className="flex-1 min-w-0 space-y-1.5">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${typeStyle[item.type] || "text-muted-foreground bg-secondary"}`}>
@@ -171,9 +199,10 @@ export default function History({ historyRefreshKey = 0, onOpenHistory, onDelete
                   <span className="text-xs text-muted-foreground hidden md:block whitespace-nowrap">{item.date}</span>
                   <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                     <button
-                      onClick={() => onOpenHistory?.(item)}
+                      onClick={() => toggleDetail(item.id)}
+                      aria-label={expandedId === item.id ? "Collapse details" : "Expand details"}
                       className="p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors">
-                      <ExternalLink size={13} />
+                      <ChevronDown size={13} className={`transition-transform ${expandedId === item.id ? "rotate-180" : ""}`} />
                     </button>
                     <button
                       onClick={() => setSaved((s) => isSaved ? s.filter((x) => x !== item.id) : [...s, item.id])}
@@ -187,6 +216,42 @@ export default function History({ historyRefreshKey = 0, onOpenHistory, onDelete
                     </button>
                   </div>
                 </div>
+                </div>
+                {expandedId === item.id && (
+                  <div className="mt-3 pt-3 border-t border-border space-y-2">
+                    {detailLoading === item.id ? (
+                      <p className="text-xs text-muted-foreground">Loading details…</p>
+                    ) : details[item.id] ? (
+                      <>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                          <div>
+                            <p className="text-muted-foreground">Rows</p>
+                            <p className="font-semibold text-foreground">{details[item.id].row_count ?? "—"}</p>
+                          </div>
+                          <div>
+                            <p className="text-muted-foreground">Source</p>
+                            <p className="font-semibold text-foreground">{details[item.id].db_name || item.source}</p>
+                          </div>
+                          <div>
+                            <p className="text-muted-foreground">Date</p>
+                            <p className="font-semibold text-foreground">{details[item.id].created_at ? new Date(details[item.id].created_at).toLocaleString() : item.date}</p>
+                          </div>
+                          <div>
+                            <p className="text-muted-foreground">Columns</p>
+                            <p className="font-semibold text-foreground truncate">{(details[item.id].columns || []).join(", ") || "—"}</p>
+                          </div>
+                        </div>
+                        {details[item.id].sql_used && (
+                          <pre className="font-mono text-[11px] text-foreground bg-muted/50 rounded-lg px-3 py-2 overflow-x-auto whitespace-pre-wrap">
+                            {details[item.id].sql_used}
+                          </pre>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">Details unavailable for this entry.</p>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}

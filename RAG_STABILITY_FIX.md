@@ -7,4 +7,4 @@ This branch addresses two live issues observed in the Insight PDF-RAG logs:
 
 The semantic routing policy, retrieval stack, grounding checks, citation validation, and selected model are unchanged.
 
-Regression coverage is in `tests/test_rag_groq_stability.py`.
+Regression coverage is in `tests/test_rag_cloud_provider_stability.py`.

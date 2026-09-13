@@ -1,10 +1,10 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useTheme } from "../App";
 import type { Page } from "../App";
 import {
   LayoutDashboard, Sparkles, Lightbulb, TrendingUp, Target,
   FlaskConical, Database, Bot, Clock, Settings, FileText,
-  ChevronLeft, ChevronRight, Bell, Sun, Moon,
+  Bell, Sun, Moon, Menu,
   Search, LogOut, ChevronDown,
 } from "lucide-react";
 
@@ -15,7 +15,7 @@ const navGroups: { label: string; items: { id: Page; label: string; icon: React.
       { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
       { id: "analytics", label: "AI Analytics", icon: Sparkles },
       { id: "insights", label: "Insights", icon: Lightbulb },
-      { id: "predictive", label: "Predictive", icon: TrendingUp },
+      { id: "predictive", label: "Forecast", icon: TrendingUp },
       { id: "prescription", label: "Prescription", icon: Target },
       { id: "hypothesis", label: "Hypothesis", icon: FlaskConical },
     ],
@@ -41,7 +41,7 @@ const pageTitles: Record<Page, string> = {
   dashboard: "Dashboard",
   analytics: "AI Analytics",
   insights: "Insights",
-  predictive: "Predictive Analysis",
+  predictive: "Forecast",
   prescription: "Prescription",
   hypothesis: "Hypothesis",
   data: "Data",
@@ -62,8 +62,20 @@ interface Props {
 
 export default function AppShell({ children, user, selectedLLM, dbName, onChangeLLM, onSignOut }: Props) {
   const { isDark, toggleTheme, page, setPage } = useTheme();
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("aria_sidebar_collapsed") === "1";
+    } catch {
+      return false;
+    }
+  });
   const [profileOpen, setProfileOpen] = useState(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("aria_sidebar_collapsed", collapsed ? "1" : "0");
+    } catch { /* private mode: session-only */ }
+  }, [collapsed]);
 
   return (
     <div className="flex h-screen bg-background font-sans text-foreground overflow-hidden">
@@ -108,6 +120,8 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
                       key={id}
                       onClick={() => setPage(id)}
                       title={collapsed ? label : undefined}
+                      aria-current={active ? "page" : undefined}
+                      aria-label={label}
                       className={`relative w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-[13px] transition-all duration-200 ${
                         active
                           ? "bg-primary/10 text-primary font-semibold shadow-[inset_0_0_0_1px_rgba(79,70,229,0.15)]"
@@ -146,14 +160,6 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
           </div>
         </div>
 
-        {/* Collapse toggle */}
-        <button
-          onClick={() => setCollapsed((c) => !c)}
-          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-          className="mx-2.5 mb-2.5 flex items-center justify-center h-8 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary/70 transition-colors flex-shrink-0"
-        >
-          {collapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
-        </button>
       </aside>
 
       {/* Main */}
@@ -163,6 +169,14 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
           className="flex items-center h-14 px-5 border-b border-border bg-card/80 backdrop-blur-xl flex-shrink-0 gap-4 z-10"
           style={{ boxShadow: "0 1px 0 0 rgba(0,0,0,0.02), 0 1px 8px -4px rgba(0,0,0,0.04)" }}
         >
+          <button
+            onClick={() => setCollapsed((c) => !c)}
+            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            className="p-1.5 -ml-1 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-all"
+          >
+            <Menu size={15} />
+          </button>
           <div className="flex items-center gap-2 animate-fade-in">
             <h1 className="text-[15px] font-semibold text-foreground tracking-tight flex items-center gap-2">{pageTitles[page]}{dbName ? <span className="text-[11px] text-muted-foreground font-normal">· {dbName}</span> : null}</h1>
           </div>
@@ -170,7 +184,11 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
           <div className="flex-1" />
 
           {/* Search */}
-          <button aria-label="Search analyses" className="hidden md:flex items-center gap-2 px-3 h-8 rounded-lg bg-secondary/70 text-muted-foreground hover:text-foreground hover:bg-secondary text-[12.5px] transition-all border border-border/60 hover:border-border hover:shadow-sm">
+          <button
+            onClick={() => setPage("analytics")}
+            aria-label="Search analyses"
+            title="Ask ARIA"
+            className="hidden md:flex items-center gap-2 px-3 h-8 rounded-lg bg-secondary/70 text-muted-foreground hover:text-foreground hover:bg-secondary text-[12.5px] transition-all border border-border/60 hover:border-border hover:shadow-sm">
             <Search size={12} />
             <span>Search...</span>
             <span className="ml-1.5 text-muted-foreground/60 text-[10px] font-mono bg-background/60 px-1.5 py-0.5 rounded border border-border/50">⌘K</span>
@@ -188,6 +206,7 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
 
           {/* Notifications */}
           <button
+            onClick={() => setPage("settings")}
             aria-label="Notifications"
             className="relative p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-all"
             title="Notifications"

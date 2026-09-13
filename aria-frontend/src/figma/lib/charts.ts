@@ -1,17 +1,18 @@
-// Shared categorical palette: charts are colorful by category, never all-blue.
+// Shared categorical palette: muted professional tones (Tableau-style),
+// never neon or purple. First color is the brand steel blue.
 export const CATEGORY_COLORS = [
-  "#4F46E5", // indigo
-  "#059669", // emerald
-  "#F59E0B", // amber
-  "#EC4899", // pink
-  "#06B6D4", // cyan
-  "#8B5CF6", // violet
-  "#EF4444", // red
-  "#14B8A6", // teal
-  "#F97316", // orange
-  "#84CC16", // lime
-  "#6366F1", // periwinkle
-  "#D946EF", // fuchsia
+  "#2F6FAD", // steel blue
+  "#2E9B6B", // green
+  "#C98A1B", // bronze
+  "#B85C4D", // terracotta
+  "#5B7C99", // slate
+  "#7A9E43", // olive
+  "#A87C4F", // tan
+  "#C65D3A", // rust
+  "#4C9A9A", // teal gray
+  "#8A8A8A", // gray
+  "#3E5C76", // navy
+  "#D9A441", // gold
 ];
 
 export const colorFor = (index: number): string =>

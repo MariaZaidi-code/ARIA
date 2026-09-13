@@ -34,7 +34,32 @@ def _make(cls, season_period):
     """Instantiate a candidate, passing a season period to models that need one."""
     if getattr(cls, "needs_period", False):
         return cls(period=season_period or 7)
-    return cls()
+    try:
+        return cls()
+    except TypeError:
+        return cls(period=season_period or 7)
+
+
+def _eligible_cls(cls, n, season_period):
+    """Whether a candidate may compete on this series at all."""
+    available = getattr(cls, "available", None)
+    if callable(available) and not available():
+        return False
+    if n < getattr(cls, "min_points", 0):
+        return False
+    if getattr(cls, "needs_real_period", False) and not season_period:
+        return False
+    return True
+
+
+def _origins(n, model_cls):
+    """Walk-forward origin indices, capped for expensive models."""
+    all_k = list(range(max(3, n // 2), n))
+    cap = getattr(model_cls, "max_origins", None)
+    if cap and len(all_k) > cap:
+        idx = np.linspace(0, len(all_k) - 1, cap).round().astype(int)
+        return [all_k[i] for i in idx]
+    return all_k
 
 
 def walk_forward_errors(model_cls, values, season_period=None):
@@ -47,9 +72,10 @@ def walk_forward_errors(model_cls, values, season_period=None):
     n = len(values)
     if n < 5:
         return []
+    if not _eligible_cls(model_cls, n, season_period):
+        return []
     errors = []
-    start = max(3, n // 2)
-    for k in range(start, n):
+    for k in _origins(n, model_cls):
         train = values[:k]
         actual = float(values[k])
         if abs(actual) < 1e-9:
@@ -95,6 +121,8 @@ def _score_candidates(values, season_period, min_points):
         return []
     results = []
     for cls in M.CANDIDATES:
+        if not _eligible_cls(cls, n, season_period):
+            continue
         oos = one_step_ahead_mape(cls, values, season_period)
         if oos is None:
             continue
@@ -111,8 +139,15 @@ def _blend_errors(members, weights, values, season_period=None):
     """Honest out-of-sample errors of a weighted blend via walk-forward."""
     n = len(values)
     errors = []
-    start = max(3, n // 2)
-    for k in range(start, n):
+    # Blend members were already selected as eligible; use the coarsest
+    # origin cap among them so ensembles stay tractable.
+    caps = [getattr(cls, "max_origins", None) for cls in members]
+    caps = [c for c in caps if c]
+    all_k = list(range(max(3, n // 2), n))
+    if caps and len(all_k) > min(caps):
+        idx = np.linspace(0, len(all_k) - 1, min(caps)).round().astype(int)
+        all_k = [all_k[i] for i in idx]
+    for k in all_k:
         train = values[:k]
         actual = float(values[k])
         if abs(actual) < 1e-9:
@@ -171,6 +206,7 @@ def select_model(values, min_points=5, season_period=None):
         "overfit_ratio": round(best["ratio"], 2),
         "overfit_rejected": best["overfit"],
         "naive_mape": round(naive_mape, 2) if naive_mape is not None else None,
+        "candidates": [r["cls"].name for r in results],
     }
 
     # ---- Ensemble voting ----

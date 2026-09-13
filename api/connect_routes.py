@@ -194,12 +194,12 @@ async def get_upload_progress(user: dict = Depends(get_current_user)):
 
 
 @router.get("/api/upload/progress/stream")
-async def stream_upload_progress(user: dict = Depends(get_current_user)):
-    """SSE stream of ingestion progress for the user."""
+async def stream_upload_progress(user: dict = Depends(require_writable)):
+    """SSE stream of ingestion progress for the user (writable sessions only, max 2 min)."""
     async def event_stream():
         uid = user["user_id"]
         last_ts = 0
-        for _ in range(300):  # max 5 minutes
+        for _ in range(120):  # max 2 minutes (was 5 min, reduces connection exhaustion)
             prog = _upload_progress.get(uid)
             if prog and prog.get("timestamp", 0) > last_ts:
                 last_ts = prog["timestamp"]
@@ -253,7 +253,10 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
 
     session["provider"] = llm
     session["provider_name"] = request.provider
-    if request.api_key:
+    # Provider isolation: API keys are stored per hosted provider only.
+    # Local (Ollama) uses no key, so a key sent with provider=local is ignored
+    # rather than stored.
+    if request.api_key and request.provider in HOSTED_PROVIDERS:
         keys = session.get("api_keys", {})
         keys[request.provider] = request.api_key
         session["api_keys"] = keys
@@ -341,6 +344,8 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     session["provider"] = llm
     session["provider_name"] = request.provider
     session["source_type"] = request.source_type
+    # A fresh database connection replaces any previously linked source.
+    session.pop("linked_db", None)
     session["db"] = None
     session["db_type"] = db_type
     session["db_uri"] = None
@@ -527,6 +532,9 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
     """
     if provider not in PROVIDER_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Choose from {sorted(PROVIDER_NAMES)}.")
+    if llm_base_url and provider != "local":
+        if not llm_base_url.startswith("https://"):
+            raise HTTPException(status_code=400, detail="Custom base_url must use https:// (http/internal hosts blocked).")
     filename = (file.filename or "").strip()
     if not filename:
         raise HTTPException(status_code=400, detail="No file received.")
@@ -564,9 +572,10 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
         file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}")
     except Exception as exc:
-        _set_progress(uid, "error", 0, f"Validation failed: {exc}", error=str(exc))
+        from core.errors import sanitize_error as _san
+        _set_progress(uid, "error", 0, "Validation failed", error=_san(exc))
         file_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"CSV processing failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"CSV processing failed: {_san(exc)}")
 
     _set_progress(uid, "extracting", 45, "Extracting schema and structure...")
 
@@ -576,9 +585,10 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
             file_path, sqlite_path, table_name=table_name
         )
     except Exception as exc:
-        _set_progress(uid, "error", 0, f"Processing failed: {exc}", error=str(exc))
+        from core.errors import sanitize_error as _san2
+        _set_progress(uid, "error", 0, "Processing failed", error=_san2(exc))
         file_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"CSV processing failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"CSV processing failed: {_san2(exc)}")
 
     _set_progress(uid, "profiling", 65, f"Profiling {row_count} rows...")
 
@@ -596,6 +606,8 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
     session["provider_name"] = provider
     session["source_type"] = "semi-structured"
     session["db"] = {".csv": str(file_path)}
+    # A fresh file source replaces any previously linked source.
+    session.pop("linked_db", None)
     session["db_type"] = "sqlite"
     session["db_uri"] = db_uri
     session["db_name"] = table_name
@@ -655,6 +667,9 @@ def connect_pdf(
     """
     if provider not in PROVIDER_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Choose from {sorted(PROVIDER_NAMES)}.")
+    if llm_base_url and provider != "local":
+        if not llm_base_url.startswith("https://"):
+            raise HTTPException(status_code=400, detail="Custom base_url must use https:// (http/internal hosts blocked).")
     filename = (file.filename or "").strip()
     if not filename:
         raise HTTPException(status_code=400, detail="No file received.")
@@ -666,7 +681,9 @@ def connect_pdf(
         )
     
     session = get_session(user["user_id"])
-    saved_key = session.get("api_keys", {}).get(provider)
+    # Provider isolation: only hosted providers use a saved API key; local
+    # (Ollama) works keyless and must never pick one up.
+    saved_key = session.get("api_keys", {}).get(provider) if provider in HOSTED_PROVIDERS else None
     try:
         llm = create_provider(
             provider=provider,
@@ -675,7 +692,7 @@ def connect_pdf(
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {exc}")
-    
+
     # Keep raw PDFs within the owning user's upload directory.
     upload_dir = DATA_DIR / "uploads" / f"user_{user['user_id']}"
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -706,9 +723,32 @@ def connect_pdf(
         raise HTTPException(status_code=500, detail=result.error or "Document processing failed")
     
     document = result.document
-    
+
     # Update session to include document reference
     session = get_session(user["user_id"])
+    # Multi-source (§7): a PDF upload must not destroy a live database
+    # connection. Stash the queryable relational/file source so Copilot can
+    # answer from both (with per-source attribution) in one session.
+    try:
+        _prev_uri = session.get("db_uri") or ""
+        _prev_type = session.get("db_type", "")
+        if _prev_type in ("postgresql", "mysql", "sqlite") and not str(_prev_uri).startswith("document://"):
+            _sp = session.get("schema_path")
+            _stash: dict = {
+                "db": session.get("db"),
+                "db_type": _prev_type,
+                "db_name": session.get("db_name"),
+                "dialect": session.get("dialect", _prev_type),
+                "source_type": session.get("source_type"),
+                "schema_path": str(_sp) if _sp else None,
+            }
+            # File-based sqlite URIs carry no secret and are safe to stash;
+            # relational URIs embed the password and are rebuilt instead.
+            if _prev_type == "sqlite":
+                _stash["db_uri"] = _prev_uri
+            session["linked_db"] = _stash
+    except Exception:
+        pass
     # A new document connection must honour the provider selected for this upload.
     session["provider"] = llm
     session["provider_name"] = provider
@@ -719,6 +759,7 @@ def connect_pdf(
     session["db_name"] = document.id
     session["dialect"] = "document"
     session["document_id"] = document.id
+    session["document_name"] = filename
     session["document_type"] = document.document_type.value if document.document_type else "unknown"
 
     # Structured PDF tables become queryable SQLite + schema mapping (§5/§15).
@@ -747,11 +788,49 @@ def connect_pdf(
             session["schema_path"] = _schema_path
     except Exception:
         pass
+
+    if not pdf_tables_loaded:
+        # Text-only PDF: stay a `document` source and drop every stale
+        # analytical pointer (schema/db/artifact refs from a previous
+        # connection). SQL analytics must never run against the old source.
+        for _key in ("schema_path", "processed_path", "insights_path",
+                     "schema_status", "pending_history_id", "file_type"):
+            session.pop(_key, None)
+        session["schema_status"] = "document"
     
     # Ensure processed directories exist
     processed_dir.mkdir(parents=True, exist_ok=True)
     vector_index_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    # Bridge (§7/§21): mirror the manifest + text chunks into the shared RAG
+    # metadata store so Copilot's document/combined branches read the same
+    # content the Documents page indexed. Best-effort; never fails the upload.
+    try:
+        from insight_rag.storage import RAGMetadataStore as _RAGStore
+        from langchain_core.documents import Document as _LCDocument
+        _rag = _RAGStore(user["user_id"])
+        _rag.put_document({
+            "document_id": document.id,
+            "filename": filename,
+            "original_filename": filename,
+            "document_type": document.document_type.value if document.document_type else "unknown",
+            "page_count": document.page_count,
+            "chunk_count": len(document.chunks),
+            "created_at": document.created_at,
+            "source": "upload",
+        })
+        _lcdocs = [_LCDocument(
+            page_content=c.content or "",
+            metadata={"page": c.page_number, "section": c.section,
+                      "chunk_id": c.id, "document_id": document.id},
+        ) for c in (document.chunks or []) if (c.content or "").strip()]
+        if _lcdocs:
+            _rag.save_chunks(document.id, _lcdocs)
+    except Exception as _bridge_exc:
+        import logging as _logging
+        _logging.getLogger("aria.connect").info(
+            "RAG store mirroring skipped (%s).", type(_bridge_exc).__name__)
+
     save_session(user["user_id"], session)
     
     return {
@@ -784,12 +863,19 @@ def session_status(user: dict = Depends(get_current_user)):
     # Never expose credentials: db_uri embeds user:password (§41).
     raw_uri = session.get("db_uri", "") or ""
     safe_uri = re.sub(r"://([^:/@]+):[^@/]*@", r"://\1:***@", raw_uri)
+    linked = session.get("linked_db") or {}
     return {
         "ok": True,
         "connection_status": "connected" if is_connected else "not-connected",
         "db_name": session.get("db_name", ""),
         "source_type": session.get("source_type", ""),
         "db_uri": safe_uri,
+        # Multi-source (§7): a linked database and/or document stay visible
+        # so the UI can show what ARIA can reason over.
+        "document_id": session.get("document_id", ""),
+        "document_name": session.get("document_name", ""),
+        "linked_db_name": linked.get("db_name", "") if isinstance(linked, dict) else "",
+        "multi_source": bool(linked and session.get("document_id")),
     }
 
 
@@ -800,7 +886,8 @@ def disconnect_source(user: dict = Depends(require_writable)):
     for key in (
         "source_type", "db", "db_uri", "db_name", "dialect", "schema_path",
         "processed_path", "insights_path", "schema_status", "file_type",
-        "document_id", "document_type", "conversation_id", "conversation_history",
+        "document_id", "document_name", "document_type", "linked_db",
+        "conversation_id", "conversation_history",
         "pending_history_id",
     ):
         session.pop(key, None)
@@ -817,8 +904,24 @@ class DatabaseTestRequest(BaseModel):
 
 
 @router.post("/api/database/test")
-async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depends(get_current_user)):
-    """Test a database connection before actually connecting."""
+async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depends(require_writable)):
+    """Test a database connection before actually connecting (writable sessions only)."""
+    # Validate host/port/db to block SSRF probing (cloud metadata, unexpected schemes).
+    host = (req.host or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", host) or len(host) > 253:
+        raise HTTPException(status_code=400, detail="Invalid host.")
+    if host.lower() in {"169.254.169.254", "metadata.google.internal"} or host.startswith("169.254."):
+        raise HTTPException(status_code=400, detail="Host is blocked.")
+    try:
+        port = int(req.port)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid port.")
+    if not 1 <= port <= 65535:
+        raise HTTPException(status_code=400, detail="Invalid port.")
+    if req.dbType not in ("postgresql", "mysql"):
+        raise HTTPException(status_code=400, detail="Unsupported dbType.")
+    if len(req.db or "") > 128 or len(req.user or "") > 128:
+        raise HTTPException(status_code=400, detail="Invalid database/user.")
     try:
         from sqlalchemy import create_engine, text
         from core.secret_box import decrypt as _decrypt_secret

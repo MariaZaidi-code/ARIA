@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { Loader2, RefreshCw, AlertCircle, Sparkles, Target, TrendingUp, TrendingDown, Crosshair, Lightbulb, Check } from "lucide-react";
-import { ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
+import { ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Brush } from "recharts";
 import { useTheme } from "../App";
 import Evidence from "../components/Evidence";
 import { ChartFrame, BizTooltip, useSeriesToggle, ToggleLegend } from "../components/charts";
@@ -33,6 +33,71 @@ const shortLabel = (label: string) => {
 };
 
 const monthKey = (label: string) => String(label || "").slice(0, 7);
+
+/** Pure forecast-story builder (exported for verification): dynamic
+ *  2–4 sentence business story + key signal from scenario values. */
+export function buildForecastStory(args: {
+  hasPredictions: boolean;
+  scenarios: { label: string; total: number; tone: string; pct: number }[] | null;
+  targetName: string;
+  horizonPeriods: number;
+  accuracy: number | null;
+  momDelta: number | null;
+}): { story: string; signal: string } {
+  const { hasPredictions, scenarios, targetName, horizonPeriods: n, accuracy, momDelta } = args;
+  const empty = { story: "", signal: "" };
+  if (!hasPredictions || !scenarios) return empty;
+  const best = scenarios.find((s) => s.tone === "good");
+  const commit = scenarios.find((s) => s.tone === "base");
+  const worst = scenarios.find((s) => s.tone === "bad");
+  if (!commit) return empty;
+  const horizonTxt = n === 1 ? "next period" : `next ${n} periods`;
+  const name = targetName || "the metric";
+
+  let s1: string;
+  if (commit.pct > 3) {
+    s1 = `ARIA expects ${name} to keep growing, reaching about ${fmtNum(commit.total)} over the ${horizonTxt} (+${commit.pct.toFixed(0)}% vs the recent pace).`;
+  } else if (commit.pct < -3) {
+    s1 = `ARIA expects ${name} to soften to about ${fmtNum(commit.total)} over the ${horizonTxt} (${commit.pct.toFixed(0)}% vs the recent pace).`;
+  } else {
+    s1 = `ARIA expects ${name} to hold around ${fmtNum(commit.total)}, close to the current pace.`;
+  }
+
+  let s2 = "";
+  const spread = best && worst ? Math.abs(best.total - worst.total) : 0;
+  const base = Math.abs(commit.total) || 1;
+  if (best && worst && spread / base > 0.05) {
+    s2 = ` Stronger momentum could lift it toward ${fmtNum(best.total)}, while a slowdown could bring it closer to ${fmtNum(worst.total)}.`;
+  }
+
+  let s3: string;
+  if (best && worst && spread / base > 0.5) {
+    s3 = " The range between scenarios is wide, so the outcome will depend heavily on how the recent trend develops.";
+  } else if (best && worst && spread / base < 0.15) {
+    s3 = " The scenarios sit close together, suggesting a steadier outlook.";
+  } else if (accuracy !== null && accuracy < 70) {
+    s3 = " Backtesting scored below 70% accuracy, so treat this as directional rather than precise.";
+  } else if (accuracy !== null) {
+    s3 = ` Backtesting scored ${accuracy.toFixed(0)}% accuracy, so this is a working estimate, not a promise.`;
+  } else {
+    s3 = " Treat distant points as directional — near-term points are the most trustworthy.";
+  }
+
+  let signal: string;
+  if (momDelta !== null && momDelta > 5) {
+    signal = "Recent momentum is strengthening.";
+  } else if (momDelta !== null && momDelta < -5) {
+    signal = "Recent momentum is weakening.";
+  } else if (best && worst && spread / base > 0.5) {
+    signal = "The upside depends on continued recent momentum.";
+  } else if (accuracy !== null && accuracy < 70) {
+    signal = "Uncertainty is higher than usual — watch incoming actuals.";
+  } else {
+    signal = "The forecast remains relatively stable.";
+  }
+
+  return { story: `${s1}${s2}${s3}`, signal };
+}
 
 function rebin(rows: any[], tab: PeriodTab) {
   if (tab === "Monthly") return rows;
@@ -111,7 +176,10 @@ export default function Predictive({ insightResult = null, goalResult = null, co
         setEligError(data.detail || "Couldn't inspect the data for forecasting.");
       }
     } catch (e: any) {
-      setEligError(e?.message || "Couldn't inspect the data for forecasting.");
+      const msg = String(e?.message || "");
+      setEligError(msg === "Failed to fetch"
+        ? "ARIA couldn't reach the server. Check that the backend is running, then retry."
+        : (e?.message || "Couldn't inspect the data for forecasting."));
     } finally {
       setEligLoading(false);
     }
@@ -161,7 +229,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   const grid = isDark ? "#2A2A35" : "#E5E7EB";
   const axis = isDark ? "#8889A0" : "#9CA3AF";
   const actualColor = "#14B8A6";
-  const projectionColor = "#6366F1";
+  const projectionColor = "#2F6FAD";
   const avgColor = "#64748B";
 
   const insightPredictions = insightResult?.predictions || {};
@@ -206,7 +274,10 @@ export default function Predictive({ insightResult = null, goalResult = null, co
         setForecast(null);
       }
     } catch (e: any) {
-      setError(e.message || "Couldn't build a forecast. Check your connection and try again.");
+      const msg = String(e?.message || "");
+      setError(msg === "Failed to fetch"
+        ? "ARIA couldn't reach the server. Check that the backend is running, then retry."
+        : (e.message || "Couldn't build a forecast. Check your connection and try again."));
       setForecast(null);
     } finally {
       clearInterval(stageTimer);
@@ -300,25 +371,14 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     ? ((historyVals[historyVals.length - 1] - historyVals[historyVals.length - 2]) / Math.abs(historyVals[historyVals.length - 2])) * 100
     : null;
 
-  // Dynamic insights — only from calculated numbers, never invented.
-  const insights: string[] = useMemo(() => {
-    const out: string[] = [];
-    if (!hasPredictions || !targetName) return out;
-    if (pctChange !== null && pctChange > 1) out.push(`${targetName} is expected to keep rising over the next ${fwdVals.length} ${fwdVals.length === 1 ? "period" : "periods"} (about +${pctChange.toFixed(1)}%).`);
-    else if (pctChange !== null && pctChange < -1) out.push(`${targetName} is expected to decline over the next ${fwdVals.length} ${fwdVals.length === 1 ? "period" : "periods"} (about ${pctChange.toFixed(1)}%).`);
-    else if (pctChange !== null) out.push(`${targetName} is expected to hold roughly steady.`);
-    if (fwdPts.length >= 2) {
-      const w0 = Math.abs(Number(fwdPts[0].upper95 ?? 0) - Number(fwdPts[0].lower95 ?? 0));
-      const w1 = Math.abs(Number(fwdPts[fwdPts.length - 1].upper95 ?? 0) - Number(fwdPts[fwdPts.length - 1].lower95 ?? 0));
-      if (w1 > w0 * 1.2) out.push("Forecast uncertainty widens toward the end of the horizon — near-term points are the most trustworthy.");
-    }
-    if (avgActual !== null && historyVals.length >= 2) {
-      const recent = historyVals.slice(-3).reduce((a, b) => a + b, 0) / Math.min(3, historyVals.length);
-      if (recent > avgActual * 1.1) out.push("Recent values are running above the historical average, which lifts the projection.");
-      else if (recent < avgActual * 0.9) out.push("Recent values are running below the historical average, which drags the projection down.");
-    }
-    return out.slice(0, 3);
-  }, [hasPredictions, targetName, pctChange, fwdVals, fwdPts, avgActual, historyVals]);
+  // Dynamic forecast story — 2–4 sentences generated from the actual
+  // scenario values, never static copy (see buildForecastStory).
+  const forecastStory: { story: string; signal: string } = useMemo(() => {
+    return buildForecastStory({
+      hasPredictions, scenarios, targetName,
+      horizonPeriods: fwdVals.length, accuracy, momDelta,
+    });
+  }, [hasPredictions, scenarios, targetName, fwdVals.length, accuracy, momDelta]);
 
   const horizonWarning = historyPoints !== null && horizon > historyPoints
     ? `Heads up: ${horizon} periods ahead from only ${historyPoints} past points — treat the far end as directional.`
@@ -463,7 +523,10 @@ export default function Predictive({ insightResult = null, goalResult = null, co
         <div className="bg-card border border-warning/40 rounded-xl p-4 space-y-2">
           <p className="text-sm font-semibold text-foreground">Couldn't forecast that selection</p>
           <p className="text-sm text-muted-foreground leading-relaxed">{error}</p>
-          <button onClick={useAutomatic} className="text-xs font-semibold text-primary hover:underline">Try automatic selection</button>
+          <div className="flex gap-3 pt-1">
+            <button onClick={() => fetchForecast()} className="text-xs font-semibold px-4 py-2 rounded-lg bg-primary text-primary-foreground hover:opacity-90">Retry</button>
+            <button onClick={useAutomatic} className="text-xs font-semibold text-primary hover:underline self-center">Try automatic selection</button>
+          </div>
         </div>
       )}
 
@@ -529,6 +592,9 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                     {!fcToggle.isHidden("Forecast") && (
                       <Line type="monotone" dataKey="forecast" stroke={projectionColor} strokeWidth={2} strokeDasharray="6 4" dot={{ r: 3 }} connectNulls name="Forecast" />
                     )}
+                    {chartRows.length > 12 && (
+                      <Brush dataKey="short" height={24} stroke="var(--primary)" travellerWidth={10} />
+                    )}
                   </ComposedChart>
                 </ResponsiveContainer>
               ) : (
@@ -545,8 +611,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                       <span
                         className="w-7 h-7 rounded-full flex items-center justify-center"
                         style={{
-                          background: s.tone === "good" ? "rgba(5,150,105,0.12)" : s.tone === "bad" ? "rgba(239,68,68,0.12)" : "rgba(99,102,241,0.12)",
-                          color: s.tone === "good" ? "#059669" : s.tone === "bad" ? "#EF4444" : "#6366F1",
+                          background: s.tone === "good" ? "rgba(5,150,105,0.12)" : s.tone === "bad" ? "rgba(239,68,68,0.12)" : "rgba(47,111,173,0.12)",
+                          color: s.tone === "good" ? "#059669" : s.tone === "bad" ? "#EF4444" : "#2F6FAD",
                         }}
                       >
                         {s.tone === "good" ? <TrendingUp size={14} /> : s.tone === "bad" ? <TrendingDown size={14} /> : <Crosshair size={14} />}
@@ -563,7 +629,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                         className="h-full rounded-full"
                         style={{
                           width: `${scenMax ? Math.max(4, (s.total / scenMax) * 100) : 4}%`,
-                          background: s.tone === "good" ? "#059669" : s.tone === "bad" ? "#EF4444" : "#6366F1",
+                          background: s.tone === "good" ? "#059669" : s.tone === "bad" ? "#EF4444" : "#2F6FAD",
                         }}
                       />
                     </div>
@@ -579,12 +645,15 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               </div>
             )}
 
-            {insights.length > 0 && (
+            {forecastStory.story && (
               <div className="bg-card border border-border rounded-xl p-4 space-y-1.5">
                 <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">What this means</p>
-                {insights.map((ins, i) => (
-                  <p key={i} className="text-sm text-foreground leading-relaxed">· {ins}</p>
-                ))}
+                <p className="text-sm text-foreground leading-relaxed">{forecastStory.story}</p>
+                {forecastStory.signal && (
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    <span className="font-semibold text-foreground">Key signal:</span> {forecastStory.signal}
+                  </p>
+                )}
               </div>
             )}
           </div>
@@ -704,14 +773,14 @@ export default function Predictive({ insightResult = null, goalResult = null, co
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="border border-border rounded-xl p-4 space-y-1">
                 <p className="text-xs text-muted-foreground">Recent average</p>
-                <p className="text-xl font-bold text-foreground">{Number(scenario.baseline).toLocaleString()}</p>
+                <p className="text-xl font-bold text-foreground">{isNaN(Number(scenario.baseline)) ? "—" : Number(scenario.baseline).toLocaleString()}</p>
                 <p className="text-xs text-muted-foreground">{scenario.periods_used} recent {scenario.periods_used === 1 ? "period" : "periods"}</p>
               </div>
               <div className="border border-primary/40 bg-primary/5 rounded-xl p-4 space-y-1">
                 <p className="text-xs text-muted-foreground">With {scenario.pct_change > 0 ? "+" : ""}{scenario.pct_change}%</p>
-                <p className="text-xl font-bold text-foreground">{Number(scenario.scenario_value).toLocaleString()}</p>
+                <p className="text-xl font-bold text-foreground">{isNaN(Number(scenario.scenario_value)) ? "—" : Number(scenario.scenario_value).toLocaleString()}</p>
                 <p className={`text-xs font-semibold ${scenario.delta >= 0 ? "text-positive" : "text-negative"}`}>
-                  {scenario.delta >= 0 ? "+" : ""}{Number(scenario.delta).toLocaleString()} vs recent average
+                  {scenario.delta >= 0 ? "+" : ""}{isNaN(Number(scenario.delta)) ? "—" : Number(scenario.delta).toLocaleString()} vs recent average
                 </p>
               </div>
               <div className="border border-border rounded-xl p-4 space-y-1">

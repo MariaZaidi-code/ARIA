@@ -35,6 +35,11 @@ def check_limit(bucket: str, key: str, max_calls: int, window_s: int) -> None:
         )
     hits.append(now)
     _hits[k] = hits
+    # Bound memory: drop buckets idle past 2x the longest window and cap total keys.
+    if len(_hits) > 5000:
+        stale = [kk for kk, vv in _hits.items() if not vv or now - vv[-1] > window_s * 2]
+        for kk in stale[:1000]:
+            _hits.pop(kk, None)
 
 
 def limit(bucket: str, max_calls: int, window_s: int = 60):

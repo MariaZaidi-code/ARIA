@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Zap, Shield, CheckCircle2 } from "lucide-react";
 
 interface LLMSelectionProps {
-  onSelectLLM: (mode: string) => void;
+  onSelectLLM: (mode: string, apiKey?: string) => Promise<void> | void;
 }
 
 const LLM_OPTIONS = [
@@ -30,6 +30,62 @@ const LLM_OPTIONS = [
 
 export default function LLMSelection({ onSelectLLM }: LLMSelectionProps) {
   const [selected, setSelected] = useState<string | null>(null);
+  const [groqKey, setGroqKey] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<Record<string, { available: boolean; reason: string }>>({});
+  const [statusLoading, setStatusLoading] = useState(true);
+
+  const loadStatus = async () => {
+    setStatusLoading(true);
+    try {
+      const token = localStorage.getItem("aria_auth_token");
+      const res = await fetch("/api/providers/status", {
+        headers: { Authorization: `Bearer ${token || ""}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && Array.isArray(data.providers)) {
+        const map: Record<string, { available: boolean; reason: string }> = {};
+        for (const p of data.providers) {
+          map[p.provider] = { available: !!p.available, reason: p.reason || "" };
+        }
+        setStatus(map);
+      }
+    } catch {
+      // Status is advisory; selection still works and the switch validates.
+    } finally {
+      setStatusLoading(false);
+    }
+  };
+
+  useEffect(() => { loadStatus(); }, []);
+
+  const confirm = async () => {
+    if (!selected || busy) return;
+    setError("");
+    if (selected === "cloud" && !groqKey.trim()) {
+      const st = status["cloud"];
+      if (st && !st.available && st.reason) {
+        setError(st.reason);
+      } else {
+        setError("Paste your Groq API key to use Cloud AI — Local AI needs no key.");
+      }
+      return;
+    }
+    const st = selected ? status[selected] : undefined;
+    if (st && !st.available) {
+      setError(`${st.reason} You can retry the status check or choose the other engine.`);
+      return;
+    }
+    setBusy(true);
+    try {
+      await onSelectLLM(selected, selected === "cloud" ? groqKey.trim() : undefined);
+    } catch (err: any) {
+      setError(err?.message || "Could not switch provider. Check the key and try again.");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="min-h-screen flex items-center justify-center p-6" style={{ background: "var(--background)" }}>
@@ -126,17 +182,63 @@ export default function LLMSelection({ onSelectLLM }: LLMSelectionProps) {
                   <span style={{ color: "var(--muted-foreground)" }}>{opt.privacy}</span>
                 </div>
               </div>
+
+              <div className="mt-3 flex items-center gap-2 text-[11px]">
+                {statusLoading ? (
+                  <span style={{ color: "var(--muted-foreground)" }}>Checking availability…</span>
+                ) : status[opt.id] ? (
+                  <>
+                    <span
+                      className="inline-block w-1.5 h-1.5 rounded-full"
+                      style={{ background: status[opt.id].available ? "var(--positive)" : "var(--negative)" }}
+                    />
+                    <span style={{ color: "var(--muted-foreground)" }}>
+                      {status[opt.id].available ? "Available" : "Unavailable"} — {status[opt.id].reason}
+                    </span>
+                  </>
+                ) : null}
+              </div>
             </button>
           ))}
         </div>
 
+        {selected === "cloud" && (
+          <div className="mb-4 animate-fade-in">
+            <label htmlFor="llm-groq-key" className="block text-xs font-semibold mb-1.5" style={{ color: "var(--foreground)" }}>
+              Groq API key (used only for Cloud AI)
+            </label>
+            <input
+              id="llm-groq-key"
+              type="password"
+              value={groqKey}
+              onChange={(e) => setGroqKey(e.target.value)}
+              placeholder="gsk_..."
+              autoComplete="off"
+              className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"
+              style={{ background: "var(--card)", border: "1px solid var(--border)", color: "var(--foreground)" }}
+            />
+            <p className="text-[11px] mt-1.5" style={{ color: "var(--muted-foreground)" }}>
+              Your key is stored encrypted and never used when Local AI is selected.
+            </p>
+          </div>
+        )}
+
+        {error && (
+          <p role="alert" className="text-xs font-medium mb-3 text-center" style={{ color: "var(--negative)" }}>
+            {error}{" "}
+            <button onClick={loadStatus} className="underline font-semibold">
+              Retry status check
+            </button>
+          </p>
+        )}
+
         <button
-          disabled={!selected}
-          onClick={() => selected && onSelectLLM(selected)}
+          disabled={!selected || busy}
+          onClick={confirm}
           className="premium-btn btn-glow w-full py-2.5 rounded-lg text-sm font-semibold text-white transition-all disabled:opacity-40"
           style={{ background: "var(--gradient-primary)" }}
         >
-          Continue
+          {busy ? "Connecting…" : "Continue"}
         </button>
       </div>
     </div>

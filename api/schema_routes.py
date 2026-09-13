@@ -28,7 +28,15 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
     require_data(request)
 
     if session["source_type"] != "relational":
-        mapping = json.loads(session["schema_path"].read_text(encoding="utf-8"))
+        _sp = session.get("schema_path")
+        if _sp is None:
+            from fastapi import HTTPException as _HTTPException
+            raise _HTTPException(
+                status_code=400,
+                detail="This source is a text document — use Document Chat "
+                       "(Copilot) instead of schema analytics.",
+            )
+        mapping = json.loads(_sp.read_text(encoding="utf-8"))
         return {
             "ok": True,
             "provider": session["provider_name"],
@@ -116,7 +124,8 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Schema extraction failed: {exc}")
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=500, detail=f"Schema extraction failed: {_san(exc)}")
 
     user_schema_dir = SCHEMA_DIR / f"user_{user['user_id']}"
     output_path, snapshot_path, latest_path, snapshot_id = schema_agent.get_output_paths(

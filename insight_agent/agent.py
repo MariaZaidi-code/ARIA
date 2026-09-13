@@ -732,6 +732,16 @@ Rules:
         so the story stays readable for a non-technical manager."""
         import re as _re
         subs = [
+            (r"\bR\^2\b|\bR²\b|\bR-squared\b", "pattern strength"),
+            (r"\bRMSE\b", "typical forecast error"),
+            (r"\bMAE\b", "average error"),
+            (r"\bp-?value\b", "reliability"),
+            (r"\bcoefficient\b", "relationship"),
+            (r"\bregression\b", "trend analysis"),
+            (r"\bconfidence interval\b", "expected range"),
+            (r"\bcorrelation\b", "relationship"),
+            (r"\banomaly score\b", "unusual activity"),
+            (r"\bfeature importance\b", "most important factors"),
             (r"\bstandard deviation\b", "typical variation"),
             (r"\bstandard deviations\b", "typical variations"),
             (r"\bmedian\b", "middle value"),
@@ -743,6 +753,8 @@ Rules:
         out = text
         for pat, repl in subs:
             out = _re.sub(pat, repl, out, flags=_re.IGNORECASE)
+        # Collapse excessive decimal precision in prose (keep 1 decimal max).
+        out = _re.sub(r"(\d+)\.(\d{3,})", lambda m: f"{m.group(1)}.{m.group(2)[0]}", out)
         return out
 
     def _narrative_story(self, processed_data, kpis, trends, anomalies, hypotheses,
@@ -762,9 +774,24 @@ Rules:
             parts.append(f"The headline finding is that {hypotheses[0]['hypothesis']}")
         if kpis:
             top = max(kpis, key=lambda k: k.get("mean") or 0)
+            def _biz(v):
+                try:
+                    n = float(v)
+                except (TypeError, ValueError):
+                    return str(v)
+                a = abs(n)
+                if a >= 1_000_000:
+                    return f"{n / 1_000_000:.1f}M"
+                if a >= 10_000:
+                    return f"{n / 1_000:.1f}K"
+                if a >= 100:
+                    return f"{round(n):,}"
+                if a >= 1:
+                    return f"{round(n, 1)}"
+                return f"{round(n, 2)}"
             parts.append(
-                f"On average, {top['column']} is about {top['mean']:,.2f}, "
-                f"ranging from {top.get('min')} to {top.get('max')}."
+                f"On average, {top['column']} is about {_biz(top['mean'])}, "
+                f"ranging from {_biz(top.get('min'))} to {_biz(top.get('max'))}."
             )
         if trends:
             t = trends[0]

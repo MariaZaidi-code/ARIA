@@ -140,6 +140,14 @@ def aggregate_scores(rows: list[dict]) -> dict:
     rows = list(rows or [])
     if not rows:
         return {"cases": 0}
+    lat = sorted(float(row.get("latency_ms") or 0.0) for row in rows)
+
+    def _pct(p: float) -> float:
+        if not lat:
+            return 0.0
+        k = min(len(lat) - 1, max(0, int(round(p * (len(lat) - 1)))))
+        return round(lat[k], 2)
+
     return {
         "cases": len(rows),
         "behavior_accuracy": round(mean(1.0 if row.get("behavior_correct") else 0.0 for row in rows), 4),
@@ -151,5 +159,7 @@ def aggregate_scores(rows: list[dict]) -> dict:
         "forbidden_failure_rate": round(
             mean(1.0 if row.get("forbidden_phrase_hits") else 0.0 for row in rows), 4
         ),
-        "average_latency_ms": round(mean(float(row.get("latency_ms") or 0.0) for row in rows), 2),
+        "average_latency_ms": round(mean(lat), 2),
+        "p50_latency_ms": _pct(0.50),
+        "p95_latency_ms": _pct(0.95),
     }

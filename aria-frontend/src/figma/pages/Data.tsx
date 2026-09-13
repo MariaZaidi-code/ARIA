@@ -29,10 +29,20 @@ const TABS: { id: Tab; label: string; icon: typeof Database }[] = [
 
 const api = async (path: string, opts?: RequestInit) => {
   const token = localStorage.getItem("aria_auth_token");
-  const res = await fetch(path, {
-    ...opts,
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...opts?.headers },
-  });
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 30000);
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      ...opts,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...opts?.headers },
+      signal: ctrl.signal,
+    });
+  } catch (err: any) {
+    clearTimeout(t);
+    throw new Error(err?.name === "AbortError" ? "Request timed out after 30s." : "Network error: backend unreachable.");
+  }
+  clearTimeout(t);
   let data: any = {};
   try {
     data = await res.json();
@@ -135,13 +145,17 @@ export default function Data({
 
   // Connection health state — fetched only on mount / connect, not on every render
   const [connHealth, setConnHealth] = useState<any>(null);
+  const [healthError, setHealthError] = useState("");
   const connHealthFetched = useRef(false);
   useEffect(() => {
     if (isConnected && !connHealthFetched.current) {
       connHealthFetched.current = true;
-      apiGet("/api/data/connection").then(setConnHealth).catch(() => {});
+      setHealthError("");
+      apiGet("/api/data/connection").then(setConnHealth).catch((e: any) => {
+        setHealthError(e?.message || "Could not load connection health.");
+      });
     }
-    if (!isConnected) { connHealthFetched.current = false; setConnHealth(null); }
+    if (!isConnected) { connHealthFetched.current = false; setConnHealth(null); setHealthError(""); }
   }, [isConnected]);
 
   // Load overrides — only once per connection
@@ -263,6 +277,11 @@ export default function Data({
   // ── SOURCES TAB (inline JSX, not a component — prevents remount/focus loss) ──
   const sourcesTabJSX = (
     <div className="space-y-5">
+      {isConnected && healthError && !connHealth && (
+        <div className="bg-warning/10 border border-warning/30 text-warning text-sm rounded-xl px-4 py-2.5 flex items-center gap-2">
+          <AlertTriangle size={14} /> {healthError}
+        </div>
+      )}
       {isConnected && connHealth && (
         <div className="premium-card bg-positive/5 border border-positive/20 rounded-xl p-4 animate-fade-in">
           <div className="flex items-start justify-between gap-4">
@@ -821,7 +840,7 @@ export default function Data({
       fg: "#0B0F1A",
       muted: "#64748B",
       secondary: "#F1F5F9",
-      primary: "#4F46E5",
+      primary: "#2F6FAD",
       positive: "#059669",
       amber: "#F59E0B",
       negative: "#DC2626",
@@ -912,7 +931,7 @@ export default function Data({
                   {/* Shadow */}
                   <rect width={BOX_W} height={totalH} rx={8} y={2} fill="rgba(0,0,0,0.06)" />
                   {/* Body */}
-                  <rect width={BOX_W} height={totalH} rx={8} fill={isHighlighted ? "#EEF2FF" : C.card}
+                  <rect width={BOX_W} height={totalH} rx={8} fill={isHighlighted ? "#E8F0FA" : C.card}
                     stroke={isHighlighted ? C.primary : C.border} strokeWidth={isHighlighted ? 1.5 : 1} />
                   {/* Header */}
                   <rect width={BOX_W} height={HEADER_H} rx={8} fill={C.secondary} />
