@@ -46,8 +46,8 @@ export default function Login({ onLogin }: LoginProps) {
           setLoading(false);
           return;
         }
-        setMode("login");
-        setLoading(false);
+        // Registration establishes the cookie session: auto-login.
+        onLogin();
         return;
       }
 
@@ -184,7 +184,7 @@ export default function Login({ onLogin }: LoginProps) {
               <div className="login-label-row">
                 <label htmlFor="login-password">Password</label>
                 {mode === "login" && (
-                  <a className="login-forgot" href="#forgot">Forgot password?</a>
+                  <button type="button" className="login-forgot" onClick={() => setError("Password reset is not available in this build. Contact your workspace admin.")}>Forgot password?</button>
                 )}
               </div>
               <input

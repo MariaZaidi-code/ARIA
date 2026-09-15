@@ -15,6 +15,8 @@ import logging
 import re
 from dataclasses import dataclass
 
+from functools import lru_cache
+
 from sqlalchemy import create_engine, text
 
 from core.validation import (
@@ -25,14 +27,12 @@ from core.validation import (
 
 log = logging.getLogger(__name__)
 
+
+@lru_cache(maxsize=8)
+def _get_engine(db_uri: str):
+    return create_engine(db_uri, pool_pre_ping=True)
+
 # Deterministic read-only guard: reject anything that can mutate data/schema.
-_DESTRUCTIVE_RE = re.compile(
-    r"\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|replace|"
-    r"merge|call|execute|copy|vacuum|attach|detach|pragma|set\s+role|commit|"
-    r"rollback|into)\b",
-    re.IGNORECASE,
-)
-_STRIP_STRINGS_RE = re.compile(r"'(?:''|[^'])*'")
 _LIMIT_RE = re.compile(r"\blimit\s+\d+", re.IGNORECASE)
 
 
@@ -55,13 +55,13 @@ class SqlResult:
 
 
 def is_read_only(sql: str) -> bool:
-    """True only for SELECT / WITH ... SELECT statements. Deterministic."""
-    if not sql:
-        return False
-    stripped = _STRIP_STRINGS_RE.sub(" ", sql)
-    if _DESTRUCTIVE_RE.search(stripped):
-        return False
-    return bool(re.match(r"\s*(select|with)\b", stripped, re.IGNORECASE))
+    """True only for SELECT / WITH ... SELECT statements. Deterministic.
+
+    Delegates to the single shared guard in core.validation so Copilot and
+    the Goal Agent enforce the same contract.
+    """
+    from core.validation import is_read_only_sql as _shared_is_read_only
+    return _shared_is_read_only(sql)
 
 
 def clean_sql(raw: str) -> str:
@@ -74,8 +74,9 @@ def clean_sql(raw: str) -> str:
     if not m:
         return candidate.strip()
     stmt = candidate[m.start():].strip()
-    # Cut a trailing explanation after the first semicolon-terminated statement.
-    semi = stmt.find(";")
+    # For CTEs (WITH ... ; SELECT ...), find the last semicolon-terminated
+    # statement so the full CTE + final SELECT is preserved.
+    semi = stmt.rfind(";")
     if semi != -1:
         stmt = stmt[:semi]
     return stmt.strip()
@@ -175,14 +176,11 @@ class SqlEngine:
             safe_sql = f"{sql.rstrip(';')} LIMIT {self.max_rows}"
 
         try:
-            engine = create_engine(self.db_uri, pool_pre_ping=True)
-            try:
-                with engine.connect() as conn:
-                    result = conn.execute(text(safe_sql))
-                    columns = list(result.keys())
-                    rows = [dict(zip(columns, r)) for r in result.fetchmany(self.max_rows)]
-            finally:
-                engine.dispose()
+            engine = _get_engine(self.db_uri)
+            with engine.connect() as conn:
+                result = conn.execute(text(safe_sql))
+                columns = list(result.keys())
+                rows = [dict(zip(columns, r)) for r in result.fetchmany(self.max_rows)]
             return SqlResult(ok=True, sql=safe_sql, columns=columns, rows=rows,
                              row_count=len(rows), dialect=self.dialect)
         except Exception as exc:
@@ -206,7 +204,7 @@ class SqlEngine:
                 # Repair attempts use light sampling so an empty first pass
                 # does not repeat identically.
                 raw = llm.complete(model_role, prompt, temperature=0.0 if attempt == 1 else 0.2,
-                                   num_predict=300, timeout=180)
+                                   num_predict=300)
             except Exception as exc:
                 return SqlResult(ok=False, error=f"LLM SQL generation failed: {exc}",
                                  attempts=attempt, dialect=self.dialect)

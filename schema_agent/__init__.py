@@ -1,3 +1,19 @@
+"""schema_agent — LEGACY schema stack (DEPRECATED).
+
+DEPRECATION NOTICE: ``schema_engine/`` is the canonical schema stack for all
+new code. This ``schema_agent/`` package is kept for backward compatibility
+only (existing callers, saved mappings, CLI history) and receives no new
+features. Legacy entry points below emit :class:`DeprecationWarning` on use.
+Do NOT add new imports of this package; import from ``schema_engine`` instead.
+"""
+
+import warnings as _warnings
+
+_warnings.warn(
+    "schema_agent is deprecated; schema_engine/ is canonical. "
+    "This package remains for backward compatibility only.",
+    DeprecationWarning, stacklevel=2)
+
 import json
 import logging
 import os
@@ -181,3 +197,24 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ── Legacy entry-point shims (backward compat + DeprecationWarning) ──────
+_LEGACY_ENTRYPOINTS = ("get_connection", "build_schema_mapping",
+                       "build_schema_mapping_all", "main")
+for _name in _LEGACY_ENTRYPOINTS:
+    _fn = globals().get(_name)
+    if callable(_fn) and not getattr(_fn, "_aria_legacy_warned", False):
+        def _wrap(_fn=_fn, _name=_name):
+            import functools as _functools
+
+            @_functools.wraps(_fn)
+            def _inner(*args, **kwargs):
+                _warnings.warn(
+                    "schema_agent.%s is deprecated; use schema_engine instead."
+                    % _name, DeprecationWarning, stacklevel=2)
+                return _fn(*args, **kwargs)
+
+            _inner._aria_legacy_warned = True
+            return _inner
+        globals()[_name] = _wrap()
+del _name, _fn, _wrap

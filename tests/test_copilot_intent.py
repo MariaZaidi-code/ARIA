@@ -98,8 +98,18 @@ def test_analyze_rows_finds_top_and_momentum():
     ]
     a = _analyze_rows(cols, rows, "hypothesis")
     assert a["top"]["label"] == "West"
-    assert a["momentum_pct"] is not None
+    # Ranked/grouped rows carry no time axis: momentum must stay None
+    # instead of fabricating a trend from return order.
+    assert a["momentum_pct"] is None
     assert not a["thin"]
+
+
+def test_analyze_rows_momentum_needs_date_axis():
+    cols = ["month", "total"]
+    rows = [{"month": f"2026-0{i + 1}", "total": 100.0 + i * 50.0} for i in range(6)]
+    a = _analyze_rows(cols, rows, "forecast")
+    assert a["momentum_pct"] is not None
+    assert a["momentum_pct"] > 0
 
 
 def test_analyze_rows_flags_thin_evidence():

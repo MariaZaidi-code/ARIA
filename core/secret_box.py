@@ -4,14 +4,45 @@ DPAPI (CryptProtectData) binds the ciphertext to the current Windows user
 account, so a stolen `.env` file is unreadable on any other machine or user.
 Keys are stored as `enc1:<base64>` values; `decrypt_env_value()` is called
 from core.config right after load_dotenv so `os.getenv` sees the real key.
+
+Platform honesty: only Windows DPAPI encrypts. On Linux/macOS there is no
+local trust anchor, so `encrypt()` returns plaintext AND warns loudly;
+`is_encrypted()` reports False so callers never claim "encrypted at rest"
+when the value is plaintext. Unix secret files must additionally carry
+0600 permissions (see `ensure_private_file`); plaintext values are never
+written to logs (see `redact`).
 """
 
 import base64
 import ctypes
 import os
 import sys
+import warnings
 
 PREFIX = "enc1:"
+
+
+def is_encrypted(value) -> bool:
+    """Return True only when the value carries the DPAPI `enc1:` envelope."""
+    return isinstance(value, str) and value.startswith(PREFIX)
+
+
+def redact(value, keep: int = 0) -> str:
+    """Return a log-safe placeholder for a secret (never the plaintext)."""
+    if not value:
+        return "[missing]"
+    if keep and isinstance(value, str) and len(value) > keep + 3:
+        return value[:keep] + "…[redacted]"
+    return "[redacted]"
+
+
+def ensure_private_file(path) -> None:
+    """Best-effort 0600 on a secret-bearing file (POSIX; no-op on Windows)."""
+    try:
+        if sys.platform != "win32":
+            os.chmod(path, 0o600)
+    except Exception:
+        pass
 
 if sys.platform == "win32":
     from ctypes import wintypes
@@ -62,9 +93,20 @@ if sys.platform == "win32":
         return _unprotect(raw).decode("utf-8")
 
 else:
-    # Non-Windows fallback: leave plaintext visible (no local trust anchor).
+    # Non-Windows fallback: NO encryption is available (no local trust
+    # anchor). Return plaintext but warn loudly every time so operators never
+    # mistake it for encrypted storage. Use file permissions (0600 via
+    # ensure_private_file) as the safest existing store on this platform.
     def encrypt(plaintext: str) -> str:
+        warnings.warn(
+            "core.secret_box: no OS keystore on this platform; secret stored "
+            "as PLAINTEXT (not encrypted). Restrict file permissions (0600) "
+            "and prefer Windows DPAPI or a managed secret store in production.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return plaintext
 
     def decrypt(ciphertext: str) -> str:
+        # Never raise on plaintext passthrough; never log the value.
         return ciphertext

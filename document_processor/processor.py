@@ -207,6 +207,16 @@ class DocumentProcessor:
         # Check extension
         if file_path.suffix.lower() != ".pdf":
             return "Only PDF files are supported"
+
+        # Check magic bytes (%PDF-) so renamed executables/scripts are rejected
+        # before pdfplumber parsing. CSV path already rejects NUL/binary.
+        try:
+            with file_path.open("rb") as _f:
+                header = _f.read(5)
+            if header != b"%PDF-":
+                return "File is not a valid PDF (missing %PDF- header)"
+        except Exception as e:
+            return f"Could not read uploaded file: {e}"
         
         # Check file size (100MB limit)
         size_mb = file_path.stat().st_size / (1024 * 1024)

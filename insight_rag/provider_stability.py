@@ -133,8 +133,19 @@ def apply_provider_stability_patches() -> None:
         timeout=None,
         reasoning_effort="low",
     ):
-        if role == "rag_scope":
-            num_predict = min(int(num_predict), 450)
+        # Per-query call budget: control-plane RAG calls stay tiny and
+        # bounded. Verification roles get a timeout ceiling so one slow
+        # verdict can never stall the whole query.
+        try:
+            from .config import RAG_VERIFY_TIMEOUT_S
+            if role in {"rag_scope", "rag_verify", "rag_rewrite", "rag_plan"}:
+                num_predict = min(int(num_predict), 450)
+                ceiling = int(RAG_VERIFY_TIMEOUT_S)
+                if timeout is None or int(timeout) > ceiling:
+                    timeout = ceiling
+        except Exception:
+            if role == "rag_scope":
+                num_predict = min(int(num_predict), 450)
         return original_chat_structured(
             self,
             role,

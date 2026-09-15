@@ -236,12 +236,16 @@ def _table_count(engine, dialect, table):
 
 def _fetch_pairs(engine, dialect, table, col_a, col_b, limit=SAMPLE_LIMIT):
     from api.schema_intel import _safe_name
+    # Deterministic sample: ORDER BY the sampled columns so identical
+    # requests analyze identical rows (bare LIMIT is return-order dependent).
     return _exec(
         engine,
         f"SELECT {_safe_name(col_a, dialect)}, {_safe_name(col_b, dialect)} "
         f"FROM {_safe_name(table, dialect)} "
         f"WHERE {_safe_name(col_a, dialect)} IS NOT NULL "
-        f"AND {_safe_name(col_b, dialect)} IS NOT NULL LIMIT {int(limit)}")
+        f"AND {_safe_name(col_b, dialect)} IS NOT NULL "
+        f"ORDER BY {_safe_name(col_a, dialect)}, {_safe_name(col_b, dialect)} "
+        f"LIMIT {int(limit)}")
 
 
 def _fetch_single(engine, dialect, table, col, limit=SAMPLE_LIMIT):
@@ -249,7 +253,8 @@ def _fetch_single(engine, dialect, table, col, limit=SAMPLE_LIMIT):
     return [r[0] for r in _exec(
         engine,
         f"SELECT {_safe_name(col, dialect)} FROM {_safe_name(table, dialect)} "
-        f"WHERE {_safe_name(col, dialect)} IS NOT NULL LIMIT {int(limit)}")]
+        f"WHERE {_safe_name(col, dialect)} IS NOT NULL "
+        f"ORDER BY {_safe_name(col, dialect)} LIMIT {int(limit)}")]
 
 
 # --------------------------------------------------------------------------
@@ -281,7 +286,7 @@ def _t_cdf(t, df):
             return float(_st.t.cdf(t, df))
         except Exception:
             pass
-    from api.hypothesis_routes import _regularized_incomplete_beta
+    from core.math_stats import regularized_incomplete_beta as _regularized_incomplete_beta
     x = df / (df + t * t)
     return 1.0 - 0.5 * _regularized_incomplete_beta(df / 2.0, 0.5, x)
 
@@ -340,7 +345,9 @@ def _kruskal(groups):
 def _ols(x, y):
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    slope, intercept = np.polyfit(x, y, 1) if len(x) >= 2 else (0.0, y[0] if len(y) else 0.0)
+    if len(x) < 2 or len(y) < 2:
+        return (0.0, 0.0, 0.0, 1.0)
+    slope, intercept = np.polyfit(x, y, 1)
     pred = slope * x + intercept
     ss_res = float(np.sum((y - pred) ** 2))
     ss_tot = float(np.sum((y - y.mean()) ** 2))
@@ -373,9 +380,18 @@ def run_correlation(engine, dialect, table, driver, metric):
     rs, ps = _spearman(x, y)
     slope, intercept, r2, _ = _ols(x, y)
     n = len(x)
+    if n <= 3:
+        return r, None, None
     z = 0.5 * math.log((1 + r) / (1 - r)) if abs(r) < 1 else 0.0
     se = 1.0 / math.sqrt(max(1, n - 3))
-    ci = (round(math.tanh(z - 1.96 * se), 3), round(math.tanh(z + 1.96 * se), 3)) if abs(r) < 1 else (r, r)
+    if abs(r) < 1:
+        if _SCIPY_OK and n - 2 > 0:
+            t_crit = _st.t.ppf(0.975, df=max(1, n - 2))
+        else:
+            t_crit = 1.96
+        ci = (round(math.tanh(z - t_crit * se), 3), round(math.tanh(z + t_crit * se), 3))
+    else:
+        ci = (r, r)
     lim = []
     if abs(r) < 0.3:
         lim.append("The relationship is weak — the driver explains little of the metric on its own.")
@@ -637,6 +653,24 @@ def analyze_question(engine, dialect, intel, tables, question, table_hint=None,
         return dict(_fail("NEEDS MORE DATA", CODE_INSUFFICIENT_DATA,
                           f"The {mtable} table is empty — connect data with rows first.",
                           hypothesis=build_hypothesis_text(question, intent), intent=intent))
+    # Centralized global gate (core/evidence.py): rows < 10 -> insufficient
+    # for ALL substantive conclusions. Additive evidence_state; keys kept.
+    if total < MIN_N:
+        try:
+            from core.evidence import assess_evidence as _assess2
+            _ev0 = _assess2(total, "hypothesis", dataset_name=mtable)
+        except Exception:
+            _ev0 = {"status": "insufficient_evidence",
+                    "reason": (f"ARIA needs at least 10 usable records before it can reliably "
+                               f"identify business patterns. Only {total} usable records were found."),
+                    "row_count": total, "usable_records": total,
+                    "min_required": MIN_N, "capability": "hypothesis"}
+        return dict(_fail("NEEDS MORE DATA", CODE_INSUFFICIENT_DATA,
+                          _ev0.get("reason") or
+                          f"The {mtable} table is empty — connect data with rows first.",
+                          hypothesis=build_hypothesis_text(question, intent), intent=intent,
+                          evidence_state=_ev0,
+                          usable_observations=total, min_required=MIN_N))
 
     driver, dtable = intent["driver"], intent["driver_table"]
     dim, dimtable = intent["dimension"], intent["dim_table"]
@@ -721,6 +755,13 @@ def analyze_question(engine, dialect, intel, tables, question, table_hint=None,
 
     segments = _top_segments(engine, dialect, intel, mtable, metric)
     sim = _whatif_basis(result)
+    try:
+        from core.evidence import assess_evidence as _assess3
+        _ev_ok = _assess3(n, "hypothesis", dataset_name=mtable)
+    except Exception:
+        _ev_ok = {"status": "supported" if n >= MIN_N else "insufficient_evidence",
+                  "reason": None, "row_count": n, "usable_records": n,
+                  "min_required": MIN_N, "capability": "hypothesis"}
     return {
         "ok": True,
         "verdict": verdict,
@@ -733,6 +774,9 @@ def analyze_question(engine, dialect, intel, tables, question, table_hint=None,
         "whatif": sim,
         "limitations": limitations,
         "explanation": _explain(result, verdict, metric),
+        "evidence_state": _ev_ok,
+        "usable_observations": n,
+        "min_required": MIN_N,
     }
 
 
@@ -1137,6 +1181,13 @@ def preview_question(engine, dialect, intel, tables, question,
                                else kind),
                   "direction": ("up" if _pv_dir == "up" else
                                 "down" if _pv_dir == "down" else None)}
+    try:
+        from core.evidence import assess_evidence as _assess
+        _ev_state = _assess(usable, "hypothesis", dataset_name=mtable)
+    except Exception:
+        _ev_state = {"status": ("insufficient_evidence" if usable < MIN_N else "supported"),
+                     "reason": None, "row_count": usable, "usable_records": usable,
+                     "min_required": MIN_N, "capability": "hypothesis"}
     return {"ok": True, "preview": {
         "statement": build_hypothesis_text(q, intent, _pv_result),
         "metric": metric, "metric_table": mtable,
@@ -1145,6 +1196,7 @@ def preview_question(engine, dialect, intel, tables, question,
         "time_col": auto_time, "analysis": kind,
         "rows_available": total, "usable_observations": usable,
         "needs_more_data": usable < MIN_N, "min_required": MIN_N,
+        "evidence_state": _ev_state,
     }}
 
 

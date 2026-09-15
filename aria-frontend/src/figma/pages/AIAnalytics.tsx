@@ -1,10 +1,13 @@
 import { useState, useRef, useEffect } from "react";
-import { Search, X, Clock, Copy, ChevronDown, ChevronUp, Sparkles, ArrowRight,
-CheckCircle, Loader2, Code2, Table2, AlertCircle, Database, GitBranch, HelpCircle, BookOpen } from "lucide-react";
+import { Search, X, Clock, ChevronDown, ChevronUp, Sparkles, ArrowRight,
+Table2, AlertCircle, Database, HelpCircle, BookOpen, TrendingUp, Lightbulb } from "lucide-react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, LineChart, Line, PieChart, Pie, Cell, ScatterChart, Scatter } from "recharts";
 import { useTheme } from "../App";
-import { colorForName } from "../lib/charts";
+import { colorForName, CATEGORY_COLORS } from "../lib/charts";
 import { BizTooltip } from "../components/charts";
+import AIProcessingIndicator from "../components/AIProcessingIndicator";
+import { saveAnalysisContext, gotoWithContext } from "../lib/analysisContext";
+import { API_BASE } from "../../services/api";
 
 type AnalysisState = "idle" | "processing" | "done" | "clarification" | "error";
 
@@ -16,13 +19,16 @@ interface AIAnalyticsProps {
   goalResult?: any;
   goalError?: string;
   loading?: boolean;
+  onNavigate?: (page: string) => void;
+  onAskCopilot?: (question: string) => void;
 }
 
-const CHART_COLORS = ["#2F6FAD", "#2E9B6B", "#C98A1B", "#B85C4D", "#5B7C99", "#7A9E43", "#C65D3A", "#4C9A9A"];
+const CHART_COLORS = CATEGORY_COLORS;
 
 // Dynamic suggestions from the actual analysis result — fully database-independent.
 function getDynamicSuggestions(goalResult: any): string[] {
-  const fromResult = goalResult?.suggestedQuestions || goalResult?.suggested_questions || [];
+  const fromResult = goalResult?.followUpQuestions || goalResult?.follow_up_questions
+    || goalResult?.suggestedQuestions || goalResult?.suggested_questions || [];
   if (fromResult.length > 0) {
     return fromResult.slice(0, 6);
   }
@@ -44,13 +50,14 @@ export default function AIAnalytics({
   goalResult = null,
   goalError = "",
   loading = false,
+  onNavigate,
+  onAskCopilot,
 }: AIAnalyticsProps) {
   const { isDark } = useTheme();
   const [query, setQuery] = useState(initialQuery);
-  const [sqlExpanded, setSqlExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
   const [showTable, setShowTable] = useState(false);
   const [showWhy, setShowWhy] = useState(false);
+  const [showEvidence, setShowEvidence] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   // Data-aware autocomplete (GET /api/autocomplete, same pattern as Dashboard).
   const [suggestions, setSuggestions] = useState<string[]>([]);
@@ -59,11 +66,9 @@ export default function AIAnalytics({
   const debounceRef = useRef<any>(null);
 
   const fetchAutocomplete = async (partial: string) => {
-    const token = localStorage.getItem("aria_auth_token") || "";
-    if (!token) { setSuggestions([]); return; }
     try {
-      const res = await fetch(`/api/autocomplete?partial=${encodeURIComponent(partial)}&limit=6`, {
-        headers: { Authorization: `Bearer ${token}` },
+      const res = await fetch(`${API_BASE}/autocomplete?partial=${encodeURIComponent(partial)}&limit=6`, {
+        credentials: "include",
       });
       if (!res.ok) { setSuggestions([]); return; }
       const data = await res.json();
@@ -96,7 +101,7 @@ export default function AIAnalytics({
     goalError ? "error" :
     goalResult?.clarificationRequired ? "clarification" :
     (analysisResult && (goalStatus === "success" || goalResult?.generatedSql)) ||
-    (goalResult?.message && goalStatus === "success") ||
+    ((goalResult?.answer || goalResult?.message) && goalStatus === "success") ||
     (goalResult?.data && goalStatus === "success") ? "done" :
     "idle";
 
@@ -108,20 +113,31 @@ export default function AIAnalytics({
     onAsk?.(text);
   };
 
-  const copySQL = () => {
-    const sql = goalResult?.generatedSql || goalResult?.sql_used || "";
-    navigator.clipboard.writeText(sql);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  };
 
-  // Extract real data from results
-  const sqlUsed = goalResult?.generatedSql || goalResult?.sql_used || "";
-  const tableData = goalResult?.data || analysisResult?.data || [];
+  // Extract real data from results (no raw SQL/provenance rendered — backend only).
+  // Stable analytics contract fields are rendered as-is; missing keys render
+  // as empty states, never fabricated client-side.
+  const visualization = goalResult?.visualization || null;
+  const tableData = (visualization?.data?.length ? visualization.data : null)
+    || goalResult?.data || analysisResult?.data || [];
   const chartData = tableData;
-  const followUps = goalResult?.suggestedQuestions || goalResult?.suggested_questions || [];
+  const followUps = (goalResult?.followUpQuestions?.length ? goalResult.followUpQuestions : null)
+    || goalResult?.follow_up_questions || goalResult?.suggestedQuestions || goalResult?.suggested_questions || [];
   const backendSpec = goalResult?.chartSpec || null;
   const analysisMeta = goalResult?.analysis || null;
+  const answer = goalResult?.answer || goalResult?.message || "";
+  const findings: any[] = Array.isArray(goalResult?.findings) ? goalResult.findings : [];
+  const evidenceList: any[] = Array.isArray(goalResult?.evidence) ? goalResult.evidence : [];
+  const limitations: any[] = Array.isArray(goalResult?.limitations) ? goalResult.limitations : [];
+  const possibleDrivers: any[] = Array.isArray(goalResult?.possibleDrivers)
+    ? goalResult.possibleDrivers
+    : (Array.isArray(goalResult?.possible_drivers) ? goalResult.possible_drivers : []);
+  const hypothesisObj = goalResult?.hypothesis || null;
+  const recommendationsList: any[] = Array.isArray(goalResult?.recommendations) ? goalResult.recommendations : [];
+  const comparisonPeriod = goalResult?.comparisonPeriod || goalResult?.comparison_period || null;
+  const resultStatus: string = goalResult?.resultStatus || goalResult?.result_status || "";
+  const resultMessage: string = goalResult?.resultMessage || goalResult?.result_message || "";
+  const interpreted = goalResult?.interpretedIntent || goalResult?.interpreted_intent || null;
 
   // Feedback tracking (personalization layer — Section 62)
   const [insightRating, setInsightRating] = useState<"useful" | "not_useful" | null>(null);
@@ -131,44 +147,38 @@ export default function AIAnalytics({
   const trackChartSwitch = async (toType: string) => {
     setChartOverride(toType);
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      if (token) {
-        const cols = Object.keys(chartData[0] || {}).sort().join("_");
-        await fetch("/api/feedback/chart", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ chart_type: toType, context: cols || "general" }),
-        });
-      }
+      const cols = Object.keys(chartData[0] || {}).sort().join("_");
+      await fetch(`${API_BASE}/feedback/chart`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ chart_type: toType, context: cols || "general" }),
+      });
     } catch (err) { console.debug("[ARIA] background request failed:", err); }
   };
   const trackSuggestionClick = async (text: string) => {
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      if (token) {
-        await fetch("/api/feedback/suggestion", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ suggestion_text: text, source: "analytics" }),
-        });
-      }
+      await fetch(`${API_BASE}/feedback/suggestion`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ suggestion_text: text, source: "analytics" }),
+      });
     } catch (err) { console.debug("[ARIA] background request failed:", err); }
   };
   const rateInsight = async (rating: "useful" | "not_useful") => {
     setInsightRating(rating);
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      if (token) {
-        await fetch("/api/feedback/insight", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-          body: JSON.stringify({
-            question: goalResult?.question || query,
-            rating,
-            category: "analytics",
-          }),
-        });
-      }
+      await fetch(`${API_BASE}/feedback/insight`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          question: goalResult?.question || query,
+          rating,
+          category: "analytics",
+        }),
+      });
     } catch (err) { console.debug("[ARIA] background request failed:", err); }
   };
 
@@ -186,6 +196,46 @@ export default function AIAnalytics({
     const pickNum = (exclude: string[] = []) =>
       numKeys.find(k => !exclude.includes(k)) || "";
     const specType = goalResult?.display?.chart?.type || goalResult?.chartSpec?.chart_type || "";
+    const vizType = String(visualization?.type || "").toLowerCase();
+    const vizX = visualization?.x && keys.includes(visualization.x) ? visualization.x : null;
+    const vizY = visualization?.y && keys.includes(visualization.y) ? visualization.y : null;
+    // Contract-first overrides: the backend intent determines the family.
+    if (vizType === "scatter" && numKeys.length >= 2) {
+      return { type: "scatter", data: chartData, xKey: vizX || numKeys[0], yKey: vizY || numKeys[1], series: [] as string[] };
+    }
+    if (vizType === "histogram" && numKeys.length >= 1) {
+      const col = (vizY && numKeys.includes(vizY) ? vizY : numKeys[0]);
+      const hvals = chartData.map(r => Number(r[col])).filter(v => !isNaN(v));
+      if (hvals.length >= 5) {
+        const hlo = Math.min(...hvals), hhi = Math.max(...hvals);
+        const hb = Math.max(4, Math.min(12, Math.round(Math.sqrt(hvals.length))));
+        const hw = (hhi - hlo) / hb || 1;
+        const hc = new Array(hb).fill(0);
+        hvals.forEach(v => {
+          const i = Math.min(hb - 1, Math.max(0, Math.floor((v - hlo) / hw)));
+          hc[i]++;
+        });
+        return { type: "histogram", data: hc.map((c, i) => ({
+          bin: `${(hlo + i * hw).toFixed(1)}–${(hlo + (i + 1) * hw).toFixed(1)}`, count: c,
+        })), xKey: "bin", yKey: "count", series: [] as string[] };
+      }
+    }
+    if ((vizType === "line" || vizType === "area") && (dateKeys.length || numKeys.length || catKeys.length)) {
+      const xk = vizX || dateKeys[0] || catKeys[0] || keys[0];
+      return { type: vizType === "area" ? "area" : "line", data: chartData, xKey: xk, yKey: vizY || pickNum([xk]), series: [] as string[] };
+    }
+    if ((vizType === "comparison" || vizType === "stacked") && catKeys.length && numKeys.length) {
+      const xk = vizX || catKeys[0];
+      if (vizType === "stacked" && numKeys.length >= 2) {
+        return { type: "stacked", data: chartData.slice(0, 10), xKey: xk, yKey: numKeys[0], series: numKeys.slice(0, 3) };
+      }
+      return { type: "bar", data: chartData.slice(0, 12), xKey: xk, yKey: vizY || pickNum(), series: [] as string[] };
+    }
+    if ((vizType === "h-bar" || vizType === "bar") && catKeys.length && numKeys.length) {
+      const xk = vizX || catKeys[0];
+      const horizontal = vizType === "h-bar" || chartData.length > 8;
+      return { type: horizontal ? "hbar" : "bar", data: horizontal ? chartData.slice(0, 12) : chartData, xKey: xk, yKey: vizY || pickNum(), series: [] as string[] };
+    }
 
     // Two numerics → scatter (backend "relationship" shape).
     if (numKeys.length >= 2 && !dateKeys.length && !catKeys.length) {
@@ -275,6 +325,98 @@ export default function AIAnalytics({
   const yKey = chartPlan?.yKey || "";
   const chartSeries: string[] = chartPlan?.series || [];
   const chartRenderData = chartPlan?.data || chartData;
+
+  const contextQuestion = query || (goalResult as any)?.interpretedGoal || "";
+  const goRelatedInsights = () => {
+    saveAnalysisContext({
+      origin: "analytics",
+      question: contextQuestion,
+      metric: analysisMeta?.entity || yKey || null,
+      dimension: xKey || null,
+      table: (goalResult?.relevantTables || [])[0] || null,
+    });
+    try {
+      sessionStorage.setItem("aria_insight_handoff", JSON.stringify({
+        origin: "analytics", question: contextQuestion,
+        metric: analysisMeta?.entity || yKey || null,
+      }));
+    } catch { /* best-effort */ }
+    gotoWithContext("insights", {});
+  };
+  const goCopilotAnalysis = () => {
+    saveAnalysisContext({
+      origin: "analytics",
+      question: contextQuestion,
+      metric: analysisMeta?.entity || yKey || null,
+      dimension: xKey || null,
+      table: (goalResult?.relevantTables || [])[0] || null,
+    });
+    if (onAskCopilot) onAskCopilot(contextQuestion || "Continue this analysis");
+    else gotoWithContext("copilot", {});
+  };
+  const goHistory = () => {
+    // History rows persist server-side on every /api/ask; this opens them.
+    gotoWithContext("history", {});
+  };
+  const goPage = (p: string) => {
+    if (onNavigate) {
+      try { onNavigate(p); return; } catch { /* fall through to hash */ }
+    }
+    gotoWithContext(p, {});
+  };
+
+  // Lifecycle-driven AI stage (real milestones only, never timers):
+  // 0 = request in flight, no payload yet · 1 = goal payload arrived,
+  // evidence building · 2 = evidence ready, finalizing visualization.
+  // Stage 3 ("Generating visualization") is the chart-reveal itself on done.
+  const aiStage = !goalResult ? 0 : !analysisResult ? 1 : 2;
+  // Chart-click drill selection: Investigate / Explain / Forecast
+  // hooks travel with the shared analysis context.
+  const [drill, setDrill] = useState<{ label: string; value: any } | null>(null);
+
+  // Persist cross-module context on every successful analysis so Forecast
+  // opens preselected via the shared context
+  // (never re-analyzing); the hypothesis capability is embedded here
+  // as Possible drivers instead of a standalone page.
+  const submittedQ = (goalResult as any)?.interpretedGoal || "";
+  useEffect(() => {
+    if (state === "done" && (goalResult || analysisResult)) {
+      const cols = Object.keys(chartData[0] || {});
+      saveAnalysisContext({
+        origin: "analytics",
+        question: submittedQ || query,
+        metric: yKey || null,
+        dimension: xKey || null,
+        table: (goalResult?.relevantTables || [])[0] || null,
+        filters: null,
+        source: goalResult?.relevantTables?.length
+          ? { tables: goalResult.relevantTables, columns: cols }
+          : null,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
+
+  const drillHooks = (label: string) => {
+    saveAnalysisContext({
+      origin: "analytics-chart",
+      question: query || submittedQ,
+      metric: yKey || null,
+      dimension: xKey || null,
+      table: (goalResult?.relevantTables || [])[0] || null,
+      segment: label || null,
+    });
+  };
+
+  const onChartClick = (st: any) => {
+    const p = st?.activePayload?.[0]?.payload;
+    if (!p || !xKey) return;
+    const label = String(p?.[xKey] ?? "");
+    if (!label) return;
+    const value = yKey ? p?.[yKey] : null;
+    setDrill({ label, value });
+    drillHooks(label);
+  };
 
   return (
     <div className="p-6 max-w-4xl mx-auto space-y-6">
@@ -371,29 +513,19 @@ export default function AIAnalytics({
         )}
       </div>
 
-      {/* Processing — stages reflect real lifecycle milestones, never timers:
-          engine working (no result yet) vs finalizing visualization (result arrived) */}
+      {/* Processing — 4 stages driven by the real request lifecycle
+          (App: ask sent → goal payload → analytics payload → reveal).
+          Chart skeleton reserves layout; reveal swaps it in, then static. */}
       {state === "processing" && (
-        <div className="bg-card border border-border rounded-xl p-6 flex flex-col items-center gap-5">
-          <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center">
-            <Loader2 size={20} className="text-primary animate-spin" />
-          </div>
-          <div className="text-center space-y-1">
-            <p className="text-sm font-medium text-foreground">
-              {goalResult ? "Preparing visualization..." : "Understanding your question..."}
-            </p>
-            <p className="text-xs text-muted-foreground">
-              {goalResult
-                ? "Analysis received, building charts and supporting data"
-                : "Inspecting data and generating analysis against real data"}
-            </p>
-          </div>
-          <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-            <span className={goalResult ? "text-positive" : "text-primary font-medium"}>● Understand</span>
-            <span>→</span>
-            <span className={goalResult ? "text-primary font-medium" : ""}>● Visualize</span>
-            <span>→</span>
-            <span>○ Result</span>
+        <div className="space-y-4">
+          <AIProcessingIndicator stage={aiStage} />
+          <div className="bg-card border border-border rounded-xl p-5 space-y-3" aria-hidden="true">
+            <div className="chart-skeleton h-5 w-48" />
+            <div className="chart-skeleton h-[220px] w-full" />
+            <div className="flex gap-2">
+              <div className="chart-skeleton h-8 w-24" />
+              <div className="chart-skeleton h-8 w-24" />
+            </div>
           </div>
         </div>
       )}
@@ -427,7 +559,7 @@ export default function AIAnalytics({
           </div>
           <p className="text-sm text-foreground leading-relaxed">{goalResult.clarificationMessage}</p>
           <div className="flex flex-wrap gap-2 pt-1">
-            {["total sales by month", "top products", "revenue by category"].map((q) => (
+            {(followUps.length > 0 ? followUps : getDynamicSuggestions(goalResult)).slice(0, 4).map((q) => (
               <button
                 key={q}
                 onClick={() => runAnalysis(q)}
@@ -443,18 +575,51 @@ export default function AIAnalytics({
       {/* Results */}
       {state === "done" && (
         <div className="space-y-4">
+          {/* Graceful states: actionable copy, never stack traces/SQL/raw errors */}
+          {resultStatus && resultStatus !== "success" && (
+            <div className="bg-warning/10 border border-warning/30 rounded-xl p-4 flex items-start gap-3">
+              <AlertCircle size={15} className="text-warning mt-0.5 flex-shrink-0" />
+              <div>
+                <p className="text-sm font-medium text-foreground capitalize">{resultStatus.replace(/-/g, " ")}</p>
+                <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed">
+                  {resultMessage || "Try narrowing to one metric or period and ask again."}
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Answer */}
-          {goalResult?.message && (
+          {answer && (
             <div className="premium-card bg-card border border-border rounded-xl p-5 space-y-3">
               <div className="flex items-center gap-2">
                 <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center">
                   <Sparkles size={12} className="text-primary" />
                 </div>
                 <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Answer</p>
+                {interpreted?.primary && (
+                  <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded capitalize">
+                    {String(interpreted.primary).replace(/_/g, " ")}
+                  </span>
+                )}
               </div>
               <p className="text-[14px] font-medium text-foreground leading-relaxed">
-                {goalResult.message}
+                {answer}
               </p>
+              {comparisonPeriod?.description && (
+                <p className="text-[11px] text-muted-foreground leading-relaxed">
+                  {comparisonPeriod.description}
+                </p>
+              )}
+              {findings.length > 1 && (
+                <ul className="space-y-1.5 pt-1">
+                  {findings.slice(0, 5).map((f: any, i: number) => (
+                    <li key={i} className="text-[13px] text-foreground leading-relaxed flex gap-2">
+                      <span className="text-primary mt-0.5">·</span>
+                      <span>{typeof f === "string" ? f : JSON.stringify(f)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
               <div className="flex flex-wrap gap-4 pt-1 text-[11px] text-muted-foreground">
                 {analysisMeta?.based_on > 0 && (
                   <span>
@@ -519,9 +684,81 @@ export default function AIAnalytics({
             </div>
           )}
 
-          {/* Visualization */}
+          {/* Possible drivers — embedded hypothesis capability (evidence-backed) */}
+          {(possibleDrivers.length > 0 || hypothesisObj) && (
+            <div className="bg-card border border-border rounded-xl p-5 space-y-3">
+              <div className="flex items-center gap-2">
+                <TrendingUp size={14} className="text-primary" />
+                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Possible drivers</p>
+                {hypothesisObj?.confidence && (
+                  <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                    {hypothesisObj.confidence} confidence
+                  </span>
+                )}
+              </div>
+              {hypothesisObj?.text && (
+                <p className="text-sm text-foreground leading-relaxed">{hypothesisObj.text}</p>
+              )}
+              {possibleDrivers.length > 0 && (
+                <div className="space-y-2">
+                  {possibleDrivers.slice(0, 5).map((d: any, i: number) => (
+                    <div key={i} className="flex items-center gap-3 bg-secondary/40 rounded-lg px-3 py-2">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[13px] font-medium text-foreground truncate">{d.driver || d.value}</p>
+                        <p className="text-[11px] text-muted-foreground">
+                          {d.metric}{d.period ? ` · ${d.period}` : ""}{d.confidence ? ` · ${d.confidence} confidence` : ""}
+                          {d.evidence?.table ? ` · ${d.evidence.table}` : ""}
+                        </p>
+                      </div>
+                      {d.contribution_pct !== undefined && (
+                        <span className="text-[13px] font-semibold text-primary flex-shrink-0">
+                          {d.contribution_pct}%
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Recommendations (from the result, never invented) */}
+          {recommendationsList.length > 0 && (
+            <div className="bg-card border border-border rounded-xl p-5 space-y-2">
+              <div className="flex items-center gap-2">
+                <Lightbulb size={14} className="text-primary" />
+                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Recommendations</p>
+              </div>
+              <ul className="space-y-1.5">
+                {recommendationsList.slice(0, 4).map((r: any, i: number) => (
+                  <li key={i} className="text-[13px] text-foreground leading-relaxed flex gap-2">
+                    <span className="text-primary mt-0.5">·</span>
+                    <span>
+                      {typeof r === "string" ? r : (r.text || JSON.stringify(r))}
+                      {r?.confidence && <span className="text-muted-foreground"> ({r.confidence} confidence)</span>}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Limitations (honest, from the backend) */}
+          {limitations.length > 0 && (
+            <div className="bg-secondary/40 border border-border rounded-xl p-4 space-y-1">
+              <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Limitations</p>
+              {limitations.slice(0, 4).map((lim: any, i: number) => (
+                <p key={i} className="text-xs text-muted-foreground leading-relaxed">· {typeof lim === "string" ? lim : JSON.stringify(lim)}</p>
+              ))}
+            </div>
+          )}
+
+          {/* Visualization: skeleton swapped for a one-shot reveal (keyed by
+              question so each new analysis replays it once, then static).
+              Click a mark to drill down — Investigate / Explain / Forecast
+              hooks travel with the shared context. */}
           {chartRenderData.length > 0 && xKey && yKey && (
-            <div className="bg-card border border-border rounded-xl p-5">
+            <div className="bg-card border border-border rounded-xl p-5 chart-reveal" key={submittedQ || query}>
               <div className="flex items-center justify-between mb-4">
                 <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Visualization</p>
                 <div className="flex items-center gap-2">
@@ -553,7 +790,7 @@ export default function AIAnalytics({
                     <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
                     <Tooltip content={<BizTooltip />} />
-                    <Area type="monotone" dataKey={yKey} stroke="#2F6FAD" fill="#2F6FAD" fillOpacity={0.15} strokeWidth={2} />
+                    <Area type="monotone" dataKey={yKey} stroke={CHART_COLORS[0]} fill={CHART_COLORS[0]} fillOpacity={0.15} strokeWidth={2} />
                   </AreaChart>
                 ) : chartType === "scatter" ? (
                   <ScatterChart>
@@ -564,7 +801,7 @@ export default function AIAnalytics({
                       content={<BizTooltip />}
                       cursor={{ strokeDasharray: "3 3" }}
                     />
-                    <Scatter data={chartRenderData} fill="#2F6FAD" fillOpacity={0.6} />
+                    <Scatter data={chartRenderData} fill={CHART_COLORS[0]} fillOpacity={0.6} />
                   </ScatterChart>
                 ) : chartType === "hbar" ? (
                   <BarChart data={chartRenderData} layout="vertical" barSize={22}>
@@ -597,7 +834,7 @@ export default function AIAnalytics({
                       outerRadius={90}
                       dataKey={yKey}
                       nameKey={xKey}
-                      label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                      label={({ name, percent }) => `${name} ${((percent ?? 0) * 100).toFixed(0)}%`}
                       labelLine={false}
                     >
                       {chartRenderData.map((_, i) => (
@@ -607,7 +844,7 @@ export default function AIAnalytics({
                     <Tooltip content={<BizTooltip />} />
                   </PieChart>
                 ) : (
-                  <BarChart data={chartRenderData} barSize={36}>
+                  <BarChart data={chartRenderData} barSize={36} onClick={onChartClick}>
                     <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
                     <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
                     <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
@@ -616,7 +853,7 @@ export default function AIAnalytics({
                       {chartRenderData.map((row: any, i: number) => (
                         <Cell
                           key={i}
-                          fill={chartType === "histogram" ? "#2F6FAD" : colorForName(String(row?.[xKey] ?? i))}
+                          fill={chartType === "histogram" ? CHART_COLORS[0] : colorForName(String(row?.[xKey] ?? i))}
                           fillOpacity={chartType === "histogram" ? 0.55 + (0.45 * i) / Math.max(1, chartRenderData.length) : 1}
                         />
                       ))}
@@ -624,6 +861,55 @@ export default function AIAnalytics({
                   </BarChart>
                 )}
               </ResponsiveContainer>
+              {drill && (
+                <div className="mt-3 rounded-lg border border-primary/25 bg-primary/5 px-3 py-2.5">
+                  <p className="text-xs text-foreground">
+                    <span className="font-semibold">{drill.label}</span>
+                    {drill.value !== null && drill.value !== undefined && (
+                      <span className="text-muted-foreground"> · {typeof drill.value === "number" ? drill.value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : String(drill.value)}</span>
+                    )}
+                    <span className="text-muted-foreground"> — what next?</span>
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    <button
+                      onClick={() => {
+                        drillHooks(drill.label);
+                        const wq = `Why did ${yKey || "the metric"} change for ${drill.label}?`;
+                        setQuery(wq);
+                        onAsk?.(wq);
+                        setDrill(null);
+                      }}
+                      className="text-[11px] font-medium px-2.5 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
+                    >
+                      Investigate why
+                    </button>
+                    <button
+                      onClick={() => {
+                        drillHooks(drill.label);
+                        onAsk?.(`Explain this finding: ${drill.label} in ${query || submittedQ}`);
+                      }}
+                      className="text-[11px] font-medium px-2.5 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
+                    >
+                      Explain
+                    </button>
+                    <button
+                      onClick={() => {
+                        drillHooks(drill.label);
+                        gotoWithContext("predictive", { metric: yKey });
+                      }}
+                      className="text-[11px] font-medium px-2.5 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
+                    >
+                      Forecast
+                    </button>
+                    <button
+                      onClick={() => setDrill(null)}
+                      className="text-[11px] text-muted-foreground hover:text-foreground px-2 py-1.5"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -725,42 +1011,39 @@ export default function AIAnalytics({
             )}
           </div>
 
-          {/* SQL */}
-          {sqlUsed && (
+          {/* Evidence — tables/columns/values only. Raw SQL stays backend-only
+              and is never rendered on this user-facing page. */}
+          {evidenceList.length > 0 && (
             <div className="bg-card border border-border rounded-xl overflow-hidden">
               <button
-                onClick={() => setSqlExpanded((e) => !e)}
+                onClick={() => setShowEvidence((e) => !e)}
                 className="w-full flex items-center justify-between px-5 py-3.5 hover:bg-secondary/40 transition-colors"
               >
                 <div className="flex items-center gap-2">
-                  <Code2 size={14} className="text-muted-foreground" />
-                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Generated SQL</p>
+                  <Database size={14} className="text-muted-foreground" />
+                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Evidence</p>
+                  {evidenceList[0]?.tables?.length > 0 && (
+                    <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                      {evidenceList[0].tables.slice(0, 3).join(", ")}
+                    </span>
+                  )}
                 </div>
-                {sqlExpanded ? <ChevronUp size={14} className="text-muted-foreground" /> : <ChevronDown size={14} className="text-muted-foreground" />}
+                {showEvidence ? <ChevronUp size={14} className="text-muted-foreground" /> : <ChevronDown size={14} className="text-muted-foreground" />}
               </button>
-              {sqlExpanded && (
-                <div className="border-t border-border">
-                  <div className="flex items-center justify-between px-4 py-2 bg-muted/60">
-                    <span className="text-xs text-muted-foreground font-mono">SQL Query</span>
-                    <div className="flex gap-2">
-                      <button onClick={copySQL} className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors">
-                        {copied ? <><CheckCircle size={12} className="text-positive" /> Copied!</> : <><Copy size={12} /> Copy</>}
-                      </button>
-                      <button
-                        onClick={() => { const q = `Explain what this SQL query does in business terms: ${sqlUsed}`; setQuery(q); runAnalysis(q); }}
-                        className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                      >
-                        <Sparkles size={12} /> Explain
-                      </button>
-                    </div>
-                  </div>
-                  <pre className="font-mono text-xs text-foreground px-5 py-4 overflow-x-auto leading-relaxed bg-muted/30">
-                    <code>{sqlUsed}</code>
-                  </pre>
+              {showEvidence && (
+                <div className="border-t border-border px-5 py-4 space-y-2 text-xs text-muted-foreground leading-relaxed">
+                  <p>Tables: {(evidenceList[0]?.tables || []).join(", ") || "—"}</p>
+                  <p>Columns: {(evidenceList[0]?.columns || []).join(", ") || "—"}</p>
+                  <p>Rows analyzed: {evidenceList[0]?.row_count ?? tableData.length}</p>
                 </div>
               )}
             </div>
           )}
+
+          {/* P2 §20: raw SQL / raw JSON / chain-of-thought / prompts are never
+              exposed on this user-facing page. Provenance (source/tables/
+              columns/SQL trace) stays in the backend goalResult payload for
+              admin/debug use only. */}
 
           {/* Follow-ups */}
           {followUps.length > 0 && (
@@ -781,70 +1064,87 @@ export default function AIAnalytics({
             </div>
           )}
 
-          {/* Provenance — source, table, column, SQL trace */}
-          {goalResult?.provenance && (
-            <div className="bg-card border border-border rounded-xl p-5 space-y-3">
-              <div className="flex items-center gap-2">
-                <GitBranch size={14} className="text-muted-foreground" />
-                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Source & Provenance</p>
-              </div>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-                <div className="space-y-1">
-                  <p className="text-muted-foreground">Source</p>
-                  <p className="text-foreground font-medium">{goalResult.provenance.source || "—"}</p>
-                </div>
-                <div className="space-y-1">
-                  <p className="text-muted-foreground">Type</p>
-                  <p className="text-foreground font-medium">{goalResult.provenance.source_type || "—"}</p>
-                </div>
-                <div className="space-y-1">
-                  <p className="text-muted-foreground">Tables</p>
-                  <p className="text-foreground font-medium">{goalResult.provenance.tables?.join(", ") || "—"}</p>
-                </div>
-                <div className="space-y-1">
-                  <p className="text-muted-foreground">Rows</p>
-                  <p className="text-foreground font-medium">{goalResult.provenance.row_count?.toLocaleString() || "—"}</p>
-                </div>
-              </div>
-              {goalResult.provenance.columns?.length > 0 && (
-                <div className="text-xs">
-                  <p className="text-muted-foreground mb-1">Columns used</p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {goalResult.provenance.columns.map((col: string) => (
-                      <span key={col} className="px-2 py-0.5 bg-muted rounded text-foreground">{col}</span>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {goalResult.provenance.join_path?.length > 0 && (
-                <div className="text-xs">
-                  <p className="text-muted-foreground mb-1">Join path</p>
-                  <p className="text-foreground font-mono text-[11px]">
-                    {goalResult.provenance.join_path.map((j: any) => `${j.from}.${j.from_col} = ${j.to}.${j.to_col}`).join(" → ")}
-                  </p>
-                </div>
-              )}
-              {goalResult.provenance.document_evidence?.length > 0 && (
-                <div className="text-xs space-y-2">
-                  <p className="text-muted-foreground mb-1">Related documents</p>
-                  {goalResult.provenance.document_evidence.map((d: any, i: number) => (
-                    <div key={i} className="bg-secondary/40 border border-border rounded-lg p-2.5">
-                      <p className="text-foreground leading-relaxed">{d.excerpt}</p>
-                      <p className="text-[10px] text-muted-foreground mt-1">
-                        Document {String(d.document_id).slice(0, 8)}{d.page ? ` · page ${d.page}` : ""}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {goalResult.conversationId && (
-                <div className="flex items-center gap-4 text-[11px] text-muted-foreground pt-1 border-t border-border">
-                  <span>Conversation: {goalResult.conversationId.split("_").slice(-1)[0]}</span>
-                  {goalResult.turnNumber && <span>Turn: {goalResult.turnNumber}</span>}
-                </div>
-              )}
+          {/* Next actions: handoffs carry the shared analysis context
+              (localStorage aria_analysis_context + hash params) so the user
+              never retypes and the target page never re-analyzes. */}
+          <div className="space-y-2">
+            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Next actions</p>
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => {
+                  const m = analysisMeta?.entity || yKey || "the metric";
+                  const wq = `Why did ${m} change?`;
+                  setQuery(wq);
+                  runAnalysis(wq);
+                }}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
+              >
+                Investigate why
+              </button>
+              <button
+                onClick={() => {
+                  const q = `Compare this period with the previous period for: ${query || submittedQ || "the current analysis"}`;
+                  setQuery(q);
+                  runAnalysis(q);
+                }}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
+              >
+                Compare periods
+              </button>
+              <button
+                onClick={() => {
+                  const m = analysisMeta?.entity || yKey || "";
+                  const period = comparisonPeriod?.granularity || (goalResult?.comparison_period as any)?.granularity || "";
+                  const table = (goalResult?.relevantTables || [])[0] || null;
+                  const q = query || submittedQ || "";
+                  saveAnalysisContext({
+                    origin: "analytics",
+                    question: q || null,
+                    metric: m || null,
+                    dimension: xKey || null,
+                    table,
+                    period: period || null,
+                    dateRange: period || null,
+                  });
+                  try {
+                    localStorage.setItem("aria_forecast_context", JSON.stringify({
+                      metric: m || undefined,
+                      dataset: table || undefined,
+                      date: period || undefined,
+                      granularity: period || undefined,
+                      question: q || undefined,
+                    }));
+                  } catch { /* best-effort */ }
+                  gotoWithContext("predictive", { metric: m, period: period || undefined, question: q || undefined });
+                }}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
+              >
+                Forecast
+              </button>
+              <button
+                onClick={goRelatedInsights}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
+              >
+                Related insights
+              </button>
+              <button
+                onClick={goCopilotAnalysis}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
+              >
+                Continue in Copilot
+              </button>
+              <button
+                onClick={goHistory}
+                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
+              >
+                Save analysis
+              </button>
             </div>
-          )}
+          </div>
+
+          {/* n.txt-10: Source & Provenance removed from this user-facing page.
+              Provenance (source/tables/columns/SQL trace) stays in the backend
+              goalResult payload for admin/debug use only. */}
         </div>
       )}
     </div>

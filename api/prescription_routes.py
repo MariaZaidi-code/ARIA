@@ -106,44 +106,41 @@ def _setup(user):
 
 
 def _doc_setup(user):
-    """Text-only document source: reloadable chunk texts, no model loading.
+    """Text-only document source: reloadable chunk texts from canonical RAG.
 
-    Returns ((chunks, doc_name, session), None) or (None, err). Chunk text
-    comes straight from the vector store's SQLite metadata — deterministic,
-    no embeddings needed.
+    Reads from the ``insight_rag`` manifest + chunks (PGVector-backed) instead
+    of the legacy FAISS SQLite database.  Returns ``((chunks, doc_name, session),
+    None)`` or ``(None, err)``.
+
+    Per astra.txt Phase 2: this is *document context*, not analytical proof.
     """
-    import sqlite3
-    from pathlib import Path
-    from core.config import PROCESSED_DIR
+    import json as _j
+    from insight_rag.storage import RAGMetadataStore
     session = get_session(user["user_id"])
     if session.get("source_type") != "document" or not session.get("document_id"):
         return None, None
     doc_id = session["document_id"]
-    docs_dir = Path(str(PROCESSED_DIR)) / f"user_{user['user_id']}" / "documents"
-    doc_name = doc_id
-    try:
-        meta = (docs_dir / f"{doc_id}.json").read_text(encoding="utf-8")
-        import json as _j
-        doc_name = _j.loads(meta).get("original_name") or _j.loads(meta).get("name") or doc_id
-    except Exception:
-        pass
-    db_path = docs_dir / "vector_metadata.db"
-    if not db_path.exists():
+    meta = RAGMetadataStore(user["user_id"])
+    record = meta.get_document(doc_id)
+    if not record:
         return None, {"ok": False, "success": False, "code": "NO_CONNECTION",
                       "detail": "This document has no readable text to base recommendations on.",
                       "recoverable": True}
+    doc_name = record.get("filename") or doc_id
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        rows = conn.execute(
-            "SELECT chunk_id, content, page_number, section FROM chunks "
-            "WHERE document_id = ? ORDER BY rowid LIMIT 400", (doc_id,)).fetchall()
-        conn.close()
+        raw_chunks = meta.load_chunks(doc_id)
     except Exception:
         return None, {"ok": False, "success": False, "code": "NO_CONNECTION",
                       "detail": "This document has no readable text to base recommendations on.",
                       "recoverable": True}
-    chunks = [{"id": r[0], "content": r[1], "page_number": r[2], "section": r[3]}
-              for r in rows if (r[1] or "").strip()]
+    chunks = [
+        {"id": str(c.metadata.get("chunk_id", "")),
+         "content": c.page_content,
+         "page_number": c.metadata.get("page"),
+         "section": c.metadata.get("section")}
+        for c in raw_chunks
+        if (c.page_content or "").strip()
+    ]
     if not chunks:
         return None, {"ok": False, "success": False, "code": "NO_CONNECTION",
                       "detail": "This document has no readable text to base recommendations on.",
@@ -205,10 +202,16 @@ def _enrich_context(engine, dialect, intel, tables, session):
     """Opportunities, per-table limitations, and latest saved evidence (§1).
 
     Opportunity candidates are schema-discovered only (no data scanned):
-    metric × controllable-ish drivers, derived stay length, and declared
-    joins. Actionable reasons name row counts and missing pieces.
+    metric × controllable-ish drivers within the same table. Foreign-key
+    relationships never auto-generate drivers (hyp §4) and derived fields
+    never auto-generate drivers (hyp §5) — actionability for those is
+    established separately inside the prescription engine behind statistical
+    evidence gates. Actionable reasons name row counts and missing pieces.
     """
-    from prescription_engine.engine import _usable_measures, classify_driver, _edge_neighbors
+    from prescription_engine.engine import _usable_measures, classify_driver
+    from prescription_engine.engine import (classify_semantic_role as _role,
+                                            NON_LEVER_ROLES as _NON_LEVER,
+                                            NON_OUTCOME_ROLES as _NON_OUTCOME)
     from sqlalchemy import text as _t
     opportunities, limitations = [], []
 
@@ -221,35 +224,57 @@ def _enrich_context(engine, dialect, intel, tables, session):
         except Exception:
             return -1
 
-    for t in tables[:3]:
+    # Rank-first scan: tiny lookup tables must not eat the 3-table modeling
+    # budget (e.g. northwind's categories/demographics hid orders entirely).
+    # Up to 12 tables are cheaply COUNTed; the 3 most promising (most rows,
+    # most measures) get the full opportunity treatment.
+    ranked = []
+    for t in tables[:12]:
         measures = _usable_measures(intel, t)
+        if not measures:
+            limitations.append(f"{t}: no measurable numeric columns to improve.")
+            continue
         n = _count(t)
         if n >= 0 and n < 10:
             limitations.append(f"{t}: only {n} rows — below the 10-observation minimum for modeling.")
             continue
-        if not measures:
-            limitations.append(f"{t}: no measurable numeric columns to improve.")
-            continue
-        dates = intel.get_datetime_cols(t)
-        neighbors = _edge_neighbors(intel, t)
+        ranked.append((n, t, measures))
+    # Uncountable tables (-1) sort last; then most rows, then most measures.
+    ranked.sort(key=lambda x: (x[0] < 0, -(x[0] if x[0] >= 0 else 0), -len(x[2])))
+    for _n, t, measures in ranked[:3]:
         for m in measures[:2]:
             cands = []
             for c in measures:
                 if c != m:
                     cands.append((c, None, "same table"))
-            if len(dates) >= 2:
-                cands.append(("length_of_stay", None, "derived from dates"))
-            for ot, sc, oc in neighbors:
-                for c in _usable_measures(intel, ot)[:2]:
-                    cands.append((c, ot, f"via {t}.{sc} → {ot}.{oc}"))
-                    if len(cands) >= 4:
-                        break
-                if len(cands) >= 4:
-                    break
+            # hyp §4: FK relationships are join metadata, never auto-drivers —
+            # no cross-table candidates are seeded here. An explicit driver
+            # request over a declared join is still supported inside the
+            # prescription engine, behind full statistical evidence gates.
+            # hyp §5: derived fields (e.g. stay length from dates) are never
+            # auto-drivers either — the engine measures them with evidence
+            # gates when they are actually analyzed.
             if not cands:
                 limitations.append(f"{t}.{m}: no other numbers reachable to test as drivers.")
                 continue
             for c, ot, how in cands[:3]:
+                # hyp.txt §§4/10-11: technical/system measurements stay
+                # analytic — they never become auto-opportunities, however
+                # "measurable" they look. Generalized role check, never
+                # per-column literals.
+                try:
+                    _m_role = _role(m, "numeric")
+                except Exception:
+                    _m_role = "MEASURE"
+                try:
+                    _c_role = _role(c, "numeric")
+                except Exception:
+                    _c_role = "MEASURE"
+                if _m_role in _NON_OUTCOME or _c_role in _NON_LEVER:
+                    _bad = c if _c_role in _NON_LEVER else m
+                    _kind = str(_c_role if _c_role in _NON_LEVER else _m_role).lower().replace("_", " ")
+                    limitations.append(f"{t}.{_bad}: a {_kind} — analytic signal only, not an actionable opportunity.")
+                    continue
                 level, _ = classify_driver(c, "numeric")
                 opportunities.append({"table": t, "metric": m, "driver": c,
                                       "driver_table": ot or t, "control": level,
@@ -332,8 +357,22 @@ def _polish_story(session, out):
     Skipped for the local provider: a cold/slow Ollama can stall the
     response ~30s for zero analytical gain — the deterministic story,
     built from real numbers, is the product.
+
+    Evidence gate FIRST: prescriptions resting on < 10 observations keep
+    their deterministic honest wording — the LLM never compensates.
     """
     try:
+        try:
+            _fit = (out.get("fit") or {}) if isinstance(out, dict) else {}
+            _n = _fit.get("n")
+            if _n is None:
+                _ev0 = ((out.get("prescriptions") or [{}])[0].get("evidence")
+                        if isinstance(out.get("prescriptions"), list) else {}) or {}
+                _n = _ev0.get("n")
+            if _n is not None and int(_n) < 10:
+                return None
+        except (TypeError, ValueError):
+            pass
         if (session.get("provider_name") or "local") == "local":
             return None
         prov = session.get("provider")

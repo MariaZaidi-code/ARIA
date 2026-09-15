@@ -77,7 +77,7 @@ def test_duplicate_rows_quality_signal(tmp_path: Path):
     path = write(tmp_path / "dup.csv", "id,name\n1,A\n1,A\n2,B\n")
     schema = CsvSchemaExtractor(path).extract()
     assert schema["quality"]["duplicate_rows"] == 1
-    assert schema["quality"]["duplicate_row_percentage"] == 33.33
+    assert schema["quality"]["duplicate_row_percentage"] == pytest.approx(33.33)
 
 
 def test_ambiguous_date_is_not_guessed(tmp_path: Path):

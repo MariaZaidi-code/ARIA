@@ -6,6 +6,13 @@
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
     "strict": false,
+    // Incremental strictness (step 1 of N): null-safety on, implicit-any
+    // off. Full `strict: true` still fails (~30 noImplicitAny + a few
+    // null-safety errors in AIAnalytics/Dashboard/Documents) — see TODO.
+    // TODO(strict): fix remaining implicit-any params (AIAnalytics,
+    // Dashboard), then flip strict:true and remove these two lines.
+    "strictNullChecks": true,
+    "noImplicitAny": false,
     "skipLibCheck": true,
     "allowJs": true,
     "checkJs": false,

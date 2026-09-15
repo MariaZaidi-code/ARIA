@@ -1,11 +1,14 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { Send, Plus, MoreHorizontal, Sparkles } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, LineChart, Line, PieChart, Pie, Cell } from "recharts";
 import { useTheme } from "../App";
 import Evidence from "../components/Evidence";
+import AIProcessingIndicator from "../components/AIProcessingIndicator";
 import { BizTooltip } from "../components/charts";
 import { colorForName } from "../lib/charts";
 import { fmtBiz } from "../lib/format";
+import { apiFetch } from "../../services/api";
+import { KEYS, storage } from "../../utils/storage";
 
 type Message = {
   id: string;
@@ -115,12 +118,8 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
   const [suggestions, setSuggestions] = useState<string[]>(FALLBACK_SUGGESTIONS);
   const refreshSuggestions = async () => {
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      const res = await fetch("/api/copilot/suggestions", {
-        headers: { Authorization: `Bearer ${token || ""}` },
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && Array.isArray(data.suggestions) && data.suggestions.length) {
+      const data: any = await apiFetch("/copilot/suggestions");
+      if (Array.isArray(data.suggestions) && data.suggestions.length) {
         setSuggestions(data.suggestions.slice(0, 4));
       }
     } catch { /* fallback list stays */ }
@@ -128,47 +127,40 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
   useEffect(() => { refreshSuggestions(); }, []);
   // Per-user persistence (§13): conversations survive refresh. Rows are
   // trimmed on save so one chat cannot exhaust localStorage quota.
-  const chatsKey = (() => {
-    try {
-      const u = JSON.parse(localStorage.getItem("aria_auth_user") || "null");
-      return `aria_copilot_chats_${u?.username || u?.email || "anon"}`;
-    } catch {
-      return "aria_copilot_chats_anon";
-    }
-  })();
+  // The key + initial chats resolve once (useMemo/useState initializer —
+  // never parsed inline during render).
+  const chatsKey = useMemo(() => {
+    const u: any = storage.get(KEYS.authUser, null);
+    return storage.scoped(KEYS.copilotChats, u);
+  }, []);
   const loadChats = (): Conversation[] => {
-    try {
-      const raw = localStorage.getItem(chatsKey);
-      if (!raw) return [];
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.slice(0, 10) : [];
-    } catch {
-      return [];
-    }
+    const parsed = storage.get(chatsKey, []);
+    return Array.isArray(parsed) ? (parsed as Conversation[]).slice(0, 10) : [];
   };
   const [conversations, setConversations] = useState<Conversation[]>(loadChats);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
+  // Lifecycle-driven AI stage (real request milestones, never timers):
+  // 0 = request sent · 1 = response headers arrived · 2 = payload parsed,
+  // rendering the answer. Unmounted when isTyping flips false.
+  const [copilotStage, setCopilotStage] = useState(0);
   const endRef = useRef<HTMLDivElement>(null);
   const consumedPrefill = useRef("");
 
   const active = conversations.find((c) => c.id === activeId) || conversations[0] || null;
 
   // Persist on every change (trimmed: 10 chats, 30 messages each, 24 rows).
+  // Versioned key + quota-guarded write; overflow stays session-only.
   useEffect(() => {
-    try {
-      const trimmed = conversations.slice(0, 10).map((c) => ({
-        ...c,
-        messages: c.messages.slice(-30).map((m) => ({
-          ...m,
-          rows: Array.isArray(m.rows) ? m.rows.slice(0, 24) : m.rows,
-        })),
-      }));
-      localStorage.setItem(chatsKey, JSON.stringify(trimmed));
-    } catch {
-      // Quota or private mode: chats simply stay session-only.
-    }
+    const trimmed = conversations.slice(0, 10).map((c) => ({
+      ...c,
+      messages: c.messages.slice(-30).map((m) => ({
+        ...m,
+        rows: Array.isArray(m.rows) ? m.rows.slice(0, 24) : m.rows,
+      })),
+    }));
+    storage.set(chatsKey, trimmed);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversations]);
 
@@ -219,18 +211,24 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
       prev.map((c) => c.id === targetId ? { ...c, messages: [...c.messages, userMsg] } : c)
     );
     setIsTyping(true);
+    setCopilotStage(0);
 
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      const res = await fetch("/api/copilot", {
+      // Chart context stashed by Decision Center / other pages (§38): measured
+      // evidence travels with the question so Copilot answers about THIS chart.
+      let chartCtx: any = null;
+      try {
+        const raw = sessionStorage.getItem("aria_copilot_context");
+        if (raw) { chartCtx = JSON.parse(raw); sessionStorage.removeItem("aria_copilot_context"); }
+      } catch { chartCtx = null; }
+      const data: any = await apiFetch("/copilot", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ question: content }),
+        body: JSON.stringify(chartCtx ? { question: content, context: chartCtx } : { question: content }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data?.detail || `Request failed (${res.status}).`);
-      }
+      // Response headers arrived — analysis running server-side.
+      setCopilotStage(1);
+      // Payload parsed — building the answer rendering.
+      setCopilotStage(2);
       const reply: Message = {
         id: (Date.now() + 1).toString(),
         role: "assistant",
@@ -345,7 +343,7 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
             <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4 custom-scroll">
               {active.messages.length === 0 && !isTyping && (
                 <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in">
-                  <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center mb-3 animate-float">
+                  <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center mb-3">
                     <Sparkles size={18} className="text-primary" />
                   </div>
                   <p className="text-sm font-medium text-foreground">ARIA Copilot</p>
@@ -398,6 +396,11 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
               )}
 
               {isTyping && (
+                <div className="px-1 py-1 max-w-2xl">
+                  <AIProcessingIndicator compact stage={copilotStage} />
+                </div>
+              )}
+              {isTyping && (
                 <div className="flex items-start gap-2.5 max-w-2xl animate-slide-in-left">
                   <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center">
                     <Sparkles size={11} className="text-primary" />
@@ -414,7 +417,7 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
           </>
         ) : (
           <div className="flex-1 flex flex-col items-center justify-center text-center animate-fade-in">
-            <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center mb-4 animate-float">
+            <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center mb-4">
               <Sparkles size={22} className="text-primary" />
             </div>
             <p className="text-base font-medium text-foreground">ARIA Copilot</p>

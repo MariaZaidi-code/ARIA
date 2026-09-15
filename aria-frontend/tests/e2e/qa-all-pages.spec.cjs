@@ -1,15 +1,18 @@
 // QA: drive login -> LLM selection -> every non-Data page, capturing runtime errors.
 const { test, expect } = require("@playwright/test");
 
-const BASE = process.env.ARIA_BASE || "http://localhost:5173";
+const BASE = process.env.ARIA_BASE || "http://localhost:8000";
 
 const PAGES = [
   { id: "dashboard", nav: "Dashboard" },
   { id: "analytics", nav: "AI Analytics" },
   { id: "insights", nav: "Insights" },
-  { id: "predictive", nav: "Predictive" },
-  { id: "prescription", nav: "Prescription" },
-  { id: "hypothesis", nav: "Hypothesis" },
+  { id: "predictive", nav: "Forecast" },
+  { id: "decision-center", nav: "Decision Center" },
+  // No standalone prescription/hypothesis pages (removed): prescription is
+  // verified via Decision Center recommendations; hypothesis via Insights
+  // "Investigate why" -> AI Analytics Possible drivers (see
+  // qa-connected-flow.spec.cjs for the contextual coverage).
   // "data" intentionally skipped (out of scope)
   { id: "documents", nav: "Documents" },
   { id: "copilot", nav: "Copilot" },

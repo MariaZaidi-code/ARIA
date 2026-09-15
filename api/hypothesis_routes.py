@@ -15,6 +15,12 @@ from core.secret_box import decrypt as _decrypt_secret
 router = APIRouter()
 
 
+# Bounded sample for correlation tests (spec §3, deterministic precedent):
+# statistics are computed over at most this many pairs and the honest sample
+# size travels with the result; the scatter payload is capped at 200 points.
+_HYPOTHESIS_SAMPLE_MAX = 2000
+
+
 def _quote_identifier(name, dialect="postgresql"):
     if dialect == "mysql":
         return f"`{name.replace('`', '``')}`"
@@ -570,11 +576,18 @@ def _select_best_pair(pairs, hypothesis, conn, dialect):
 
 
 def _fetch_sample(conn, table, x_col, y_col, dialect):
+    """Bounded sample for correlation tests (spec §3).
+
+    Correlation is computed over at most _HYPOTHESIS_SAMPLE_MAX pairs; the
+    scatter payload is separately capped at 200 points by the caller. The
+    honest sample size (n) is always reported alongside the statistics, so a
+    bounded sample never masquerades as full-data inference.
+    """
     q_x = _quote_identifier(x_col, dialect)
     q_y = _quote_identifier(y_col, dialect)
     q_t = _quote_identifier(table, dialect)
     result = conn.execute(text(
-        f"SELECT {q_x}, {q_y} FROM {q_t} WHERE {q_x} IS NOT NULL AND {q_y} IS NOT NULL LIMIT 5000"
+        f"SELECT {q_x}, {q_y} FROM {q_t} WHERE {q_x} IS NOT NULL AND {q_y} IS NOT NULL LIMIT {_HYPOTHESIS_SAMPLE_MAX}"
     ))
     return result.fetchall()
 
@@ -618,54 +631,8 @@ def _t_cdf(t, df):
 
 
 def _regularized_incomplete_beta(a, b, x):
-    if x <= 0:
-        return 0.0
-    if x >= 1:
-        return 1.0
-    lbeta = math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
-    front = math.exp(math.log(x) * a + math.log(1 - x) * b - lbeta)
-    if x < (a + 1) / (a + b + 2):
-        return front * _beta_cf(a, b, x) / a
-    else:
-        return 1.0 - front * _beta_cf(b, a, 1 - x) / b
-
-
-def _beta_cf(a, b, x):
-    max_iter = 200
-    eps = 1e-14
-    qab = a + b
-    qap = a + 1
-    qam = a - 1
-    c = 1.0
-    d = 1.0 - qab * x / qap
-    if abs(d) < 1e-30:
-        d = 1e-30
-    d = 1.0 / d
-    h = d
-    for m in range(1, max_iter + 1):
-        m2 = 2 * m
-        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
-        d = 1.0 + aa * d
-        if abs(d) < 1e-30:
-            d = 1e-30
-        c = 1.0 + aa / c
-        if abs(c) < 1e-30:
-            c = 1e-30
-        d = 1.0 / d
-        h *= d * c
-        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
-        d = 1.0 + aa * d
-        if abs(d) < 1e-30:
-            d = 1e-30
-        c = 1.0 + aa / c
-        if abs(c) < 1e-30:
-            c = 1e-30
-        d = 1.0 / d
-        delta = d * c
-        h *= delta
-        if abs(delta - 1.0) < eps:
-            break
-    return h
+    from core.math_stats import regularized_incomplete_beta
+    return regularized_incomplete_beta(a, b, x)
 
 
 def _r_ci(r: float, n: int) -> dict:

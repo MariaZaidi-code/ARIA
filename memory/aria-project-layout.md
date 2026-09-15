@@ -43,7 +43,7 @@ metadata:
 
 ## Playwright E2E
 - `aria-frontend/tests/e2e/` — 5 `.cjs` specs (01-auth, 02-figma-pages, 03-main-pages, 04-data-connect, full-journey)
-- `aria-frontend/playwright.config.cjs` — CommonJS, port 5174, webServer `npm run dev`
+- `aria-frontend/playwright.config.cjs` — CommonJS, baseURL http://localhost:8000 (backend-served dist/ build; vite :5173 is dev-only)
 - Browser: chromium-1243 installed
 
 ## Dev Ports

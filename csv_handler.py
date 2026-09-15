@@ -9,12 +9,53 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+
+_CURRENCY_RE = re.compile(r"[\u20b9\u00a3\u00a5\u20ac$\u00a4\uffe0\uffe1\uffe5\uffe6\u20b1\u20a9]")
+_THOUSAND_SEP_RE = re.compile(r"(?<=\d),(?=\d{3})")
+
+
+def _clean_currency(value: str) -> str:
+    """Strip currency symbols, thousand-separator commas, and percentage signs.
+
+    Returns the cleaned numeric-looking string, or the original if no cleaning
+    changed anything.  ``"₹1,099"`` -> ``"1099"``, ``"64%"`` -> ``"0.64"``,
+    ``"$12,345.67"`` -> ``"12345.67"``.
+    """
+    v = value.strip()
+    v = _CURRENCY_RE.sub("", v)
+    v = v.replace(",", "")
+    stripped = v.strip()
+    if stripped.endswith("%"):
+        try:
+            num = float(stripped[:-1])
+            return str(num / 100)
+        except ValueError:
+            pass
+    return stripped
+
 import pandas as pd
 from pandas.errors import EmptyDataError, ParserError
 
 
 class CsvValidationError(ValueError):
     """Raised when a CSV file cannot be safely interpreted as a table."""
+
+
+# Scalability bounds (spec §1). Profiling a large CSV through a single
+# full-frame pandas read holds several copies of the data at once (frame +
+# string casts + boolean masks + to_dict records) and repeats per-column
+# Python loops over every row. Files above FULL_PROFILE_MAX_ROWS use a
+# bounded path instead: type inference from a head sample plus one chunked
+# streaming pass with a bounded working set. There is NO analytical row cap —
+# every data row still contributes to the exact aggregates (row_count,
+# null counts, numeric min/max/mean, ISO date range); only the inference
+# sample and the in-memory cardinality working sets are bounded. Whenever a
+# field is sample-based or estimated, the profile's "sampling" block says so.
+FULL_PROFILE_MAX_ROWS = 50_000
+INFERENCE_SAMPLE_ROWS = 20_000
+PROFILE_CHUNK_ROWS = 50_000
+MAX_DISTINCT_TRACKED = 200_000
+MAX_DUP_ROWS_TRACKED = 500_000
 
 
 @dataclass(frozen=True)
@@ -78,10 +119,20 @@ class CsvSchemaExtractor:
         self._encoding = self._detect_encoding()
         self._dialect = self._detect_dialect(self._encoding)
         self._validate_header(self._encoding, self._dialect)
+        row_count = self.count_rows()
+        if row_count <= FULL_PROFILE_MAX_ROWS:
+            return self._extract_full(row_count)
+        return self._extract_sampled(row_count)
+
+    def _extract_full(self, row_count: int) -> dict[str, Any]:
+        """Exact single-frame profile for small files (previous behaviour)."""
+        assert self._encoding is not None and self._dialect is not None
         self._df = self._read_dataframe(self._encoding, self._dialect)
+        # count_rows() skips blank lines exactly like pandas (skip_blank_lines),
+        # so the streaming count must agree with the parsed frame here.
+        row_count = len(self._df)
 
         table_name = self._safe_table_name(self.path.stem)
-        row_count = len(self._df)
 
         columns = [
             self._profile_column(self._df[column_name], column_name, row_count)
@@ -91,6 +142,330 @@ class CsvSchemaExtractor:
         duplicate_rows = int(self._df.duplicated().sum()) if row_count else 0
         duplicate_pct = round((duplicate_rows / row_count) * 100, 2) if row_count else 0.0
 
+        composite_keys = self._detect_composite_keys(self._df, columns, row_count)
+
+        warnings = self._build_warnings(columns, row_count, duplicate_rows)
+
+        return {
+            "source_type": "csv",
+            "source_name": self.path.name,
+            "table_name": table_name,
+            "file": self._file_block(),
+            "row_count": row_count,
+            "column_count": len(self._df.columns),
+            "columns": columns,
+            "composite_candidate_keys": composite_keys,
+            "quality": {
+                "duplicate_rows": duplicate_rows,
+                "duplicate_row_percentage": duplicate_pct,
+                "warnings": warnings,
+            },
+            "sampling": {
+                "sampled": False,
+                "sample_rows": row_count,
+                "total_rows": row_count,
+                "exact_fields": [
+                    "row_count", "null_count", "distinct_count",
+                    "duplicate_rows", "statistics", "composite_candidate_keys",
+                ],
+                "sample_based_fields": [],
+            },
+        }
+
+    def _extract_sampled(self, row_count: int) -> dict[str, Any]:
+        """Bounded-memory profile for large files.
+
+        Inference (logical types, sample values, medians, composite ranking)
+        comes from a bounded head sample; row_count, null counts, numeric
+        min/max/mean and ISO date ranges are exact over ALL rows via one
+        chunked streaming pass. Cardinality fields degrade gracefully with
+        explicit flags instead of unbounded memory.
+        """
+        assert self._encoding is not None and self._dialect is not None
+        sample_n = min(INFERENCE_SAMPLE_ROWS, row_count)
+        sample_df = self.read_sample(sample_n)
+        table_name = self._safe_table_name(self.path.stem)
+
+        # --- inference from the bounded sample (same helpers as full path) ---
+        inferred: dict[str, tuple[str, str | None]] = {}
+        sample_values: dict[str, list[Any]] = {}
+        sample_medians: dict[str, int | float | None] = {}
+        for column_name in sample_df.columns:
+            string_series = sample_df[column_name].astype("string")
+            trimmed = string_series.str.strip()
+            missing_mask = trimmed.str.lower().isin(self.missing_tokens) | trimmed.isna()
+            non_missing = trimmed[~missing_mask]
+            original_non_missing = string_series[~missing_mask]
+            inferred[column_name] = self._infer_logical_type(non_missing.tolist())
+            sample_values[column_name] = [
+                self._json_scalar(value)
+                for value in non_missing.drop_duplicates().head(self.sample_values).tolist()
+            ]
+            logical, _ = inferred[column_name]
+            if logical in {"INTEGER", "DECIMAL"}:
+                numeric = pd.to_numeric(non_missing.map(_clean_currency), errors="coerce")
+                sample_medians[column_name] = self._json_number(
+                    numeric.median(), rounded=True)
+            _ = original_non_missing  # whitespace counts come from the full pass below
+
+        # --- one chunked pass: exact counts + aggregates, capped sets ---
+        null_counts: dict[str, int] = {c: 0 for c in sample_df.columns}
+        ws_counts: dict[str, int] = {c: 0 for c in sample_df.columns}
+        num_acc: dict[str, list[float]] = {}  # col -> [n, sum, min, max]
+        date_cands: dict[str, list[str]] = {}  # col -> chunk min/max candidates
+        distinct_sets: dict[str, set] = {c: set() for c in sample_df.columns}
+        distinct_capped: list[str] = []
+        seen_rows: set[int] = set()
+        duplicate_rows = 0
+        duplicates_estimated = False
+
+        for chunk in self.iter_chunks(PROFILE_CHUNK_ROWS):
+            # counters must stay aligned even if a chunk is empty
+            for column_name in sample_df.columns:
+                if column_name not in chunk.columns:
+                    continue
+                string_series = chunk[column_name].astype("string")
+                trimmed = string_series.str.strip()
+                missing_mask = trimmed.str.lower().isin(self.missing_tokens) | trimmed.isna()
+                null_counts[column_name] += int(missing_mask.sum())
+                non_missing = trimmed[~missing_mask]
+                original_non_missing = string_series[~missing_mask]
+                ws_counts[column_name] += int((original_non_missing != non_missing).sum())
+
+                logical = inferred[column_name][0]
+                if logical in {"INTEGER", "DECIMAL"}:
+                    numeric = pd.to_numeric(non_missing.map(_clean_currency), errors="coerce").dropna()
+                    if len(numeric):
+                        vals = numeric.tolist()
+                        acc = num_acc.setdefault(column_name, [0.0, 0.0, 0.0, 0.0])
+                        acc[0] += len(vals)
+                        acc[1] += float(sum(vals))
+                        acc[2] = min(vals) if acc[0] == len(vals) else min(acc[2], min(vals))
+                        acc[3] = max(vals) if acc[0] == len(vals) else max(acc[3], max(vals))
+                elif logical in {"DATE", "DATETIME"}:
+                    if len(non_missing):
+                        date_cands.setdefault(column_name, []).extend(
+                            [str(non_missing.min()), str(non_missing.max())])
+                # capped distinct tracking (exact until the cap, flagged after)
+                if column_name not in distinct_capped:
+                    tracker = distinct_sets[column_name]
+                    for value in non_missing.tolist():
+                        tracker.add(value)
+                        if len(tracker) > MAX_DISTINCT_TRACKED:
+                            distinct_capped.append(column_name)
+                            tracker.clear()
+                            break
+            # duplicate detection over raw (unstripped) values, like
+            # DataFrame.duplicated() on the full frame. Hashes keep the
+            # working set bounded; the cap flips to a sampled estimate.
+            if not duplicates_estimated:
+                try:
+                    frozen = chunk.fillna("")
+                    for row in frozen.itertuples(index=False, name=None):
+                        h = hash(row)
+                        if h in seen_rows:
+                            duplicate_rows += 1
+                        else:
+                            seen_rows.add(h)
+                            if len(seen_rows) > MAX_DUP_ROWS_TRACKED:
+                                duplicates_estimated = True
+                                seen_rows.clear()
+                                break
+                except Exception:
+                    duplicates_estimated = True
+                    seen_rows.clear()
+        # free the dedup working set before building the payload
+        seen_rows.clear()
+        del seen_rows
+
+        if duplicates_estimated:
+            # Bounded fallback: estimate from the inference sample and flag it.
+            sample_dupes = int(sample_df.duplicated().sum()) if len(sample_df) else 0
+            duplicate_rows = round(sample_dupes / max(1, len(sample_df)) * row_count)
+        duplicate_pct = round((duplicate_rows / row_count) * 100, 2) if row_count else 0.0
+
+        columns = []
+        for column_name in sample_df.columns:
+            logical, note = inferred[column_name]
+            null_count = null_counts[column_name]
+            non_null_count = row_count - null_count
+            if column_name in distinct_capped:
+                distinct_count = MAX_DISTINCT_TRACKED + 1  # lower bound, flagged below
+                distinct_estimated = True
+            else:
+                distinct_count = len(distinct_sets[column_name])
+                distinct_estimated = False
+            null_percentage = round((null_count / row_count) * 100, 2) if row_count else 0.0
+            distinct_percentage = (
+                round((distinct_count / row_count) * 100, 2) if row_count else 0.0
+            )
+            is_unique = non_null_count > 0 and distinct_count == non_null_count
+            identifier_name = self._is_identifier_like(column_name)
+            candidate_key = (
+                is_unique and null_count == 0 and identifier_name
+                and not distinct_estimated
+            )
+            statistics = self._sampled_statistics(
+                column_name, logical, num_acc, date_cands,
+                sample_df[column_name], sample_medians.get(column_name),
+            )
+            profile = {
+                "name": column_name,
+                "inferred_type": logical,
+                "inference_note": note,
+                "nullable": null_count > 0,
+                "non_null_count": non_null_count,
+                "null_count": null_count,
+                "null_percentage": null_percentage,
+                "distinct_count": distinct_count,
+                "distinct_percentage": distinct_percentage,
+                "is_unique": is_unique,
+                "candidate_key": candidate_key,
+                "whitespace_value_count": ws_counts[column_name],
+                "sample_values": sample_values[column_name],
+            }
+            if distinct_estimated:
+                profile["distinct_estimated"] = True
+            if statistics is not None:
+                profile["statistics"] = statistics
+            columns.append(profile)
+        distinct_sets.clear()
+
+        composite_keys = self._verify_composite_sampled(columns, row_count)
+
+        warnings = self._build_warnings(columns, row_count, duplicate_rows)
+
+        exact_fields = [
+            "row_count", "null_count", "duplicate_rows",
+            "numeric_min_max_mean", "date_range",
+        ]
+        sample_based_fields = ["inferred_type", "sample_values", "median"]
+        if distinct_capped:
+            sample_based_fields.append("distinct_count(capped columns)")
+        if duplicates_estimated:
+            sample_based_fields.append("duplicate_rows")
+            exact_fields.remove("duplicate_rows")
+
+        return {
+            "source_type": "csv",
+            "source_name": self.path.name,
+            "table_name": table_name,
+            "file": self._file_block(),
+            "row_count": row_count,
+            "column_count": len(sample_df.columns),
+            "columns": columns,
+            "composite_candidate_keys": composite_keys,
+            "quality": {
+                "duplicate_rows": duplicate_rows,
+                "duplicate_row_percentage": duplicate_pct,
+                "warnings": warnings,
+            },
+            "sampling": {
+                "sampled": True,
+                "sample_rows": int(len(sample_df)),
+                "total_rows": row_count,
+                "exact_fields": exact_fields,
+                "sample_based_fields": sample_based_fields,
+                "distinct_capped_columns": sorted(distinct_capped),
+                "duplicates_estimated": duplicates_estimated,
+            },
+        }
+
+    def _sampled_statistics(
+        self,
+        column_name: str,
+        logical: str,
+        num_acc: dict[str, list[float]],
+        date_cands: dict[str, list[str]],
+        sample_series: pd.Series,
+        sample_median: int | float | None,
+    ) -> dict[str, Any] | None:
+        """Statistics for the sampled path: exact min/max/mean, sample median."""
+        if logical in {"INTEGER", "DECIMAL"}:
+            acc = num_acc.get(column_name)
+            if not acc or not acc[0]:
+                return None
+            count, total, minimum, maximum = acc
+            return {
+                "min": self._json_number(minimum),
+                "max": self._json_number(maximum),
+                "mean": self._json_number(total / count, rounded=True),
+                "median": sample_median,
+            }
+        if logical in {"DATE", "DATETIME"}:
+            valid = sorted({
+                c for c in date_cands.get(column_name, [])
+                if self._is_iso_datetime(c)
+            })
+            if valid:
+                # Render through pandas like the full path so both paths emit
+                # identical ISO shapes ('YYYY-MM-DDT00:00:00' for dates).
+                try:
+                    parsed = pd.to_datetime(valid, errors="coerce",
+                                            utc=(logical == "DATETIME"))
+                    if len(parsed) and not parsed.isna().all():
+                        return {"earliest": parsed.min().isoformat(),
+                                "latest": parsed.max().isoformat()}
+                except Exception:
+                    pass
+                return {"earliest": valid[0], "latest": valid[-1]}
+            # No verifiable ISO extreme: fall back to the sample aggregate.
+            string_series = sample_series.astype("string")
+            trimmed = string_series.str.strip()
+            missing_mask = trimmed.str.lower().isin(self.missing_tokens) | trimmed.isna()
+            return self._column_statistics(trimmed[~missing_mask], logical)
+        return None
+
+    def _verify_composite_sampled(
+        self, col_profiles: list[dict], row_count: int
+    ) -> list:
+        """Composite-key check for large files without a full-frame pass.
+
+        Pairs are ranked from the sample profiles with the same generic
+        policy as the full path; only the single best-ranked pair is then
+        verified exactly with one chunked pass over just those two columns.
+        Returns [] when nothing verifies (valid: no key, not an error).
+        """
+        import itertools as _it
+
+        if row_count is None or row_count <= 1:
+            return []
+        try:
+            eligible = [c for c in (col_profiles or [])
+                        if c.get("null_count", 1) == 0
+                        and not c.get("distinct_estimated", False)
+                        and c.get("distinct_count", 0) > 1
+                        and c.get("distinct_count", 0) < row_count]
+            if len(eligible) < 2:
+                return []
+            ranked = sorted(eligible, key=self._composite_rank)
+            non_measure = [c for c in ranked
+                           if c.get("inferred_type") not in ("DECIMAL", "UNKNOWN")]
+            pool = (non_measure or ranked)[:6]
+            if len(pool) < 2:
+                return []
+            names = [c["name"] for c in pool]
+            pairs = list(_it.combinations(names, 2))
+            top = names[0]
+            pairs.sort(key=lambda p: (0 if top in p else 1, p))
+            best = list(pairs[0])
+            seen: set[int] = set()
+            for chunk in self.iter_chunks(PROFILE_CHUNK_ROWS, usecols=best):
+                frozen = chunk.fillna("")
+                for row in frozen.itertuples(index=False, name=None):
+                    h = hash(row)
+                    if h in seen:
+                        return []
+                    seen.add(h)
+                    if len(seen) > MAX_DUP_ROWS_TRACKED:
+                        return []
+            return [best]
+        except Exception:
+            return []
+
+    def _build_warnings(
+        self, columns: list[dict], row_count: int, duplicate_rows: int
+    ) -> list[str]:
         warnings: list[str] = []
         if row_count == 0:
             warnings.append("CSV contains headers but no data rows.")
@@ -109,30 +484,20 @@ class CsvSchemaExtractor:
                     f"Column '{name}' has {column['whitespace_value_count']} value(s) "
                     "with surrounding whitespace."
                 )
+        return warnings
 
+    def _file_block(self) -> dict[str, Any]:
+        assert self._encoding is not None and self._dialect is not None
         return {
-            "source_type": "csv",
-            "source_name": self.path.name,
-            "table_name": table_name,
-            "file": {
-                "path": str(self.path),
-                "size_bytes": self.path.stat().st_size,
-                "sha256": self._sha256(),
-                "modified_at_utc": datetime.fromtimestamp(
-                    self.path.stat().st_mtime, tz=timezone.utc
-                ).isoformat(),
-                "encoding": self._encoding,
-                "delimiter": self._dialect.delimiter,
-                "quotechar": self._dialect.quotechar,
-            },
-            "row_count": row_count,
-            "column_count": len(self._df.columns),
-            "columns": columns,
-            "quality": {
-                "duplicate_rows": duplicate_rows,
-                "duplicate_row_percentage": duplicate_pct,
-                "warnings": warnings,
-            },
+            "path": str(self.path),
+            "size_bytes": self.path.stat().st_size,
+            "sha256": self._sha256(),
+            "modified_at_utc": datetime.fromtimestamp(
+                self.path.stat().st_mtime, tz=timezone.utc
+            ).isoformat(),
+            "encoding": self._encoding,
+            "delimiter": self._dialect.delimiter,
+            "quotechar": self._dialect.quotechar,
         }
 
     def load_dataframe(self) -> pd.DataFrame:
@@ -158,6 +523,107 @@ class CsvSchemaExtractor:
             encoding="utf-8",
         )
         return output
+
+    # ------------------------------------------------------------------
+    # Bounded streaming access (spec §1: no full-frame copies for big files)
+    # ------------------------------------------------------------------
+
+    def detect(self) -> tuple[str, CsvDialectInfo]:
+        """Validate + detect encoding/dialect/header without reading rows."""
+        self._validate_file()
+        if self._encoding is None:
+            self._encoding = self._detect_encoding()
+        if self._dialect is None:
+            self._dialect = self._detect_dialect(self._encoding)
+            self._validate_header(self._encoding, self._dialect)
+        assert self._encoding is not None and self._dialect is not None
+        return self._encoding, self._dialect
+
+    def count_rows(self) -> int:
+        """Exact data-row count via a streaming csv pass (bounded memory).
+
+        Skips blank lines exactly like pandas ``skip_blank_lines`` so the
+        count agrees with the parsed frame. Ragged rows are counted here
+        but still rejected later by the strict pandas parse (on_bad_lines).
+        """
+        encoding, dialect = self.detect()
+        try:
+            with self.path.open("r", encoding=encoding, errors="strict", newline="") as fh:
+                reader = csv.reader(
+                    fh,
+                    delimiter=dialect.delimiter,
+                    quotechar=dialect.quotechar,
+                    doublequote=dialect.doublequote,
+                    escapechar=dialect.escapechar,
+                    skipinitialspace=dialect.skipinitialspace,
+                )
+                next(reader, None)  # header (already validated)
+                total = 0
+                for row in reader:
+                    if not row or all(not str(cell).strip() for cell in row):
+                        continue
+                    total += 1
+        except (StopIteration, csv.Error, UnicodeDecodeError, ValueError) as exc:
+            raise CsvValidationError(f"CSV parsing failed: {exc}") from exc
+        return total
+
+    def _read_options(self, encoding: str, dialect: CsvDialectInfo) -> dict[str, Any]:
+        """Shared pandas read options: raw strings, strict errors."""
+        return {
+            "sep": dialect.delimiter,
+            "quotechar": dialect.quotechar,
+            "doublequote": dialect.doublequote,
+            "escapechar": dialect.escapechar,
+            "skipinitialspace": dialect.skipinitialspace,
+            "encoding": encoding,
+            "encoding_errors": "strict",
+            "dtype": "string",
+            "keep_default_na": False,
+            "on_bad_lines": "error",
+            "low_memory": False,
+        }
+
+    def read_sample(self, nrows: int = INFERENCE_SAMPLE_ROWS) -> pd.DataFrame:
+        """Read at most ``nrows`` head rows (bounded inference sample)."""
+        encoding, dialect = self.detect()
+        try:
+            df = pd.read_csv(
+                self.path,
+                nrows=max(1, int(nrows)),
+                **self._read_options(encoding, dialect),
+            )
+        except EmptyDataError as exc:
+            raise CsvValidationError("CSV contains no tabular data.") from exc
+        except (ParserError, UnicodeDecodeError, ValueError) as exc:
+            raise CsvValidationError(f"CSV parsing failed: {exc}") from exc
+        df.columns = [str(column).strip() for column in df.columns]
+        lowered = [column.casefold() for column in df.columns]
+        if len(lowered) != len(set(lowered)):
+            raise CsvValidationError("CSV column names are not unique after parsing.")
+        return df
+
+    def iter_chunks(self, chunksize: int = PROFILE_CHUNK_ROWS,
+                    usecols: list[str] | None = None):
+        """Yield bounded string-dtype chunks over ALL rows (one streaming pass).
+
+        Parsing stays strict (``on_bad_lines="error"``) so malformed rows
+        anywhere in the file still raise CsvValidationError.
+        """
+        encoding, dialect = self.detect()
+        options = self._read_options(encoding, dialect)
+        if usecols:
+            options["usecols"] = list(usecols)
+        try:
+            reader = pd.read_csv(
+                self.path, chunksize=max(1, int(chunksize)), **options)
+        except (ParserError, UnicodeDecodeError, ValueError) as exc:
+            raise CsvValidationError(f"CSV parsing failed: {exc}") from exc
+        try:
+            for chunk in reader:
+                chunk.columns = [str(column).strip() for column in chunk.columns]
+                yield chunk
+        except (ParserError, UnicodeDecodeError, ValueError) as exc:
+            raise CsvValidationError(f"CSV parsing failed: {exc}") from exc
 
     # ------------------------------------------------------------------
     # File and dialect validation
@@ -241,6 +707,27 @@ class CsvSchemaExtractor:
             escapechar = None
             skipinitialspace = False
 
+        # Verify doublequote by checking if lines have inconsistent field counts
+        # when parsed with the detected dialect.  The Sniffer often mis-detects
+        # doublequote as False for CSVs that contain quoted fields with embedded
+        # delimiters.
+        if not doublequote:
+            try:
+                with self.path.open("r", encoding=encoding, errors="strict", newline="") as fh:
+                    reader = csv.reader(
+                        fh,
+                        delimiter=delimiter,
+                        quotechar=quotechar,
+                        doublequote=True,
+                        escapechar=escapechar,
+                        skipinitialspace=skipinitialspace,
+                    )
+                    field_counts = [len(row) for _, row in zip(range(20), reader)]
+                if field_counts and len(set(field_counts)) == 1:
+                    doublequote = True
+            except Exception:
+                pass
+
         return CsvDialectInfo(
             delimiter=delimiter,
             quotechar=quotechar,
@@ -281,20 +768,7 @@ class CsvSchemaExtractor:
 
     def _read_dataframe(self, encoding: str, dialect: CsvDialectInfo) -> pd.DataFrame:
         try:
-            df = pd.read_csv(
-                self.path,
-                sep=dialect.delimiter,
-                quotechar=dialect.quotechar,
-                doublequote=dialect.doublequote,
-                escapechar=dialect.escapechar,
-                skipinitialspace=dialect.skipinitialspace,
-                encoding=encoding,
-                encoding_errors="strict",
-                dtype="string",
-                keep_default_na=False,
-                on_bad_lines="error",
-                low_memory=False,
-            )
+            df = pd.read_csv(self.path, **self._read_options(encoding, dialect))
         except EmptyDataError as exc:
             raise CsvValidationError("CSV contains no tabular data.") from exc
         except (ParserError, UnicodeDecodeError, ValueError) as exc:
@@ -378,7 +852,8 @@ class CsvSchemaExtractor:
             return None
 
         if inferred_type in {"INTEGER", "DECIMAL"}:
-            numeric = pd.to_numeric(values, errors="coerce")
+            cleaned = values.map(_clean_currency)
+            numeric = pd.to_numeric(cleaned, errors="coerce")
             return {
                 "min": self._json_number(numeric.min()),
                 "max": self._json_number(numeric.max()),
@@ -398,8 +873,15 @@ class CsvSchemaExtractor:
         return None
 
     @staticmethod
-    def _json_number(value: Any, *, rounded: bool = False) -> int | float:
-        number = float(value)
+    def _json_number(value: Any, *, rounded: bool = False) -> int | float | None:
+        if value is pd.NA or value is None:
+            return None
+        try:
+            number = float(value)
+        except (ValueError, TypeError):
+            return None
+        if number != number:  # NaN check
+            return None
         if number.is_integer():
             return int(number)
         return round(number, 4) if rounded else number
@@ -419,6 +901,65 @@ class CsvSchemaExtractor:
         normalised = re.sub(r"[^0-9a-zA-Z]+", "_", separated).strip("_").lower()
         return bool(re.search(r"(?:^|_)(?:id|key|code)$", normalised))
 
+    @staticmethod
+    def _composite_rank(col_profile: dict) -> tuple:
+        """Rank composite-PK candidates generically (lower is better).
+
+        No hardcoded names: identifier-like, then INTEGER, then DATE/DATETIME,
+        then STRING, then BOOLEAN, then DECIMAL/UNKNOWN last (continuous
+        measures almost never form a key; excluding them avoids accidental
+        unique pairs like store+weekly_sales).
+        """
+        name = str(col_profile.get("name", ""))
+        typ = str(col_profile.get("inferred_type", ""))
+        if CsvSchemaExtractor._is_identifier_like(name):
+            return (0, name)
+        order = {"INTEGER": 1, "DATE": 2, "DATETIME": 2, "STRING": 3,
+                 "BOOLEAN": 4, "DECIMAL": 5, "UNKNOWN": 6}
+        return (order.get(typ, 3), name)
+
+    def _detect_composite_keys(self, df, col_profiles, row_count,
+                               max_cols: int = 6, max_pairs: int = 12) -> list:
+        """Find minimal 2-column unique combos (generic composite PKs).
+
+        Only fully-populated columns participate (PKs are NOT NULL); DECIMAL
+        measures are skipped when dimension-like columns exist. Bounded
+        (<= max_pairs pandas dup checks) so wide tables stay cheap. Returns
+        a list of [col_a, col_b] pairs; [] is valid (no key, not an error).
+        """
+        import itertools as _it
+
+        if df is None or row_count is None or row_count <= 1:
+            return []
+        try:
+            eligible = [c for c in (col_profiles or [])
+                        if c.get("null_count", 1) == 0
+                        and c.get("distinct_count", 0) > 1
+                        and c.get("distinct_count", 0) < row_count]
+            if len(eligible) < 2:
+                return []
+            ranked = sorted(eligible, key=self._composite_rank)
+            non_measure = [c for c in ranked
+                           if c.get("inferred_type") not in ("DECIMAL", "UNKNOWN")]
+            pool = (non_measure or ranked)[:max_cols]
+            if len(pool) < 2:
+                return []
+            names = [c["name"] for c in pool]
+            pairs = list(_it.combinations(names, 2))
+            top = names[0]
+            pairs.sort(key=lambda p: (0 if top in p else 1, p))
+            found = []
+            for pair in pairs[:max_pairs]:
+                try:
+                    if int(df.duplicated(subset=list(pair)).sum()) == 0:
+                        found.append(list(pair))
+                        break  # first (best-ranked) minimal key wins
+                except Exception:
+                    continue
+            return found
+        except Exception:
+            return []
+
     def _infer_logical_type(self, values: list[Any]) -> tuple[str, str | None]:
         cleaned = [str(value).strip() for value in values if str(value).strip()]
         if not cleaned:
@@ -431,6 +972,28 @@ class CsvSchemaExtractor:
         if lowered.issubset(bool_tokens) and len(lowered) >= 1:
             return "BOOLEAN", None
 
+        # Try numeric inference on currency-cleaned values.
+        numeric_re = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+        cleaned_numeric = [_clean_currency(v) for v in cleaned]
+        cleaned_for_test = [v for v in cleaned_numeric if v and numeric_re.fullmatch(v)]
+        if len(cleaned_for_test) >= len(cleaned) * 0.8 and cleaned_for_test:
+            integer_re = re.compile(r"^[+-]?\d+$")
+            if all(integer_re.fullmatch(v) for v in cleaned_for_test):
+                unsigned = [v.lstrip("+-") for v in cleaned_for_test]
+                if any(len(v) > 1 and v.startswith("0") for v in unsigned):
+                    return (
+                        "STRING",
+                        "Numeric-looking values contain leading zeros; kept as STRING to preserve identifiers.",
+                    )
+                return "INTEGER", None
+            decimal_re = re.compile(r"^[+-]?(?:\d+\.\d+|\d+\.|\.\d+|\d+[eE][+-]?\d+|\d+\.\d+[eE][+-]?\d+)$")
+            if any(decimal_re.fullmatch(v) for v in cleaned_for_test):
+                return "DECIMAL", None
+            # If most cleaned values parse as numeric, treat as DECIMAL
+            if len(cleaned_for_test) >= len(cleaned) * 0.9:
+                return "DECIMAL", None
+
+        # Fall back to pure-numeric check (no currency cleaning)
         integer_re = re.compile(r"^[+-]?\d+$")
         if all(integer_re.fullmatch(value) for value in cleaned):
             unsigned = [value.lstrip("+-") for value in cleaned]
@@ -442,8 +1005,8 @@ class CsvSchemaExtractor:
             return "INTEGER", None
 
         decimal_re = re.compile(r"^[+-]?(?:\d+\.\d+|\d+\.|\.\d+|\d+[eE][+-]?\d+|\d+\.\d+[eE][+-]?\d+)$")
-        numeric_re = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
-        if all(numeric_re.fullmatch(value) for value in cleaned) and any(
+        numeric_re2 = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+        if all(numeric_re2.fullmatch(value) for value in cleaned) and any(
             decimal_re.fullmatch(value) for value in cleaned
         ):
             return "DECIMAL", None

@@ -252,9 +252,148 @@ def _column_is_empty(conn, table_name, column, schema, db_type):
         logger.warning("empty-column check failed for %s.%s: %s", table_name, column, exc)
         return False
 
+# ---- composite PK helpers (1-table first-class) ----
+
+# Budget guard for PK profiling queries (follows schema_engine ProfileBudget
+# pattern: bounded, truthful; exhaustion means "unknown", never a guess).
+MAX_PK_PROFILE_QUERIES = 50
+_MAX_COMPOSITE_COLS = 6
+_MAX_COMPOSITE_PAIRS = 12
+
+_FLOAT_TOKENS = ("float", "double", "real", "decimal", "numeric", "money")
+
+
+def _pk_candidate_rank(column_name, data_type):
+    """Rank PK candidate columns (lower is better); floats deprioritized.
+
+    Generic, no hardcoded table names: id-like first, then integers,
+    then text/date-like, then everything else; continuous measures
+    (float/decimal) last so e.g. (store, date) beats (store, weekly_sales).
+    """
+    name = str(column_name or "").lower()
+    dtype = str(data_type or "").lower()
+    if name == "id" or name.endswith("_id"):
+        return 0
+    if any(tok in dtype for tok in ("int", "serial", "bigint", "smallint")):
+        return 1
+    if any(tok in dtype for tok in ("char", "varchar", "text", "citext",
+                                    "string", "uuid", "date", "time")):
+        return 2
+    if any(tok in dtype for tok in _FLOAT_TOKENS):
+        return 4
+    return 3
+
+
+def _composite_is_unique(conn, table_name, columns, schema, db_type):
+    """Return True when the column combo has no duplicate tuples (PK-valid).
+
+    Generic GROUP BY ... HAVING COUNT(*)>1 LIMIT 1 probe: one query per
+    combo, works on PostgreSQL/MySQL/SQLite without dtype assumptions.
+    NULL-containing combos are rejected by the caller (PKs must be NOT NULL).
+    Returns False on any error (safe: never infer from failed evidence).
+    """
+    if not columns:
+        return False
+    try:
+        cur = conn.cursor()
+        if db_type == "postgresql":
+            table_ref = f"{_qname(db_type, schema)}.{_qname(db_type, table_name)}"
+        else:
+            table_ref = _qname(db_type, table_name)
+        group_cols = ", ".join(_qname(db_type, c) for c in columns)
+        not_null = " AND ".join(f"{_qname(db_type, c)} IS NOT NULL"
+                                for c in columns)
+        cur.execute(
+            f"SELECT 1 FROM {table_ref} WHERE {not_null} "
+            f"GROUP BY {group_cols} HAVING COUNT(*) > 1 LIMIT 1"
+        )
+        row = cur.fetchone()
+        # Any duplicate group -> not unique.
+        if row is not None:
+            return False
+        # No duplicates: verify the combo is fully populated (PKs are NOT NULL).
+        cur.execute(f"SELECT COUNT(*) FROM {table_ref}")
+        total = (cur.fetchone() or [None])[0]
+        cur.execute(f"SELECT COUNT(*) FROM {table_ref} WHERE {not_null}")
+        filled = (cur.fetchone() or [None])[0]
+        return (total is not None and total > 0 and filled == total)
+    except Exception as exc:
+        logger.debug("composite uniqueness check failed for %s%s: %s",
+                     table_name, tuple(columns), exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def infer_composite_primary_keys(conn, tables, schema, db_type, existing_pks,
+                                 max_rows=500000, exclude_columns=None,
+                                 budget=None):
+    """Infer composite (multi-column) PKs where no single column is unique.
+
+    Generic: for tables with no declared/inferred single-col key, probe
+    NOT-NULL column pairs (e.g. store+date on a 6435-row single-table
+    dataset) for full uniqueness. `budget` is an optional dict/counter or
+    schema_engine ProfileBudget; each probe spends 2 queries. Exhaustion
+    leaves the PK empty (valid for 1-table datasets) instead of guessing.
+    """
+    import itertools
+
+    exclude_columns = exclude_columns or set()
+    inferred = {}
+    spent = 0
+
+    def _spend(n=2):
+        nonlocal spent
+        if budget is not None and hasattr(budget, "spend"):
+            for _ in range(n):
+                if not budget.spend():
+                    return False
+            return True
+        spent += n
+        return spent <= MAX_PK_PROFILE_QUERIES
+
+    for table_name, columns in tables.items():
+        if existing_pks.get(table_name):
+            continue
+        rows = _table_rows(conn, table_name, schema, db_type)
+        if rows is not None and rows > max_rows:
+            continue
+        if rows == 0:
+            continue
+        # Candidate pool: non-empty, non-excluded columns ranked generically.
+        ranked = sorted(
+            (c for c in columns
+             if (table_name, c["column"]) not in exclude_columns
+             and not _is_reference_to_other_table(
+                 c["column"], table_name, tables)),
+            key=lambda c: (_pk_candidate_rank(c["column"], c.get("data_type")), c["column"]),
+        )
+        # Drop trailing float measures when non-floats exist (keeps the probe
+        # budget on dimension-like columns; avoids accidental float combos).
+        non_float = [c for c in ranked
+                     if _pk_candidate_rank(c["column"], c.get("data_type")) < 4]
+        pool = (non_float or ranked)[:_MAX_COMPOSITE_COLS]
+        if len(pool) < 2:
+            continue
+        pairs = list(itertools.combinations([c["column"] for c in pool], 2))
+        # Prefer pairs containing the top-ranked column (most key-like).
+        top = pool[0]["column"]
+        pairs.sort(key=lambda p: (0 if top in p else 1, p))
+        pairs = pairs[:_MAX_COMPOSITE_PAIRS]
+        for pair in pairs:
+            if not _spend(2):
+                return inferred
+            if _composite_is_unique(conn, table_name, list(pair), schema, db_type):
+                inferred[table_name] = list(pair)
+                break
+    return inferred
+
+
 # ---- infer_primary_keys_from_data (572-619) ----
 
-def infer_primary_keys_from_data(conn, tables, schema, db_type, existing_pks, max_rows=500000, exclude_columns=None):
+def infer_primary_keys_from_data(conn, tables, schema, db_type, existing_pks, max_rows=500000, exclude_columns=None, null_stats=None, budget=None):
     """Data-backed PK inference for tables the name heuristics could not resolve.
 
     When a table declares no PK and no column *name* points to one, look at the
@@ -267,6 +406,12 @@ def infer_primary_keys_from_data(conn, tables, schema, db_type, existing_pks, ma
     `exclude_columns` ((table, column) pairs) lets confirmed foreign-key columns
     be ruled out as key candidates — a column that provably references another
     table is a reference, not the table's own identity.
+
+    When no single id-like column is unique, falls back to composite
+    (multi-column) uniqueness probes via infer_composite_primary_keys
+    (e.g. store+date on a single-table dataset). Empty result is valid
+    (single-table datasets with no key report relationships.none, not an
+    error); callers must treat it as healthy.
     """
     exclude_columns = exclude_columns or set()
     inferred = {}
@@ -301,9 +446,53 @@ def infer_primary_keys_from_data(conn, tables, schema, db_type, existing_pks, ma
                          ("id", table_norm + "id", _singularize(table_norm) + "id")]
         if len(primary_named) == 1:
             inferred[table_name] = primary_named
+    # Composite fallback: tables still without a key get generic pair probes.
+    # Budget-guarded; exhaustion leaves PK empty (valid, not failure).
+    try:
+        remaining = {t: c for t, c in tables.items()
+                     if not existing_pks.get(t) and t not in inferred}
+        if remaining:
+            inferred.update(infer_composite_primary_keys(
+                conn, remaining, schema, db_type,
+                {**existing_pks, **inferred},
+                max_rows=max_rows, exclude_columns=exclude_columns,
+                budget=budget,
+            ))
+    except Exception:
+        logger.debug("composite PK fallback failed", exc_info=True)
     return inferred
 
 # ---- infer_relationships (622-635) ----
+
+def is_join_key_not_driver(col_name, table_name, tables, declared_fks=None) -> bool:
+    """hyp.txt PHASE 1-2 helper: FK/identifier keys are join context, never drivers.
+
+    Additive only. Returns True when the column is a declared FK source or
+    an identifier-flavored reference to another table — such fields may
+    join/aggregate but must never become a Decision driver/lever.
+    Generic relational signals only; no per-column exclusions.
+    """
+    try:
+        for r in (declared_fks or []):
+            if isinstance(r, dict):
+                src = (r.get("table_name") or r.get("table"),
+                       r.get("column_name") or r.get("column"))
+                if src[0] == table_name and src[1] == col_name:
+                    return True
+    except Exception:
+        pass
+    try:
+        from core.semantic import classify_field_role as _cfr
+        role = _cfr(col_name or "", "", is_fk=False, is_pk=False)
+        if role in ("FOREIGN_KEY", "IDENTIFIER"):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(_is_reference_to_other_table(col_name, table_name, tables))
+    except Exception:
+        return False
+
 
 def infer_relationships(tables, primary_keys, declared_fks, conn=None, schema="public", db_type="postgresql", null_stats=None):
     """Infer relationships for columns with no declared FK constraint.

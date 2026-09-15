@@ -57,7 +57,7 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
     # ---- __init__ (__init__) ----
 
     def __init__(self, schema_json_path=None, db_uri=None,
-                 provider=None, dialect="postgresql", overrides=None):
+                 provider=None, api_key=None, dialect="postgresql", overrides=None):
         if schema_json_path:
             schema_file = Path(schema_json_path)
         else:
@@ -89,8 +89,58 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
         self.dialect = dialect
         self.schema = (self.full_schema.get("schema") or "public").strip()
         self.engine = self._build_engine(db_uri)
-        self.llm = provider or create_provider()
+        if isinstance(provider, str):
+            self.llm = create_provider(provider=provider, api_key=api_key)
+        elif provider is not None:
+            self.llm = provider
+        else:
+            self.llm = create_provider()
         self.kpi_index = self._build_kpi_index()
+        # Universal Data Intelligence Layer (n.txt 11/12): reuse the mapping's
+        # contract when this extraction already carries it; otherwise derive
+        # the same contract from the normalized tables so every Goal Agent —
+        # including ones loaded from older/stale mappings — exposes it.
+        self.data_intelligence = (self.full_schema.get("data_intelligence")
+                                  if isinstance(self.full_schema, dict) else None)
+        self.capabilities = (self.full_schema.get("capabilities")
+                             if isinstance(self.full_schema, dict) else None)
+        if not isinstance(self.data_intelligence, dict):
+            try:
+                from core.data_intelligence import (
+                    build_data_intelligence as _build_intel,
+                    detect_capabilities as _detect_caps,
+                )
+                _rel_edges = [
+                    {"source_table": e.get("left_table"),
+                     "source_column": e.get("left_column"),
+                     "target_table": e.get("right_table"),
+                     "target_column": e.get("right_column"),
+                     "type": e.get("relationship_type", "declared")}
+                    for e in (self.relationship_edges or [])
+                ]
+                _adapter = {
+                    "tables": {
+                        t: {"columns": [{"column": c, "data_type": (mi or {}).get("data_type", "TEXT"),
+                                        "nullable": (mi or {}).get("nullable", True)}
+                                       for c, mi in (info.get("columns", {}) or {}).items()],
+                            "primary_key": list(info.get("primary_key", []) or []),
+                            "inferred_composite_primary_key": list(
+                                info.get("composite_primary_key", []) or []),
+                            "row_count": info.get("row_count"),
+                            "empty": bool(info.get("empty")),
+                            "foreign_keys": list(info.get("foreign_keys", []) or [])}
+                        for t, info in (self.tables or {}).items()
+                    },
+                    "declared_relationships": [],
+                    "inferred_relationships": [],
+                    "relationship_edges": _rel_edges,
+                }
+                self.data_intelligence = _build_intel(_adapter)
+                self.capabilities = _detect_caps(self.data_intelligence)
+            except Exception:
+                logger.debug("GoalAgent data intelligence derivation failed", exc_info=True)
+                self.data_intelligence = {}
+                self.capabilities = {"capabilities": {}, "suitable_analyses": []}
         self._row_counts_cache = None
         self.preprocessing_report = None
         self._last_execution_ms = None
@@ -182,11 +232,45 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
 
         raw_sql = self._generate_sql(user_goal, join_path, kpi_map, ir=ir, join_plan=join_plan)
         logger.info("Generated SQL: %s", raw_sql)
+        # Post-generation gate (n.txt item 2): log validation BEFORE execution.
+        pre_issues = self._validate_generated_sql(raw_sql)
+        if pre_issues:
+            logger.warning("Post-generation validation issues: %s", pre_issues)
 
         data_rows, final_sql, note = self._execute_with_retry(
             user_goal, join_path, kpi_map, raw_sql, ir=ir, join_plan=join_plan
         )
         cleaned_data = self._clean_data(data_rows)
+        # Internal diagnostic trace (P3 §31, internal only): full contract
+        # fields; legacy keys (exec_ms/shape/viz) kept for compatibility.
+        try:
+            _cols = sorted({m.get("resolved_column") for m in (ir or {}).get("metrics", []) if m.get("resolved_column")} |
+                           {d.get("resolved_column") for d in (ir or {}).get("dimensions", []) if d.get("resolved_column")})
+            _shape = {"rows": len(cleaned_data),
+                      "columns": list(cleaned_data[0].keys()) if cleaned_data else []}
+            self._log_pipeline_diagnostic({
+                "request_id": getattr(self, "_active_request_id", None),
+                "session_id": getattr(self, "_active_session_id", None),
+                "dataset_id": getattr(self, "_active_dataset_id", None),
+                "question": self._active_original_goal or user_goal,
+                "tables": list(join_path),
+                "columns": _cols,
+                "intent": (ir or {}).get("intent"),
+                "sql": final_sql,
+                "validation": pre_issues or [],
+                "exec_status": "failed" if (note and note.get("failed")) else "ok",
+                "exec_ms": self._last_execution_ms,
+                "shape": _shape,
+                "result_shape": _shape,
+                "context": {"join_plan": (ir or {}).get("join_plan", [])},
+                "model": getattr(getattr(self, "llm", None), "model", None) or getattr(self, "_provider_name", None),
+                "latency_ms": self._last_execution_ms,
+                "final_status": "query_failed" if (note and note.get("failed")) else "success",
+                "viz": "deferred to /api/ask chart_spec",
+                "answer": (note or {}).get("message"),
+            })
+        except Exception:
+            pass
 
         failed = bool(note and note.get("failed"))
         output = {
@@ -210,6 +294,9 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
                     + self._last_semantic_warnings,
             execution_time_ms=self._last_execution_ms,
         ))
+        # Additive diagnostics envelope (n.txt item 2): never breaks the
+        # existing contract; the UI ignores unknown keys.
+        output["diagnostics"] = getattr(self, "_last_pipeline_trace", None) or {}
 
         out_path = Path(output_path)
         out_path.write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")

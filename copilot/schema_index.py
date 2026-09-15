@@ -132,11 +132,20 @@ class SchemaIndex:
                  if classify_type(c["data_type"]) == "datetime"
                  or any(h in c["column"].lower() for h in _DATE_HINTS)]
         row_count = info.get("row_count")
+        description = str(
+            info.get("description") or info.get("business_meaning")
+            or info.get("business_description") or ""
+        )[:500]
+        col_descriptions = {
+            c["column"]: str(c.get("description", ""))[:200]
+            for c in cols if isinstance(c, dict) and c.get("description")
+        }
         rels = [f"{fk.get('column')} -> {fk.get('referenced_table')}.{fk.get('referenced_column')}"
                 for fk in fks if fk.get("referenced_table")]
         text = (
             f"Table {table} ({_natural(table)}). "
-            f"Columns: {', '.join(c['column'] for c in cols)}. "
+            + (f"{description} " if description else "")
+            + f"Columns: {', '.join(c['column'] for c in cols)}. "
             f"Measures: {', '.join(measures) or 'none'}. "
             f"Dates: {', '.join(dates) or 'none'}. "
             f"Primary key: {', '.join(pk) or 'inferred'}. "
@@ -152,6 +161,8 @@ class SchemaIndex:
                 "table": table,
                 "columns": [c["column"] for c in cols],
                 "column_types": {c["column"]: c["data_type"] for c in cols},
+                "column_descriptions": col_descriptions,
+                "description": description,
                 "measures": measures,
                 "dates": dates,
                 "primary_key": pk,
@@ -164,6 +175,7 @@ class SchemaIndex:
         name = col["column"]
         dtype = col["data_type"]
         category = classify_type(dtype)
+        description = str(col.get("description", "") or "")[:200]
         pk = set(_pk_of(info))
         fk_cols = {fk.get("column") for fk in _fk_of(info)}
         role = "key" if name in pk else ("foreign key" if name in fk_cols else category)
@@ -172,6 +184,7 @@ class SchemaIndex:
         text = (
             f"Column {table}.{name} ({_natural(name)}) "
             f"of type {dtype or category}, role {role}."
+            + (f" {description}" if description else "")
         )
         self.documents.append(SchemaDocument(
             doc_id=f"column:{table}.{name}",
@@ -179,7 +192,8 @@ class SchemaIndex:
             table=table,
             text=text,
             payload={"table": table, "column": name, "data_type": dtype,
-                     "category": category, "role": role},
+                     "category": category, "role": role,
+                     "description": description},
         ))
 
     def _collect_edges(self) -> None:

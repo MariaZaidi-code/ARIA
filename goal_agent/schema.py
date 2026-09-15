@@ -176,12 +176,32 @@ class SchemaMixin:
             for key in pk:
                 if key in col_map:
                     col_map[key]["is_primary_key"] = True
+            # Composite uniqueness (e.g. a fully-populated unique pair on a
+            # 1-table dataset) is preserved separately and generically: it
+            # informs relationship reasoning without removing its members
+            # from GROUP-BY-able dimensions (composite members stay
+            # dimensions, never ungroupable PKs).
+            composite_pk = list(
+                info.get("inferred_composite_primary_key", []) or []
+            )
+            if not composite_pk:
+                try:
+                    _cck = info.get("composite_candidate_keys", []) or []
+                    if _cck and isinstance(_cck[0], (list, tuple)):
+                        composite_pk = [str(c) for c in _cck[0]]
+                except Exception:
+                    composite_pk = []
 
             tables[table_name] = {
                 "columns": col_map, "primary_key": pk, "foreign_keys": [],
                 "empty": bool(info.get("empty")),
                 "row_count": info.get("row_count"),
+                "composite_primary_key": composite_pk,
             }
+            for cname, cmeta in col_map.items():
+                cmeta.setdefault("is_primary_key", cname in pk)
+                cmeta.setdefault("is_foreign_key", False)
+                cmeta.setdefault("references", None)
 
         for edge in all_edges:
             add_fk(
@@ -220,6 +240,16 @@ class SchemaMixin:
                         "Schema mapping references unknown column '%s.%s' from %s.%s",
                         target, fk.get("referenced_column"), table_name, fk.get("column"),
                     )
+                else:
+                    col_name = fk.get("column")
+                    if col_name and col_name in tables[table_name]["columns"]:
+                        tables[table_name]["columns"][col_name]["is_foreign_key"] = True
+                        tables[table_name]["columns"][col_name]["references"] = {
+                            "table": target,
+                            "column": fk.get("referenced_column"),
+                            "relationship_type": fk.get("type", "unknown"),
+                            "confidence": fk.get("confidence"),
+                        }
 
         return tables
 

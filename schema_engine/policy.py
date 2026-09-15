@@ -120,6 +120,18 @@ class AcceptancePolicy:
         if state == "CONFIRMED" and (n_groups is None or n_groups < 2):
             state = "PROBABLE"
 
+        # Name-only (no STATISTICAL/SEMANTIC/DECLARED evidence) must never
+        # reach PROBABLE: naming alone is not data evidence. Cap at UNCERTAIN.
+        # Only applies when evidence_groups are present (real classifier
+        # output); legacy dicts without groups keep historic behavior.
+        groups = rel.get("evidence_groups")
+        if groups:
+            has_data_evidence = bool(
+                groups.get("STATISTICAL") or groups.get("SEMANTIC") or groups.get("DECLARED_METADATA")
+            )
+            if state in ("PROBABLE", "CONFIRMED") and not has_data_evidence:
+                state = "UNCERTAIN"
+
         rel["relationship_state"] = state
         # Derive review_status from the (possibly downgraded) state, not raw score.
         # When state is downgraded from CONFIRMED to PROBABLE due to insufficient
@@ -133,6 +145,16 @@ class AcceptancePolicy:
         rel["confidence_band"] = self.band_for(score)
         rel["confidence_level"] = self.confidence_level_for(score)
         return "inferred", state
+
+    def is_driver_eligible(self, role: str) -> bool:
+        """hyp.txt PHASE 2: join-context and non-lever roles never drive.
+
+        Additive helper — decide() behavior is unchanged. FOREIGN_KEY /
+        IDENTIFIER are join context only; TECHNICAL_MEASURE / DIMENSION /
+        CATEGORY / TEXT / DATE / UNKNOWN are never levers.
+        """
+        return str(role or "").upper() in ("MEASURE", "BUSINESS_MEASURE",
+                                           "DERIVED_METRIC")
 
     def corroborate(self, rel: dict, score_delta: float, evidence: str) -> dict:
         """Re-apply the policy when an independent evidence group corroborates

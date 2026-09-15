@@ -33,10 +33,8 @@ class TestSemanticHelpers(unittest.TestCase):
         self.assertEqual(classify_semantic_type("qty", "integer"), "measure")
         self.assertEqual(classify_semantic_type("is_active", "boolean"), "boolean")
         # Unknown schema names still classify without crashing.
-        self.assertIn(
-            classify_semantic_type("blorpt_field", "text"),
-            ("text", "category", "measure", "identifier"),
-        )
+        result = classify_semantic_type("blorpt_field", "text")
+        self.assertIn(result, ("text", "category"))
 
     def test_envelope_contract(self):
         env = build_result_envelope(

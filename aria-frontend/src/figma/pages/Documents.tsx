@@ -38,7 +38,7 @@ export default function Documents() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<any[] | null>(null);
   const [searching, setSearching] = useState(false);
-  const { error: toastError, success: toastSuccess, info: toastInfo } = useToast();
+  const { error: toastError, success: toastSuccess, info: toastInfo } = useToast() as any;
 
   const fetchAll = async () => {
     setLoading(true);

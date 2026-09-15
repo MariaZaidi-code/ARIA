@@ -101,6 +101,39 @@ _SQL_TABLE_RE = re.compile(
 )
 
 
+_READONLY_DESTRUCTIVE_RE = re.compile(
+    r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM"
+    r"|DROP\s+(?:TABLE|DATABASE|VIEW|INDEX|SCHEMA|TRIGGER|FUNCTION|PROCEDURE)"
+    r"|ALTER\s+(?:TABLE|DATABASE|VIEW|SCHEMA|SYSTEM)"
+    r"|CREATE\s+(?:TABLE|DATABASE|INDEX|VIEW|SCHEMA|TRIGGER|FUNCTION|PROCEDURE)"
+    r"|TRUNCATE\s+(?:TABLE\s+)?|GRANT|REVOKE|CALL|EXEC(?:UTE)?\b|MERGE\s+INTO"
+    r"|COMMENT\s+ON|COPY\s+(?:\(?[A-Z_][\w$]*\)?\s+)?(?:TO|FROM)\b"
+    r"|\bVACUUM\b|\bANALYZE\b|\bEXPLAIN\b|\bSET\b|\bSHOW\b"
+    r"|\bLISTEN\b|\bNOTIFY\b|\bLOAD\b|\bIMPORT\b|\bINTO\b"
+    r"|pg_sleep\s*\(|pg_read_file\s*\(|dblink\s*\()",
+    re.IGNORECASE,
+)
+_READONLY_STRIP_STRINGS_RE = re.compile(r"'([^']|'')*'|\"([^\"]|\"\")*\"|`[^`]*`")
+_READONLY_STRIP_COMMENTS_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def is_read_only_sql(sql) -> bool:
+    """Single shared read-only SQL guard for all agents.
+
+    True only for SELECT / WITH ... SELECT statements with no destructive
+    keywords. Strings and -- /* */ comments are stripped first so keywords
+    inside literals/comments cannot cause false accepts or rejects.
+    Returns False for empty/None SQL.
+    """
+    if not sql or not isinstance(sql, str):
+        return False
+    stripped = _READONLY_STRIP_STRINGS_RE.sub(" ", sql)
+    stripped = _READONLY_STRIP_COMMENTS_RE.sub(" ", stripped)
+    if _READONLY_DESTRUCTIVE_RE.search(stripped):
+        return False
+    return bool(re.match(r"\s*(select|with)\b", stripped, re.IGNORECASE))
+
+
 def strip_code_fences(text):
     """Extract the content of any ```...``` block, otherwise return trimmed text."""
     text = (text or "").strip()
@@ -268,6 +301,171 @@ def unknown_sql_columns(sql, columns_by_table):
 
 
 # ---------------------------------------------------------------------------
+# Query-generation pipeline validation (n.txt item 2).
+#
+# Post-generation gate used by GoalAgent BEFORE execution: nonexistent
+# table/column, invalid JOIN (missing FROM entry), bad aggregation (nested
+# aggregates, bare SELECT * for an aggregating goal, SUM/AVG over an
+# incompatible text/datetime type) and execution failure. Returns issues so
+# the caller can repair/regenerate instead of sending a broken result to UI.
+# ---------------------------------------------------------------------------
+
+_NESTED_AGG_RE = re.compile(
+    r"\b(AVG|SUM|COUNT|MIN|MAX)\s*\(\s*(?:DISTINCT\s+)?(AVG|SUM|COUNT|MIN|MAX)\s*\(",
+    re.IGNORECASE,
+)
+
+_BARE_STAR_RE = re.compile(r"\bselect\b([\s\S]*?)\bfrom\b", re.IGNORECASE)
+_AGG_FN_RE = re.compile(
+    r"\b(?:count|sum|avg|average|min|max|stddev|std|variance|var_pop|var_samp"
+    r"|median|percentile_cont|percentile_disc)\s*\(",
+    re.IGNORECASE,
+)
+
+_AGG_CALL_RE = re.compile(
+    r"\b(SUM|AVG|MIN|MAX|COUNT)\s*\(\s*(?:DISTINCT\s+)?"
+    r"(?:([A-Za-z_][\w$]*)\s*\.\s*)?[\"`\[]?([A-Za-z_][\w$*]*)[\]\"`]?\s*\)",
+    re.IGNORECASE,
+)
+
+_INCOMPATIBLE_AGG_TEXT_TYPES = (
+    "char", "text", "varchar", "citext", "uuid", "ltree",
+)
+_INCOMPATIBLE_AGG_DT_TYPES = ("date", "time", "timestamp", "datetime", "smalldatetime")
+
+
+def _classify_col_type(data_type) -> str:
+    dt = str(data_type or "").lower().strip()
+    if not dt:
+        return "unknown"
+    if any(k in dt for k in ("int", "decimal", "numeric", "float", "real",
+                             "double", "money")):
+        return "numeric"
+    if any(k in dt for k in ("date", "time", "timestamp", "datetime", "smalldatetime")):
+        return "datetime"
+    if any(k in dt for k in ("char", "text", "varchar", "citext", "uuid", "ltree")):
+        return "text"
+    if any(k in dt for k in ("bytea", "blob", "binary", "varbinary")):
+        return "binary"
+    return "other"
+
+
+def find_nested_aggregates(sql) -> list:
+    """Return nested-aggregate snippets like AVG(SUM(...)); [] when clean."""
+    return [f"{a}({b}" for a, b in _NESTED_AGG_RE.findall(sql or "")]
+
+
+def is_bare_select_star(sql) -> bool:
+    """True when sql is SELECT * with no aggregate fn and no GROUP BY."""
+    if not sql:
+        return False
+    m = _BARE_STAR_RE.search(sql)
+    if not m or "*" not in m.group(1):
+        return False
+    if _AGG_FN_RE.search(sql):
+        return False
+    return True
+
+
+def find_incompatible_aggregations(sql, columns_by_type=None) -> list:
+    """Flag SUM/AVG over text/datetime/binary columns (wrong-datatype math).
+
+    `columns_by_type` maps table -> {column: data_type}. COUNT(*) is always
+    valid and never flagged. Returns issue strings.
+    """
+    if not sql or not columns_by_type:
+        return []
+    type_map = {
+        str(t).lower(): {str(c).lower(): _classify_col_type(dt)
+                         for c, dt in (cols or {}).items()}
+        for t, cols in columns_by_type.items()
+    }
+    aliases = {}
+    for m in _SQL_ALIAS_RE.finditer(sql):
+        aliases[m.group(1).lower()] = m.group(1)
+        if m.group(2):
+            aliases[m.group(2).lower()] = m.group(1)
+    issues = []
+    for m in _AGG_CALL_RE.finditer(sql):
+        fn, qual, col = m.group(1).upper(), m.group(2), m.group(3)
+        if col == "*" or fn in ("COUNT", "MIN", "MAX"):
+            continue
+        # SUM/AVG over a text/datetime/binary column is a datatype error.
+        table = aliases.get((qual or "").lower()) if qual else None
+        candidates = [table] if table else list(type_map)
+        for t in candidates:
+            kind = type_map.get(str(t or "").lower(), {}).get(col.lower())
+            if kind in ("text", "datetime", "binary"):
+                issues.append(
+                    f"{fn} over incompatible {kind} column "
+                    f"{(table or qual or '?')}.{col}"
+                )
+                break
+    return sorted(set(issues))
+
+
+def validate_generated_sql(sql, *, schema_tables=None, columns_by_table=None,
+                           columns_by_type=None, join_path=None) -> list:
+    """Single post-generation gate. Returns ordered issue strings ([] = PASS).
+
+    Checks: unknown tables, unknown columns, nested aggregates, incompatible
+    aggregation datatypes. Missing-FROM / PK-FK JOIN checks live on the agent
+    (they need the FK graph); execution/zero-row checks happen after execute.
+    """
+    issues = []
+    for t in unknown_sql_tables(sql, schema_tables or []):
+        issues.append(f"nonexistent table: {t}")
+    for c in unknown_sql_columns(sql, columns_by_table or {}):
+        issues.append(f"nonexistent column: {c}")
+    for n in find_nested_aggregates(sql):
+        issues.append(f"nested aggregate: {n} is invalid SQL")
+    for inc in find_incompatible_aggregations(sql, columns_by_type):
+        issues.append(f"incompatible datatype: {inc}")
+    return issues
+
+
+def enforce_readonly_guards(sql, mapping=None) -> str:
+    """Fail-closed allowlist guard called before EVERY SQL execution.
+
+    Asserts ``is_read_only_sql(sql)`` AND ``validate_generated_sql`` unknown
+    table/column issues == []. ``mapping`` is ``{table: columns}`` (either
+    ``{table: {col: meta}}`` or ``{table: [cols]}``); when omitted only the
+    read-only check runs. Returns the cleaned SQL on pass; raises
+    RuntimeError with a clear message on failure (never returns a forgiving
+    default).
+    """
+    cleaned = (sql or "").strip()
+    if not is_read_only_sql(cleaned):
+        raise RuntimeError(
+            "SQL guard rejected execution: statement is not read-only "
+            "(only SELECT / WITH ... SELECT are allowed)."
+        )
+    schema_tables = list((mapping or {}).keys())
+    columns_by_table: dict = {}
+    if mapping:
+        for table, cols in mapping.items():
+            if isinstance(cols, dict):
+                columns_by_table[table] = list(cols.keys())
+            else:
+                try:
+                    columns_by_table[table] = list(cols)
+                except TypeError:
+                    columns_by_table[table] = []
+    bad_tables = unknown_sql_tables(cleaned, schema_tables) if mapping is not None else []
+    bad_columns = unknown_sql_columns(cleaned, columns_by_table) if mapping else []
+    if bad_tables or bad_columns:
+        details = []
+        if bad_tables:
+            details.append(f"unknown tables: {', '.join(bad_tables)}")
+        if bad_columns:
+            details.append(f"unknown columns: {', '.join(bad_columns)}")
+        raise RuntimeError(
+            "SQL guard rejected execution (" + "; ".join(details) + ")."
+        )
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
 # Chart-type guardrail.
 #
 # The LLM (local or cloud) may PROPOSE a chart type after seeing the data, but
@@ -355,6 +553,56 @@ def _normalize_chart(suggested):
     for word in re.findall(r"[a-z]+", low):
         if word in _CHART_ALIASES:
             return _CHART_ALIASES[word]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# hyp.txt PHASE 1-2 — semantic pair helpers for Decision eligibility
+# (additive only; existing guards above are unchanged).
+#
+# All checks operate on canonical FIELD_ROLES from core.semantic
+# (never on raw column names), so no per-column exclusions exist here.
+# ---------------------------------------------------------------------------
+
+_MEASURE_FAMILY = frozenset({
+    "MEASURE", "BUSINESS_MEASURE", "TECHNICAL_MEASURE", "DERIVED_METRIC",
+})
+_JOIN_ONLY_ROLES = frozenset({"FOREIGN_KEY", "IDENTIFIER"})
+
+
+def is_measure_role_name(role) -> bool:
+    return str(role or "").upper() in _MEASURE_FAMILY
+
+
+def measure_used_as_dimension(metric_role, segment_role) -> bool:
+    """True when a measure-family field is used as a segment/dimension.
+
+    hyp #12: ``metric = Price Per Night, segment = Total Amt`` is invalid
+    when both sides are measures — never turn one measure into a segment.
+    """
+    return (is_measure_role_name(metric_role)
+            and is_measure_role_name(segment_role))
+
+
+def fk_used_as_driver(driver_role) -> bool:
+    """True when a join-context key is proposed as a driver/lever.
+
+    Foreign keys are join/relational context only, never a business
+    driver or lever (hyp #10/#95).
+    """
+    return str(driver_role or "").upper() in _JOIN_ONLY_ROLES
+
+
+def semantic_pair_rejection(metric_role, segment_role,
+                             driver_role=None) -> str | None:
+    """Return the eligibility rejection code for a semantic pair, or None.
+
+    Codes align with services.decision_eligibility reason vocabulary.
+    """
+    if measure_used_as_dimension(metric_role, segment_role):
+        return "measure_used_as_dimension"
+    if driver_role is not None and fk_used_as_driver(driver_role):
+        return "no_actionable_lever"
     return None
 
 

@@ -70,6 +70,42 @@ class ProfileBudget:
         return True
 
 
+class _SqliteDictCursor:
+    """Minimal dict-cursor context manager for sqlite3 (generic DB support)."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._cur = None
+
+    def __enter__(self):
+        self._conn.row_factory = None
+        self._cur = self._conn.cursor()
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self._cur.close()
+        except Exception:
+            pass
+        return False
+
+    def execute(self, sql, params=None):
+        if params is None:
+            return self._cur.execute(sql)
+        return self._cur.execute(sql, params)
+
+    def fetchall(self):
+        cols = [d[0] for d in (self._cur.description or [])]
+        return [dict(zip(cols, r)) for r in self._cur.fetchall()]
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in (self._cur.description or [])]
+        return dict(zip(cols, row))
+
+
 class ValueProfiler:
     """Samples distinct column values so relationships can be confirmed from DATA.
 
@@ -110,7 +146,7 @@ class ValueProfiler:
 
     def rel_table(self, table):
         """SQL-safe qualified table reference (schema-qualified where needed)."""
-        if self.db_type == "mysql":
+        if self.db_type in ("mysql", "sqlite"):
             return self.quote(table)
         if isinstance(table, str) and "." in table:
             parts = table.split(".", 1)
@@ -170,7 +206,7 @@ class ValueProfiler:
                 )
                 for row in cur.fetchall():
                     values.add(norm_value(row["v"]))
-        except Exception as exc:
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             logger.debug("distinct sample failed for %s.%s: %s", table, col, exc)
             values = set()
         cache[key] = values
@@ -180,6 +216,8 @@ class ValueProfiler:
         if self.db_type == "mysql":
             import pymysql.cursors
             return self.conn.cursor(pymysql.cursors.DictCursor)
+        if self.db_type == "sqlite":
+            return _SqliteDictCursor(self.conn)
         import psycopg2.extras
         return self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
@@ -192,7 +230,7 @@ class ValueProfiler:
                 with self._dict_cursor() as cur:
                     cur.execute(f"SELECT COUNT(*) AS n FROM {self.rel_table(table)}")
                     self._rows_cache[table] = cur.fetchone()["n"] or 0
-            except Exception as exc:
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 logger.debug("row count failed for %s: %s", table, exc)
                 self._rows_cache[table] = 0
         return self._rows_cache[table]
@@ -402,6 +440,14 @@ class ValueProfiler:
                         f"WHERE {ident} IN ({marks})",
                         tuple(values),
                     )
+                elif self.db_type == "sqlite":
+                    marks = ", ".join(["?"] * len(values))
+                    cur.execute(
+                        f"SELECT count(DISTINCT {ident}) AS matched "
+                        f"FROM {self.rel_table(table)} "
+                        f"WHERE {ident} IN ({marks})",
+                        tuple(values),
+                    )
                 else:
                     cur.execute(
                         f"SELECT count(DISTINCT {ident}) AS matched "
@@ -479,3 +525,25 @@ class ValueProfiler:
             return True
         dtype = str(col.get("data_type", "")).upper()
         return any(tok in dtype for tok in ("INT", "NUMERIC", "DECIMAL", "NUMBER", "REAL", "FLOAT"))
+
+
+def suggest_measure_vs_dimension(distinct_count, total_rows, data_type="") -> str:
+    """hyp.txt PHASE 1 helper: cardinality signal for measure vs dimension.
+
+    Additive only (no change to profiling queries). High-cardinality
+    numerics behave as measures; low-cardinality fields behave as
+    dimensions/categories. Never uses column names.
+    """
+    try:
+        dtype = str(data_type or "").lower()
+        if any(h in dtype for h in ("date", "time", "timestamp", "datetime")):
+            return "DATE"
+        dc = int(distinct_count) if distinct_count is not None else None
+        n = int(total_rows) if total_rows is not None else None
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if dc is None or n is None or n <= 0:
+        return "UNKNOWN"
+    if dc <= 50:
+        return "DIMENSION"
+    return "MEASURE"

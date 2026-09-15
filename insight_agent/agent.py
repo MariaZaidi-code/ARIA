@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 from llm_provider import LLMProvider, create_provider
-from core.validation import validate_chart_choice
+from core.validation import clean_llm_text, validate_chart_choice
 from .chart_catalog import compatible_chart_options
 from prediction import PredictionAgent
 from prescription_agent import PrescriptionAgent
@@ -54,6 +54,61 @@ def sanitize_json(obj):
 
 CHART_TEMPLATES_PATH = Path(__file__).resolve().parent.parent / "static" / "chart_templates.json"
 
+# ── n.txt items 9 + P2: controlled chart vocabulary ──────────────────────
+# The backend may only emit these chart types. The frontend renders the spec
+# object only — the LLM is never allowed to return arbitrary frontend code,
+# templates, or render configs. Every proposal (including `chart_suggestions`)
+# passes the deterministic guardrail in core.validation before use.
+CHART_SPEC_VOCAB = ("line", "bar", "area", "scatter", "pie", "donut", "histogram", "heatmap")
+
+# Internal template ids -> controlled vocabulary. Anything not listed falls
+# back to "bar" (or "table-equivalent" kpi handling) so the frontend never
+# receives an unsupported type.
+_TEMPLATE_TO_VOCAB = {
+    "line": "line", "multi_line": "line", "step_line": "line",
+    "sparkline": "line", "slope": "line", "control_chart": "line",
+    "area": "area", "stacked_area": "area", "density": "area", "ecdf": "area",
+    "bar": "bar", "bar_horizontal": "bar", "bar_stacked": "bar",
+    "bar_grouped": "bar", "bar_normalized": "bar", "bar_diverging": "bar",
+    "lollipop": "bar", "pareto": "bar", "waterfall": "bar", "combo": "bar",
+    "radar": "bar", "bullet": "bar", "funnel": "bar",
+    "scatter": "scatter", "bubble": "scatter", "hexbin": "scatter", "contour": "scatter",
+    "pie": "pie", "polar_area": "pie",
+    "doughnut": "donut", "donut": "donut", "gauge": "donut",
+    "histogram": "histogram", "box_plot": "histogram", "violin": "histogram",
+    "heatmap": "heatmap", "calendar_heatmap": "heatmap",
+}
+
+
+def vocab_type_for_template(tid: str) -> str:
+    """Map an internal template id to the controlled frontend vocabulary."""
+    return _TEMPLATE_TO_VOCAB.get((tid or "").lower(), "bar")
+
+
+def validate_spec_data(rows, limit: int = 500):
+    """Validate + sanitize chart data before it leaves the backend.
+
+    Drops non-dict rows, caps length, converts NaN/Inf to None. Returns a
+    plain JSON-safe list. Never raises — returns [] when unusable so the
+    frontend can show an insufficient-data state.
+    """
+    if not isinstance(rows, (list, tuple)):
+        return []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        clean = {}
+        for k, v in r.items():
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                clean[k] = None
+            else:
+                clean[k] = v
+        out.append(clean)
+        if len(out) >= limit:
+            break
+    return out
+
 
 class InsightAgent:
     def __init__(self, provider=None):
@@ -61,6 +116,7 @@ class InsightAgent:
         self.prediction = PredictionAgent()
         self.prescription = PrescriptionAgent(provider=self.llm)
         self._templates = None
+        self.last_story_status = "SUCCESS"
 
     # ------------------------------------------------------------------
     # Chart templates (code/config kept in a JSON file, not in code)
@@ -219,7 +275,9 @@ class InsightAgent:
     def detect_anomalies(self, df, numeric_cols):
         """Flag numeric rows whose z-score exceeds the threshold as anomalies.
         Identifier-like columns (ids/keys/codes) are never flagged: they are
-        synthetic keys, not measures."""
+        synthetic keys, not measures. Output is capped at the strongest 20
+        (by |z|) with a total count, so noisy columns cannot flood insights.
+        """
         anomalies = []
         for col in numeric_cols:
             low = col.lower().strip()
@@ -243,6 +301,11 @@ class InsightAgent:
                         "z_score": round(float(z[idx]), 2),
                         "note": "beyond 2 standard deviations",
                     })
+        total = len(anomalies)
+        if total > 20:
+            anomalies = sorted(anomalies, key=lambda a: abs(a["z_score"]), reverse=True)[:20]
+            for a in anomalies:
+                a["total_anomaly_count"] = total
         return anomalies
 
     # ------------------------------------------------------------------
@@ -273,6 +336,49 @@ class InsightAgent:
             else:
                 out[k] = v
         return out
+
+    @staticmethod
+    def _spec_data_rows(spec_type, labels, datasets, x, y):
+        """Flatten labels+datasets into frontend-ready row dicts for the spec.
+
+        Single-series bar/line/area/histogram -> [{x, y}]. Multi-series ->
+        [{x, s1, s2, ...}]. Scatter/bubble point lists pass through unchanged
+        (validated later). Returns [] when the shape is unusable.
+        """
+        try:
+            datasets = datasets or []
+            if spec_type == "scatter":
+                for d in datasets:
+                    pts = (d or {}).get("data") if isinstance(d, dict) else None
+                    if isinstance(pts, list) and pts and isinstance(pts[0], dict):
+                        return pts[:500]
+                return []
+            if spec_type == "heatmap":
+                # Heatmap rows: {x, y, value}; fall back to category matrix.
+                rows = []
+                for d in datasets:
+                    if not isinstance(d, dict):
+                        continue
+                    for lbl, val in zip(labels or [], (d.get("data") or [])):
+                        rows.append({"x": lbl, "y": d.get("label"), "value": val})
+                return rows[:500]
+            labels = labels or []
+            if not labels or not datasets:
+                return []
+            if len(datasets) == 1:
+                vals = (datasets[0] or {}).get("data") or []
+                return [{str(x): lbl, str(y): val} for lbl, val in zip(labels, vals)][:500]
+            rows = []
+            for i, lbl in enumerate(labels):
+                row = {str(x): lbl}
+                for d in datasets:
+                    if isinstance(d, dict) and d.get("label"):
+                        vals = d.get("data") or []
+                        row[str(d["label"])] = vals[i] if i < len(vals) else None
+                rows.append(row)
+            return rows[:500]
+        except Exception:
+            return []
 
     def build_dashboard_spec(self, df, numeric_cols, category_cols, datetime_cols,
                              chart_suggestions=None):
@@ -314,6 +420,15 @@ class InsightAgent:
             options.setdefault("responsive", True)
             options.setdefault("maintainAspectRatio", False)
             chart_type = cfg.get("type", "bar")
+            # Controlled chart spec (n.txt-9): frontend renders ONLY this
+            # {type,x,y,series,title,interactive,data} object. `type` is drawn
+            # from CHART_SPEC_VOCAB; raw template/config internals stay as
+            # legacy compat and must never carry LLM-supplied code.
+            spec_type = vocab_type_for_template(tid)
+            series = [d.get("label") for d in (datasets or []) if isinstance(d, dict) and d.get("label")]
+            spec_data = validate_spec_data(
+                self._spec_data_rows(spec_type, labels, datasets, x, y)
+            )
             return {
                 "chart_type": tid,
                 "title": title,
@@ -327,6 +442,20 @@ class InsightAgent:
                     "data": {"labels": labels, "datasets": datasets},
                     "options": options,
                 },
+                # ── controlled spec: the only contract the frontend renders ──
+                "spec": {
+                    "type": spec_type,
+                    "x": x,
+                    "y": y,
+                    "series": series[:8],
+                    "title": title,
+                    "interactive": tid != "kpi_card",
+                    "data": spec_data,
+                },
+                "type": spec_type,
+                "series": series[:8],
+                "interactive": tid != "kpi_card",
+                "data": spec_data,
             }
 
         def ds_style(label, data, kind, color):
@@ -523,13 +652,21 @@ class InsightAgent:
                     effective_numeric.append(col)
 
         if effective_numeric:
+            kpi_rows = validate_spec_data(self.compute_kpis(df, effective_numeric))
             specs.append({
                 "chart_type": "kpi_card",
                 "title": "Key performance indicators",
                 "x": None, "y": None, "labels": [], "datasets": [],
                 "template": templates.get("kpi_card", {}).get("config", {}),
                 "config": {"type": "kpi_card", "data": {"labels": [], "datasets": []}, "options": {}},
-                "data": self.compute_kpis(df, effective_numeric),
+                "data": kpi_rows,
+                # Controlled spec for KPI cards (non-interactive by design).
+                "spec": {
+                    "type": "bar", "x": None, "y": None, "series": [],
+                    "title": "Key performance indicators",
+                    "interactive": False, "data": kpi_rows,
+                },
+                "type": "bar", "series": [], "interactive": False,
             })
 
         return specs
@@ -679,8 +816,34 @@ class InsightAgent:
         the LLM is available it is asked to polish/expand that narrative; any
         failure, timeout or unusable output falls back to the deterministic
         version so the story is never missing or stuck.
+
+        Evidence gate FIRST (core/evidence.py): rows < 10 -> honest
+        deterministic insufficient state is returned WITHOUT calling the LLM.
+        The LLM must never compensate for missing evidence.
         """
+        try:
+            from core.evidence import insufficient_narrative as _insuf
+            _rows = processed_data.get("row_count", len(processed_data.get("data", []) or []))
+            try:
+                _rows = int(_rows)
+            except (TypeError, ValueError):
+                _rows = 0
+            if _rows < 10:
+                _cols = list(processed_data.get("columns", []) or [])
+                if not _cols and isinstance(processed_data.get("data"), list) \
+                        and processed_data["data"]:
+                    _first = processed_data["data"][0]
+                    if isinstance(_first, dict):
+                        _cols = list(_first.keys())
+                _fb = _insuf(_rows, "narrative",
+                             dataset_name=processed_data.get("user_goal"),
+                             columns=_cols)
+                self.last_story_status = "INSUFFICIENT_EVIDENCE"
+                return _fb["text"]
+        except Exception:
+            pass
         base = self._narrative_story(processed_data, kpis, trends, anomalies, hypotheses, predictions)
+        self.last_story_status = "SUCCESS"
 
         context = {
             "user_goal": processed_data.get("user_goal", "Unknown goal"),
@@ -699,6 +862,8 @@ class InsightAgent:
                 "projected_pct_change": predictions["projected_pct_change"],
                 "points": predictions["points"][:4],
             }
+        claims = self._build_story_claims(processed_data, kpis, trends, anomalies,
+                                          hypotheses, predictions)
 
         prompt = f"""
 You are the Insight Agent of a BI system. Below is a draft narrative written from
@@ -711,21 +876,309 @@ Draft narrative:
 Raw findings:
 {json.dumps(context, indent=2, default=str)}
 
+STRICT EVIDENCE PAYLOAD — the story may ONLY use these computed facts.
+Do not invent numbers, segments, entities, or periods outside this list:
+{json.dumps(claims, indent=2, default=str)}
+
 Rules:
 - Keep every claim grounded in the numbers given; do not invent facts.
+- Every numeric value must come from the evidence payload (formatting/rounding only).
+- Every named segment/entity/period must appear in the evidence payload.
+- Direction words (increased/decreased) must match the sign of the computed change.
 - Start with the headline finding, then supporting points, then any outlook.
 - Plain language, under 250 words, no markdown, no JSON, no lists of jargon.
 """
         try:
             polished = self.llm.chat("story", messages=[{"role": "user", "content": prompt}],
                                      temperature=0.4, num_predict=400, timeout=45)
+            if not (polished or "").strip():
+                self.last_story_status = "LLM_EMPTY"
+                logging.warning("Story LLM returned empty; using deterministic narrative.")
+                return base
             polished = (polished or "").strip()
-            if len(polished) >= 40 and len(polished) <= 1200:
-                return self._plain_english_story(polished)
-            logging.warning("Story LLM output unusable; using deterministic narrative.")
+            text, reason = clean_llm_text(polished)
+            if not text:
+                self.last_story_status = "INVALID_LLM_RESPONSE"
+                logging.warning("Story LLM output rejected (%s); using deterministic narrative.",
+                                reason or "empty after cleaning")
+                return base
+            if not (40 <= len(text) <= 1200):
+                self.last_story_status = "INVALID_LLM_RESPONSE"
+                logging.warning("Story LLM output rejected (bad length); using deterministic narrative.")
+                return base
+            ok, fail_reason = self._validate_polished_story(
+                text, processed_data, kpis, trends, anomalies, hypotheses, predictions)
+            if ok:
+                return self._plain_english_story(text)
+            self.last_story_status = "INVALID_LLM_RESPONSE"
+            logging.warning("Story LLM output rejected (%s); using deterministic narrative.",
+                            fail_reason or reason or "ungrounded numbers")
         except Exception as exc:
+            self.last_story_status = "LLM_UNAVAILABLE"
             logging.warning(f"Storytelling LLM failed: {exc}. Using deterministic narrative.")
         return base
+
+    def _build_story_claims(self, processed_data, kpis, trends, anomalies,
+                              hypotheses=None, predictions=None):
+        """Structured claims list from computed evidence (no LLM involved).
+
+        Each claim carries metric, value, comparison_value, direction,
+        pct_change, period/comparison_period, segment/entity so the polish
+        prompt is constrained and the validator can check numbers (on
+        underlying values, formatting only at presentation), entities,
+        periods, and direction sign.
+        """
+        import re as _re
+        claims = []
+        for k in kpis or []:
+            col = k.get("column")
+            if not col:
+                continue
+            claims.append({
+                "metric": col, "value": k.get("mean"),
+                "comparison_value": None,
+                "direction": None, "pct_change": None,
+                "period": None, "comparison_period": None,
+                "segment": None, "entity": None,
+                "detail": {f: k.get(f) for f in
+                           ("sum", "mean", "median", "min", "max", "std", "count")
+                           if k.get(f) is not None},
+            })
+        for t in trends or []:
+            cols = t.get("columns") or ([t["column"]] if t.get("column") else [])
+            pct = t.get("pct_change")
+            try:
+                pct_f = float(str(pct).replace("%", "")) if pct is not None else None
+            except (TypeError, ValueError):
+                pct_f = None
+            direction = t.get("direction")
+            if not direction and pct_f is not None:
+                direction = "increasing" if pct_f > 0 else ("decreasing" if pct_f < 0 else "mixed")
+            claims.append({
+                "metric": cols[0] if cols else t.get("dimension"),
+                "value": None, "comparison_value": None,
+                "direction": direction, "pct_change": pct_f,
+                "period": t.get("dimension"), "comparison_period": "previous period",
+                "segment": None, "entity": None,
+            })
+        for a in anomalies or []:
+            claims.append({
+                "metric": a.get("column"), "value": a.get("value"),
+                "comparison_value": None,
+                "direction": None, "pct_change": None,
+                "period": None, "comparison_period": None,
+                "segment": None, "entity": None,
+            })
+        for h in hypotheses or []:
+            txt = (h or {}).get("hypothesis", "") if isinstance(h, dict) else str(h)
+            ents = set(_re.findall(r"'([^']{1,60})'", txt))
+            for e in ents:
+                claims.append({
+                    "metric": None, "value": None, "comparison_value": None,
+                    "direction": None, "pct_change": None,
+                    "period": None, "comparison_period": None,
+                    "segment": e, "entity": e,
+                })
+        if predictions and predictions.get("valid"):
+            claims.append({
+                "metric": predictions.get("column"), "value": predictions.get("last_actual"),
+                "comparison_value": None,
+                "direction": None, "pct_change": predictions.get("projected_pct_change"),
+                "period": f"next {predictions.get('horizon')} {predictions.get('period') or 'periods'}",
+                "comparison_period": "recent period",
+                "segment": None, "entity": None,
+            })
+        return claims
+
+    def _story_numbers_grounded(self, text, processed_data, kpis, trends, anomalies,
+                                hypotheses=None, predictions=None) -> bool:
+        """Back-compat wrapper: numeric heuristic now delegates to structured validation."""
+        ok, _ = self._validate_polished_story(
+            text, processed_data, kpis, trends, anomalies, hypotheses, predictions)
+        return ok
+
+    def _validate_polished_story(self, text, processed_data, kpis, trends, anomalies,
+                                 hypotheses=None, predictions=None):
+        """Structured-claims validation: numbers, entities, periods, direction.
+
+        Returns (ok, reason). Numbers are compared on underlying values with
+        rounding-awareness (not string equality); entities/periods must exist
+        in evidence; direction words must match the sign of computed change.
+        """
+        import re as _re
+        import json as _json
+        known: list = []
+        try:
+            known.append(float((processed_data or {}).get("row_count") or 0))
+        except (TypeError, ValueError):
+            pass
+        for k in kpis or []:
+            for f in ("sum", "mean", "median", "min", "max", "std", "count"):
+                try:
+                    if k.get(f) is not None:
+                        known.append(float(k[f]))
+                except (TypeError, ValueError):
+                    continue
+        for t in trends or []:
+            try:
+                if t.get("pct_change") is not None:
+                    known.append(float(str(t["pct_change"]).replace("%", "")))
+            except (TypeError, ValueError):
+                continue
+        for a in anomalies or []:
+            try:
+                if a.get("value") is not None:
+                    known.append(float(a["value"]))
+            except (TypeError, ValueError):
+                continue
+        if predictions and predictions.get("valid"):
+            for f in ("projected_pct_change", "accuracy_pct", "last_actual"):
+                try:
+                    if predictions.get(f) is not None:
+                        known.append(float(str(predictions[f]).replace("%", "")))
+                except (TypeError, ValueError):
+                    continue
+            for p in predictions.get("points") or []:
+                for f in ("forecast", "value", "actual", "fitted"):
+                    try:
+                        if isinstance(p, dict) and p.get(f) is not None:
+                            known.append(float(p[f]))
+                    except (TypeError, ValueError):
+                        continue
+        # Hypothesis prose is computed evidence: numbers inside it (e.g. "40%")
+        # are grounded by construction.
+        for h in hypotheses or []:
+            txt = (h or {}).get("hypothesis", "") if isinstance(h, dict) else str(h)
+            txt += " " + (((h or {}).get("basis", "")) if isinstance(h, dict) else "")
+            for m in _re.finditer(r"-?\d[\d,]*\.?\d*", txt):
+                try:
+                    known.append(float(m.group(0).replace(",", "")))
+                except ValueError:
+                    continue
+        known = [v for v in known if v == v]  # drop NaN
+        cols = {str(k.get("column", "")).lower() for k in kpis or [] if k.get("column")}
+        cols |= {str(c or "").lower() for t in trends or [] for c in (t.get("columns") or [])}
+        cols |= {str(t.get("column", "")).lower() for t in trends or [] if t.get("column")}
+        cols |= {str(a.get("column", "")).lower() for a in anomalies or [] if a.get("column")}
+        if predictions and predictions.get("column"):
+            cols.add(str(predictions["column"]).lower())
+        evidence_text = _json.dumps({
+            "kpis": kpis or [], "trends": trends or [], "anomalies": anomalies or [],
+            "hypotheses": hypotheses or [], "predictions": predictions or {},
+            "row_count": (processed_data or {}).get("row_count"),
+        }, default=str).lower()
+
+        def _close(a, b, suffix="") -> bool:
+            if b == 0:
+                return abs(a) < 1.0
+            # Rounding-aware presentation: 1.84M for 1840000, 42.8K for 42800.
+            if suffix in ("m", "k"):
+                scale = 1_000_000 if suffix == "m" else 1_000
+                try:
+                    if abs(a - round(b / scale, 1)) <= max(0.15, abs(b / scale) * 0.05):
+                        return True
+                except Exception:
+                    pass
+                return False
+            return abs(a - b) <= max(0.6, abs(b) * 0.05)
+
+        for m in _re.finditer(r"-?\d[\d,]*\.?\d*\s*[kKmM%]?", text):
+            token = m.group(0)
+            suffix_m = _re.search(r"([kKmM%])\s*$", token)
+            suffix = (suffix_m.group(1).lower() if suffix_m else "")
+            raw = _re.sub(r"[,%\s kKmM]+$", "", token).replace(",", "")
+            if not raw or raw in ("-", ".", "-."):
+                continue
+            try:
+                num = float(raw)
+            except ValueError:
+                continue
+            if suffix == "%":
+                # Percent values must match a computed pct_change.
+                pct_known = []
+                for t in trends or []:
+                    try:
+                        if t.get("pct_change") is not None:
+                            pct_known.append(float(str(t["pct_change"]).replace("%", "")))
+                    except (TypeError, ValueError):
+                        continue
+                if predictions and predictions.get("projected_pct_change") is not None:
+                    try:
+                        pct_known.append(float(str(predictions["projected_pct_change"]).replace("%", "")))
+                    except (TypeError, ValueError):
+                        pass
+                for h in hypotheses or []:
+                    txt = (h or {}).get("hypothesis", "") if isinstance(h, dict) else str(h)
+                    for m in _re.finditer(r"(-?\d[\d,]*\.?\d*)\s*%", txt):
+                        try:
+                            pct_known.append(float(m.group(1).replace(",", "")))
+                        except ValueError:
+                            continue
+                if not pct_known:
+                    continue  # no computed change to contradict; skip
+                if any(abs(num - p) <= max(0.6, abs(p) * 0.05) for p in pct_known):
+                    continue
+                return False, f"unmapped percent {token.strip()}"
+            if abs(num) < 10 and not suffix:
+                continue  # counts / ranks / small prose numbers
+            if 1900 <= abs(num) <= 2100 and num.is_integer() and not suffix:
+                # Year-like periods must exist in evidence; otherwise invented.
+                if str(int(num)) not in evidence_text:
+                    return False, f"unmapped period {token.strip()}"
+                continue
+            if any(_close(num, k, suffix) for k in known):
+                continue
+            return False, f"unmapped numeric {token.strip()}"
+        for tok in set(_re.findall(r"[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+", text)):
+            if tok.lower() not in cols:
+                return False, f"unknown segment {tok}"
+        # Quoted segment/entity names must exist in evidence.
+        for q in set(_re.findall(r"'([^']{1,60})'|\"([^\"]{1,60})\"", text)):
+            name = (q[0] or q[1] or "").strip()
+            if not name or len(name) < 2:
+                continue
+            if _re.fullmatch(r"-?\d[\d,.\s%kKmM]*", name):
+                continue
+            low = name.lower()
+            if low in {"previous period", "recent period", "over time", "next period",
+                       "next periods", "usual range", "typical range"}:
+                continue
+            if low not in evidence_text:
+                return False, f"unknown entity {name[:40]}"
+        # Month-name periods must exist in evidence.
+        months = ("january", "february", "march", "april", "may", "june", "july",
+                  "august", "september", "october", "november", "december",
+                  "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+                  "q1", "q2", "q3", "q4", "quarter")
+        for m in set(_re.findall(r"[A-Za-z]{3,9}", text.lower())):
+            if m in months and m not in evidence_text:
+                return False, f"unmapped period {m}"
+        # Direction words must match the sign of computed change.
+        pct_signs = []
+        for t in trends or []:
+            try:
+                if t.get("pct_change") is not None:
+                    pct_signs.append(float(str(t["pct_change"]).replace("%", "")))
+            except (TypeError, ValueError):
+                continue
+        if predictions and predictions.get("projected_pct_change") is not None:
+            try:
+                pct_signs.append(float(str(predictions["projected_pct_change"]).replace("%", "")))
+            except (TypeError, ValueError):
+                pass
+        if pct_signs:
+            up_words = ("increas", "grew", "growth", "rose", "rising", " up ", "upward")
+            down_words = ("decreas", "declin", "fell", "falling", "dropped", " down ", "downward")
+            low_text = f" {text.lower()} "
+            says_up = any(w in low_text for w in up_words)
+            says_down = any(w in low_text for w in down_words)
+            all_up = all(v > 0 for v in pct_signs)
+            all_down = all(v < 0 for v in pct_signs)
+            if says_up and not says_down and all_down:
+                return False, "direction mismatch (says increased, computed decrease)"
+            if says_down and not says_up and all_up:
+                return False, "direction mismatch (says decreased, computed increase)"
+        return True, ""
 
     def _plain_english_story(self, text):
         """Strip residual technical jargon an LLM polish may have reintroduced,
@@ -747,7 +1200,7 @@ Rules:
             (r"\bmedian\b", "middle value"),
             (r"\bcoefficient of variation\b", "relative variation"),
             (r"\bdispersion\b", "spread"),
-            (r"\bz-score\b", "deviation score"),
+            (r"\bz-scores?\b", "unusual pattern"),
             (r"\bstats\b", "statistics"),
         ]
         out = text
@@ -817,7 +1270,21 @@ Rules:
                 f"{predictions['horizon']} {period_word}."
             )
         story = " ".join(parts)
-        return story or "No notable signals detected in this dataset."
+        if story and (kpis or trends or anomalies or hypotheses):
+            return story
+        # Insufficient evidence: honest state, or a plain evidence sentence
+        # when a single safe fact exists (never invent).
+        if trends:
+            t = trends[0]
+            metric = (t.get("columns") or ["metric"])[0]
+            return (f"{metric} {t.get('direction', 'changed')} "
+                    f"{t.get('pct_change', '')}% compared with the previous period.")
+        if kpis:
+            top = max(kpis, key=lambda k: k.get("mean") or 0)
+            return (f"ARIA reviewed {rows} rows; {top.get('column')} averages "
+                    f"{top.get('mean')} with no strong pattern to report.")
+        return (f"ARIA reviewed {rows} rows but found no strong pattern to report. "
+                f"Review the KPIs and charts below.")
 
     # ------------------------------------------------------------------
     # Main analysis pipeline
@@ -933,6 +1400,7 @@ Rules:
             "hypothesis_ranking_score": round(ranking_score, 2),
             "dashboard": dashboard_spec,
             "business_story": story,
+            "business_story_status": getattr(self, "last_story_status", "SUCCESS"),
             "warning": "; ".join(warnings) if warnings else None,
         }
 

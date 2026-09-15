@@ -24,7 +24,9 @@ class ForecastRequest(BaseModel):
     question: str = ""
     column: str | None = None
     time_dim: str | None = None
-    horizon: int = 6
+    # None = auto-suggest from frequency + history length (dynamic default);
+    # any integer overrides the suggestion.
+    horizon: int | None = None
 
 
 class PrescriptionRequest(BaseModel):
@@ -107,6 +109,28 @@ def _validate_time_dim(engine, dialect, table, column, dtype):
         "parse_ratio": round(ratio, 2),
         "span": span,
     }
+
+
+def _evidence_state_for_forecast(forecast, table_rows, table):
+    """Additive canonical state for forecast payloads (never overrides)."""
+    try:
+        from core.evidence import assess_evidence as _assess
+        n_obs = (forecast or {}).get("n_obs")
+        rows = table_rows if table_rows is not None else n_obs
+        return _assess(rows if rows is not None else 0, "forecast",
+                       history_points=n_obs, dataset_name=table)
+    except Exception:
+        return None
+
+
+def _scenario_evidence_state(row_count, table, history_points=None):
+    """Additive canonical state for scenario payloads."""
+    try:
+        from core.evidence import assess_evidence as _assess
+        return _assess(row_count, "scenario", history_points=history_points,
+                       dataset_name=table)
+    except Exception:
+        return None
 
 
 @router.get("/api/predictive/eligibility")
@@ -217,7 +241,30 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
         engine.dispose()
     except Exception:
         pass
-    return {
+    # Per-target prediction validation (core/data_intelligence.py): cheap,
+    # pure and generic — attached for transparency alongside the live
+    # measure/time-dim discovery above. Never overrides it.
+    try:
+        from core.data_intelligence import (
+            build_data_intelligence as _bdi,
+            detect_capabilities as _dcaps,
+        )
+        _caps = _dcaps(_bdi(mapping))
+        prediction_targets = _caps.get("prediction_targets", [])
+    except Exception:
+        prediction_targets = []
+    # Additive canonical state: global rows<10 dominates (REUSED
+    # GLOBAL_MIN_ROWS=10); per-table forecast minimum (min_points=5 history
+    # periods) stays in the per-table time_dims/distinct checks above.
+    try:
+        from core.evidence import assess_evidence as _assess_el
+        _max_rows = max([int(t.get("row_count") or 0) for t in out_tables] or [0])
+        _ev_el = _assess_el(_max_rows, "forecast",
+                           history_points=(recommended or {}).get("history_points"),
+                           dataset_name=(recommended or {}).get("table"))
+    except Exception:
+        _ev_el = None
+    _elig = {
         "ok": True,
         "eligible": recommended is not None,
         "connected": True,
@@ -225,7 +272,15 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
         "recommended": recommended,
         "reasons": reasons,
         "min_points": 5,
+        "prediction_targets": prediction_targets,
     }
+    if _ev_el is not None:
+        _elig["evidence_state"] = _ev_el
+        if _ev_el.get("status") != "supported":
+            _elig["eligible"] = False
+            if _ev_el.get("reason") and _ev_el["reason"] not in _elig["reasons"]:
+                _elig["reasons"] = [_ev_el["reason"]] + list(_elig["reasons"])
+    return _elig
 
 
 @router.post("/api/predictive/scenario")
@@ -392,13 +447,42 @@ def run_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(re
         raise HTTPException(status_code=500, detail=f"Scenario data retrieval failed: {_san(exc)[:200]}")
     if not series:
         raise HTTPException(status_code=400, detail="Not enough data for scenario analysis.")
+    # Centralized global gate: rows < 10 -> insufficient scenario state.
+    # Consume the mapping row count first (csv_handler contract), else the
+    # live COUNT(*). REUSES SCENARIO_MIN_OBS == 10 (prescription MIN_N).
+    _sc_rows, _sc_known = None, False
+    try:
+        _ti_sc = (mapping.get("tables") or {}).get(target_table) or {}
+        if isinstance(_ti_sc.get("row_count"), int):
+            _sc_rows, _sc_known = max(0, int(_ti_sc["row_count"])), True
+    except Exception:
+        pass
+    if not _sc_known:
+        try:
+            with engine.connect() as _cc:
+                _sc_rows = int(_cc.execute(_text(
+                    f"SELECT COUNT(*) FROM {_safe_name(target_table, dialect)}")).fetchone()[0] or 0)
+            _sc_known = True
+        except Exception:
+            pass
+    if _sc_known:
+        _ev_sc = _scenario_evidence_state(_sc_rows, target_table, len(series))
+        if _ev_sc is not None and _ev_sc.get("status") != "supported":
+            raise HTTPException(status_code=400, detail=_ev_sc.get("reason") or
+                                "Not enough data for scenario analysis.")
     baseline = sum(s["actual"] for s in series) / len(series)
     factor = 1.0 + pct / 100.0
     for s in series:
         s["scenario"] = round(s["actual"] * factor, 2)
     scenario_value = round(baseline * factor, 2)
     from insight_agent import sanitize_json
-    return sanitize_json({
+    _ev_sc_ok = None
+    try:
+        _ev_sc_ok = _scenario_evidence_state(
+            _sc_rows if _sc_known else len(series), target_table, len(series))
+    except Exception:
+        pass
+    _sc_payload = {
         "ok": True,
         "estimate": True,
         "table": target_table,
@@ -415,7 +499,10 @@ def run_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(re
             "Baseline is the trailing average, not a forecast.",
         ],
         "limitations": "Arithmetic estimate only. Combine with the validated forecast for a fuller picture.",
-    })
+    }
+    if _ev_sc_ok is not None:
+        _sc_payload["evidence_state"] = _ev_sc_ok
+    return sanitize_json(_sc_payload)
 
 
 @router.post("/api/predictive/forecast")
@@ -469,6 +556,59 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
             detail="No forecastable number found in this data. Forecasting needs a numeric measure (not ids, keys or codes).",
         )
 
+    # Centralized global gate (core/evidence.py): rows < 10 -> refusal for
+    # ALL substantive conclusions, BEFORE any GoalAgent/LLM work. Consume the
+    # row counts the mapping exposes; fall back to a live COUNT(*) only when
+    # the mapping has no counts. Per-capability forecast minimum
+    # (min_points=5 history periods) is REUSED downstream in PredictionAgent.
+    _fc_rows, _fc_known = None, False
+    try:
+        _tinfo0 = (_mapping0.get("tables") or {}).get(valid_table) or {}
+        if isinstance(_tinfo0.get("row_count"), int):
+            _fc_rows, _fc_known = max(0, int(_tinfo0["row_count"])), True
+    except Exception:
+        pass
+    if not _fc_known:
+        try:
+            from api.kpi_routes import _build_engine as _kb0
+            from api.schema_intel import _safe_name as _sn0
+            from sqlalchemy import text as _t0
+            _eng0, _dial0, _ = _kb0(session)
+            if _eng0 is not None:
+                with _eng0.connect() as _c0:
+                    _fc_rows = int(_c0.execute(_t0(
+                        f"SELECT COUNT(*) FROM {_sn0(valid_table, _dial0)}")).fetchone()[0] or 0)
+                _fc_known = True
+                try:
+                    _eng0.dispose()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    if _fc_known:
+        try:
+            from core.evidence import assess_evidence as _assess_fc
+            _ev_fc = _assess_fc(_fc_rows, "forecast", dataset_name=valid_table)
+        except Exception:
+            _ev_fc = None
+        if _ev_fc is not None and _ev_fc.get("status") != "supported":
+            from insight_agent import sanitize_json as _sj_fc
+            return _sj_fc({
+                "ok": False,
+                "question": req.question or f"Show {valid_measure} over time",
+                "reason": _ev_fc.get("reason"),
+                "missing_field": "history",
+                "suggestion": "Connect at least 10 usable records, then try again.",
+                "target": valid_measure,
+                "selection": {"measure": valid_measure, "table": valid_table,
+                              "time_dim": None},
+                "info": {"rows_analyzed": _fc_rows, "fallback_used": False,
+                         "goal_message": None},
+                "evidence_state": _ev_fc,
+                "reliability": "insufficient_data",
+                "n_obs": _fc_rows,
+            })
+
     # Validate the requested time dimension against the table's real
     # temporal candidates; fall back to the best-detected one.
     _tcols = _table_columns(_mapping0.get("tables", {}), valid_table)
@@ -492,15 +632,23 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
     output_dir = Path("artifacts/processed_data") / f"user_{user['user_id']}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"forecast_input_{int(time.time())}.json"
+    try:
+        from core.config import prune_regenerable_outputs as _prune
+        _prune(output_dir)
+    except Exception:
+        pass
     goal_error = None
     try:
         from goal_agent.agent import GoalAgent
         from goal_agent.schema import load_user_overrides
+        from core.config import resolve_provider_key
 
+        api_key = resolve_provider_key(provider, session.get("api_keys", {}))
         agent = GoalAgent(
             schema_json_path=str(schema_path),
             db_uri=db_uri,
             provider=provider,
+            api_key=api_key,
             dialect=dialect,
             overrides=load_user_overrides(user["user_id"], session.get("db_name", "")),
         )
@@ -573,7 +721,6 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
             return sub[0] if sub else None
 
         pred_agent = PredictionAgent(
-            horizon=req.horizon,
             min_points=5,
             valid_threshold=70.0,
         )
@@ -582,9 +729,24 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
             _fb = _deterministic_series()
             if _fb:
                 processed_data = _fb
+        # Pass the validated time dimension through only when it is really a
+        # column of the result rows — otherwise the agent auto-detects the
+        # time axis from the data (fully dynamic, never assumed).
+        def _resolve_time(data):
+            result_cols = list((data.get("data") or [{}])[0].keys()) \
+                if data.get("data") else []
+            if valid_time in result_cols:
+                return valid_time
+            low = {c.lower(): c for c in result_cols}
+            if valid_time and valid_time.lower() in low:
+                return low[valid_time.lower()]
+            return None
+
         forecast = pred_agent.forecast(
             processed_data,
             numeric_col=_resolve_target(processed_data),
+            datetime_col=_resolve_time(processed_data),
+            horizon=req.horizon,
         )
         if not forecast.get("valid") and not (forecast.get("points") or []) \
                 and not processed_data.get("fallback"):
@@ -594,15 +756,45 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
                 forecast = pred_agent.forecast(
                     processed_data,
                     numeric_col=_resolve_target(processed_data),
+                    datetime_col=_resolve_time(processed_data),
+                    horizon=req.horizon,
                 )
     except Exception as e:
-        log.error("PredictionAgent failed: %s\n%s", e, _tb.format_exc())
+        from core.errors import sanitize_error as _san3
+        log.error("PredictionAgent failed: %s", _san3(e))
         forecast = {
+            "ok": False,
             "valid": False,
             "method": "unavailable",
-            "error": str(e),
+            "model": "none",
+            "model_selected": None,
+            "candidates": [],
+            "drivers": [],
+            "details": {},
+            "preparation": {},
+            "accuracy": {"pct": None, "summary": "Forecast unavailable."},
+            "reason": f"Forecast unavailable right now: {_san3(e)[:200]}",
+            "missing_field": "internal",
+            "suggestion": "Ask ARIA to analyze this dataset instead.",
+            "message": None,
+            "recommendation": None,
+            "n_obs": 0,
+            "reliability": "insufficient_data",
+            "forecast_stage": "none",
             "points": [],
             "history": [],
+            "historical": [],
+            "forecast": [],
+            "confidence_interval": [],
+            "timestamps": [],
+            "frequency": None,
+            "target": valid_measure,
+            "horizon": int(req.horizon or 6),
+            "horizon_suggested": None,
+            "metrics": {"mae": None, "rmse": None, "mape": None},
+            "selection_statement": None,
+            "uncertainty_note": None,
+            "interval_method": None,
         }
 
     if not forecast.get("valid") and not (forecast.get("points") or []) \
@@ -610,7 +802,81 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
         forecast["reason"] = (
             "The data could not be prepared for forecasting right now. "
             "Try again shortly or pick a different number.")
+    # Data contract (n.txt item 3): the `forecast` object itself carries the
+    # contract keys (historical/forecast/frequency/target/model/horizon/
+    # metrics). They are mirrored at the top level for convenience — except
+    # `forecast`, which keeps its legacy meaning (the full forecast object);
+    # the future series is aliased as `forecast_series` up here.
     from insight_agent import sanitize_json
+    # Genuinely unforecastable data: structured graceful JSON (ok:false with
+    # reason + missing field + suggestion) — never a fabricated forecast,
+    # never a stack trace.
+    if forecast.get("ok") is False and not (forecast.get("points") or []):
+        try:
+            from core.evidence import assess_evidence as _assess_uf
+            _ev_uf = _assess_uf(forecast.get("n_obs", 0), "forecast",
+                               history_points=forecast.get("n_obs", 0),
+                               dataset_name=valid_table)
+        except Exception:
+            _ev_uf = None
+        _uf_payload = {
+            "ok": False,
+            "question": question,
+            "reason": forecast.get("reason") or (
+                goal_error or "This dataset cannot be forecast."),
+            "missing_field": forecast.get("missing_field"),
+            "suggestion": forecast.get("suggestion")
+            or "Ask ARIA to analyze this dataset instead.",
+            "target": forecast.get("target") or valid_measure,
+            "selection": {
+                "measure": valid_measure,
+                "table": valid_table,
+                "time_dim": valid_time,
+            },
+            "info": {
+                "rows_analyzed": len((processed_data.get("data") or [])),
+                "fallback_used": bool(processed_data.get("fallback")),
+                "goal_message": processed_data.get("message"),
+            },
+            "preparation": forecast.get("preparation") or {},
+            "reliability": forecast.get("reliability"),
+            "n_obs": forecast.get("n_obs", 0),
+        }
+        if _ev_uf is not None:
+            _uf_payload["evidence_state"] = _ev_uf
+        return sanitize_json(_uf_payload)
+    _future_series = forecast.get("forecast") or []
+    if isinstance(_future_series, dict):
+        _future_series = []
+    contract = {
+        "historical": forecast.get("historical") or [],
+        "forecast_series": _future_series,
+        "confidence_interval": forecast.get("confidence_interval") or [],
+        "timestamps": forecast.get("timestamps") or [],
+        "frequency": forecast.get("frequency"),
+        "target": forecast.get("target") or valid_measure,
+        "model": forecast.get("model") or forecast.get("method") or "none",
+        "model_selected": forecast.get("model_selected")
+        or forecast.get("model") or forecast.get("method") or "none",
+        "candidates": forecast.get("candidates") or [],
+        "drivers": forecast.get("drivers") or [],
+        "accuracy": forecast.get("accuracy"),
+        "details": forecast.get("details") or {},
+        "preparation": forecast.get("preparation") or {},
+        "validation": forecast.get("validation") or {},
+        "reliability": forecast.get("reliability"),
+        "forecast_stage": forecast.get("forecast_stage"),
+        "message": forecast.get("message"),
+        "recommendation": forecast.get("recommendation"),
+        "n_obs": forecast.get("n_obs", 0),
+        "horizon": forecast.get("horizon") or int(req.horizon or 6),
+        "horizon_suggested": forecast.get("horizon_suggested"),
+        "metrics": forecast.get("metrics") or {"mae": None, "rmse": None, "mape": None},
+        "selection_statement": forecast.get("selection_statement"),
+        "uncertainty_note": forecast.get("uncertainty_note"),
+        "interval_method": forecast.get("interval_method")
+        or ("pointwise" if (forecast.get("points") or []) else None),
+    }
     return sanitize_json({
         "ok": True,
         "question": question,
@@ -625,12 +891,22 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
             "fallback_used": bool(processed_data.get("fallback")),
             "goal_message": processed_data.get("message"),
         },
+        "evidence_state": _evidence_state_for_forecast(
+            forecast, _fc_rows if _fc_known else None, valid_table),
+        **contract,
     })
 
 
 @router.post("/api/prescription/generate")
 def generate_prescription(req: PrescriptionRequest, request: Request, user: dict = Depends(require_writable)):
-    """Generate evidence-based recommendations from the connected data."""
+    """DEPRECATED — kept for old clients only. Use /api/prescriptions/* or Decision Center instead.
+
+    Legacy duplicate of the prescription path: runs the old GoalAgent ->
+    InsightAgent -> PredictionAgent -> PrescriptionAgent chain. New code must
+    use the shared prescription_engine (analyze/run_scenario/priority_score/
+    quality_gate) via /api/prescriptions/* or the Decision Center
+    (/api/decision-center/*), which never calls PrescriptionAgent. DO NOT
+    delete this endpoint (old clients still call it)."""
     import traceback as _tb
     session = get_session(user["user_id"])
     reject_document_sql(session)
@@ -656,15 +932,18 @@ def generate_prescription(req: PrescriptionRequest, request: Request, user: dict
     try:
         from goal_agent.agent import GoalAgent
         from goal_agent.schema import load_user_overrides
+        from core.config import resolve_provider_key
 
         output_dir = Path("artifacts/processed_data") / f"user_{user['user_id']}"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"prescription_input_{int(time.time())}.json"
 
+        api_key = resolve_provider_key(provider, session.get("api_keys", {}))
         agent = GoalAgent(
             schema_json_path=str(schema_path),
             db_uri=db_uri,
             provider=provider,
+            api_key=api_key,
             dialect=dialect,
             overrides=load_user_overrides(user["user_id"], session.get("db_name", "")),
         )
@@ -686,6 +965,10 @@ def generate_prescription(req: PrescriptionRequest, request: Request, user: dict
     anomalies = []
     hypotheses = []
     try:
+        # Canonical insight path: insight_agent.agent.InsightAgent only.
+        # Advanced/Industry variants (insight_agent/advanced.py,
+        # insight_agent/industry.py, repo-root insight_agent_*.py) are
+        # intentionally NOT in the live path and stay unreachable but intact.
         from insight_agent.agent import InsightAgent
 
         insight_agent = InsightAgent(provider=provider)

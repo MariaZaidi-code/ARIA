@@ -10,6 +10,8 @@ import {
   ChevronUp, Download, MoreHorizontal, Copy, Trash2,
 } from "lucide-react";
 
+import { API_BASE } from "../../services/api";
+
 type SourceType = "postgresql" | "mysql" | "csv" | "pdf" | "";
 type Tab = "sources" | "schema" | "preview" | "quality";
 
@@ -28,14 +30,22 @@ const TABS: { id: Tab; label: string; icon: typeof Database }[] = [
 ];
 
 const api = async (path: string, opts?: RequestInit) => {
-  const token = localStorage.getItem("aria_auth_token");
+  // Centralized base + cookie auth (no Authorization header). Full res.ok
+  // handling: 401 clears session + notifies app; other failures throw.
+  // Callers pass "/api/..." paths; they are rebased onto API_BASE so
+  // VITE_API_BASE keeps working (dev proxy /api -> :8000 by default).
+  const url = path.startsWith("http") ? path : `${API_BASE}${path.replace(/^\/api/, "") || "/"}`;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 30000);
   let res: Response;
   try {
-    res = await fetch(path, {
+    const headers: Record<string, string> = { "Content-Type": "application/json", ...((opts?.headers as Record<string, string>) || {}) };
+    delete (headers as any)["Authorization"];
+    delete (headers as any)["authorization"];
+    res = await fetch(url, {
       ...opts,
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...opts?.headers },
+      headers,
+      credentials: "include",
       signal: ctrl.signal,
     });
   } catch (err: any) {
@@ -50,6 +60,10 @@ const api = async (path: string, opts?: RequestInit) => {
     console.debug("[ARIA] non-JSON response:", err);
     if (!res.ok) throw new Error(`HTTP ${res.status}: server returned a non-JSON error`);
     return data;
+  }
+  if (res.status === 401) {
+    try { window.dispatchEvent(new Event("aria:unauthorized")); } catch { /* ignore */ }
+    throw new Error("Session expired. Please sign in again.");
   }
   if (!res.ok) {
     const detail = (data as any)?.detail ?? (data as any)?.message ?? `HTTP ${res.status}`;
@@ -286,7 +300,7 @@ export default function Data({
         <div className="premium-card bg-positive/5 border border-positive/20 rounded-xl p-4 animate-fade-in">
           <div className="flex items-start justify-between gap-4">
             <div className="flex items-center gap-3">
-              <div className="w-9 h-9 rounded-lg bg-positive/10 flex items-center justify-center">
+              <div key={String(connHealth.database || dbName)} className="w-9 h-9 rounded-lg bg-positive/10 flex items-center justify-center connect-success-pop">
                 <SourceIcon size={16} className="text-positive" />
               </div>
               <div>
@@ -320,7 +334,7 @@ export default function Data({
             </div>
           </div>
           <div className="mt-3 bg-secondary/60 rounded-full h-1">
-            <div className="h-1 rounded-full bg-positive transition-all duration-500"
+            <div className="h-1 rounded-full bg-positive connect-progress"
               style={{ width: schemaStatus === "success" ? "100%" : schemaStatus === "running" ? "65%" : "25%" }} />
           </div>
           <div className="flex items-center justify-between mt-1.5">
@@ -656,6 +670,8 @@ export default function Data({
                           <div><span className="text-muted-foreground">Nullable:</span> <span className="text-foreground">{col.nullable !== false ? "Yes" : "No"}</span></div>
                           <div><span className="text-muted-foreground">Nulls:</span> <span className="text-foreground">{ns.nulls ?? 0} ({ns.null_pct?.toFixed(0) ?? 0}%)</span></div>
                           <div><span className="text-muted-foreground">Total:</span> <span className="text-foreground">{ns.total_rows ?? "?"}</span></div>
+                          {col.is_primary_key && <div><span className="text-muted-foreground">Role:</span> <span className="text-foreground flex items-center gap-1"><Key size={10} className="text-positive" /> Primary Key</span></div>}
+                          {col.is_foreign_key && col.references && <div><span className="text-muted-foreground">Role:</span> <span className="text-foreground flex items-center gap-1"><Link size={10} className="text-blue-500" /> FK → {col.references.table}.{col.references.column}</span></div>}
                           {col.distinct_count != null && <div><span className="text-muted-foreground">Distinct:</span> <span className="text-foreground">{col.distinct_count}</span></div>}
                           {col.min != null && <div><span className="text-muted-foreground">Min:</span> <span className="text-foreground">{col.min}</span></div>}
                           {col.max != null && <div><span className="text-muted-foreground">Max:</span> <span className="text-foreground">{col.max}</span></div>}

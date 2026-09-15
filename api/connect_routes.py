@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 import csv_orchestrator
 import schema_agent
-from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session, save_session
+from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session, save_session, get_user_artifact_paths
 from core.db import build_db_uri
 from core.deps import require_writable, get_current_user
 from core.secret_box import decrypt as _decrypt_secret
@@ -29,7 +29,7 @@ from document_processor import create_document_processor
 router = APIRouter()
 
 # Hosted providers run inference off-machine (need an API key, can serve vision).
-HOSTED_PROVIDERS = {"cloud", "deepseek", "omniroute"}
+HOSTED_PROVIDERS = {"cloud", "deepseek", "omniroute", "grok"}
 
 # Upload bounds (§40): enforced while streaming so oversized bodies never
 # fill the disk. CSV cap matches the handler's 100 MB post-write check.
@@ -40,24 +40,50 @@ MAX_UPLOAD_BYTES_PDF = int(os.getenv("ARIA_MAX_UPLOAD_PDF_MB", "50")) * 1024 * 1
 def _spool_limited(upload_file, dest: Path, max_bytes: int, label: str) -> int:
     """Stream an upload to disk, aborting with 413 past max_bytes."""
     total = 0
-    with open(dest, "wb") as _f:
-        while True:
-            chunk = upload_file.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > max_bytes:
-                try:
-                    _f.close()
-                    dest.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"{label} exceeds the {max_bytes // (1024 * 1024)} MB upload limit.",
-                )
-            _f.write(chunk)
+    try:
+        with open(dest, "wb") as _f:
+            while True:
+                chunk = upload_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"{label} exceeds the {max_bytes // (1024 * 1024)} MB upload limit.",
+                    )
+                _f.write(chunk)
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
     return total
+
+
+_BLOCKED_DB_HOSTS = {"169.254.169.254", "metadata.google.internal"}
+
+
+def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql") -> int:
+    """Shared SSRF/host validation for database connect + test paths.
+
+    Used by both the real connect path and /api/database/test so probing
+    via error oracle is blocked consistently. Returns validated port int.
+    """
+    host = (host or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", host) or len(host) > 253:
+        raise HTTPException(status_code=400, detail="Invalid host.")
+    if host.lower() in _BLOCKED_DB_HOSTS or host.startswith("169.254."):
+        raise HTTPException(status_code=400, detail="Host is blocked.")
+    try:
+        port_int = int(port)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid port.")
+    if not 1 <= port_int <= 65535:
+        raise HTTPException(status_code=400, detail="Invalid port.")
+    if db_type not in ("postgresql", "mysql"):
+        raise HTTPException(status_code=400, detail="Unsupported dbType.")
+    if len(db or "") > 128 or len(user or "") > 128:
+        raise HTTPException(status_code=400, detail="Invalid database/user.")
+    return port_int
 
 
 def _pdf_tables_to_sqlite(document, upload_dir: Path, stem: str, stamp: str):
@@ -242,7 +268,7 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
 
     # Validate hosted keys with a no-cost ping so a bad key fails here,
     # not pages later inside an analysis.
-    if request.provider != "local" and (request.api_key or request.provider in ("cloud", "deepseek", "omniroute")):
+    if request.provider != "local" and (request.api_key or request.provider in ("cloud", "deepseek", "omniroute", "grok")):
         try:
             llm.ping(timeout=25)
         except Exception as exc:
@@ -265,7 +291,7 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
 
 
 class ConnectRequest(BaseModel):
-    provider: str = "local"
+    provider: str | None = None
     source_type: str = "relational"
     db_type: str = "postgresql"   # 'postgresql' | 'mysql'
     host: str = "localhost"
@@ -322,6 +348,10 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     _set_progress(uid, "connecting", 15, f"Connecting to {db_type} database...")
 
     session = get_session(uid)
+    # Omitted provider keeps the session's selected backend so connecting
+    # data never silently flips a cloud session back to local.
+    if not request.provider:
+        request.provider = session.get("provider_name") or "local"
     if request.provider not in PROVIDER_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{request.provider}'. Choose from {sorted(PROVIDER_NAMES)}.")
     if request.source_type not in SOURCE_TYPES:
@@ -332,6 +362,9 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     if request.source_type == "relational":
         if not (request.db and request.user and request.password):
             raise HTTPException(status_code=400, detail="Relational source requires db, user, and password.")
+        request.port = _validate_db_endpoint(
+            request.host, request.port, request.db, request.user, db_type
+        )
 
     # Use user's saved API key for hosted providers if available
     user_key = session.get("api_keys", {}).get(request.provider) if request.provider in HOSTED_PROVIDERS else None
@@ -350,12 +383,12 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     session["db_type"] = db_type
     session["db_uri"] = None
     session["db_name"] = None
-    uid_dir = f"user_{user['user_id']}"
-    session["schema_path"] = SCHEMA_DIR / uid_dir / "schema_mapping_latest.json"
-    session["processed_path"] = PROCESSED_DIR / uid_dir / "processed_data.json"
-    session["insights_path"] = INSIGHTS_DIR / uid_dir / "insights.json"
-    session["processed_path"].parent.mkdir(parents=True, exist_ok=True)
-    session["insights_path"].parent.mkdir(parents=True, exist_ok=True)
+    # Isolated per-user artifact paths (validated int id, pathlib-safe,
+    # no traversal; dirs created deterministically).
+    _upaths = get_user_artifact_paths(user["user_id"])
+    session["schema_path"] = _upaths["schema_path"]
+    session["processed_path"] = _upaths["processed_path"]
+    session["insights_path"] = _upaths["insights_path"]
 
     config = request.model_dump()
     config["db_type"] = db_type
@@ -406,14 +439,13 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     session["dialect"] = db_type
 
     safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", db_name)
-    uid_dir = f"user_{user['user_id']}"
+    # Per-DB artifact files stay inside the authenticated user's own dirs.
+    _upaths = get_user_artifact_paths(user["user_id"])
     # Schema Agent writes DB-specific files (e.g. schema_mapping_northwind_latest.json)
     # so the session must point to the same naming convention.
-    session["schema_path"] = SCHEMA_DIR / uid_dir / f"schema_mapping_{safe}_latest.json"
-    session["processed_path"] = PROCESSED_DIR / uid_dir / f"processed_data_{safe}.json"
-    session["insights_path"] = INSIGHTS_DIR / uid_dir / f"insights_{safe}.json"
-    session["processed_path"].parent.mkdir(parents=True, exist_ok=True)
-    session["insights_path"].parent.mkdir(parents=True, exist_ok=True)
+    session["schema_path"] = _upaths["schema_dir"] / f"schema_mapping_{safe}_latest.json"
+    session["processed_path"] = _upaths["processed_dir"] / f"processed_data_{safe}.json"
+    session["insights_path"] = _upaths["insights_dir"] / f"insights_{safe}.json"
 
     save_session(user["user_id"], session)
 
@@ -456,8 +488,27 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
                     session["db"]["db_schema"] = discovered
                     current_db_schema = discovered
             if mapping.get("tables"):
-                user_schema_dir = SCHEMA_DIR / f"user_{user['user_id']}"
-                user_schema_dir.mkdir(parents=True, exist_ok=True)
+                # Single-table rule: a 1-table Postgres/MySQL DB is shaped
+                # exactly like a CSV dataset (profiling + PK-composite +
+                # FK-none + relationship-empty + no-join) so GoalAgent,
+                # KPI, and RAG-tabular see an identical contract. Generic
+                # (table count only); native types/indexes are preserved.
+                try:
+                    from core.relational import normalize_single_table_mapping as _norm_1t
+                    mapping = _norm_1t(mapping)
+                    try:
+                        from core.data_intelligence import (
+                            build_data_intelligence as _bdi,
+                            detect_capabilities as _dcap,
+                        )
+                        _intel = _bdi(mapping)
+                        mapping["data_intelligence"] = _intel
+                        mapping["capabilities"] = _dcap(_intel)
+                    except Exception:
+                        pass
+                except Exception:
+                    _conn_log.debug("single-table normalization failed", exc_info=True)
+                user_schema_dir = _upaths["schema_dir"]
                 safe_name_for_file = re.sub(r"[^a-zA-Z0-9_-]+", "_", db_name)[:64] or "db"
                 user_path = user_schema_dir / f"schema_mapping_{safe_name_for_file}_latest.json"
                 user_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
@@ -517,7 +568,7 @@ def connect_mysql(request: ConnectRequest, user: dict = Depends(require_writable
 
 
 @router.post("/api/connect_file")
-def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
+def connect_file(provider: str | None = Form(None), file: UploadFile = File(...),
                  llm_api_key: str | None = Form(None),
                  llm_base_url: str | None = Form(None),
                  user: dict = Depends(require_writable)):
@@ -529,7 +580,15 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
     format, the rows are loaded into a file-based SQLite database, and the
     session is pointed at it so the Goal Agent and Insight Agent consume it
     exactly like a relational source (dialect=sqlite).
+
+    When ``provider`` is omitted, the session's selected backend is kept so
+    connecting data never silently flips a cloud session back to local.
     """
+    if not provider:
+        try:
+            provider = get_session(user["user_id"]).get("provider_name") or "local"
+        except Exception:
+            provider = "local"
     if provider not in PROVIDER_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Choose from {sorted(PROVIDER_NAMES)}.")
     if llm_base_url and provider != "local":
@@ -553,10 +612,11 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
     uid = user["user_id"]
     _set_progress(uid, "uploading", 10, "Uploading file...")
 
-    # Isolate uploads by user and use an unpredictable suffix to prevent
+    # Isolate uploads by authenticated user (validated id, pathlib-safe,
+    # no traversal) and use an unpredictable suffix to prevent
     # same-name uploads from overwriting one another.
-    upload_dir = DATA_DIR / "uploads" / f"user_{uid}"
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    _upaths = get_user_artifact_paths(uid)
+    upload_dir = _upaths["upload_dir"]
     stamp = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(8)}"
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
     file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
@@ -565,8 +625,14 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
     _set_progress(uid, "validating", 25, "Validating CSV structure...")
 
     try:
+        from csv_handler import CsvSchemaExtractor
         table_name = csv_orchestrator.safe_table_name(safe_name)
-        mapping = csv_orchestrator.build_csv_schema_mapping(file_path, table_name=table_name)
+        # Single extract: the profile feeds both the schema mapping and the
+        # SQLite loader, so a large CSV is never parsed twice on upload.
+        # The loader streams rows in bounded chunks from the same profile.
+        profile = CsvSchemaExtractor(file_path).extract()
+        mapping = csv_orchestrator.build_csv_schema_mapping(
+            file_path, table_name=table_name, profile=profile)
     except CsvValidationError as exc:
         _set_progress(uid, "error", 0, f"Invalid CSV: {exc}", error=str(exc))
         file_path.unlink(missing_ok=True)
@@ -579,23 +645,25 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
 
     _set_progress(uid, "extracting", 45, "Extracting schema and structure...")
 
+    sqlite_path = upload_dir / f"{safe_name}_{stamp}.db"
     try:
-        sqlite_path = upload_dir / f"{safe_name}_{stamp}.db"
         db_uri, table_name, row_count = csv_orchestrator.load_csv_to_sqlite(
-            file_path, sqlite_path, table_name=table_name
+            file_path, sqlite_path, table_name=table_name, profile=profile
         )
     except Exception as exc:
         from core.errors import sanitize_error as _san2
         _set_progress(uid, "error", 0, "Processing failed", error=_san2(exc))
         file_path.unlink(missing_ok=True)
+        try:
+            sqlite_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"CSV processing failed: {_san2(exc)}")
 
     _set_progress(uid, "profiling", 65, f"Profiling {row_count} rows...")
 
-    uid_dir = f"user_{uid}"
     safe_db_name = mapping["database"]
-    schema_path = SCHEMA_DIR / uid_dir / f"schema_mapping_{safe_db_name}_latest.json"
-    schema_path.parent.mkdir(parents=True, exist_ok=True)
+    schema_path = _upaths["schema_dir"] / f"schema_mapping_{safe_db_name}_latest.json"
     schema_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
 
     _set_progress(uid, "understanding", 80, "Understanding data structure...")
@@ -612,10 +680,8 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
     session["db_uri"] = db_uri
     session["db_name"] = table_name
     session["schema_path"] = schema_path
-    session["processed_path"] = PROCESSED_DIR / uid_dir / f"processed_data_{safe_db_name}.json"
-    session["insights_path"] = INSIGHTS_DIR / uid_dir / f"insights_{safe_db_name}.json"
-    session["processed_path"].parent.mkdir(parents=True, exist_ok=True)
-    session["insights_path"].parent.mkdir(parents=True, exist_ok=True)
+    session["processed_path"] = _upaths["processed_dir"] / f"processed_data_{safe_db_name}.json"
+    session["insights_path"] = _upaths["insights_dir"] / f"insights_{safe_db_name}.json"
     session["dialect"] = "sqlite"
     session["file_type"] = "csv"
 
@@ -648,7 +714,7 @@ def connect_file(provider: str = Form("local"), file: UploadFile = File(...),
 
 @router.post("/api/connect_pdf")
 def connect_pdf(
-    provider: str = Form("local"),
+    provider: str | None = Form(None),
     file: UploadFile = File(...),
     llm_api_key: str | None = Form(None),
     llm_base_url: str | None = Form(None),
@@ -664,7 +730,14 @@ def connect_pdf(
     - Chunking with metadata
     - Embedding generation
     - Vector indexing for RAG retrieval
+
+    When ``provider`` is omitted, the session's selected backend is kept.
     """
+    if not provider:
+        try:
+            provider = get_session(user["user_id"]).get("provider_name") or "local"
+        except Exception:
+            provider = "local"
     if provider not in PROVIDER_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Choose from {sorted(PROVIDER_NAMES)}.")
     if llm_base_url and provider != "local":
@@ -693,17 +766,30 @@ def connect_pdf(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {exc}")
 
-    # Keep raw PDFs within the owning user's upload directory.
-    upload_dir = DATA_DIR / "uploads" / f"user_{user['user_id']}"
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    # Keep raw PDFs within the owning user's upload directory (validated id).
+    _pdf_upaths = get_user_artifact_paths(user["user_id"])
+    upload_dir = _pdf_upaths["upload_dir"]
     stamp = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(8)}"
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
     file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
     _spool_limited(file.file, file_path, MAX_UPLOAD_BYTES_PDF, "PDF file")
+    # Fail fast on non-PDF magic bytes (renamed scripts/executables).
+    try:
+        with open(file_path, "rb") as _pf:
+            _header = _pf.read(5)
+        if _header != b"%PDF-":
+            file_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="File is not a valid PDF (missing %PDF- header).")
+    except HTTPException:
+        raise
+    except Exception:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Could not read uploaded PDF.")
 
-    # Create document processor
-    processed_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "documents"
-    vector_index_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "vector_store"
+    # Create document processor (dirs isolated per authenticated user).
+    processed_dir = _pdf_upaths["documents_dir"]
+    vector_index_dir = _pdf_upaths["processed_dir"] / "vector_store"
+    vector_index_dir.mkdir(parents=True, exist_ok=True)
     
     processor = create_document_processor(
         upload_dir=upload_dir,
@@ -769,12 +855,8 @@ def connect_pdf(
         _pdf_uri, _pdf_mapping, pdf_tables_loaded = _pdf_tables_to_sqlite(
             document, upload_dir, safe_name, stamp)
         if _pdf_uri and _pdf_mapping:
-            from core.config import SCHEMA_DIR as _SCHEMA_DIR
-
-            _uid_dir = f"user_{user['user_id']}"
             _safe_db = re.sub(r"[^a-zA-Z0-9_-]+", "_", f"pdf_{safe_name}")[:64] or "pdf_doc"
-            _schema_path = _SCHEMA_DIR / _uid_dir / f"schema_mapping_{_safe_db}_latest.json"
-            _schema_path.parent.mkdir(parents=True, exist_ok=True)
+            _schema_path = _pdf_upaths["schema_dir"] / f"schema_mapping_{_safe_db}_latest.json"
             _schema_path.write_text(json.dumps({
                 "database": _safe_db,
                 "tables": _pdf_mapping,
@@ -864,9 +946,26 @@ def session_status(user: dict = Depends(get_current_user)):
     raw_uri = session.get("db_uri", "") or ""
     safe_uri = re.sub(r"://([^:/@]+):[^@/]*@", r"://\1:***@", raw_uri)
     linked = session.get("linked_db") or {}
+    # P3 §19: expose schema readiness so the frontend derives
+    # Disconnected/Connecting/Connected/Schema-loading/Ready/Error from the
+    # backend instead of button success. Cached metadata (schema_status) is
+    # reused; no re-extraction is triggered here.
+    schema_status = session.get("schema_status", "unknown")
+    if not is_connected:
+        display_state = "disconnected"
+    elif schema_status in ("pending", "extracting"):
+        display_state = "schema-loading"
+    elif schema_status in ("ok", "document"):
+        display_state = "ready"
+    elif schema_status in ("empty", "failed", "error"):
+        display_state = "error"
+    else:
+        display_state = "connected"
     return {
         "ok": True,
         "connection_status": "connected" if is_connected else "not-connected",
+        "display_state": display_state,
+        "schema_status": schema_status,
         "db_name": session.get("db_name", ""),
         "source_type": session.get("source_type", ""),
         "db_uri": safe_uri,
@@ -906,22 +1005,8 @@ class DatabaseTestRequest(BaseModel):
 @router.post("/api/database/test")
 async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depends(require_writable)):
     """Test a database connection before actually connecting (writable sessions only)."""
-    # Validate host/port/db to block SSRF probing (cloud metadata, unexpected schemes).
-    host = (req.host or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", host) or len(host) > 253:
-        raise HTTPException(status_code=400, detail="Invalid host.")
-    if host.lower() in {"169.254.169.254", "metadata.google.internal"} or host.startswith("169.254."):
-        raise HTTPException(status_code=400, detail="Host is blocked.")
-    try:
-        port = int(req.port)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid port.")
-    if not 1 <= port <= 65535:
-        raise HTTPException(status_code=400, detail="Invalid port.")
-    if req.dbType not in ("postgresql", "mysql"):
-        raise HTTPException(status_code=400, detail="Unsupported dbType.")
-    if len(req.db or "") > 128 or len(req.user or "") > 128:
-        raise HTTPException(status_code=400, detail="Invalid database/user.")
+    # Shared SSRF/host validation (same as real connect path).
+    port = _validate_db_endpoint(req.host, req.port, req.db, req.user, req.dbType)
     try:
         from sqlalchemy import create_engine, text
         from core.secret_box import decrypt as _decrypt_secret
@@ -939,8 +1024,11 @@ async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depen
             url = f"postgresql+psycopg2://{quote_plus(str(req.user))}:{quote_plus(str(password))}@{req.host}:{req.port}/{req.db}"
 
         engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+        finally:
+            engine.dispose()
 
         return {"ok": True, "message": "Connection successful"}
     except Exception as e:

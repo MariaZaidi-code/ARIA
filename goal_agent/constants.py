@@ -154,7 +154,13 @@ class ConstantsMixin:
 
     _DIMENSION_LIKE_NUMERIC = (
         "year", "date", "month", "day", "status", "state", "code", "rank",
-        "rating", "level", "version", "quarter", "age", "no", "num",
+        "level", "version", "quarter", "age", "no", "num",
+        # Single-table category/flag numerics (Walmart Store/Holiday_Flag as
+        # bigint, and analogues): generic fragments only, never literals, so
+        # multi-table measure resolution is unaffected.
+        "store", "flag", "holiday", "brand", "category", "segment", "region",
+        "channel", "department", "division", "group", "type", "class",
+        "gender", "outlet", "branch", "location", "site", "shop",
     )
 
     # ---- _EXTREMES_MAX (_EXTREMES_MAX) ----

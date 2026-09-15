@@ -1,6 +1,8 @@
 import { useState, useEffect } from "react";
 import { User, Palette, Brain, Database, Bell, Shield, Monitor, ChevronRight } from "lucide-react";
 import { useTheme } from "../App";
+import { apiFetch } from "../../services/api";
+import { KEYS, storage } from "../../utils/storage";
 
 type Tab = "profile" | "appearance" | "ai" | "datasources" | "notifications" | "privacy" | "application";
 
@@ -39,7 +41,9 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
   const [notifInsights, setNotifInsights] = useState(true);
   const [notifSystem, setNotifSystem] = useState(false);
   // Browser-local avatar (no backend storage; honest about scope).
-  const [avatar, setAvatar] = useState<string | null>(() => localStorage.getItem("aria_avatar"));
+  // Versioned key (aria.v1.profile.avatar), read once via the state
+  // initializer — never parsed inline during render.
+  const [avatar, setAvatar] = useState<string | null>(() => storage.getString(KEYS.avatar, null));
 
   const pickAvatar = (file: File | undefined) => {
     if (!file) return;
@@ -49,7 +53,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
     reader.onload = () => {
       const url = String(reader.result || "");
       setAvatar(url);
-      try { localStorage.setItem("aria_avatar", url); } catch { /* quota: keep session-only */ }
+      storage.set(KEYS.avatar, url);
       setSaveMsg("Avatar updated in this browser");
       setTimeout(() => setSaveMsg(""), 3000);
     };
@@ -60,28 +64,25 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
 
   const fetchProviders = async () => {
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      const res = await fetch("/api/settings/providers", { headers: { Authorization: `Bearer ${token}` } });
-      if (res.ok) { const data = await res.json(); setProviders(data.providers || []); }
-    } catch (err) { console.debug("[ARIA] background request failed:", err); }
+      const data: any = await apiFetch("/settings/providers");
+      setProviders(data.providers || []);
+    } catch (e: any) {
+      if (e?.status !== 401) console.debug("[ARIA] background request failed:", e);
+    }
   };
 
   const saveProvider = async () => {
     if (selectedProvider !== "local" && !apiKey.trim()) return;
     setSaving(true);
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      const res = await fetch("/api/settings/providers", {
+      const data: any = await apiFetch("/settings/providers", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ provider: selectedProvider, api_key: apiKey, is_default: true }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.detail || "Failed to save provider");
       onProviderSwitched?.(data.provider || selectedProvider);
       setSaveMsg(data.message || "Provider saved"); setApiKey(""); fetchProviders();
       setTimeout(() => setSaveMsg(""), 3000);
-    } catch (e: any) { setSaveMsg(e?.message || "Failed"); } finally { setSaving(false); }
+    } catch (e: any) { setSaveMsg(e?.status === 401 ? "Session expired. Please sign in again." : (e?.message || "Failed")); } finally { setSaving(false); }
   };
 
   return (
@@ -146,10 +147,8 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
             <button onClick={async () => {
                 setSaving(true);
                 try {
-                  const token = localStorage.getItem("aria_auth_token");
-                  await fetch("/api/settings/general", {
+                  await apiFetch("/settings/general", {
                     method: "POST",
-                    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
                     body: JSON.stringify({ theme: isDark ? "dark" : "light", language: "en" }),
                   });
                   setSaveMsg("Profile saved");

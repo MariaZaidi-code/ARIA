@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from textwrap import dedent
 
+import warnings
+
 import psycopg2
 import psycopg2.extras
 from psycopg2 import sql
@@ -40,6 +42,18 @@ from core.config import SCHEMA_DIR
 
 logger = logging.getLogger("aria.schema_agent")
 
+# DEPRECATED: schema_agent/ is the legacy schema stack. schema_engine/ is
+# canonical for all new code. This module stays for backward compatibility
+# only (existing callers + saved mappings); do not add new importers.
+_LEGACY_TIMEOUT_ERRORS: tuple = tuple(
+    t for t in (
+        getattr(psycopg2, "Error", None),
+        (getattr(pymysql, "MySQLError", None) if MYSQL_AVAILABLE else None),
+        OSError, ValueError, TypeError, AttributeError,
+    )
+    if isinstance(t, type)
+)
+
 JSON_INDENT = 2
 K = 2
 QUERY_TIMEOUT_MS = 30_000
@@ -61,13 +75,21 @@ def _apply_session_timeout(conn, db_type="postgresql"):
                 cur.execute(f"SET SESSION MAX_EXECUTION_TIME = {QUERY_TIMEOUT_MS}")
             else:
                 cur.execute(f"SET statement_timeout = {QUERY_TIMEOUT_MS}")
-    except Exception:
-        pass
+    except _LEGACY_TIMEOUT_ERRORS as exc:
+        logger.debug("session timeout not applied (db_type=%s): %s", db_type, exc)
 
 # ---- get_connection (77-137) ----
 
 def get_connection(args):
-    """Build a database connection (PostgreSQL or MySQL) from CLI args / env vars."""
+    """Build a database connection (PostgreSQL or MySQL) from CLI args / env vars.
+
+    .. deprecated::
+        Legacy stack — new code must use ``schema_engine``. Kept for
+        backward compatibility only.
+    """
+    warnings.warn(
+        "schema_agent.get_connection is deprecated; use schema_engine instead.",
+        DeprecationWarning, stacklevel=2)
     db_type = getattr(args, "db_type", None) or "postgresql"
     host = args.host or os.getenv("DB_HOST", "localhost")
     # The port must never leak across engine types: DB_PORT in .env targets

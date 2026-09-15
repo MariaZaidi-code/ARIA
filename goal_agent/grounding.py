@@ -26,6 +26,8 @@ except ImportError:
     END = None
     StateGraph = None
 
+logger = logging.getLogger(__name__)
+
 
 class GroundingMixin:
     # ---- _table_keyword_score (_table_keyword_score) ----
@@ -139,10 +141,16 @@ class GroundingMixin:
             fallback = [name for name, _ in self.tables.items() if not self.tables[name].get("empty")]
             fallback.sort(key=lambda x: (-len(self.tables[x].get("foreign_keys", [])), x))
             selected = fallback[:max_tables] if fallback else []
+            if len(selected) < max_tables:
+                selected = self._expand_with_neighbors(selected, max_tables)
+            return selected[:max_tables]
 
-        if len(selected) < max_tables:
-            selected = self._expand_with_neighbors(selected, max_tables)
-
+        # Positively-scored tables answer the goal on their own: never
+        # auto-pull FK neighbors here. Neighbor expansion would force extra
+        # tables (and JOINs) into every query — including single-table
+        # questions such as "What are my sales?" which must run with NO JOIN.
+        # Multi-table context is added later by deterministic join planning,
+        # only for tables the resolved goal actually needs.
         return selected[:max_tables]
 
     # ---- _find_join_hops (_find_join_hops) ----
@@ -170,7 +178,11 @@ class GroundingMixin:
     def _determine_join_path(self, relevant_tables):
         """
         Return the ordered join path that connects all relevant tables, using
-        the schema's relationship graph. Falls back to the table list itself.
+        the schema's relationship graph.
+
+        Only FK-reachable tables enter the path. Tables with NO join path are
+        never forced in: inventing a JOIN where no relationship exists produces
+        cartesian products, and a single-table question must run with NO JOIN.
         """
         if not relevant_tables:
             return []
@@ -191,18 +203,43 @@ class GroundingMixin:
                         path.append(node)
                 remaining = [t for t in remaining if t != connected]
             else:
-                # No path found; append remaining tables in order as a fallback.
-                path.extend([t for t in remaining if t not in path])
+                # No FK path to the remaining tables: leave them out rather
+                # than assuming a JOIN exists. The resolved goal (IR) decides
+                # the required tables later; unconnected tables would only
+                # corrupt the query.
+                logger.info(
+                    "No FK join path to %s from %s; answering without them.",
+                    remaining, path,
+                )
                 break
         return path
 
     # ---- _pick_measure_column (_pick_measure_column) ----
 
     def _pick_measure_column(self, table_name):
-        """First numeric, non-key, non-id, non-FK column (best-guess measure)."""
+        """First numeric, non-key, non-id, non-FK, non-dimension column (best-guess measure).
+
+        Dimension-like numerics (store ids, flags, years, ...) are skipped via
+        the shared predicate so a single-table dataset resolves to its real
+        measure (e.g. Walmart weekly_sales, not store).
+        """
         info = self.tables[table_name]
         pk = set(info.get("primary_key", []) or [])
         fk_cols = {fk.get("column") for fk in info.get("foreign_keys", [])}
+        fallback = None
+        for col in info["columns"]:
+            low = col.lower()
+            if col in pk or col in fk_cols or low == "id" \
+                    or low.endswith("_id") or low.endswith("id"):
+                continue
+            if self._classify_column(table_name, col) == "numeric":
+                if self._is_dimension_like(table_name, col):
+                    if fallback is None:
+                        fallback = col
+                    continue
+                return col
+        if fallback is not None:
+            return fallback
         for col in info["columns"]:
             low = col.lower()
             if col in pk or col in fk_cols or low == "id" \
@@ -215,6 +252,17 @@ class GroundingMixin:
     # ---- _first_date_column (_first_date_column) ----
 
     def _first_date_column(self, tables):
+        # Shared path: datetime role (handles TEXT dates like Walmart DD-MM-YYYY
+        # via the name hint) wins; legacy dtype-substring check is the fallback.
+        for table in tables:
+            if table not in self.tables:
+                continue
+            for col_name in self.tables[table].get("columns", {}):
+                try:
+                    if self._classify_column(table, col_name) == "date":
+                        return (table, col_name)
+                except Exception:
+                    pass
         for table in tables:
             if table not in self.tables:
                 continue
@@ -454,8 +502,14 @@ class GroundingMixin:
 
     def _explicit_breakdown_tokens(self, goal_l):
         """Goal tokens that name an explicit breakdown dimension via a
-        'by X / per X / for each X' phrase. Empty when the goal has no explicit
-        breakdown (so only the subject label becomes a dimension)."""
+        'by X / per X / for each X' phrase — plus comparison phrasing
+        ('vs X', 'versus X', 'compare ...', 'between ...').
+
+        Empty when the goal has no explicit breakdown (so only the subject
+        label becomes a dimension). Shared path: handles Walmart
+        'holiday vs non-holiday' the same way as multi-table
+        'compare sales between regions'.
+        """
         goal_l = str(goal_l).lower()
         tokens = self._normalize_tokens(goal_l)
         breakdown = set()
@@ -467,6 +521,13 @@ class GroundingMixin:
             for m in re.finditer(r"for each\s+([a-z][a-z0-9_\s]+)", goal_l):
                 for w in m.group(1).split():
                     breakdown.add(w.rstrip("s") if w.endswith("s") else w)
+        # Comparison phrasing names the breakdown dimension too:
+        # "holiday vs non-holiday", "compare sales between regions".
+        if re.search(r"\bvs\b|\bversus\b|\bcompare\b|\bbetween\b|\bamong\b", goal_l):
+            cmp_tokens = set(tokens) - set(self._ANALYTICAL_GOAL_WORDS) - set(self._METRIC_CONCEPT_WORDS)
+            # 'vs'/'non' style glue words carry no schema meaning on their own.
+            cmp_tokens -= {"vs", "versus", "compare", "between", "among", "non", "not"}
+            breakdown |= cmp_tokens
         # Intersect with what the goal actually contains so we never invent words.
         return breakdown & tokens
 
@@ -564,6 +625,24 @@ class GroundingMixin:
                                 "confidence": 0.85,
                                 "reason": "dimension/breakdown column meant in the question",
                             })
+        if not dims and len(relevant) == 1:
+            # Single-table fallback (Walmart 'holiday vs non-holiday', bare
+            # 'monthly trend' with no by/per): the breakdown may live in the
+            # goal tokens without an explicit marker, or the subject match may
+            # be empty. Ground any dimension-like column the goal names rather
+            # than returning no dimensions. Multi-table paths already carry
+            # subject dims, so this only fires when nothing else grounded.
+            table = relevant[0]
+            cols = self._match_dimension_columns(goal_l, table)
+            for _score, col in cols[:2]:
+                if (table, col) not in {(d.get("resolved_table"), d.get("resolved_column")) for d in dims}:
+                    dims.append({
+                        "concept": col,
+                        "resolved_table": table,
+                        "resolved_column": col,
+                        "confidence": 0.7,
+                        "reason": "single-table dimension named in the question",
+                    })
         seen_dims = set()
         for d in dims:
             key = (d["resolved_table"], d["resolved_column"])
@@ -625,6 +704,17 @@ class GroundingMixin:
                 if key > best_key:
                     best_key = key
                     best = m
+            # Goal-name override: if the user explicitly names a column
+            # (e.g. "average rating" -> "rating"), prefer it over the
+            # concept-token match which may pick the wrong column.
+            if not monetary_bias:
+                goal_words = {w for w in goal_l.split() if len(w) >= 3}
+                for m in measures:
+                    col_lower = m["column"].lower()
+                    col_base = col_lower.split("_")[0]
+                    if col_lower in goal_words or col_base in goal_words:
+                        best = m
+                        break
             # If nothing matched (best is None) the computed-measure path
             # below synthesizes a quantity*unit_price expression.
             # Also prefer the computed expression when monetary_bias is on

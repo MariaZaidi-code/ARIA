@@ -34,6 +34,34 @@
   --chart-3: #C98A1B;
   --chart-4: #B85C4D;
   --chart-5: #5B7C99;
+  /* ---- Premium extended palette (theme tokens — charts/KPIs consume these,
+     never hardcoded hex outside lib/charts) ---- */
+  --brand-600: #1E5AA8;
+  --brand-500: #2F6FAD;
+  --brand-400: #4C8AC2;
+  --indigo-600: #4F46E5;
+  --indigo-500: #6366F1;
+  --violet-600: #7C3AED;
+  --violet-500: #8B5CF6;
+  --teal-600: #0D9488;
+  --teal-500: #14B8A6;
+  --cyan-600: #0891B2;
+  --cyan-500: #06B6D4;
+  --green-600: #059669;
+  --green-500: #10B981;
+  --success: #059669;
+  --success-light: #ECFDF5;
+  --success-muted: #A7F3D0;
+  --danger: #DC2626;
+  --danger-light: #FEF2F2;
+  --danger-muted: #FECACA;
+  --neutral: #64748B;
+  --neutral-light: #F1F5F9;
+  --chart-6: #6366F1;
+  --chart-7: #8B5CF6;
+  --chart-8: #14B8A6;
+  --chart-9: #06B6D4;
+  --chart-10: #10B981;
   --shadow-sm: 0 1px 2px 0 rgba(15, 23, 42, 0.04), 0 1px 3px 0 rgba(15, 23, 42, 0.06);
   --shadow-md: 0 4px 12px -2px rgba(15, 23, 42, 0.08), 0 2px 6px -1px rgba(15, 23, 42, 0.04);
   --shadow-lg: 0 12px 28px -6px rgba(15, 23, 42, 0.12), 0 4px 10px -2px rgba(15, 23, 42, 0.05);
@@ -84,6 +112,32 @@
   --chart-3: #FBBF24;
   --chart-4: #E8836B;
   --chart-5: #9FB3C8;
+  --brand-600: #7BA7D9;
+  --brand-500: #8FB6DE;
+  --brand-400: #A5C4E4;
+  --indigo-600: #818CF8;
+  --indigo-500: #A5B4FC;
+  --violet-600: #A78BFA;
+  --violet-500: #C4B5FD;
+  --teal-600: #2DD4BF;
+  --teal-500: #5EEAD4;
+  --cyan-600: #22D3EE;
+  --cyan-500: #67E8F9;
+  --green-600: #34D399;
+  --green-500: #6EE7B7;
+  --success: #34D399;
+  --success-light: rgba(52, 211, 153, 0.1);
+  --success-muted: rgba(52, 211, 153, 0.2);
+  --danger: #F87171;
+  --danger-light: rgba(248, 113, 113, 0.1);
+  --danger-muted: rgba(248, 113, 113, 0.2);
+  --neutral: #A1A1AA;
+  --neutral-light: #27272A;
+  --chart-6: #818CF8;
+  --chart-7: #A78BFA;
+  --chart-8: #2DD4BF;
+  --chart-9: #22D3EE;
+  --chart-10: #34D399;
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.25);
   --shadow-md: 0 6px 16px -2px rgba(0, 0, 0, 0.4), 0 2px 6px -1px rgba(0, 0, 0, 0.25);
   --shadow-lg: 0 16px 32px -6px rgba(0, 0, 0, 0.5), 0 4px 10px -2px rgba(0, 0, 0, 0.3);
@@ -120,18 +174,42 @@ html, body, #root {
   height: 100%;
 }
 
+/* Visible scrollbars (a11y): keyboard and low-vision users must be able to
+   perceive and operate scroll regions. Never `scrollbar-width: none` or
+   `display: none` on scrollbars globally — use thin themed bars instead. */
 * {
-  scrollbar-width: none;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
 }
 *::-webkit-scrollbar {
-  display: none;
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--muted-foreground);
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 *:focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
-/* ===================== PREMIUM ANIMATIONS ===================== */
+/* ===================== SOPHISTICATED MOTION SYSTEM =====================
+   One-shot, purpose-driven transitions only. No continuous, bouncy, or glowy
+   loops: every animation below runs once (both/fill) and settles to static.
+   Loading spinners (.ask-submit-spinner, Loader2 animate-spin) and the
+   skeleton shimmer (.skeleton, loading-only) are the only permitted repeats,
+   because they signal in-progress work and unmount on completion. */
 
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(6px); }
@@ -158,11 +236,6 @@ html, body, #root {
   to { opacity: 1; transform: translateY(0); }
 }
 
-@keyframes pulse-subtle {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
-}
-
 @keyframes shimmer {
   0% { background-position: -200% 0; }
   100% { background-position: 200% 0; }
@@ -173,9 +246,53 @@ html, body, #root {
   to { opacity: 1; transform: scale(1); }
 }
 
-@keyframes float {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-2px); }
+/* Page transition: mounted once per route change, then static. */
+@keyframes pageEnter {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Chart reveal: skeleton cross-fades out, chart fades/slides in once. */
+@keyframes chartReveal {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Line-draw for SVG chart strokes: dashoffset settles at 0, then static. */
+@keyframes lineDraw {
+  from { stroke-dashoffset: var(--line-draw-len, 600); }
+  to { stroke-dashoffset: 0; }
+}
+
+/* Insight appearance: staggered single rise, then static. */
+@keyframes insightAppear {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Forecast reveal: history stays mounted/stable; forecast band fades in. */
+@keyframes forecastReveal {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Confidence-interval fade: uncertainty band eases in after the line. */
+@keyframes ciFade {
+  from { opacity: 0; }
+  to { opacity: var(--ci-opacity, 0.14); }
+}
+
+/* Decision card transition: selection/accept state change, one shot. */
+@keyframes decisionEnter {
+  from { opacity: 0; transform: translateY(8px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Data-connect success: single check pop, then static. */
+@keyframes successPop {
+  0% { opacity: 0; transform: scale(0.6); }
+  60% { opacity: 1; transform: scale(1.06); }
+  100% { opacity: 1; transform: scale(1); }
 }
 
 /* Animation utility classes */
@@ -203,18 +320,62 @@ html, body, #root {
   animation: scaleIn 0.25s ease-out both;
 }
 
-.animate-pulse-subtle {
-  animation: pulse-subtle 2s ease-in-out infinite;
+/* Page transition wrapper: apply to the per-route container. */
+.page-enter {
+  animation: pageEnter 0.32s var(--ease-out) both;
 }
 
-.animate-shimmer {
-  background: linear-gradient(90deg, transparent 25%, var(--border) 50%, transparent 75%);
+/* Chart loading skeleton (loading-only) + one-shot reveal wrapper. */
+.chart-skeleton {
+  background: linear-gradient(90deg, var(--secondary) 25%, var(--border) 50%, var(--secondary) 75%);
   background-size: 200% 100%;
-  animation: shimmer 1.5s ease-in-out infinite;
+  animation: shimmer 1.4s ease-in-out infinite;
+  border-radius: 12px;
+}
+.chart-reveal {
+  animation: chartReveal 0.45s var(--ease-out) both;
+}
+/* SVG line-draw: set --line-draw-len + dasharray inline; settles static. */
+.line-draw {
+  stroke-dasharray: var(--line-draw-len, 600);
+  animation: lineDraw 0.9s var(--ease-out) both;
 }
 
-.animate-float {
-  animation: float 3s ease-in-out infinite;
+/* AI processing steps + insight appearance (one-shot stagger). */
+.ai-step-current {
+  animation: fadeIn 0.3s ease-out both;
+}
+.insight-appear {
+  animation: insightAppear 0.4s var(--ease-out) both;
+}
+.insight-stagger > * {
+  animation: insightAppear 0.4s var(--ease-out) both;
+}
+.insight-stagger > *:nth-child(1) { animation-delay: 0ms; }
+.insight-stagger > *:nth-child(2) { animation-delay: 60ms; }
+.insight-stagger > *:nth-child(3) { animation-delay: 120ms; }
+.insight-stagger > *:nth-child(4) { animation-delay: 180ms; }
+.insight-stagger > *:nth-child(5) { animation-delay: 240ms; }
+.insight-stagger > *:nth-child(6) { animation-delay: 300ms; }
+
+/* Forecast: history stays mounted; forecast layer + CI band fade in once. */
+.forecast-reveal {
+  animation: forecastReveal 0.5s ease-out both;
+}
+.ci-fade {
+  --ci-opacity: 0.14;
+  animation: ciFade 0.6s ease-out 0.15s both;
+}
+
+/* Decision transitions + data-connect success. */
+.decision-enter {
+  animation: decisionEnter 0.35s var(--ease-out) both;
+}
+.connect-progress {
+  transition: width 0.3s var(--ease-out);
+}
+.connect-success-pop {
+  animation: successPop 0.4s var(--ease-out) both;
 }
 
 /* Staggered children animation */
@@ -283,17 +444,18 @@ html, body, #root {
   border-color: var(--primary);
 }
 
-/* Typing indicator dots */
+/* Typing indicator dots: static stepped opacity (stage-driven, no loop).
+   Active progress is carried by AIProcessingIndicator instead. */
 .typing-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: var(--muted-foreground);
   opacity: 0.4;
-  animation: pulse-subtle 1.4s ease-in-out infinite;
 }
-.typing-dot:nth-child(2) { animation-delay: 0.2s; }
-.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+.typing-dot.is-on { opacity: 1; }
+.typing-dot:nth-child(2).is-on { opacity: 0.75; }
+.typing-dot:nth-child(3).is-on { opacity: 0.55; }
 
 /* Gradient border effect */
 .gradient-border {
@@ -357,9 +519,7 @@ html, body, #root {
   border-color: var(--primary-muted);
 }
 
-.btn-glow:hover {
-  box-shadow: 0 4px 16px rgba(79,70,229,0.25), var(--shadow-md);
-}
+/* Primary buttons: subtle state change on hover, no glow. */
 
 .glass-panel {
   background: rgba(255,255,255,0.65);
@@ -401,7 +561,7 @@ html, body, #root {
   background: linear-gradient(90deg, transparent 0%, var(--border) 50%, transparent 100%);
 }
 
-/* Subtle shimmer on hover for interactive cards */
+/* Subtle sheen sweep on hover for interactive cards (one-shot, settles). */
 .shimmer-hover {
   position: relative;
   overflow: hidden;
@@ -434,6 +594,30 @@ html, body, #root {
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}
+
+/* KPI cards (Dashboard): subtle fade+rise on load ONLY — runs once, never
+   loops. Hover is elevation/border only. Number glide is JS-driven.
+   No bounce / float / pulse / glow / flip anywhere on these cards. */
+@keyframes kpiRise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.kpi-fade-rise {
+  animation: kpiRise 0.45s ease-out both;
+}
+
+.kpi-card {
+  transition: box-shadow 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+}
+.kpi-card:hover {
+  box-shadow: var(--shadow-md);
+  border-color: var(--primary-muted);
+  transform: translateY(-1px);
+}
+.kpi-num {
+  font-variant-numeric: tabular-nums;
 }
 
 /* Disabled state for buttons */
@@ -540,11 +724,11 @@ html, body, #root {
   background: var(--primary-light);
 }
 
-/* Skeleton loading pulse */
+/* Skeleton loading (loading-only shimmer; unmounts on reveal). */
 .skeleton {
   background: linear-gradient(90deg, var(--secondary) 25%, var(--border) 50%, var(--secondary) 75%);
   background-size: 200% 100%;
-  animation: shimmer 1.5s ease-in-out infinite;
+  animation: shimmer 1.4s ease-in-out infinite;
   border-radius: 6px;
 }
 
@@ -562,3 +746,27 @@ html, body, #root {
 /* Visible keyboard focus (a11y) */
 :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: 6px; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
+
+/* ===== ARIA Intelligence — motion + polish (matches PNG, enhances feel) ===== */
+@keyframes intelFadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes intelFadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes chartReveal { from { opacity: 0; transform: scaleY(0.96); } to { opacity: 1; transform: scaleY(1); } }
+.chart-reveal { animation: chartReveal 0.45s cubic-bezier(0.16,1,0.3,1) both; transform-origin: bottom; }
+.skeleton { background: linear-gradient(90deg, #eef1f7 25%, #e2e8f5 50%, #eef1f7 75%); background-size: 200% 100%; animation: intelSkeleton 1.4s ease infinite; }
+@keyframes intelSkeleton { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+.intel-hero-gradient { position: absolute; inset: 0; background: radial-gradient(600px 200px at 70% 0%, rgba(46,94,255,0.10), transparent 70%); }
+.intel-orb { position: absolute; border-radius: 9999px; filter: blur(60px); opacity: 0.5; }
+.intel-orb-subtle-1 { width: 420px; height: 220px; right: -80px; top: -60px; background: rgba(99,140,255,0.18); }
+.intel-orb-subtle-2 { width: 300px; height: 160px; left: 30%; top: -40px; background: rgba(139,92,246,0.12); }
+.intel-orb-hero-1 { width: 380px; height: 200px; right: 10%; top: -60px; background: rgba(147,197,253,0.25); }
+.intel-orb-hero-2 { width: 260px; height: 140px; right: 30%; bottom: -60px; background: rgba(59,130,246,0.20); }
+.intel-grid-overlay { position: absolute; inset: 0; background-image: linear-gradient(rgba(255,255,255,0.06) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.06) 1px, transparent 1px); background-size: 28px 28px; mask-image: radial-gradient(ellipse at 70% 20%, black 30%, transparent 75%); }
+button { transition: transform 0.08s ease, background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease; }
+button:active:not(:disabled) { transform: scale(0.98); }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid #2E5EFF; outline-offset: 1px; }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+@media print {
+  aside, nav, .no-print { display: none !important; }
+  body { background: #fff !important; }
+  #intel-report-preview { box-shadow: none !important; border: 1px solid #ddd !important; }
+}

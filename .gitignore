@@ -3,6 +3,8 @@
 !.env.example
 kaggle_credentials.local.sh
 data/.jwt_secret
+.jwt_secret
+**/.jwt_secret
 data/*.db
 data/*.sqlite
 .venv/
@@ -21,6 +23,7 @@ ft_story_data_sample.jsonl
 
 # --- runtime outputs / artifacts (regenerated; keep the repo clean) ---
 data/
+uploads/
 artifacts/
 pro_images/
 test_embeddings_cache/
@@ -58,3 +61,4 @@ test-results/
 *.key
 *.p12
 service-account*.json
+test_copilot_e2e.py

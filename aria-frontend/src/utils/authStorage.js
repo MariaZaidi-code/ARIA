@@ -10,12 +10,13 @@
 //   â†“
 // SQLite + JWT
 //
-// The JWT returned by the backend is stored in localStorage so every
-// later API call can send `Authorization: Bearer <token>`.
+// Cookie auth: the backend sets an httpOnly `aria_token` cookie on
+// login/register. Only the display identity is kept in localStorage;
+// no JWT is stored and no Authorization header is sent.
 
-const API_BASE = "/api";
+import { API_BASE } from "../services/api.js";
 
-const TOKEN_KEY = "aria_auth_token";
+const TOKEN_KEY = "aria_auth_token"; // legacy: kept only to clear old sessions; cookie auth now
 const USER_KEY = "aria_auth_user";
 
 // =========================================================
@@ -64,8 +65,11 @@ const normalizeEmail = (email) => {
 // TOKEN / SESSION STORAGE
 // =========================================================
 
+// Cookie auth: the backend httpOnly `aria_token` cookie is the session.
+// No JWT is kept in localStorage; getAuthToken stays as a deprecated stub
+// returning "" so legacy callers never emit `Bearer null`/empty.
 export const getAuthToken = () => {
-  return localStorage.getItem(TOKEN_KEY) || "";
+  return "";
 };
 
 export const getAuthUser = () => {
@@ -79,8 +83,11 @@ export const getAuthUser = () => {
 };
 
 export const setAuthSession = (token, username, email) => {
-  if (!token) return;
-  localStorage.setItem(TOKEN_KEY, token || "");
+  // token ignored: session lives in the httpOnly cookie. Keep only the
+  // display identity; drop any legacy JWT copy.
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+  } catch { /* ignore */ }
 
   localStorage.setItem(
     USER_KEY,
@@ -104,6 +111,11 @@ export const clearAuthSession = () => {
 const authRequest = async (path, payload) => {
   const response = await fetch(`${API_BASE}${path}`, {
     method: "POST",
+
+    // Include cookies so the backend's httpOnly `aria_token` cookie
+    // (set on login/register) is stored and sent automatically.
+    // The localStorage copy below is kept for expiry pre-checks.
+    credentials: "include",
 
     headers: {
       "Content-Type": "application/json",

@@ -72,6 +72,20 @@ class IntentMixin:
         if analytical:
             return False, None
 
+        # 2b) Pure time/trend phrasing ("monthly trend", "sales over time")
+        #    grounds via the schema's date column + measure, not via a literal
+        #    column name. Single-table datasets (Walmart Date TEXT) must not be
+        #    rejected here; the semantic layer binds the date + measure next.
+        trend_words = ("trend", "monthly", "daily", "weekly", "yearly",
+                       "over time", "growth", "time series")
+        if any(w in goal_l for w in trend_words):
+            try:
+                has_date = self._first_date_column(list(self.tables.keys() or [])) is not None
+            except Exception:
+                has_date = False
+            if has_date:
+                return False, None
+
         # 3-5) Anti-join / comparison / why patterns only bypass clarification
         #    when SOMETHING is grounded. "why did sales drop" grounds via
         #    sales->orders; but "explain the weather forecast" grounds to
@@ -501,6 +515,18 @@ class IntentMixin:
         elif ir["intent"] == "trend":
             operation = "trend"
         ir["operation"] = operation
+        # Additive general-analytics capabilities (sections 1-8): one question
+        # maps to multiple capabilities via classifier + schema grounding.
+        # Never overrides the deterministic operation above (SQL planning is
+        # unchanged); purely descriptive for the stable result contract.
+        try:
+            from goal_agent.analytics_intent import classify_analytics as _cls_a
+            _c = _cls_a(goal)
+            ir["capabilities"] = _c.get("capabilities", [ir["intent"]])
+            ir["interpreted_intent"] = _c.get("primary", ir["intent"])
+        except Exception:
+            ir["capabilities"] = [ir["intent"]]
+            ir["interpreted_intent"] = ir["intent"]
         return ir
 
     # ---- _detect_intent (_detect_intent) ----
@@ -524,12 +550,15 @@ class IntentMixin:
         """Heuristic analysis-type classification for the goal contract."""
         g = str(user_goal).lower()
         if any(k in g for k in ("predict", "forecast", "future", "expected",
-                                "will ")):
+                                "will ", "what if", "what-if", "scenario",
+                                "simulate", "projection")):
             return "predictive"
-        if any(k in g for k in ("why", "cause", "reason", "driver", "because")):
+        if any(k in g for k in ("why", "cause", "reason", "driver", "because",
+                                "anomaly", "outlier", "hypothes")):
             return "diagnostic"
         if any(k in g for k in ("recommend", "should", "action", "improve",
-                                "optimize", "suggest")):
+                                "optimize", "suggest", "what to do",
+                                "next step")):
             return "prescriptive"
         return "descriptive"
 

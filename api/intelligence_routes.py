@@ -1,0 +1,489 @@
+"""ARIA Intelligence Module — API routes.
+
+Provides Explore / Hypotheses / Goals / What-If / Reports / Coverage endpoints.
+All persistence is per-user per-dataset under data/users/user_{id}/intelligence/.
+
+Router prefix: /api/intelligence
+"""
+
+import logging
+import time
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+
+from core.config import get_session
+from core.deps import get_current_user, require_data, require_writable, get_request_id
+from services import intelligence_service as intel
+
+log = logging.getLogger("aria.intelligence.api")
+
+router = APIRouter(prefix="/api/intelligence", tags=["intelligence"])
+
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+
+class ExploreRequest(BaseModel):
+    metric: str
+    breakdown: str | None = None
+    secondary_breakdown: str | None = None
+    secondaryBreakdown: str | None = None
+    time: str | None = None
+    time_grain: str | None = None
+    timeGrain: str | None = None
+    compare: str | None = None
+    comparison: str | None = None
+    date_range: dict | str | None = None
+    dateRange: dict | str | None = None
+    filters: list | None = None
+
+    class Config:
+        extra = "allow"
+
+
+class WhatIfRequest(BaseModel):
+    variable: str | None = None
+    metric: str | None = None
+    column: str | None = None
+    change_type: str | None = None
+    changeType: str | None = None
+    change_value: float | None = None
+    changeValue: float | None = None
+    apply_to: str | None = None
+    applyTo: str | None = None
+    scope: str | None = None
+
+    class Config:
+        extra = "allow"
+
+
+class GoalRequest(BaseModel):
+    title: str | None = None
+    name: str | None = None
+    metric: str | None = None
+    target_value: float | str | None = None
+    target: float | str | None = None
+    targetValue: float | str | None = None
+    current_value: float | str | None = None
+    current: float | str | None = None
+    currentValue: float | str | None = None
+    due_date: str | None = None
+    dueDate: str | None = None
+    due: str | None = None
+    status: str | None = None
+
+    class Config:
+        extra = "allow"
+
+
+class ReportRequest(BaseModel):
+    name: str = "ARIA Report"
+    description: str = ""
+    date_range: str | None = None
+    dateRange: str | None = None
+    sections: list | None = None
+    template: str = "professional"
+
+    class Config:
+        extra = "allow"
+
+
+class AnalysisRequest(BaseModel):
+    title: str = "Untitled Analysis"
+    name: str | None = None
+    metric: str | None = None
+    breakdown: str | None = None
+    time_grain: str | None = None
+    result: dict | None = None
+    result_summary: str | None = None
+    summary: str | None = None
+
+    class Config:
+        extra = "allow"
+
+
+class ScenarioRequest(BaseModel):
+    title: str | None = None
+    name: str | None = None
+    variable: str | None = None
+    change_value: float | None = None
+    change_type: str | None = None
+    result: dict | None = None
+
+    class Config:
+        extra = "allow"
+
+
+class TemplateRequest(BaseModel):
+    name: str = "Untitled template"
+    description: str = ""
+    sections: list | None = None
+    template: str | None = None
+
+    class Config:
+        extra = "allow"
+
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
+def _get_session_and_user(request: Request, user: dict = Depends(get_current_user)):
+    """Resolve session + ownership for Intelligence endpoints."""
+    session = get_session(user["user_id"])
+    provider = session.get("provider")
+    if not provider:
+        raise HTTPException(status_code=400, detail="Choose an LLM provider and connect a source first.")
+    if session.get("source_type") == "relational" and not session.get("db"):
+        raise HTTPException(status_code=400, detail="Connect to a database first.")
+    if session.get("source_type") == "semi-structured" and not session.get("db_uri"):
+        raise HTTPException(status_code=400, detail="Upload a CSV or PDF first.")
+    return session, user
+
+
+def _dataset_id(session: dict) -> str:
+    return intel._dataset_id(session)
+
+
+# ---------------------------------------------------------------------------
+# GET /meta
+# ---------------------------------------------------------------------------
+
+@router.get("/meta")
+def get_meta(request: Request, user: dict = Depends(get_current_user)):
+    """Return available metrics, dimensions, date columns for Explore."""
+    try:
+        session, user = _get_session_and_user(request, user)
+    except HTTPException:
+        return {"ok": True, "metrics": [], "measures": [], "dimensions": [], "breakdowns": [], "date_columns": [], "tables": [], "time_grains": ["Monthly"], "comparisons": ["Previous Period"], "date_ranges": ["Last 12 months"], "filterable_columns": [], "variables": [], "change_types": ["Increase", "Decrease"], "apply_targets": ["All data"], "ranges": {}}
+    return intel.get_intelligence_meta(session)
+
+
+# ---------------------------------------------------------------------------
+# POST /explore
+# ---------------------------------------------------------------------------
+
+@router.post("/explore")
+def run_explore(req: ExploreRequest, request: Request, user: dict = Depends(get_current_user)):
+    """Run a server-side aggregation analysis."""
+    try:
+        session, user = _get_session_and_user(request, user)
+    except HTTPException as exc:
+        return {"ok": False, "detail": exc.detail, "code": "NO_DATA"}
+    payload = req.model_dump()
+    # normalize frontend aliases for service
+    if not payload.get("time") and (payload.get("time_grain") or payload.get("timeGrain")):
+        payload["time"] = payload.get("time_grain") or payload.get("timeGrain")
+    if not payload.get("compare") and payload.get("comparison"):
+        payload["compare"] = payload["comparison"]
+    if payload.get("dateRange") and not payload.get("date_range"):
+        payload["date_range"] = payload["dateRange"]
+    result = intel.run_explore(session, payload)
+    rid = get_request_id(request)
+    if result.get("ok"):
+        log.info("Explore OK [rid=%s] metric=%s rows=%s", rid, req.metric, result.get("row_count"))
+    else:
+        log.warning("Explore rejected [rid=%s] reason=%s", rid, result.get("detail"))
+    # wrap so api.js `data?.data || data` works
+    result["data"] = {k: v for k, v in result.items() if k != "data"}
+    return result
+
+
+# ---------------------------------------------------------------------------
+# POST /hypotheses
+# ---------------------------------------------------------------------------
+
+@router.get("/hypotheses")
+@router.post("/hypotheses")
+def list_hypotheses(request: Request, user: dict = Depends(get_current_user)):
+    """Return hypothesis candidates from the connected dataset."""
+    try:
+        session, user = _get_session_and_user(request, user)
+    except HTTPException:
+        return {"ok": True, "candidates": [], "items": [], "data": [], "total_candidates": 0, "total": 0, "count": 0}
+    params = dict(request.query_params) if request else {}
+    result = intel.generate_hypotheses(session, params)
+    result["data"] = result.get("data", [])
+    result["items"] = result.get("items", result["data"])
+    return result
+
+
+@router.get("/hypotheses/{hypothesis_id}")
+def get_hypothesis(hypothesis_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Single hypothesis detail for the Hypotheses tab."""
+    try:
+        session, user = _get_session_and_user(request, user)
+    except HTTPException as exc:
+        return {"ok": False, "detail": exc.detail, "code": "NO_DATA"}
+    detail = intel.get_hypothesis_detail(session, hypothesis_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Hypothesis not found.")
+    return {"ok": True, "data": detail, **detail}
+
+
+# ---------------------------------------------------------------------------
+# Goals CRUD
+# ---------------------------------------------------------------------------
+
+@router.get("/goals")
+def list_goals(request: Request, user: dict = Depends(get_current_user), status: str = "active"):
+    """List goals filtered by dataset and status."""
+    qp = dict(request.query_params) if request else {}
+    status = qp.get("status", status) or "active"
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    items = intel.list_goals(user["user_id"], did, status)
+    return {"ok": True, "items": items, "data": items, "total": len(items), "count": len(items)}
+
+
+@router.post("/goals")
+def create_goal(req: GoalRequest, request: Request, user: dict = Depends(get_current_user)):
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    data = req.model_dump(exclude_unset=True)
+    if not (data.get("title") or data.get("name")):
+        raise HTTPException(status_code=422, detail="Give the goal a title.")
+    if data.get("target_value") is None and data.get("target") is None and data.get("targetValue") is None:
+        raise HTTPException(status_code=422, detail="Give the goal a target value.")
+    goal = intel.create_goal(user["user_id"], did, data)
+    return {"ok": True, "item": goal, "data": goal}
+
+
+@router.patch("/goals/{goal_id}")
+def update_goal(goal_id: str, req: GoalRequest, request: Request, user: dict = Depends(get_current_user)):
+    """Update a goal's status or fields."""
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    updated = intel.update_goal(user["user_id"], goal_id, req.model_dump(exclude_unset=True))
+    if not updated:
+        raise HTTPException(status_code=404, detail="Goal not found.")
+    return {"ok": True, "item": updated, "data": updated}
+
+
+@router.delete("/goals/{goal_id}")
+def delete_goal(goal_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Delete a goal."""
+    session = get_session(user["user_id"])
+    if not intel.delete_goal(user["user_id"], goal_id):
+        raise HTTPException(status_code=404, detail="Goal not found.")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# What-If
+# ---------------------------------------------------------------------------
+
+@router.get("/what-if/meta")
+def whatif_meta(request: Request, user: dict = Depends(get_current_user)):
+    """Return available variables and slider ranges."""
+    try:
+        session, user = _get_session_and_user(request, user)
+    except HTTPException:
+        return {"ok": True, "variables": [], "change_types": ["Increase", "Decrease"], "apply_targets": ["All data"], "ranges": {}, "range": None}
+    return intel.get_whatif_meta(session)
+
+
+@router.post("/what-if/run")
+def run_whatif(req: WhatIfRequest, request: Request, user: dict = Depends(get_current_user)):
+    """Run a What-If scenario."""
+    try:
+        session, user = _get_session_and_user(request, user)
+    except HTTPException as exc:
+        return {"ok": False, "detail": exc.detail, "code": "NO_DATA"}
+    payload = req.model_dump()
+    if not payload.get("variable"):
+        payload["variable"] = payload.get("metric") or payload.get("column")
+    if not payload.get("change_type"):
+        payload["change_type"] = payload.get("changeType") or "increase"
+    if payload.get("change_value") is None:
+        payload["change_value"] = payload.get("changeValue", 10)
+    if not payload.get("apply_to"):
+        payload["apply_to"] = payload.get("applyTo") or payload.get("scope") or "All data"
+    result = intel.run_whatif(session, payload)
+    rid = get_request_id(request)
+    if result.get("ok"):
+        result["data"] = {k: v for k, v in result.items() if k != "data"}
+        log.info("What-If OK [rid=%s] variable=%s", rid, payload.get("variable"))
+    else:
+        log.warning("What-If rejected [rid=%s] reason=%s", rid, result.get("detail"))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Analyses
+# ---------------------------------------------------------------------------
+
+@router.get("/analyses")
+def list_analyses(request: Request, user: dict = Depends(get_current_user)):
+    """List saved analyses."""
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    params = dict(request.query_params) if request else {}
+    items = intel.list_analyses(user["user_id"], did, params)
+    return {"ok": True, "items": items, "data": items, "total": len(items), "count": len(items)}
+
+
+@router.post("/analyses")
+def save_analysis(req: AnalysisRequest, request: Request, user: dict = Depends(get_current_user)):
+    """Save an analysis."""
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    analysis = intel.save_analysis(user["user_id"], did, req.model_dump())
+    return {"ok": True, "item": analysis, "data": analysis}
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+
+@router.get("/what-if/scenarios")
+def list_scenarios(request: Request, user: dict = Depends(get_current_user)):
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    params = dict(request.query_params) if request else {}
+    items = intel.list_scenarios(user["user_id"], did, params)
+    return {"ok": True, "items": items, "data": items, "total": len(items)}
+
+
+@router.post("/what-if/scenarios")
+def save_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(get_current_user)):
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    item = intel.save_scenario(user["user_id"], did, req.model_dump())
+    return {"ok": True, "item": item, "data": item}
+
+
+@router.get("/reports/templates")
+def list_report_templates(request: Request, user: dict = Depends(get_current_user)):
+    items = intel.list_report_templates(user["user_id"])
+    return {"ok": True, "items": items, "data": items, "total": len(items)}
+
+
+@router.post("/reports/templates")
+def save_report_template(req: TemplateRequest, request: Request, user: dict = Depends(get_current_user)):
+    item = intel.save_report_template(user["user_id"], req.model_dump())
+    return {"ok": True, "item": item, "data": item}
+
+
+@router.post("/reports/schedule")
+def schedule_report(req: ReportRequest, request: Request, user: dict = Depends(get_current_user)):
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    payload = req.model_dump(); payload["scheduled"] = True
+    item = intel.generate_report(user["user_id"], did, payload)
+    return {"ok": True, "item": item, "data": item, "message": "Report scheduled."}
+
+
+@router.post("/reports/share")
+def share_report(req: ReportRequest, request: Request, user: dict = Depends(get_current_user)):
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    payload = req.model_dump(); payload["shared"] = True
+    item = intel.generate_report(user["user_id"], did, payload)
+    return {"ok": True, "item": item, "data": item, "message": "Share link created.", "share_url": "#/intelligence?tab=reports"}
+
+
+@router.post("/reports/export")
+def export_report(request: Request, user: dict = Depends(get_current_user)):
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    item = intel.generate_report(user["user_id"], did, {"name": "Export", "template": "professional", "sections": []})
+    return {"ok": True, "item": item, "data": item, "message": "Export started."}
+
+
+@router.get("/reports")
+def list_reports(request: Request, user: dict = Depends(get_current_user)):
+    """List generated reports."""
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    items = intel.list_reports(user["user_id"], did)
+    return {"ok": True, "items": items, "data": items, "total": len(items)}
+
+
+@router.post("/reports/generate")
+def generate_report(req: ReportRequest, request: Request, user: dict = Depends(get_current_user)):
+    """Generate a structured report."""
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    payload = req.model_dump()
+    if payload.get("dateRange") and not payload.get("date_range"):
+        payload["date_range"] = payload["dateRange"]
+    report = intel.generate_report(user["user_id"], did, payload)
+    return {"ok": True, "item": report, "data": report}
+
+
+
+
+@router.delete("/analyses/{analysis_id}")
+def delete_analysis(analysis_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Delete a saved analysis."""
+    if not intel.delete_analysis(user["user_id"], analysis_id):
+        raise HTTPException(status_code=404, detail="Analysis not found.")
+    return {"ok": True}
+
+
+@router.delete("/what-if/scenarios/{scenario_id}")
+def delete_scenario(scenario_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Delete a saved scenario."""
+    if not intel.delete_scenario(user["user_id"], scenario_id):
+        raise HTTPException(status_code=404, detail="Scenario not found.")
+    return {"ok": True}
+
+
+@router.delete("/reports/{report_id}")
+def delete_report(report_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Delete a generated report."""
+    if not intel.delete_report(user["user_id"], report_id):
+        raise HTTPException(status_code=404, detail="Report not found.")
+    return {"ok": True}
+
+
+@router.get("/reports/{report_id}")
+def get_report(report_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Single report for preview."""
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    item = intel.get_report(user["user_id"], did, report_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Report not found.")
+    return {"ok": True, "item": item, "data": item}
+
+
+# ---------------------------------------------------------------------------
+# Coverage audit
+# ---------------------------------------------------------------------------
+
+@router.get("/coverage")
+def get_coverage(request: Request, user: dict = Depends(get_current_user)):
+    """Return what ARIA examined in the last analysis run."""
+    try:
+        session, user = _get_session_and_user(request, user)
+    except HTTPException:
+        return {"ok": True, "tables": [], "columns": [], "total_cells": 0}
+    return intel.get_coverage(session)
+
+
+# ---------------------------------------------------------------------------
+# Refresh
+# ---------------------------------------------------------------------------
+
+@router.post("/refresh")
+def refresh(request: Request, user: dict = Depends(get_current_user)):
+    """Re-run analytics and return updated Intelligence state."""
+    try:
+        session, user = _get_session_and_user(request, user)
+    except HTTPException:
+        return {"ok": True, "meta": {"ok": True, "metrics": [], "dimensions": [], "date_columns": [], "tables": []}, "coverage": {"ok": True, "tables": [], "columns": [], "total_cells": 0}, "active_goals": 0, "timestamp": time.time()}
+    meta = intel.get_intelligence_meta(session)
+    coverage = intel.get_coverage(session)
+    did = _dataset_id(session)
+    goals = intel.list_goals(user["user_id"], did, "active")
+    return {
+        "ok": True,
+        "meta": meta,
+        "coverage": coverage,
+        "active_goals": len(goals),
+        "timestamp": time.time(),
+    }

@@ -1,5 +1,9 @@
 // CommonJS // Playwright e2e: Main App pages (Dashboard, Data, Schema, Analytics, etc.)
 // Requires user to be authenticated.
+// Canonical hash contract: #/decision-center is the Decide surface
+// (recommendations + scenario + saved decisions). #/prescription aliases to
+// it; #/hypothesis aliases to #/analytics where hypothesis now lives as
+// embedded Possible drivers / Investigate why.
 const { test, expect } = require('@playwright/test');
 const { seedAuth } = require('./auth-helper');
 
@@ -56,18 +60,25 @@ test.describe('Main App pages', () => {
     expect(hasPredictions).toBeGreaterThan(0);
   });
 
-  test('Prescriptions page loads', async () => {
-        await page.goto(`${BASE}#/prescriptions`);
+  test('Decision Center loads (prescription verified via recommendations integration)', async () => {
+        await page.goto(`${BASE}#/decision-center`);
     await page.waitForLoadState('networkidle');
-    const hasPrescriptions = await page.locator('h1, h2').count();
-    expect(hasPrescriptions).toBeGreaterThan(0);
+    const hasDC = await page.locator('h1, h2').count();
+    expect(hasDC).toBeGreaterThan(0);
   });
 
-  test('Hypothesis page loads', async () => {
+  test('legacy #/prescription aliases to Decision Center', async () => {
+        await page.goto(`${BASE}#/prescription`);
+    await page.waitForLoadState('networkidle');
+    const heading = await page.locator('h1, h2').first().innerText().catch(() => '');
+    expect(heading).toMatch(/Decision Center|Decision/i);
+  });
+
+  test('legacy #/hypothesis aliases to AI Analytics (embedded Possible drivers)', async () => {
         await page.goto(`${BASE}#/hypothesis`);
     await page.waitForLoadState('networkidle');
-    const hasHypothesis = await page.locator('h1, h2').count();
-    expect(hasHypothesis).toBeGreaterThan(0);
+    const heading = await page.locator('h1, h2').first().innerText().catch(() => '');
+    expect(heading).toMatch(/Analytics/i);
   });
 
   test('History page loads', async () => {

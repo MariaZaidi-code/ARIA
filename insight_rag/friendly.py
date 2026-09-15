@@ -661,6 +661,17 @@ class InsightPDFRAG(BaseInsightPDFRAG):
                 history=history,
                 plan=plan,
             )
+            if not (answer or "").strip():
+                return self._base_result(
+                    conversation_id=conversation_id, question=question,
+                    answer=("I found relevant PDF evidence, but the AI explanation "
+                            "is currently unavailable. Please try the question again "
+                            "in a moment."),
+                    intent="document_query", document_ids=selected_ids,
+                    search_query=search_query, retrieval=retrieval_name,
+                    evidence_status="model_unavailable", model=RAG_LLM_MODEL,
+                    context_plan={**plan_payload, "search_queries": queries},
+                )
             integrity = citation_integrity(answer, sources)
             verification = (
                 verify_answer(self.llm, question=search_query, answer=answer,

@@ -5,6 +5,17 @@ endpoints (``/``, ``/api/providers``). Run with:
 
     python app.py
     uvicorn app:app
+
+Environment variables honoured here:
+
+* ARIA_ENABLE_DOCS (default "0", production-safe): set to "1" to expose
+  /docs, /redoc and /openapi.json. Docs stay OFF unless explicitly enabled.
+* ARIA_TRUSTED_HOSTS (comma-separated, optional): extra hostnames accepted
+  by TrustedHostMiddleware. Local loopback (127.0.0.1, localhost) plus the
+  test client ("testserver") are always allowed so dev never breaks.
+* CORS_ORIGINS (comma-separated): allowed browser origins for the API.
+  "*" is rejected (incompatible with allow_credentials).
+* ARIA_PORT: preferred listen port (falls forward to the next free port).
 """
 
 import os
@@ -13,7 +24,8 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,8 +38,8 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 from core.config import STATIC_DIR, BASE_DIR  # noqa: E402
 from core.checks import run_checks  # noqa: E402
 from llm_provider import PROVIDERS  # noqa: E402
-from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, settings_routes, feedback_routes, autocomplete_routes, data_routes, insight_rag_routes, insights_routes, predictive_routes, prescription_routes, rl_routes  # noqa: E402
-from core.ratelimit import limit, limit_heavy, limit_llm  # noqa: E402
+from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, hypothesis_investigation_routes, settings_routes, feedback_routes, autocomplete_routes, data_routes, insight_rag_routes, insights_routes, predictive_routes, prescription_routes, rl_routes, intelligence_routes  # noqa: E402
+from core.ratelimit import limit, limit_heavy, limit_ip, limit_llm  # noqa: E402
 from fastapi import Depends as _Depends  # noqa: E402
 
 
@@ -45,11 +57,34 @@ async def lifespan(app: FastAPI):
         logging.getLogger("uvicorn.error").warning(
             "ARIA startup check: %s", report["ollama"]["detail"]
         )
+    # Single-worker safety: multi-worker without a shared store diverges
+    # sessions (file) and rate limits (memory). Warn loudly but never crash
+    # dev (single worker default). See ARIA_REDIS_URL / ARIA_REQUIRE_SHARED_STORE.
+    try:
+        _workers = 1
+        for _var in ("UVICORN_WORKERS", "WEB_CONCURRENCY", "ARIA_WORKERS"):
+            try:
+                _n = int(os.getenv(_var, "1") or 1)
+                if _n > _workers:
+                    _workers = _n
+            except (TypeError, ValueError):
+                continue
+        _redis_url = (os.getenv("ARIA_REDIS_URL", "") or "").strip()
+        if _workers > 1 and not _redis_url:
+            logging.getLogger("uvicorn.error").error(
+                "Multi-worker deployment (%d workers via UVICORN_WORKERS/WEB_CONCURRENCY) "
+                "without ARIA_REDIS_URL: sessions and rate limits will diverge "
+                "per-process. Set ARIA_REDIS_URL to a shared Redis, or run a "
+                "single worker. Set ARIA_REQUIRE_SHARED_STORE=1 to fail closed.",
+                _workers,
+            )
+    except Exception:
+        pass
     logging.getLogger("uvicorn.error").info("ARIA startup checks complete.")
     yield
 
 
-_enable_docs = os.getenv("ARIA_ENABLE_DOCS", "1").strip() not in {"0", "false", "no", "off"}
+_enable_docs = os.getenv("ARIA_ENABLE_DOCS", "0").strip().lower() in {"1", "true", "yes", "on"}
 app = FastAPI(
     title="ARIA Testing UI",
     lifespan=lifespan,
@@ -57,6 +92,20 @@ app = FastAPI(
     redoc_url="/redoc" if _enable_docs else None,
     openapi_url="/openapi.json" if _enable_docs else None,
 )
+
+# Local-dev host allowlist: loopback + test client always pass; operators add
+# public hostnames via ARIA_TRUSTED_HOSTS. Never breaks `python app.py`.
+_trusted_hosts = ["127.0.0.1", "localhost", "testserver"]
+for _extra in (os.getenv("ARIA_TRUSTED_HOSTS", "") or "").split(","):
+    _extra = _extra.strip().lower()
+    if _extra and _extra not in _trusted_hosts:
+        _trusted_hosts.append(_extra)
+try:
+    from starlette.middleware.trustedhost import TrustedHostMiddleware as _TrustedHost
+    # allow 127.0.0.1/localhost (+ testserver for TestClient) without breaking dev
+    app.add_middleware(_TrustedHost, allowed_hosts=_trusted_hosts)
+except Exception:  # pragma: no cover - middleware must never break startup
+    pass
 
 
 @app.middleware("http")
@@ -89,11 +138,16 @@ async def _request_id(request: Request, call_next):
     resp.headers["X-Request-ID"] = rid
     return resp
 
-_cors_origins = os.getenv(
-    "CORS_ORIGINS",
-    "http://127.0.0.1:8000,http://localhost:8000,http://localhost:5173,http://127.0.0.1:5173",
-).split(",")
-if "*" in [o.strip() for o in _cors_origins]:
+# Single-origin deployment: the backend serves the built frontend on :8000,
+# so API calls are same-origin (/api). CORS exists only for operator
+# overrides via CORS_ORIGINS.
+_cors_origins = [
+    o.strip() for o in os.getenv(
+        "CORS_ORIGINS",
+        "http://127.0.0.1:8000,http://localhost:8000",
+    ).split(",") if o.strip()
+]
+if "*" in _cors_origins:
     # "*" + allow_credentials is rejected by browsers anyway; drop it loudly
     # rather than running an insecure no-op config.
     import logging as _logging
@@ -101,13 +155,13 @@ if "*" in [o.strip() for o in _cors_origins]:
     _logging.getLogger("uvicorn.error").warning(
         "CORS_ORIGINS contains '*', which is incompatible with allow_credentials; ignoring '*'."
     )
-    _cors_origins = [o for o in _cors_origins if o.strip() != "*"] or ["http://localhost:8000"]
+    _cors_origins = [o for o in _cors_origins if o != "*"] or ["http://localhost:8000"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-Client-Type"],
 )
 
 app.include_router(auth_routes.router)  # has its own login/register limiter
@@ -126,7 +180,51 @@ app.include_router(insight_rag_routes.router, dependencies=[_Depends(limit_llm()
 app.include_router(insights_routes.router, dependencies=[_Depends(limit_heavy())])
 app.include_router(predictive_routes.router, dependencies=[_Depends(limit_llm())])
 app.include_router(prescription_routes.router, dependencies=[_Depends(limit_heavy())])
+app.include_router(hypothesis_investigation_routes.router, dependencies=[_Depends(limit_heavy())])
 app.include_router(rl_routes.router, dependencies=[_Depends(limit("rl", 60))])
+app.include_router(intelligence_routes.router, dependencies=[_Depends(limit_heavy())])
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Converge FastAPI HTTP errors toward the canonical shape.
+
+    Canonical error body: {ok:false, success:false, code, detail, request_id}.
+    Never looks like success (ok is always False); request_id always present
+    (mirrors X-Request-ID); detail is sanitized so no stack/SQL/secret leaks.
+    """
+    from core.errors import sanitize_error as _san
+    rid = getattr(request.state, "request_id", None) or request.headers.get("X-Request-ID") or "unknown"
+    code = "UNAUTHORIZED" if exc.status_code == 401 else (
+        "FORBIDDEN" if exc.status_code == 403 else (
+            "NOT_FOUND" if exc.status_code == 404 else "REQUEST_FAILED"))
+    detail = exc.detail if isinstance(exc.detail, str) else "Request failed."
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "ok": False,
+            "success": False,
+            "code": code,
+            "detail": _san(detail),
+            "request_id": rid,
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """422 bodies carry the same canonical shape (no raw trace, has request_id)."""
+    rid = getattr(request.state, "request_id", None) or request.headers.get("X-Request-ID") or "unknown"
+    return JSONResponse(
+        status_code=422,
+        content={
+            "ok": False,
+            "success": False,
+            "code": "INVALID_REQUEST",
+            "detail": "Invalid request. Check the highlighted fields and retry.",
+            "request_id": rid,
+        },
+    )
 
 
 @app.exception_handler(Exception)
@@ -144,19 +242,22 @@ async def unhandled_exception(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
         content={
+            "ok": False,
+            "success": False,
+            "code": "INTERNAL_ERROR",
             "detail": "Something went wrong. Reference ID: " + rid,
             "request_id": rid,
         },
     )
 
 
-@app.get("/api/health")
+@app.get("/api/health", dependencies=[_Depends(limit_ip("health", 120))])
 def health():
     """Live dependency/health status for ops and the UI."""
     return run_checks()
 
 
-@app.get("/api/providers")
+@app.get("/api/providers", dependencies=[_Depends(limit_ip("providers", 120))])
 def providers():
     """Return provider metadata (labels + privacy context) for the UI."""
     return {
@@ -182,11 +283,25 @@ def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 # Fallback: any unmatched non-API route -> index.html (SPA routing).
-# /api/* must never silently return HTML; unknown API paths return 404.
+# /api/* must never silently return HTML; unknown API paths return the
+# canonical error shape (ok:false + request_id, never success-like).
 @app.get("/{full_path:path}")
-def catch_all(full_path: str):
+def catch_all(full_path: str, request: Request):
+    rid = getattr(request.state, "request_id", None) or request.headers.get("X-Request-ID") or "unknown"
     if full_path == "api" or full_path.startswith("api/"):
-        return JSONResponse(status_code=404, content={"detail": "Unknown API endpoint."})
+        return JSONResponse(status_code=404, content={
+            "ok": False, "success": False, "code": "NOT_FOUND",
+            "detail": "Unknown API endpoint.", "request_id": rid})
+    # If the path looks like a static asset but doesn't exist, return 404
+    # instead of falling through to index.html.
+    static_file = DIST_DIR / full_path
+    if full_path.startswith("assets/") or full_path.endswith(('.js', '.css', '.png', '.jpg', '.svg', '.ico', '.woff', '.woff2')):
+        if not static_file.exists():
+            static_file = STATIC_DIR / full_path
+            if not static_file.exists():
+                return JSONResponse(status_code=404, content={
+                    "ok": False, "success": False, "code": "NOT_FOUND",
+                    "detail": "Static file not found.", "request_id": rid})
     prod_index = DIST_DIR / "index.html"
     if prod_index.exists():
         return FileResponse(prod_index)

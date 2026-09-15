@@ -54,10 +54,63 @@ MAX_SELECTED_DOCUMENTS = int(os.getenv("ARIA_RAG_MAX_SELECTED_DOCUMENTS", "8"))
 TEXT_CHUNK_SIZE = int(os.getenv("ARIA_RAG_TEXT_CHUNK_SIZE", "1500"))
 TEXT_CHUNK_OVERLAP = int(os.getenv("ARIA_RAG_TEXT_CHUNK_OVERLAP", "220"))
 TABLE_ROWS_PER_CHUNK = int(os.getenv("ARIA_RAG_TABLE_ROWS_PER_CHUNK", "25"))
+# Generic tabular (CSV/DB-row) ingestion limits. Large row sets are represented
+# by a full-coverage summary chunk plus a bounded stratified sample of row
+# chunks so retrieval context stays within budget for any table size.
+TABULAR_MAX_ROW_CHUNKS = int(os.getenv("ARIA_RAG_TABULAR_MAX_ROW_CHUNKS", "12"))
+TABULAR_MAX_ROWS = int(os.getenv("ARIA_RAG_TABULAR_MAX_ROWS", "50000"))
+# Sibling expansion restores split-table neighbours for deterministic table
+# math. The cap keeps very large tables (any source) from flooding context;
+# full-table aggregates remain available via tabular summary chunks.
+TABLE_SIBLING_MAX_CHUNKS = int(os.getenv("ARIA_RAG_TABLE_SIBLING_MAX_CHUNKS", "16"))
 RETRIEVAL_FETCH_K = int(os.getenv("ARIA_RAG_RETRIEVAL_FETCH_K", "18"))
 RETRIEVAL_TOP_K = int(os.getenv("ARIA_RAG_RETRIEVAL_TOP_K", "8"))
 MAX_CONTEXT_CHARS = int(os.getenv("ARIA_RAG_MAX_CONTEXT_CHARS", "24000"))
 RECENT_HISTORY_TURNS = int(os.getenv("ARIA_RAG_RECENT_HISTORY_TURNS", "8"))
+
+# Per-query LLM call budget / timeouts / circuit-breaker (reliability, no rewrite).
+# Bounded so one question can never loop the hosted provider indefinitely.
+RAG_MAX_LLM_CALLS_PER_QUERY = int(os.getenv("ARIA_RAG_MAX_LLM_CALLS_PER_QUERY", "8"))
+RAG_VERIFY_TIMEOUT_S = int(os.getenv("ARIA_RAG_VERIFY_TIMEOUT_S", "12"))
+RAG_QUERY_TIMEOUT_S = int(os.getenv("ARIA_RAG_QUERY_TIMEOUT_S", "120"))
+RAG_CIRCUIT_BREAKER_FAILURES = int(os.getenv("ARIA_RAG_CIRCUIT_BREAKER_FAILURES", "5"))
+RAG_CIRCUIT_BREAKER_WINDOW_S = int(os.getenv("ARIA_RAG_CIRCUIT_BREAKER_WINDOW_S", "300"))
+# Lexical/BM25 corpus bounds: never score an unbounded whole corpus in memory.
+# 3000 docs max; per-doc text is truncated for scoring only (evidence text is
+# never mutated); paging + early-exit keep peak memory flat for any library.
+RAG_BM25_MAX_DOCS = int(os.getenv("ARIA_RAG_BM25_MAX_DOCS", "3000"))
+RAG_BM25_MAX_CHARS_PER_DOC = int(os.getenv("ARIA_RAG_BM25_MAX_CHARS_PER_DOC", "8000"))
+RAG_LEXICAL_CORPUS_MAX_CHUNKS = int(os.getenv("ARIA_RAG_LEXICAL_CORPUS_MAX_CHUNKS", "3000"))
+RAG_BM25_PAGE_SIZE = int(os.getenv("ARIA_RAG_BM25_PAGE_SIZE", "1000"))
+RAG_BM25_EARLY_EXIT = os.getenv("ARIA_RAG_BM25_EARLY_EXIT", "true").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+
+
+def bm25_scan_bounds(
+    max_docs: int | None = None,
+    max_chars_per_doc: int | None = None,
+    page_size: int | None = None,
+) -> tuple[int, int, int]:
+    """Return enforced (max_docs, max_chars_per_doc, page_size) BM25 bounds.
+
+    Caps: max_docs <= 3000 (hard ceiling), per-doc chars >= 1, page size
+    bounded to [100, max_docs] so one scan can never OOM the request.
+    """
+    docs = RAG_BM25_MAX_DOCS if max_docs is None else int(max_docs)
+    chars = RAG_BM25_MAX_CHARS_PER_DOC if max_chars_per_doc is None else int(max_chars_per_doc)
+    page = RAG_BM25_PAGE_SIZE if page_size is None else int(page_size)
+    docs = max(1, min(docs, 3000))
+    chars = max(1, chars)
+    page = max(100, min(page, docs))
+    return docs, chars, page
+
+
+def truncate_for_bm25(text: str, max_chars: int | None = None) -> str:
+    """Enforce the per-doc char cap for BM25 term counting (scoring only)."""
+    cap = RAG_BM25_MAX_CHARS_PER_DOC if max_chars is None else int(max_chars)
+    value = text or ""
+    return value[:max(1, cap)]
 
 
 def validate_rag_config() -> None:
@@ -73,6 +126,12 @@ def validate_rag_config() -> None:
         errors.append("ARIA_RAG_TEXT_CHUNK_OVERLAP must be >= 0 and smaller than chunk size")
     if TABLE_ROWS_PER_CHUNK < 1:
         errors.append("ARIA_RAG_TABLE_ROWS_PER_CHUNK must be >= 1")
+    if TABULAR_MAX_ROW_CHUNKS < 1:
+        errors.append("ARIA_RAG_TABULAR_MAX_ROW_CHUNKS must be >= 1")
+    if TABULAR_MAX_ROWS < 1:
+        errors.append("ARIA_RAG_TABULAR_MAX_ROWS must be >= 1")
+    if TABLE_SIBLING_MAX_CHUNKS < 1:
+        errors.append("ARIA_RAG_TABLE_SIBLING_MAX_CHUNKS must be >= 1")
     if RETRIEVAL_TOP_K < 1 or RETRIEVAL_FETCH_K < RETRIEVAL_TOP_K:
         errors.append("retrieval fetch_k must be >= top_k >= 1")
     if MAX_CONTEXT_CHARS < 4000:
@@ -83,6 +142,24 @@ def validate_rag_config() -> None:
         errors.append("ARIA_RAG_MAX_SELECTED_DOCUMENTS must be between 1 and 20")
     if RECENT_HISTORY_TURNS < 1:
         errors.append("ARIA_RAG_RECENT_HISTORY_TURNS must be >= 1")
+    if RAG_MAX_LLM_CALLS_PER_QUERY < 1:
+        errors.append("ARIA_RAG_MAX_LLM_CALLS_PER_QUERY must be >= 1")
+    if RAG_VERIFY_TIMEOUT_S < 1:
+        errors.append("ARIA_RAG_VERIFY_TIMEOUT_S must be >= 1")
+    if RAG_QUERY_TIMEOUT_S < 10:
+        errors.append("ARIA_RAG_QUERY_TIMEOUT_S must be >= 10")
+    if RAG_CIRCUIT_BREAKER_FAILURES < 1:
+        errors.append("ARIA_RAG_CIRCUIT_BREAKER_FAILURES must be >= 1")
+    if RAG_CIRCUIT_BREAKER_WINDOW_S < 10:
+        errors.append("ARIA_RAG_CIRCUIT_BREAKER_WINDOW_S must be >= 10")
+    if RAG_BM25_MAX_DOCS < 100 or RAG_BM25_MAX_DOCS > 3000:
+        errors.append("ARIA_RAG_BM25_MAX_DOCS must be between 100 and 3000")
+    if RAG_BM25_MAX_CHARS_PER_DOC < 1000:
+        errors.append("ARIA_RAG_BM25_MAX_CHARS_PER_DOC must be >= 1000")
+    if RAG_BM25_PAGE_SIZE < 100:
+        errors.append("ARIA_RAG_BM25_PAGE_SIZE must be >= 100")
+    if RAG_LEXICAL_CORPUS_MAX_CHUNKS < 100:
+        errors.append("ARIA_RAG_LEXICAL_CORPUS_MAX_CHUNKS must be >= 100")
     if errors:
         raise RuntimeError("Invalid ARIA RAG configuration: " + "; ".join(errors))
 

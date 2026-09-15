@@ -17,6 +17,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -116,12 +117,19 @@ def _build_engine(session):
         except Exception:
             pass
     db_type = session.get("db_type", "postgresql")
+    user = quote_plus(str(db_config.get("user", "")))
+    password = quote_plus(str(db_config.get("password", "")))
+    host = db_config.get("host", "localhost")
+    port = db_config.get("port", 5432)
+    db = db_config.get("db", "")
+    if not db:
+        raise HTTPException(status_code=400, detail="No database configured.")
     if db_type == "mysql":
-        uri = (f"mysql+pymysql://{db_config['user']}:{db_config['password']}"
-               f"@{db_config['host']}:{db_config['port']}/{db_config['db']}")
+        uri = (f"mysql+pymysql://{user}:{password}"
+               f"@{host}:{port}/{db}")
     else:
-        uri = (f"postgresql://{db_config['user']}:{db_config['password']}"
-               f"@{db_config['host']}:{db_config['port']}/{db_config['db']}")
+        uri = (f"postgresql://{user}:{password}"
+               f"@{host}:{port}/{db}")
     return create_engine(uri, pool_pre_ping=True), session.get("dialect", "postgresql"), db_type
 
 

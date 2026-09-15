@@ -1,17 +1,25 @@
 import { useState, useEffect } from "react";
 import { Search, Trash2, Bookmark, ChevronDown, Clock } from "lucide-react";
+import { API_BASE } from "../../services/api";
 
-type Category = "All" | "Analytics" | "Insight" | "Prediction" | "Prescription" | "Hypothesis";
+// Standalone Hypothesis/Prescription pages were removed (hypothesis now
+// surfaces as Possible drivers; prescriptions are historical).
+// Legacy history rows keep their stored type; the filter maps them to
+// Analytics so old records stay findable.
+type Category = "All" | "Analytics" | "Insight" | "Prediction";
+
+const LEGACY_TYPE_MAP: Record<string, string> = {
+  Prescription: "Analytics",
+  Hypothesis: "Analytics",
+};
 
 const typeStyle: Record<string, string> = {
   Analytics: "text-primary bg-primary/10",
   Insight: "text-positive bg-positive/10",
   Prediction: "text-warning bg-warning/10",
-  Prescription: "text-negative bg-negative/10",
-  Hypothesis: "text-primary bg-primary/10",
 };
 
-const categories: Category[] = ["All", "Analytics", "Insight", "Prediction", "Prescription", "Hypothesis"];
+const categories: Category[] = ["All", "Analytics", "Insight", "Prediction"];
 
 interface HistoryItem {
   id: string;
@@ -50,11 +58,11 @@ export default function History({ historyRefreshKey = 0, onDeleteHistory }: Prop
     if (details[id]) return;
     setDetailLoading(id);
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      const res = await fetch(`/api/history/${id}`, {
-        headers: { Authorization: `Bearer ${token}` },
+      const res = await fetch(`${API_BASE}/history/${id}`, {
+        credentials: "include",
       });
-      const data = await res.json();
+      if (res.status === 401) { try { window.dispatchEvent(new Event("aria:unauthorized")); } catch { /* ignore */ } return; }
+      const data = await res.json().catch(() => ({}));
       if (res.ok && data?.record) {
         setDetails((d) => ({ ...d, [id]: data.record }));
       }
@@ -72,12 +80,12 @@ export default function History({ historyRefreshKey = 0, onDeleteHistory }: Prop
   const fetchHistory = async () => {
     setLoading(true);
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      const res = await fetch("/api/history?limit=100", {
-        headers: { Authorization: `Bearer ${token}` },
+      const res = await fetch(`${API_BASE}/history?limit=100`, {
+        credentials: "include",
       });
+      if (res.status === 401) { try { window.dispatchEvent(new Event("aria:unauthorized")); } catch { /* ignore */ } return; }
       if (res.ok) {
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         const mapped = (data.items || data.history || []).map((h: any) => ({
           id: String(h.id),
           type: h.source_type || "Analytics",
@@ -98,7 +106,8 @@ export default function History({ historyRefreshKey = 0, onDeleteHistory }: Prop
 
   const filtered = items.filter((h) => {
     if (deleted.includes(h.id)) return false;
-    if (category !== "All" && h.type !== category) return false;
+    const mappedType = LEGACY_TYPE_MAP[h.type] || h.type;
+    if (category !== "All" && mappedType !== category) return false;
     if (search && !h.title.toLowerCase().includes(search.toLowerCase()) && !h.summary.toLowerCase().includes(search.toLowerCase())) return false;
     return true;
   });
@@ -113,10 +122,9 @@ export default function History({ historyRefreshKey = 0, onDeleteHistory }: Prop
 
   const handleDelete = async (id: string) => {
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      await fetch(`/api/history/${id}`, {
+      await fetch(`${API_BASE}/history/${id}`, {
         method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+        credentials: "include",
       });
     } catch (err) {
       console.error("Delete failed:", err);
@@ -172,7 +180,7 @@ export default function History({ historyRefreshKey = 0, onDeleteHistory }: Prop
 
       {loading ? (
         <div className="flex flex-col items-center justify-center py-24 text-center">
-          <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center mb-4 animate-pulse">
+          <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center mb-4">
             <Clock size={20} className="text-muted-foreground" />
           </div>
           <p className="text-sm text-muted-foreground">Loading history...</p>
@@ -186,8 +194,8 @@ export default function History({ historyRefreshKey = 0, onDeleteHistory }: Prop
                 <div className="flex items-center gap-4">
                 <div className="flex-1 min-w-0 space-y-1.5">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${typeStyle[item.type] || "text-muted-foreground bg-secondary"}`}>
-                      {item.type}
+                    <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${typeStyle[LEGACY_TYPE_MAP[item.type] || item.type] || "text-muted-foreground bg-secondary"}`}>
+                      {LEGACY_TYPE_MAP[item.type] || item.type}
                     </span>
                     <span className="text-xs text-muted-foreground bg-secondary px-2 py-0.5 rounded-full">{item.source}</span>
                   </div>

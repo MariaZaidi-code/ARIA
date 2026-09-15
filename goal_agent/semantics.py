@@ -34,7 +34,7 @@ class SemanticMixin:
         tokens = set()
         for word in re.findall(r"[a-zA-Z0-9_]+", str(raw_text)):
             tokens.add(word.lower())
-            tokens.update(part for part in word.split("_") if part)
+            tokens.update(part.lower() for part in word.split("_") if part)
         return {t for t in tokens if t}
 
     # ---- _has_resolvable_analytical_structure (_has_resolvable_analytical_structure) ----
@@ -233,14 +233,27 @@ class SemanticMixin:
     # ---- _classify_column (_classify_column) ----
 
     def _classify_column(self, table_name, col):
-        data_type = str(
-            self.tables[table_name]["columns"][col].get("data_type", "")
-        ).lower()
-        if any(token in data_type for token in self._NUMERIC_TYPES):
-            return "numeric"
-        if any(token in data_type for token in self._DATE_TYPES):
-            return "date"
-        return "text"
+        # Shared path: delegate to the universal Data Intelligence Layer so
+        # PostgreSQL, MySQL, SQLite and CSV/SQLite types classify identically.
+        # Legacy labels ("numeric"/"date"/"text") are preserved for callers.
+        try:
+            from core.data_intelligence import classify_column as _shared_classify
+            data_type = self.tables[table_name]["columns"][col].get("data_type", "")
+            role = _shared_classify(col, data_type)
+            if role == "numerical":
+                return "numeric"
+            if role == "datetime":
+                return "date"
+            return "text"
+        except Exception:
+            data_type = str(
+                self.tables[table_name]["columns"][col].get("data_type", "")
+            ).lower()
+            if any(token in data_type for token in self._NUMERIC_TYPES):
+                return "numeric"
+            if any(token in data_type for token in self._DATE_TYPES):
+                return "date"
+            return "text"
 
     # ---- _is_entity_table (_is_entity_table) ----
 

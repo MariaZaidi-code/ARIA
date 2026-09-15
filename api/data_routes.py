@@ -219,6 +219,11 @@ def get_data_summary(request: Request, user: dict = Depends(get_current_user)):
 # DATA PREVIEW (paginated rows)
 # =============================================================
 
+MAX_PREVIEW_LIMIT = 1000
+MAX_PREVIEW_OFFSET = 1000000
+MAX_PREVIEW_SEARCH = 200
+
+
 class PreviewRequest(BaseModel):
     table: str
     limit: int = 50
@@ -227,10 +232,50 @@ class PreviewRequest(BaseModel):
     sort_column: str = ""
     sort_direction: str = "ASC"
 
+    @field_validator("limit")
+    @classmethod
+    def _bounded_limit(cls, v):
+        try:
+            n = int(v or 0)
+        except (TypeError, ValueError):
+            raise ValueError("limit must be an integer")
+        if n < 1:
+            return 1
+        return min(n, MAX_PREVIEW_LIMIT)
+
     @field_validator("offset")
     @classmethod
     def _non_negative_offset(cls, v):
-        return max(0, int(v or 0))
+        try:
+            n = int(v or 0)
+        except (TypeError, ValueError):
+            raise ValueError("offset must be an integer")
+        if n < 0:
+            return 0
+        return min(n, MAX_PREVIEW_OFFSET)
+
+    @field_validator("search")
+    @classmethod
+    def _bounded_search(cls, v):
+        s = str(v or "")
+        if len(s) > MAX_PREVIEW_SEARCH:
+            return s[:MAX_PREVIEW_SEARCH]
+        return s
+
+    @field_validator("sort_column")
+    @classmethod
+    def _safe_sort_column(cls, v):
+        from core.semantic import is_valid_identifier
+        s = str(v or "")
+        if s and not is_valid_identifier(s):
+            raise ValueError(f"Invalid sort_column name: {s!r}")
+        return s
+
+    @field_validator("sort_direction")
+    @classmethod
+    def _safe_sort_direction(cls, v):
+        s = str(v or "ASC").upper()
+        return "DESC" if s == "DESC" else "ASC"
 
 
 @router.post("/api/data/preview")
@@ -277,7 +322,7 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
                     f"CAST({_quote(c, dialect)} AS TEXT) ILIKE :search" for c in columns[:20]
                 )
             return " OR ".join(
-                f"LOWER(CAST({_quote(c, dialect)} AS TEXT)) LIKE LOWER(:search))"
+                f"LOWER(CAST({_quote(c, dialect)} AS TEXT)) LIKE LOWER(:search)"
                 for c in columns[:20]
             )
 
@@ -305,8 +350,13 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
         else:
             query += f" ORDER BY 1"
 
-        safe_limit = min(max(1, req.limit), 1000)
-        query += f" LIMIT {safe_limit} OFFSET {req.offset}"
+        safe_limit = min(max(1, int(req.limit)), MAX_PREVIEW_LIMIT)
+        safe_offset = min(max(0, int(req.offset)), MAX_PREVIEW_OFFSET)
+        # Bound params for pagination values (identifiers stay quoted via
+        # _quote after schema-membership + sort_column validation above).
+        query += " LIMIT :limit OFFSET :offset"
+        params["limit"] = safe_limit
+        params["offset"] = safe_offset
 
         with engine.connect() as conn:
             rows = conn.execute(text(query), params).fetchall()
@@ -318,7 +368,7 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
             "columns": columns,
             "total": total,
             "limit": safe_limit,
-            "offset": req.offset,
+            "offset": safe_offset,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preview failed: {sanitize_error(e)}")

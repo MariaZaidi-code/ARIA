@@ -137,12 +137,35 @@ def _looks_like_datetime(value) -> bool:
 
 
 def _fmt(value) -> str:
+    """Human-readable number formatting (reuses the insights-engine pattern).
+
+    Large magnitudes use compact 1-decimal M/K suffixes (1.84M / 184K);
+    smaller values keep grouped thousands with up to 1 decimal. Plain,
+    jargon-free output for user-facing answer/story strings.
+    """
     if value is None:
         return "—"
-    if isinstance(value, float):
-        return f"{value:,.2f}"
-    if isinstance(value, int):
-        return f"{value:,}"
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if math.isnan(f) or math.isinf(f):
+            return "—"
+        a = abs(f)
+        if a >= 1_000_000:
+            return f"{f / 1_000_000:.1f}M"
+        if a >= 1_000:
+            return f"{f / 1_000:.1f}K"
+        if isinstance(value, int):
+            return f"{value:,}"
+        if a >= 100:
+            return f"{f:,.0f}"
+        if a >= 1:
+            return f"{f:,.1f}"
+        return f"{f:,.2f}"
     return str(value)
 
 
@@ -478,6 +501,15 @@ def _compatible(op, wants_share, n_groups):
         base = ["bar_horizontal", "bar", "pie"]
     elif op in _TREND_OPS:
         base = ["line", "area", "bar"]
+    elif op in ("comparison", "period_over_period", "contribution",
+                "change_detection"):
+        base = ["bar", "bar_horizontal", "line"]
+    elif op in ("correlation",):
+        base = ["scatter", "bar", "line"]
+    elif op in ("segmentation",):
+        base = ["bar_stacked", "bar", "bar_horizontal"]
+    elif op == "distribution":
+        base = ["histogram", "bar", "bar_horizontal"]
     else:
         base = ["bar", "bar_horizontal"]
     if wants_share and n_groups <= 8:
@@ -524,6 +556,15 @@ def select_visualization(intent, columns, frame, measure_label) -> dict:
         chart_type = "bar_horizontal"
     elif op in _TREND_OPS:
         chart_type = "line"
+    elif op == "correlation":
+        chart_type = "scatter"
+    elif op == "distribution":
+        chart_type = "histogram"
+    elif op == "segmentation":
+        chart_type = "bar_stacked"
+    elif op in ("comparison", "period_over_period", "contribution",
+                "change_detection"):
+        chart_type = "bar"
     elif intent.get("wants_share") and n_groups <= 8:
         chart_type = "pie"
     else:

@@ -67,18 +67,26 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         """Authoritative upload metadata safe to expose in non-document turns."""
         if not documents:
             return "No PDFs are currently uploaded/indexed for this user."
-        lines = [f"Uploaded/indexed PDFs: {len(documents)}"]
+        lines = [f"Uploaded/indexed sources: {len(documents)}"]
         for index, document in enumerate(documents[:20], start=1):
             quality = (document.get("ingestion_quality") or {}).get("grade")
             quality_note = f", extraction quality {quality}" if quality else ""
-            lines.append(
-                f"{index}. {document.get('filename') or 'Untitled PDF'} "
-                f"({int(document.get('pages', 0) or 0)} pages, "
-                f"{int(document.get('tables', 0) or 0)} tables, "
-                f"{int(document.get('total_chunks', 0) or 0)} chunks{quality_note})"
-            )
+            if (document.get("source_type") or "pdf") == "tabular":
+                lines.append(
+                    f"{index}. {document.get('filename') or 'Untitled table'} "
+                    f"(tabular: {int(document.get('row_count', 0) or 0)} rows, "
+                    f"{int(document.get('column_count', 0) or 0)} columns, "
+                    f"{int(document.get('total_chunks', 0) or 0)} chunks{quality_note})"
+                )
+            else:
+                lines.append(
+                    f"{index}. {document.get('filename') or 'Untitled PDF'} "
+                    f"({int(document.get('pages', 0) or 0)} pages, "
+                    f"{int(document.get('tables', 0) or 0)} tables, "
+                    f"{int(document.get('total_chunks', 0) or 0)} chunks{quality_note})"
+                )
         if len(documents) > 20:
-            lines.append(f"...and {len(documents) - 20} more PDFs")
+            lines.append(f"...and {len(documents) - 20} more sources")
         return "\n".join(lines)
 
     def _system_context_answer(self, question: str, history: list[dict]) -> str:
@@ -191,6 +199,45 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         record("request_id", request_id)
         history = self.conversations.load_recent(conversation_id).get("messages", [])
         documents = self.metadata.list_documents()
+        # Structured-DB awareness (n.txt §5): analytics questions over
+        # relational schemas must never be answered from PDF evidence. When
+        # no PDFs are uploaded, such a question cannot be a document
+        # question, so hand off honestly to Copilot/Data instead of running
+        # PDF retrieval (which would hallucinate). When PDFs exist, routing
+        # stays with the semantic router — the PDFs may contain the answer.
+        try:
+            from .structured_db import (
+                describe_structured_handoff,
+                is_structured_db_question,
+            )
+
+            if not documents and is_structured_db_question(question):
+                handoff = describe_structured_handoff(question)
+                result = self._base_result(
+                    conversation_id=conversation_id,
+                    question=question,
+                    answer=handoff,
+                    intent="structured_db_handoff",
+                    retrieval="not_used",
+                    evidence_status="not_applicable",
+                    model=None,
+                    context_plan={"route": "structured_db_handoff",
+                                  "reason": "analytics question needs SQL evidence"},
+                )
+                result["citation_status"] = "not_applicable"
+                result["grounding"] = {
+                    "intent": "structured_db_handoff",
+                    "evidence_status": "not_applicable",
+                    "citation_status": "not_applicable",
+                    "used_pdf_evidence": False,
+                    "retrieval": "not_used",
+                }
+                result["scope"] = "CLARIFICATION"
+                result["request_id"] = request_id
+                result["pipeline_version"] = RAG_PIPELINE_VERSION
+                return result
+        except Exception:
+            pass
         with stage("semantic_router"):
             decision = self.semantic_router.decide(
                 question,

@@ -53,33 +53,130 @@ if DEEPSEEK_THINKING not in {"enabled", "disabled"}:
 _CONTROL_ROLES = {"rag_scope", "rag_verify", "rag_rewrite", "rag_plan"}
 _RETRY_AFTER_RE = re.compile(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
 
+# Per-user LLM budgets (DoS/cost containment). Normal use never trips these;
+# bursts get a fail-closed 429 so one caller cannot loop the provider.
+_LLM_BUCKET_MAX = int(os.getenv("ARIA_LLM_MAX_PER_MIN", "30"))
+_LLM_BUCKET_WINDOW_S = int(os.getenv("ARIA_LLM_WINDOW_S", "60"))
+_LLM_LOCAL_MINIMIZE_THRESHOLD = int(os.getenv("ARIA_LLM_LOCAL_MINIMIZE_CHARS", "24000"))
+_llm_buckets: dict[str, list[float]] = {}
+
+
+def _llm_rate_limit(key="default") -> None:
+    """Enforce a per-user/per-role LLM call budget (fail-closed on exceed).
+
+    Prefers the shared ``core.ratelimit.check_limit`` sliding window when
+    available; otherwise falls back to a simple in-process token bucket with
+    the same bounds. Exceeding the budget raises (429-style) instead of
+    queueing, so bursts fail fast and never hang a request.
+    """
+    bucket_key = str(key or "default")
+    try:
+        from core.ratelimit import check_limit as _shared_check
+        _shared_check("llm_provider", bucket_key,
+                      _LLM_BUCKET_MAX, _LLM_BUCKET_WINDOW_S)
+        return
+    except ImportError:
+        pass
+    except Exception as exc:
+        if getattr(exc, "status_code", None) in (429, 503):
+            raise
+    now = time.monotonic()
+    hits = [t for t in _llm_buckets.get(bucket_key, []) if now - t < _LLM_BUCKET_WINDOW_S]
+    if len(hits) >= _LLM_BUCKET_MAX:
+        raise RuntimeError(
+            f"LLM rate limit exceeded for '{bucket_key}' "
+            f"({_LLM_BUCKET_MAX} calls per {_LLM_BUCKET_WINDOW_S}s). "
+            "Slow down and try again shortly."
+        )
+    hits.append(now)
+    _llm_buckets[bucket_key] = hits
+
+
+def _content_chars(messages) -> int:
+    """Total prompt chars (used to bound the local path like the cloud path)."""
+    try:
+        if isinstance(messages, str):
+            return len(messages)
+        total = 0
+        for m in messages or []:
+            if isinstance(m, dict):
+                content = m.get("content")
+                if isinstance(content, str):
+                    total += len(content)
+                elif isinstance(content, list):
+                    for p in content:
+                        if isinstance(p, dict) and isinstance(p.get("text"), str):
+                            total += len(p["text"])
+        return total
+    except Exception:
+        return 0
+
 # OmniRoute gateway (OpenAI-compatible routing to many models).
 OMNIROUTE_BASE_URL = os.getenv("OMNIROUTE_BASE_URL", "http://localhost:20128/v1").rstrip("/")
 
-# Cloud privacy controls (P1-11). Selecting a hosted provider is explicit
-# user consent for that request; ARIA_CLOUD_ALLOWED=0 disables all hosted
-# inference so Local Ollama remains fully usable offline.
+# Grok / xAI (OpenAI-compatible). Generic hosted provider: key from
+# GROK_API_KEY (fallback XAI_API_KEY), endpoint override via GROK_BASE_URL,
+# model override via GROK_MODEL (fallback XAI_MODEL). No dataset-specific
+# defaults; any model id listed by the API can be used.
+GROK_BASE_URL = os.getenv("GROK_BASE_URL", "https://api.x.ai/v1").rstrip("/")
+GROK_MODEL = os.getenv("GROK_MODEL", os.getenv("XAI_MODEL", "grok-3-mini")).strip() or "grok-3-mini"
+
+# Cloud privacy controls (P1-11). Hosted inference needs explicit *backend*
+# consent: ARIA_CLOUD_ALLOWED=0 is a kill-switch, and ARIA_CLOUD_CONSENT=1 is
+# an opt-in. A frontend toggle or per-request flag alone is insufficient —
+# the backend env must grant consent, otherwise cloud calls raise and Local
+# Ollama remains fully usable offline.
+_CLOUD_CONSENT_VALUES = {"1", "true", "yes", "on"}
+
 def _cloud_allowed() -> bool:
     return os.getenv("ARIA_CLOUD_ALLOWED", "1").strip() not in {"0", "false", "no", "off"}
 
 
-def _require_cloud_consent(provider: str):
-    if provider != "local" and not _cloud_allowed():
+def _cloud_consent_granted() -> bool:
+    return os.getenv("ARIA_CLOUD_CONSENT", "0").strip().lower() in _CLOUD_CONSENT_VALUES
+
+
+def _require_cloud_consent(provider: str, consent=None):
+    if provider == "local":
+        return
+    if not _cloud_allowed():
         raise RuntimeError(
             "Cloud processing is disabled by configuration (ARIA_CLOUD_ALLOWED=0). "
             "Switch to Local Ollama or enable cloud consent."
+        )
+    # Explicit per-call deny always wins.
+    if consent is False:
+        raise RuntimeError(
+            "Cloud processing was explicitly denied for this request. "
+            "Switch to Local Ollama or grant consent."
+        )
+    # Backend consent is mandatory; a frontend-supplied consent flag alone
+    # never enables cloud (it is accepted only as an additional signal).
+    if not _cloud_consent_granted():
+        raise RuntimeError(
+            "Cloud processing requires explicit backend consent (ARIA_CLOUD_CONSENT=1). "
+            "Switch to Local Ollama or set backend consent."
         )
 
 
 _SECRET_PATTERNS = [
     re.compile(r"(gsk_[A-Za-z0-9]{8,})"),
+    re.compile(r"(xai-[A-Za-z0-9\-_]{8,})"),
     re.compile(r"(sk-[A-Za-z0-9\-_]{8,})"),
     re.compile(r"(hf_[A-Za-z0-9]{8,})"),
-    re.compile(r"(?i)(password\s*[:=]\s*)([^\s,;]+)"),
-    re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)([^\s,;]+)"),
-    re.compile(r"(?i)(secret\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(AKIA[0-9A-Z]{16})"),
+    re.compile(r"(?i)(aws_secret_access_key\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)([^\s,;'\"]+)"),
+    re.compile(r"(?i)(password\s*[:=]\s*)([^\s,;'\"]+)"),
+    re.compile(r"(?i)(passwd\s*[:=]\s*)([^\s,;'\"]+)"),
+    re.compile(r"(?i)(secret\s*[:=]\s*)([^\s,;'\"]+)"),
     re.compile(r"(?i)(bearer\s+)([A-Za-z0-9\-._~+/=]+)"),
-    re.compile(r"(postgresql|mysql)://[^\s'\";]+"),
+    re.compile(r"(?i)(authorization\s*:\s*(?:bearer\s+|basic\s+)?)([A-Za-z0-9\-._~+/=]{8,})"),
+    re.compile(r"(eyJ[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,})"),
+    re.compile(r"(?i)(mongodb(?:\+srv)?|postgresql|postgres|mysql|mssql|sqlserver|redis|sqlite):\/\/[^\s'\";]+"),
+    re.compile(r"(?i)(server\s*=\s*[^;]+;\s*(?:uid|user id)\s*=\s*[^;]+;\s*(?:pwd|password)\s*=\s*)([^;]+)"),
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"(?i)(groq_api_key|deepseek_api_key|openai_api_key|xai_api_key|grok_api_key\s*[:=]\s*)([^\s,;'\"]+)"),
 ]
 
 
@@ -99,14 +196,34 @@ def _redact_secrets(text: str) -> str:
     return out
 
 
-def _minimize_for_cloud(messages, max_chars: int = 6000):
+def _sanitize_for_log(value) -> str:
+    """Redact secrets and truncate before any logging/persistence.
+
+    Call on exception messages and payloads before they reach logs, traces,
+    or stored diagnostics. Redaction runs first; truncation second.
+    """
+    try:
+        text = value if isinstance(value, str) else str(value)
+    except Exception:
+        return "[unrenderable]"
+    redacted = _redact_secrets(text)
+    if len(redacted) > 500:
+        redacted = redacted[:500] + "…[truncated]"
+    return redacted
+
+
+def _minimize_for_cloud(messages, max_chars: int = 4000):
     """Data-minimize cloud payloads: redact secrets, bound size.
 
     Keeps schema metadata and the tail (usually the actual question) while
     truncating over-long middle content. Local provider path never calls this.
     """
     if isinstance(messages, str):
-        return _redact_secrets(messages)[:max_chars]
+        red = _redact_secrets(messages)
+        if len(red) > max_chars:
+            # Keep the tail (question usually lives at the end)
+            red = "…[context truncated]\n" + red[-(max_chars - 30):]
+        return red
     out = []
     for m in messages or []:
         if not isinstance(m, dict):
@@ -151,11 +268,11 @@ PROVIDERS = {
         "label": "Cloud LLM (Groq API)",
         "privacy": "Fast inference on Groq's LPU hardware, but your schema, queries and data samples are sent to the Groq API.",
         "models": {
-            "sql": "openai/gpt-oss-120b",
-            "story": "openai/gpt-oss-120b",
-            "suggest": "openai/gpt-oss-120b",
-            "semi": "openai/gpt-oss-120b",
-            "schema": "openai/gpt-oss-120b",
+            "sql": "llama-3.3-70b-versatile",
+            "story": "llama-3.3-70b-versatile",
+            "suggest": "llama-3.3-70b-versatile",
+            "semi": "llama-3.3-70b-versatile",
+            "schema": "llama-3.3-70b-versatile",
             "vision": "qwen/qwen3.6-27b",
         },
     },
@@ -181,6 +298,17 @@ PROVIDERS = {
             "vision": DEEPSEEK_VISION_MODEL,
         },
     },
+    "grok": {
+        "label": "Cloud LLM (Grok xAI API)",
+        "privacy": "Hosted xAI Grok inference (OpenAI-compatible). Your schema, queries, selected PDF evidence, and data samples may be sent to the xAI API.",
+        "models": {
+            "sql": GROK_MODEL,
+            "story": GROK_MODEL,
+            "suggest": GROK_MODEL,
+            "semi": GROK_MODEL,
+            "schema": GROK_MODEL,
+        },
+    },
 }
 
 GROQ_MODEL = PROVIDERS["cloud"]["models"]["sql"]
@@ -197,6 +325,10 @@ class LLMProvider:
     def __init__(self, provider="local", api_key=None, models=None, base_url=None):
         if provider not in PROVIDERS:
             raise ValueError(f"Unknown provider '{provider}'. Choose from {list(PROVIDERS)}")
+        # Provider-selection layer enforcement: constructing a hosted
+        # provider without backend consent fails closed (no network touched).
+        if provider != "local":
+            _require_cloud_consent(provider)
         self.provider = provider
         self.base_url = base_url
         self.models = dict(PROVIDERS[provider]["models"])
@@ -231,6 +363,14 @@ class LLMProvider:
             )
             if not self._cloud_client.api_key:
                 raise RuntimeError("Missing OMNIROUTE_API_KEY. Set it in .env or pass api_key.")
+        elif provider == "grok":
+            from openai import OpenAI
+            self._cloud_client = OpenAI(
+                api_key=api_key or os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY"),
+                base_url=base_url or GROK_BASE_URL,
+            )
+            if not self._cloud_client.api_key:
+                raise RuntimeError("Missing GROK_API_KEY (or XAI_API_KEY). Set it in .env or pass api_key.")
 
     # -- model lookup ---------------------------------------------------
 
@@ -259,6 +399,8 @@ class LLMProvider:
         model returns empty content for tiny probes). Local: tiny chat.
         Raises on failure with the underlying reason.
         """
+        if self.provider != "local":
+            _require_cloud_consent(self.provider)
         if self.provider == "local":
             out = self.chat("suggest",
                             messages=[{"role": "user", "content": "Reply with: OK"}],
@@ -346,27 +488,35 @@ class LLMProvider:
             raise
         except Exception as exc:
             logging.warning("LLMProvider.%s structured chat failed (%s): %s",
-                            self.provider, role, exc)
+                            self.provider, role, _sanitize_for_log(exc))
             raise
 
     # -- unified chat ---------------------------------------------------
 
-    def chat(self, role, messages, temperature=0.1, num_predict=400, timeout=None):
+    def chat(self, role, messages, temperature=0.1, num_predict=400, timeout=None,
+             user_id=None):
         """Send messages to the active backend for a given role (sql/story/suggest/semi).
 
         `timeout` is in seconds. If the call exceeds it, a TimeoutError is raised so
         the caller can fall back to a fast template instead of waiting indefinitely.
-        Defaults: 30s for cloud, 60s for local (fast 1.5B coder on CPU).
+        Defaults: 15s cloud, 30s local, 120s max for local story (never 900s).
+        A per-user rate-limit budget is enforced before any provider I/O.
         """
+        _llm_rate_limit(str(user_id or "default") + f":{role}")
         if timeout is None:
             if self.provider == "local" and role in ("story",):
-                # Slow local model on CPU: generous default, but an explicit
-                # timeout passed by the caller always wins (no hidden hang).
-                timeout = 900
+                # Bounded local story budget: 120s max. An explicit timeout
+                # passed by the caller always wins but is capped below.
+                timeout = 120
             else:
                 # Short, bounded timeouts so analytical queries respond quickly
                 # rather than blocking indefinitely on a slow LLM response.
                 timeout = 15 if self.provider != "local" else 30
+        timeout = min(int(timeout), 120) if self.provider == "local" else int(timeout)
+        if self.provider == "local" and _content_chars(messages) > _LLM_LOCAL_MINIMIZE_THRESHOLD:
+            # Same data-minimization as the cloud path (4000 chars/msg) when
+            # local context exceeds 24k chars: bounds memory/time on CPU.
+            messages = _minimize_for_cloud(messages)
         model = self.model_for(role)
         if not model:
             raise ValueError(f"No model configured for role '{role}'")
@@ -378,21 +528,30 @@ class LLMProvider:
         except TimeoutError:
             raise
         except Exception as exc:
-            logging.warning(f"LLMProvider.{self.provider} chat failed ({role}): {exc}")
+            logging.warning("LLMProvider.%s chat failed (%s): %s",
+                            self.provider, role, _sanitize_for_log(exc))
             raise
 
-    def complete(self, role, prompt, temperature=0.1, num_predict=400, timeout=None):
+    def complete(self, role, prompt, temperature=0.1, num_predict=400, timeout=None,
+                 user_id=None):
         """Generate a raw completion for `prompt`.
 
         Used for completion-only models (e.g. sqlcoder locally, which has no chat
         template and just echoes the prompt when driven through `chat()`). For the
         cloud backend the prompt is sent as a single user message.
+        Local timeouts are capped at 120s (never 900s); a per-user rate-limit
+        budget is enforced before any provider I/O.
         """
+        _llm_rate_limit(str(user_id or "default") + f":{role}")
         if timeout is None:
             if self.provider == "local" and role == "sql":
-                timeout = 900
+                timeout = 120
             else:
-                timeout = 30 if self.provider != "local" else 300
+                timeout = 30 if self.provider != "local" else 120
+        timeout = min(int(timeout), 120) if self.provider == "local" else int(timeout)
+        if self.provider == "local" and isinstance(prompt, str) \
+                and len(prompt) > _LLM_LOCAL_MINIMIZE_THRESHOLD:
+            prompt = _minimize_for_cloud(prompt)
         model = self.model_for(role)
         if not model:
             raise ValueError(f"No model configured for role '{role}'")
@@ -438,7 +597,8 @@ class LLMProvider:
         except TimeoutError:
             raise
         except Exception as exc:
-            logging.warning(f"LLMProvider.{self.provider} complete failed ({role}): {exc}")
+            logging.warning("LLMProvider.%s complete failed (%s): %s",
+                            self.provider, role, _sanitize_for_log(exc))
             raise
 
     def _complete_local(self, model, prompt, temperature, num_predict, timeout):
@@ -532,7 +692,7 @@ class LLMProvider:
                 pass
         return None
 
-    def _cloud_with_retry(self, fn, attempts=3):
+    def _cloud_with_retry(self, fn, attempts=2):
         """Call `fn` (a hosted API request) with a bounded retry for rate limits.
 
         Both clients are configured/used with retries disabled so a 429 never
@@ -623,11 +783,15 @@ def create_provider(provider="local", api_key=None, models=None, base_url=None):
     """Build an LLMProvider.
 
     Policy: never silently switch backend. If a hosted provider ('cloud',
-    'deepseek' or 'omniroute') is requested but its dependencies/key are
+    'deepseek', 'omniroute' or 'grok') is requested but its dependencies/key are
     missing, raise so the caller/user decides (no silent downgrade to local). Switching provider
     mid-session only happens through an explicit user action (see
     /api/provider/switch) — never automatically.
     """
+    # Provider-selection layer enforcement (fail closed before any import,
+    # client construction, or network I/O for hosted providers).
+    if provider != "local":
+        _require_cloud_consent(provider)
     if provider == "cloud":
         if not GROQ_AVAILABLE:
             raise RuntimeError(
@@ -661,5 +825,17 @@ def create_provider(provider="local", api_key=None, models=None, base_url=None):
         llm = LLMProvider("omniroute", api_key=api_key or os.getenv("OMNIROUTE_API_KEY"), models=models, base_url=base_url)
         if not llm._cloud_client.api_key:
             raise RuntimeError("Missing OMNIROUTE_API_KEY. Set it in .env or pass api_key.")
+        return llm
+    if provider == "grok":
+        try:
+            from openai import OpenAI  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "The Grok provider is unavailable because the 'openai' package is not "
+                "installed (pip install openai). Choose another provider."
+            )
+        llm = LLMProvider("grok", api_key=api_key or os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY"), models=models, base_url=base_url)
+        if not llm._cloud_client.api_key:
+            raise RuntimeError("Missing GROK_API_KEY (or XAI_API_KEY). Set it in .env or pass api_key.")
         return llm
     return LLMProvider("local", models=models)

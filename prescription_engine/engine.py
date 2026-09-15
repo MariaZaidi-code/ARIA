@@ -7,6 +7,7 @@ wording built deterministically from the evidence.
 
 import logging
 import math
+import re
 
 import numpy as np
 
@@ -64,6 +65,229 @@ _LOWER_BETTER_HINTS = ("cost", "expense", "churn", "loss", "debt", "risk",
                        "complaint", "return_rate", "defect", "delay")
 
 
+# --------------------------------------------------------------------------
+# Semantic roles + actionability (hyp.txt Response §§5-6). Generalized name
+# signals only — NEVER a hardcoded per-column check. Association is
+# evidence of association: only a lever passing semantic-role +
+# actionability validation may become a recommendation/scenario variable.
+# Reuses core/semantic.py and core/relational.py where they exist.
+# --------------------------------------------------------------------------
+
+# Recognized business-outcome vocabulary: higher values indicate
+# improvement. Generalized semantics (never lever→outcome pairs).
+_HIGHER_BETTER_HINTS = ("revenue", "revenues", "profit", "profits", "margin",
+                        "margins", "income", "sales", "conversion",
+                        "conversions", "retention", "satisfaction", "growth",
+                        "gain", "gains", "yield", "booking", "bookings",
+                        "demand", "attendance", "enrollment", "signup",
+                        "signups", "subscription", "subscriptions")
+
+# Telemetry/system measurement vocabulary: analytic signal, never a lever.
+_TECHNICAL_MEASURE_HINTS = (
+    "bytes", "byte_size", "millisecond", "milliseconds", "millisec",
+    "microsecond", "microseconds", "nanosecond", "nanoseconds",
+    "latency", "ping", "ttl", "cpu", "gpu", "memory", "heap",
+    "disk", "iops", "cache", "page_fault", "packet", "packets",
+    "bandwidth", "throughput", "payload", "query_time", "query_duration",
+    "execution_time", "exec_time", "response_time", "elapsed",
+    "duration_ms", "duration_sec", "duration_seconds", "wait_time",
+    "load_avg", "thread", "threads", "kernel", "uptime", "file_size",
+    "filesize", "memory_mb", "cpu_time", "io_wait", "network_io",
+)
+
+# Counters / storage internals: analytic metadata, never a lever.
+_SYSTEM_METADATA_HINTS = (
+    "row_count", "rowcount", "record_count", "num_rows", "counter",
+    "counters", "sequence", "seq_no", "seqno", "checksum", "encoding",
+    "encoded", "partition_key",
+)
+
+# Recognized business-measure vocabulary (generic, schema-agnostic).
+_BUSINESS_MEASURE_HINTS = (
+    "price", "pricing", "cost", "amount", "revenue", "profit", "margin",
+    "sales", "total", "payment", "spend", "spending", "budget", "discount",
+    "quantity", "qty", "inventory", "stock", "wage", "salary", "fee",
+    "rate", "pct", "percent", "ratio", "conversion", "retention",
+    "order", "orders", "booking", "demand", "supply", "volume", "traffic",
+    "freight", "fare", "tuition", "premium", "warranty",
+)
+
+# Roles that may (subject to the 8-point actionability check) become levers.
+LEVER_ROLES = frozenset({"BUSINESS_MEASURE", "MEASURE"})
+# Roles that can never be a recommendation outcome.
+NON_OUTCOME_ROLES = frozenset({"TECHNICAL_MEASURE", "SYSTEM_METADATA",
+                               "IDENTIFIER", "FOREIGN_KEY", "DATE_TIME",
+                               "UNKNOWN"})
+# Roles that can never be a lever/scenario variable.
+NON_LEVER_ROLES = frozenset({"TECHNICAL_MEASURE", "SYSTEM_METADATA",
+                             "IDENTIFIER", "FOREIGN_KEY", "DATE_TIME",
+                             "DIMENSION", "CATEGORY", "TEXT", "UNKNOWN"})
+
+# Canonical honest state when no legitimate business lever exists (§9).
+NO_SUPPORTED_SCENARIO = "No supported actionable scenario"
+
+
+def _name_tokens(name) -> list:
+    """Lowercase alphanumeric tokens of a column name (snake/camel safe)."""
+    parts = re.split(r"[^a-z0-9]+", str(name or "").lower())
+    toks: list = []
+    for p in parts:
+        toks.extend(re.findall(r"[a-z]+|[0-9]+", p))
+    return [t for t in toks if t]
+
+
+def _has_hint(name, hints) -> bool:
+    """Generalized vocabulary match: token equality for short hints,
+    substring for compound/long hints (len>=8 or containing '_').
+
+    Token equality keeps short signals precise (``ram`` never matches
+    ``program``; ``counter`` never matches ``encounter``).
+    """
+    low = str(name or "").lower()
+    toks = set(_name_tokens(low))
+    for h in hints:
+        h = str(h).lower()
+        if not h:
+            continue
+        if h in toks:
+            return True
+        if len(h) >= 8 or "_" in h:
+            if h in low:
+                return True
+    return False
+
+
+def classify_semantic_role(name, col_category="", *, is_pk=False,
+                           is_fk=False, is_join_key=False) -> str:
+    """Semantic role of a field (hyp.txt §5) — generalized, data-aware.
+
+    Returns one of: IDENTIFIER / FOREIGN_KEY / DATE_TIME / MEASURE /
+    BUSINESS_MEASURE / TECHNICAL_MEASURE / DIMENSION / CATEGORY / TEXT /
+    SYSTEM_METADATA / UNKNOWN. Reuses core/semantic.py and
+    core/relational.py signals where available; never a per-column check.
+    """
+    low = str(name or "")
+    cat = str(col_category or "").lower()
+    try:
+        from core.relational import is_ref_flavored as _is_ref
+        _ref = bool(_is_ref(name))
+    except Exception:
+        _ref = False
+    tail = low.lower().split("_")[-1] if low else ""
+    id_like = (_ref or tail in ("id", "key", "code", "no", "num", "uuid",
+                               "guid", "pk", "fk")
+               or low.lower() in ("id", "key", "code"))
+    if is_fk:
+        return "FOREIGN_KEY"
+    if is_pk or is_join_key and id_like:
+        return "IDENTIFIER"
+    if id_like:
+        return "IDENTIFIER"
+    if cat == "datetime" or any(h in low.lower() for h in _TIME_HINTS):
+        return "DATE_TIME"
+    if _has_hint(low, _TECHNICAL_MEASURE_HINTS):
+        return "TECHNICAL_MEASURE" if cat in ("numeric", "", "unknown",
+                                              "other") else "SYSTEM_METADATA"
+    if _has_hint(low, _SYSTEM_METADATA_HINTS):
+        return "SYSTEM_METADATA"
+    if cat == "numeric":
+        try:
+            from core.semantic import classify_semantic_type as _cst
+            _st = _cst(low, "")
+        except Exception:
+            _st = "measure"
+        if _st == "identifier":
+            return "IDENTIFIER"
+        if _has_hint(low, _BUSINESS_MEASURE_HINTS):
+            return "BUSINESS_MEASURE"
+        return "MEASURE"
+    if cat in ("text", "binary", "other", "", "unknown"):
+        try:
+            from core.semantic import classify_semantic_type as _cst2
+            _st2 = _cst2(low, "")
+        except Exception:
+            _st2 = "text"
+        if _st2 == "identifier":
+            return "IDENTIFIER"
+        if _st2 == "date":
+            return "DATE_TIME"
+        if _st2 == "category":
+            return "CATEGORY"
+        if _st2 == "geography":
+            return "DIMENSION"
+        return "TEXT"
+    return "UNKNOWN"
+
+
+def assess_actionability(lever_name, lever_role, control_level, *,
+                         metric_role=None, direction_known=False,
+                         has_evidence=False) -> dict:
+    """8-point business-actionability check (hyp.txt §6).
+
+    A variable becomes a recommendation/scenario lever ONLY if every
+    applicable check passes. Correlation alone (has_evidence without the
+    other gates) can never carry a lever.
+    """
+    failed, notes = [], []
+
+    def _need(ok: bool, code: str, note: str):
+        if not ok:
+            failed.append(code)
+            notes.append(note)
+
+    _need(lever_role in LEVER_ROLES, "business_concept",
+          f"'{lever_name}' is a {lever_role}, not a meaningful business concept.")
+    _need(control_level in ("controllable", "potentially_controllable"),
+          "controllable",
+          f"'{lever_name}' is not controllable or influenceable ({control_level}).")
+    _need(lever_role not in NON_LEVER_ROLES, "plausible_action",
+          f"Changing '{lever_name}' is not a plausible business action.")
+    if metric_role is not None:
+        _need(metric_role not in NON_OUTCOME_ROLES, "outcome_metric",
+              "No meaningful business outcome metric is attached to this driver.")
+    _need(bool(has_evidence), "evidence",
+          "No statistical evidence supports the driver→outcome relationship.")
+    _need(bool(direction_known), "justified_direction",
+          "The proposed direction of change is not justified.")
+    _need(bool(has_evidence and direction_known
+               and control_level in ("controllable", "potentially_controllable")
+               and (metric_role is None or metric_role not in NON_OUTCOME_ROLES)),
+          "not_correlation_only",
+          "Correlation alone cannot justify an intervention.")
+    # Check 8 (no invented assumption) holds structurally: direction is only
+    # ever 'known' via recognized outcome semantics or an explicitly
+    # recorded modeling assumption — never a silent generic rule.
+    return {"actionable": not failed, "failed": failed, "notes": notes}
+
+
+def _disp(raw):
+    """User-facing 'Human (raw)' label for refusal/diagnostic strings.
+
+    The humanized name is the primary label; the raw column name follows
+    in parentheses so logs, tests and technical readers can still match
+    the physical field. Findings prose uses humanize() alone instead.
+    """
+    from core.semantic import humanize as _h
+    h = _h(raw)
+    return f"{h} ({raw})" if h != str(raw) else str(raw)
+
+
+def _join_phrase(join_used) -> str | None:
+    """User-facing join provenance in business words.
+
+    Generic over any declared edge ("linked X records"); the raw
+    table.column path stays in the structured join/join_ref fields and
+    server logs, never as the primary label.
+    """
+    if not join_used:
+        return None
+    try:
+        from core.semantic import humanize as _h
+        return f"linked {_h(join_used[0])} records"
+    except Exception:
+        return "linked records"
+
+
 def classify_driver(name, col_category):
     """Return (level, reason) with level in controllable / potentially /
     segmentation / not_controllable."""
@@ -73,6 +297,14 @@ def classify_driver(name, col_category):
         return "not_controllable", "Time cannot be changed — ARIA can only prepare for it."
     if tail in ("id", "key", "code", "no") or low in ("id", "key", "code"):
         return "not_controllable", "Identifiers cannot be intervened on."
+    # Technical/system measurements and storage metadata describe the
+    # machinery, not the business — association only, never a lever (§§4-6).
+    # Generalized vocabulary (never per-column); checked BEFORE the
+    # controllable hints so e.g. an inventory-flavored cache counter can
+    # never slip through as actionable.
+    if _has_hint(name, _TECHNICAL_MEASURE_HINTS) or _has_hint(name, _SYSTEM_METADATA_HINTS):
+        return ("not_controllable",
+                "Technical/system measurements cannot be intervened on — association only, never a driver.")
     if any(h in low for h in _CONTROLLABLE_HINTS):
         return "controllable", "This driver can be set directly as an intervention."
     if any(h in low for h in _MAYBE_CONTROLLABLE):
@@ -86,11 +318,29 @@ def classify_driver(name, col_category):
 
 
 def improvement_up(metric):
-    """Assume higher metric is better unless the name says otherwise."""
+    """Validated improvement direction (hyp.txt §12) — never a silent
+    generic assumption.
+
+    Returns (up_better_or_None, basis). Direction is established ONLY from
+    recognized outcome semantics (higher-better / lower-better vocabulary)
+    or, for business-plausible metrics without recognized semantics, an
+    EXPLICITLY recorded modeling assumption (confidence is capped
+    downstream when the fallback is used). Technical/system fields have
+    unknown direction → None, which refuses the recommendation at the
+    call site instead of inventing one.
+    """
+    role = classify_semantic_role(metric, "numeric")
+    if role in NON_OUTCOME_ROLES:
+        return None, ("direction cannot be established for this field — it is "
+                      "not a business outcome, so no recommendation basis exists")
     low = (metric or "").lower()
     if any(h in low for h in _LOWER_BETTER_HINTS):
-        return False, "assumes lower values of this metric are preferable"
-    return True, "assumes higher values of this metric are preferable"
+        return False, "lower values indicate improvement for this outcome (recognized cost/risk semantics)"
+    if _has_hint(metric, _HIGHER_BETTER_HINTS):
+        return True, "higher values indicate improvement for this outcome (recognized outcome semantics)"
+    from core.semantic import humanize as _h
+    return True, (f"no outcome semantics recognized for {_h(metric)} — treating higher values as "
+                  "improvement as an explicit modeling assumption; confirm this matches your objective")
 
 
 # --------------------------------------------------------------------------
@@ -110,9 +360,12 @@ def _fetch_pairs(engine, dialect, table, col_a, col_b, filt=None, limit=SAMPLE_L
     if filt:
         where += f" AND {_safe_name(filt[0], dialect)} = :flt"
         params["flt"] = filt[1]
+    # Deterministic sample: ORDER BY the sampled columns so identical
+    # requests analyze identical rows (bare LIMIT is return-order dependent).
     return _exec(engine,
                  f"SELECT {_safe_name(col_a, dialect)}, {_safe_name(col_b, dialect)} "
                  f"FROM {_safe_name(table, dialect)} WHERE {where} "
+                 f"ORDER BY {_safe_name(col_a, dialect)}, {_safe_name(col_b, dialect)} "
                  f"LIMIT {int(limit)}", params)
 
 
@@ -138,9 +391,33 @@ def _pearson_p(r, n):
 
 
 def _spearman(x, y):
-    rx = np.argsort(np.argsort(x)).astype(float)
-    ry = np.argsort(np.argsort(y)).astype(float)
-    r = float(np.corrcoef(rx, ry)[0, 1]) if len(x) > 2 else 0.0
+    if len(x) < 3:
+        return 0.0, 1.0
+    if _SCIPY_OK:
+        rx = _st.rankdata(x, method='average')
+        ry = _st.rankdata(y, method='average')
+    else:
+        # numpy-only fallback: average ranks with tie-breaking
+        def _avg_rank(arr):
+            order = arr.argsort()
+            ranks = np.empty_like(order, dtype=float)
+            ranks[order] = np.arange(1, len(arr) + 1, dtype=float)
+            # average tied ranks
+            sorted_arr = arr[order]
+            i = 0
+            while i < len(sorted_arr):
+                j = i + 1
+                while j < len(sorted_arr) and sorted_arr[j] == sorted_arr[i]:
+                    j += 1
+                if j > i + 1:
+                    avg = np.arange(i + 1, j + 1, dtype=float).mean()
+                    for k in range(i, j):
+                        ranks[order[k]] = avg
+                i = j
+            return ranks
+        rx = _avg_rank(np.asarray(x, dtype=float))
+        ry = _avg_rank(np.asarray(y, dtype=float))
+    r = float(np.corrcoef(rx, ry)[0, 1])
     return r, _pearson_p(r, len(x))
 
 
@@ -231,17 +508,335 @@ def _score(fit, pct, control_level):
 
 
 # --------------------------------------------------------------------------
+# Canonical quality gate (§3): ONE function every decision surface uses.
+# Thresholds reuse the module's own bars (MIN_N, MIN_ABS_R); the two extra
+# effect floors are documented here, never invented per-call.
+# --------------------------------------------------------------------------
+MIN_REL_PCT = 5.0    # negligible-effect floor: |rel_pct| below this is noise
+MIN_COHENS_D = 0.2   # Cohen's "small" boundary: below this is NOT_ACTIONABLE
+CAUSATION_WARNING = ("Historical data shows an association; it does not establish "
+                     "that changing this variable will directly cause the predicted result.")
+
+
+def quality_gate(evidence: dict | None, *, require_baseline: bool = False) -> dict:
+    """Reject/downgrade weak evidence. Returns a code + reason, never a Decision.
+
+    Codes: OK | INSUFFICIENT_DATA | WEAK_SIGNAL | NOT_ACTIONABLE.
+    `evidence` is a plain dict (engine prescription evidence + impact +
+    confidence merged by the caller via gate_input_from_prescription).
+    """
+    ev = evidence if isinstance(evidence, dict) else {}
+
+    def _num(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        if f != f:  # NaN-safe
+            return None
+        return f
+
+    metric = ev.get("metric")
+    n = ev.get("n")
+    try:
+        n = int(n) if n is not None else None
+    except (TypeError, ValueError):
+        n = None
+    p = _num(ev.get("p_value"))
+    r = _num(ev.get("r") if ev.get("r") is not None else ev.get("effect_r"))
+    rel = _num(ev.get("rel_pct") if ev.get("rel_pct") is not None
+               else ev.get("effect_gap_pct"))
+    d = _num(ev.get("cohens_d"))
+    conf = str(ev.get("confidence") or "").strip().lower()
+    baseline = ev.get("baseline")
+    delta = ev.get("delta")
+    control = str(ev.get("control_level") or ev.get("control") or "").lower()
+
+    def _refuse(code, reason):
+        try:
+            from core.evidence import quality_gate_status as _qgs
+            _status = _qgs(code)
+        except Exception:
+            _status = "insufficient_evidence"
+        return {"pass": False, "code": code, "reason": reason,
+                "status": _status,
+                "evidence_quality": "Limited",
+                "confidence": ev.get("confidence") if ev.get("confidence") else "Limited"}
+
+    if not ev:
+        return _refuse("INSUFFICIENT_DATA", "No evidence was computed for this driver.")
+    if not metric:
+        return _refuse("INSUFFICIENT_DATA", "No measurable target metric is attached to this evidence.")
+    if ev.get("metric_reliable") is False:
+        return _refuse("INSUFFICIENT_DATA", "The target metric failed the reliability check.")
+    if n is None or n < MIN_N:
+        return _refuse("INSUFFICIENT_DATA",
+                       f"Only {n if n is not None else 0} usable observations — "
+                       f"at least {MIN_N} are needed.")
+    if p is None:
+        return _refuse("INSUFFICIENT_DATA", "No significance test supports this driver yet.")
+    if p >= 0.05:
+        return _refuse("WEAK_SIGNAL", f"Not statistically significant (p={p:.3f} ≥ 0.05).")
+    if r is not None and abs(r) < MIN_ABS_R:
+        return _refuse("WEAK_SIGNAL",
+                       f"Negligible association (|r|={abs(r):.2f} < {MIN_ABS_R:.2f}).")
+    if rel is not None and abs(rel) < MIN_REL_PCT:
+        return _refuse("NOT_ACTIONABLE",
+                       f"Negligible effect ({rel:+.1f}% < ±{MIN_REL_PCT:g}% materiality floor).")
+    if d is not None and abs(d) < MIN_COHENS_D:
+        return _refuse("NOT_ACTIONABLE",
+                       f"Tiny effect size (Cohen's d={d:.2f} < {MIN_COHENS_D:g}).")
+    if conf in ("", "unknown", "none"):
+        return _refuse("INSUFFICIENT_DATA",
+                       "Confidence is unquantified — no validated decision can be made.")
+    if ev.get("rank_consistent") is False:
+        return _refuse("WEAK_SIGNAL",
+                       "Unstable link — rank-based check disagrees with the linear fit.")
+    _sp = _num(ev.get("spearman_r"))
+    if r is not None and _sp is not None and abs(r - _sp) > 0.4:
+        return _refuse("WEAK_SIGNAL",
+                       f"Unstable link (Pearson {r:+.2f} vs Spearman {_sp:+.2f}).")
+    if control in ("not_controllable", "segmentation"):
+        return _refuse("NOT_ACTIONABLE",
+                       "This field describes groups; it cannot be moved as an intervention.")
+    if require_baseline:
+        try:
+            b = float(baseline) if baseline is not None else None
+        except (TypeError, ValueError):
+            b = None
+        try:
+            dl = float(delta) if delta is not None else None
+        except (TypeError, ValueError):
+            dl = None
+        if b is None:
+            return _refuse("INSUFFICIENT_DATA",
+                           "No measured baseline — the impact cannot be quantified.")
+        if dl is None and rel is None:
+            return _refuse("INSUFFICIENT_DATA",
+                           "Impact is unquantifiable — no modeled delta or relative change.")
+
+    quality = "Moderate"
+    try:
+        strong = (p < 0.01 and n >= 100 and
+                  ((r is not None and abs(r) >= 0.5) or (d is not None and abs(d) >= 0.8)))
+    except TypeError:
+        strong = False
+    if strong:
+        quality = "Strong"
+    try:
+        from core.evidence import quality_gate_status as _qgs2
+        _ok_status = _qgs2("OK")
+    except Exception:
+        _ok_status = "supported"
+    return {"pass": True, "code": "OK", "reason": None,
+            "status": _ok_status,
+            "evidence_quality": quality, "confidence": ev.get("confidence")}
+
+
+def gate_input_from_prescription(rec: dict, *, require_baseline: bool = True) -> dict:
+    """Merge one engine prescription into a quality_gate input dict."""
+    rec = rec if isinstance(rec, dict) else {}
+    ev = rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {}
+    imp = rec.get("impact") if isinstance(rec.get("impact"), dict) else {}
+    return {
+        "metric": rec.get("metric") or ev.get("metric"),
+        "n": ev.get("n"),
+        "p_value": ev.get("p_value"),
+        "r": ev.get("effect_r", ev.get("r")),
+        "effect_r": ev.get("effect_r", ev.get("r")),
+        "spearman_r": ev.get("spearman_r"),
+        "rank_consistent": ev.get("rank_consistent"),
+        "rel_pct": imp.get("rel_pct"),
+        "effect_gap_pct": ev.get("effect_gap_pct"),
+        "cohens_d": ev.get("cohens_d"),
+        "baseline": imp.get("baseline"),
+        "delta": imp.get("delta"),
+        "confidence": rec.get("confidence"),
+        "control_level": rec.get("control_level"),
+        "validation_method": ev.get("validation_method") or rec.get("validation_method"),
+    }
+
+
+def priority_score(rec: dict) -> tuple:
+    """Transparent Priority (0–100): Impact × Confidence × Urgency ×
+    Actionability × EvidenceQuality. Reuses this module's _score
+    components plus impact rel% + p/n. Returns (total, breakdown)."""
+    rec = rec if isinstance(rec, dict) else {}
+    ev = rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {}
+    imp = rec.get("impact") if isinstance(rec.get("impact"), dict) else {}
+    comps_in = rec.get("score_breakdown") if isinstance(rec.get("score_breakdown"), dict) else {}
+
+    def _num(v, default=0.0):
+        try:
+            f = float(v)
+            return f if f == f else default
+        except (TypeError, ValueError):
+            return default
+
+    rel = imp.get("rel_pct")
+    if rel is None:
+        rel = ev.get("effect_gap_pct")
+    impact_c = round(min(30.0, abs(_num(rel)) * 1.5), 1)                      # 0–30
+    conf = str(rec.get("confidence") or "").lower()
+    base = {"high": 20.0, "moderate": 12.0, "medium": 12.0, "low": 4.0}.get(conf, 0.0)
+    p = _num(ev.get("p_value"), 1.0)
+    bonus = 5.0 if p < 0.01 else (2.0 if p < 0.05 else 0.0)
+    confidence_c = round(min(25.0, base + bonus), 1)                          # 0–25
+    rp = str(rec.get("review_period") or "").lower()
+    if "2 week" in rp:
+        urgency_c = 10.0
+    elif "4 week" in rp:
+        urgency_c = 8.0
+    elif "quarter" in rp or "month" in rp:
+        urgency_c = 7.0
+    else:
+        urgency_c = 5.0                                                      # 0–10
+    atype = str(rec.get("action_type") or "").lower()
+    ctrl = _num(comps_in.get("controllability"), -1)
+    if atype == "scenario":
+        action_c = 20.0 if ctrl >= 15 else (14.0 if ctrl >= 9 else 10.0) if ctrl >= 0 else 12.0
+    elif atype == "investigate":
+        action_c = 10.0
+    elif atype == "qualitative":
+        action_c = 6.0
+    else:
+        action_c = 8.0                                                       # 0–20
+    try:
+        nn = int(ev.get("n")) if ev.get("n") is not None else 0
+    except (TypeError, ValueError):
+        nn = 0
+    evidence_c = round(min(15.0, min(10.0, nn / 50.0)
+                           + (5.0 if ev.get("rank_consistent") else 0.0)), 1)  # 0–15
+    comps = {"impact": impact_c, "confidence": confidence_c, "urgency": urgency_c,
+             "actionability": round(action_c, 1), "evidence_quality": evidence_c}
+    return min(100.0, round(sum(comps.values()), 1)), comps
+
+
+# ---------------------------------------------------------------------------
+# Model-layer deduplication (hyp §§16-17 + §22): finding + unordered
+# metric pair + scope + direction + analytical-basis identity — NEVER title
+# string matching.
+# "Test a 20% increase in Milliseconds" vs "Test a 45% increase in
+# Milliseconds" vs "Test a 45% increase in Bytes (other table, same story)"
+# share one key when the underlying finding is the same and collapse to the
+# highest-scoring card. Scenario variants (+20/+30/+45%) belong INSIDE the
+# surviving decision (`scenario_options`), not as cards. ONE finding → ONE
+# decision context.
+# §22: the pair is UNORDERED — "Milliseconds → Bytes" and
+# "Bytes → Milliseconds" are the same bidirectional correlation evaluated
+# in both directions and must collapse to one decision, never two cards.
+# ---------------------------------------------------------------------------
+def dedupe_key(rec: dict) -> tuple:
+    """Duplicate identity for one prescription/decision card."""
+    rec = rec if isinstance(rec, dict) else {}
+    ev = rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {}
+    imp = rec.get("impact") if isinstance(rec.get("impact"), dict) else {}
+    metric = rec.get("metric") or ev.get("metric")
+    driver = rec.get("driver") or ev.get("driver")
+    scope = rec.get("table") or ev.get("table")
+    try:
+        _pct = imp.get("driver_pct")
+        _pct = float(_pct) if _pct is not None else 0.0
+        direction = "up" if _pct > 0 else "down" if _pct < 0 else "flat"
+    except (TypeError, ValueError):
+        direction = "flat"
+    r = ev.get("effect_r", ev.get("r"))
+    try:
+        _r = float(r) if r is not None else None
+    except (TypeError, ValueError):
+        _r = None
+    gap = ev.get("effect_gap_pct")
+    try:
+        _gap = float(gap) if gap is not None else None
+    except (TypeError, ValueError):
+        _gap = None
+    if _r is not None:
+        basis = "pos" if _r > 0 else "neg" if _r < 0 else "none"
+    elif _gap is not None:
+        basis = "gap"
+    else:
+        basis = "none"
+    finding = rec.get("action_type") or rec.get("scenario_label") or ""
+    _m = str(metric or "").lower().strip()
+    _d = str(driver or "").lower().strip()
+    _pair = tuple(sorted([_m, _d]))
+    return (_pair,
+            str(scope or "").lower(), direction, basis,
+            str(finding or "").lower())
+
+
+def dedupe_prescriptions(recs: list) -> list:
+    """Collapse model-layer duplicates, keeping the highest score each."""
+    best, order = {}, []
+
+    def _score_of(r):
+        try:
+            return float((r or {}).get("priority_score",
+                                       (r or {}).get("score", 0)) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for r in (recs or []):
+        k = dedupe_key(r if isinstance(r, dict) else {})
+        if k not in best:
+            best[k] = r
+            order.append(k)
+        elif _score_of(r) > _score_of(best[k]):
+            best[k] = r
+    return [best[k] for k in order]
+
+
+# --------------------------------------------------------------------------
 # Orchestrator (§4 pipeline)
 # --------------------------------------------------------------------------
+def _join_key_cols(intel, table):
+    """Lowercased join-key columns touching `table` (declared edges + FKs).
+
+    Generalized: derived from the schema mapping, never column literals.
+    Join keys relate records; they are not business levers (§4).
+    """
+    keys = set()
+    try:
+        for e in ((intel.mapping or {}).get("relationship_edges") or []):
+            s, sc = e.get("source_table"), e.get("source_column")
+            t, tc = e.get("target_table"), e.get("target_column")
+            if s == table and sc:
+                keys.add(str(sc).lower())
+            if t == table and tc:
+                keys.add(str(tc).lower())
+    except Exception:
+        pass
+    try:
+        for c, _rt, _rc in intel.get_fks(table):
+            keys.add(str(c).lower())
+    except Exception:
+        pass
+    return keys
+
+
 def _usable_measures(intel, table):
+    """Numeric columns eligible as metric/lever candidates (§4).
+
+    Excludes, by generalized rule (never per-column literals): PKs, FKs,
+    join keys, identifier-like names, datetime-like names, technical
+    measurements, system metadata/counters/encodings. A numeric column
+    that merely CAN be increased/decreased is not automatically actionable
+    — semantic-role + actionability gates decide downstream.
+    """
     fks = {f[0].lower() for f in intel.get_fks(table)}
     pks = {p.lower() for p in intel.get_pk(table)}
+    join_keys = _join_key_cols(intel, table)
     out = []
     for c in intel.get_numeric_cols(table):
         low = c.lower()
-        if low in fks or low in pks:
+        if low in fks or low in pks or low in join_keys:
             continue
         if low.endswith(("_id", "_key", "_no", "_code")) or low in ("id", "key", "code"):
+            continue
+        role = classify_semantic_role(
+            c, "numeric", is_pk=(low in pks), is_fk=(low in fks),
+            is_join_key=(low in join_keys))
+        if role in NON_OUTCOME_ROLES or role in NON_LEVER_ROLES:
             continue
         out.append(c)
     return out
@@ -369,8 +964,12 @@ def _investigate_cands(engine, dialect, intel, table, metric, m_h,
             "rank": 0, "title": f"Investigate {d_h} performance for {m_h}: {top} vs {bottom}",
             "summary": (f"{m_h} differs across {d_h} ({top} averages {means[top]:,.1f} vs "
                         f"{bottom} at {means[bottom]:,.1f}, a {gap * 100:+.1f}% gap, p={p:.3f}). "
-                        f"Something about these groups drives the difference — find it before acting."),
+                        f"These groups are observed alongside the difference — association only, "
+                        f"so investigate the cause before acting."),
             "action_type": "investigate", "scenario_label": "investigate",
+            # hyp §13: a segment gap with no modeled intervention is an
+            # Insight (a meaningful interpretation), never an Opportunity.
+            "decision_type": "insight",
             "confidence": conf, "risk": "low",
             "risk_reasons": ["No intervention is modeled — this only directs investigation."],
             "score": round(min(60.0, abs(gap) * 100) + (15 if p < 0.01 else 8)
@@ -417,17 +1016,56 @@ def _investigate_response(inv, metric, table, m_h, priors):
     for i, c in enumerate(inv):
         c["rank"] = i + 1
     top = inv[0]
-    story = (f"No adjustable lever for {m_h} cleared the evidence bar, but "
-             f"{m_h} differs meaningfully across {top['evidence']['driver']} "
+    from core.semantic import humanize as _hh
+    story = (f"No adjustable driver for {m_h} cleared the evidence bar, but "
+             f"{m_h} differs meaningfully across {_hh(top['evidence']['driver'])} "
              f"({top['evidence']['effect_gap_pct']:+.1f}% gap). "
              f"Investigation is warranted before any intervention.")
+    # hyp.txt §10-11: investigate path carries real group evidence, so it
+    # must also carry a chart-ready spec (bar of group means). Never None
+    # when groups exist — _build_visual renders this without re-querying.
+    _viz = None
+    try:
+        _groups = top.get("evidence", {}).get("groups") or []
+        _rows = []
+        for g in _groups:
+            if not isinstance(g, dict):
+                continue
+            if g.get("label") is None or g.get("mean") is None:
+                continue
+            try:
+                _val = float(g.get("mean"))
+            except (TypeError, ValueError):
+                continue
+            if _val != _val:  # NaN-safe
+                continue
+            _rows.append({"name": str(g.get("label")), "value": _val})
+        if len(_rows) >= 2:
+            _title = f"{m_h} by {_hh(top['evidence']['driver'])}"
+            try:
+                from api.insights_routes import _normalize_chart_spec as _norm
+                _spec = _norm("bar", _rows[:200], _title)
+                if isinstance(_spec, dict) and not _spec.get("unsupported") \
+                        and not _spec.get("insufficient") and _spec.get("data"):
+                    _viz = {"type": "bar", "data": _spec["data"],
+                            "title": _spec.get("title") or _title,
+                            "x": _spec.get("x") or "name",
+                            "y": _spec.get("y") or "value"}
+                else:
+                    _viz = {"type": "bar", "data": _rows[:200],
+                            "title": _title, "x": "name", "y": "value"}
+            except Exception:
+                _viz = {"type": "bar", "data": _rows[:200],
+                        "title": _title, "x": "name", "y": "value"}
+    except (TypeError, ValueError):
+        _viz = None
     return {"ok": True, "success": True, "status": "completed",
             "analysis_id": f"rxa_{table}_{metric}_investigate",
             "metric": metric, "driver": top["evidence"]["driver"],
             "table": table, "driver_table": table, "join": None, "join_ref": None,
             "control": {"level": "investigation",
                         "reason": "No intervention modeled — evidence directs investigation."},
-            "auto_note": None, "fit": None, "evidence_viz": None,
+            "auto_note": None, "fit": None, "evidence_viz": _viz,
             "prescriptions": inv,
             "signals": {"supporting": 1,
                         "priors_origin": (priors or {}).get("origin")},
@@ -507,6 +1145,7 @@ def _fetch_joined(engine, dialect, mtable, mcol, otable, ocol, self_col, other_c
                  f"m.{_qi(self_col, dialect)} = o.{_qi(other_col, dialect)} "
                  f"WHERE o.{_qi(ocol, dialect)} IS NOT NULL "
                  f"AND m.{_qi(mcol, dialect)} IS NOT NULL "
+                 f"ORDER BY 1, 2 "
                  f"LIMIT {int(limit)}")
 
 
@@ -556,7 +1195,7 @@ def _dynamic_limitations(fit, scen, targeted, driver_h):
     return lim
 
 
-def _plain_summary(m_h, d_h, fit, rec, join_label=None):
+def _plain_summary(m_h, d_h, fit, rec, join_phrase=None):
     """Plain-English summary of the whole analysis — a normal person reads
     only this and understands what was tested, found, and recommended."""
     if rec.get("action_type") == "investigate":
@@ -565,27 +1204,27 @@ def _plain_summary(m_h, d_h, fit, rec, join_label=None):
         top_mean = gs[0]["mean"] if gs else "?"
         bot_mean = gs[-1]["mean"] if gs else "?"
         return (
-            f"We looked for an adjustable lever for {m_h.lower()} across "
+            f"We looked for an adjustable driver for {m_h.lower()} across "
             f"{ev.get('n', 0):,} rows but found no strong one. What we did find: "
             f"{ev.get('top')} averages {top_mean} vs "
             f"{ev.get('bottom')} at {bot_mean} "
             f"— a {ev.get('effect_gap_pct'):+.1f}% gap across {ev.get('driver')}. "
-            f"Our recommendation: {rec['title']}. Start by finding what drives the "
-            f"difference — a gap shows where to look, not what to change."
+            f"Our recommendation: {rec['title']}. Start by finding what is "
+            f"associated with the difference — a gap shows where to look, not what to change."
         )
     direction = "go up together" if fit["slope"] > 0 else "move in opposite directions"
     strength = ("strong" if abs(fit["r"]) >= 0.7 else "moderate" if abs(fit["r"]) >= 0.5 else "noticeable")
     r_imp = rec["impact"]
     m, d = m_h.lower(), d_h.lower()
     return (
-        f"We tested whether changing {d} moves {m}, using {fit['n']:,} rows of your data. "
-        f"It does: the two {direction} ({strength} link, r={fit['r']:+.2f})"
-        + (f", measured across the {join_label} link" if join_label else "")
+        f"We tested whether {d} is associated with {m}, using {fit['n']:,} rows of your data. "
+        f"The two {direction} ({strength} association, r={fit['r']:+.2f})"
+        + (f", measured {join_phrase}" if join_phrase else "")
         + ". "
         f"Our recommendation: {rec['title']}: "
         f"{m} would go from about {r_imp['baseline']:,.1f} to about {r_imp['scenario']:,.1f} "
         f"({r_imp['rel_pct']:+.1f}%), within a range of {r_imp['range'][0]:,.1f} to {r_imp['range'][1]:,.1f}. "
-        f"Confidence is {rec['confidence']}, risk is {rec['risk']} — and this is an association in past data, not proof it will work."
+        f"Confidence is {rec['confidence']}, risk is {rec['risk']} — and this is an association in past data, not a promise of future results."
     )
 
 
@@ -597,8 +1236,27 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
     priors = priors or {}
 
     # 1) Validate metric (§34/§35: schema-discovered, never assumed).
+    # hyp.txt §10-11: the metric must be a genuine business outcome,
+    # determined semantically (never hardcoded lever→outcome mappings). A
+    # technical/system measurement is analytic signal — strong correlations
+    # stay evidence, but no actionable recommendation is generated.
     measures = _usable_measures(intel, table)
     if metric not in measures:
+        if metric in intel.get_numeric_cols(table):
+            _mpks = {p.lower() for p in intel.get_pk(table)}
+            _mfks = {f[0].lower() for f in intel.get_fks(table)}
+            _mrole = classify_semantic_role(
+                metric, "numeric", is_pk=(metric.lower() in _mpks),
+                is_fk=(metric.lower() in _mfks),
+                is_join_key=(metric.lower() in _join_key_cols(intel, table)))
+            if _mrole in NON_OUTCOME_ROLES:
+                return {"ok": True, "success": True, "status": "no_prescription",
+                        "reason": (f"{_disp(metric)} is a {_mrole.lower().replace('_', ' ')} — useful for "
+                                   f"analysis, but ARIA does not turn associations involving technical/system "
+                                   f"measurements into actionable recommendations. Association is evidence of "
+                                   f"association, not evidence of an actionable driver."),
+                        "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                        "metric": metric, "table": table}
         return _fail(CODE_INVALID_METRIC,
                      f"ARIA couldn't find a measurable '{metric}' in this data.",
                      available_metrics=[{"table": table, "column": c} for c in measures[:8]])
@@ -614,7 +1272,28 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
     # Guards fail loudly with the reason — never a silent wrong-pair analysis.
     if driver and driver == metric:
         return _fail(CODE_INVALID_DRIVER,
-                     f"'{metric}' can't be both the target and the lever. Pick a different driver.")
+                     f"'{metric}' can't be both the target and the driver. Pick a different driver.")
+    # hyp.txt §§4-6: an explicitly requested driver still needs semantic
+    # actionability. A correlation with a technical/system field is supporting
+    # evidence ONLY — it never becomes a "Test X% increase" lever, no matter
+    # how strong the correlation is.
+    if driver and driver != "length_of_stay":
+        _dpks = {p.lower() for p in intel.get_pk(table)}
+        _dfks = {f[0].lower() for f in intel.get_fks(table)}
+        _dkeys = _join_key_cols(intel, table)
+        _dkind = _col_kind(intel, table, driver)
+        _drole = classify_semantic_role(
+            driver, _dkind or "numeric", is_pk=(str(driver).lower() in _dpks),
+            is_fk=(str(driver).lower() in _dfks),
+            is_join_key=(str(driver).lower() in _dkeys))
+        if _drole in NON_LEVER_ROLES:
+            return {"ok": True, "success": True, "status": "no_prescription",
+                    "reason": (f"{_disp(driver)} is a {_drole.lower().replace('_', ' ')} — ARIA keeps the "
+                               f"association with {_disp(metric)} as supporting evidence, but it cannot be "
+                               f"moved as an intervention. Association is evidence of association, not evidence "
+                               f"of an actionable driver."),
+                    "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                    "metric": metric, "driver": driver, "table": table}
     neighbors = _edge_neighbors(intel, table)
     auto_note = None
     if driver == "length_of_stay":
@@ -626,11 +1305,11 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
         if nights is None:
             return _fail(CODE_INSUFFICIENT_DATA,
                          "Not enough dated rows to measure stay length against "
-                         f"{metric}.")
+                         f"{_disp(metric)}.")
         f = fit_relationship(nights, ys)
         if not (f and abs(f["r"]) >= MIN_ABS_R and f["p_value"] < 0.05):
             return {"ok": True, "success": True, "status": "no_prescription",
-                    "reason": (f"ARIA measured stay length against {metric} but the link "
+                    "reason": (f"ARIA measured stay length against {_disp(metric)} but the link "
                                f"is too weak to justify an intervention."),
                     "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
                     "metric": metric, "table": table}
@@ -686,6 +1365,11 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                 if f and abs(f["r"]) >= MIN_ABS_R and f["p_value"] < 0.05:
                     best, best_fit, best_xy = "length_of_stay", f, (nights, ys)
     for c, join in cands:
+        # Self-correlation guard: a driver with the same name as the metric
+        # (even across a join, e.g. rooms.price vs bookings.price) correlates
+        # ~1.0 with itself and would render as "X moves with X". Never a lever.
+        if str(c).lower() == str(metric).lower():
+            continue
         if join is None and _col_kind(intel, table, c) != "numeric":
             continue
         try:
@@ -701,6 +1385,10 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
         except Exception:
             continue
         f = fit_relationship(xs, ys)
+        # Perfect correlation is a self-join/constant-column artifact, not a
+        # discovery (|r|>=0.999 cannot be a controllable lever).
+        if f and abs(f["r"]) >= 0.999:
+            continue
         if f and abs(f["r"]) >= MIN_ABS_R and f["p_value"] < 0.05:
             if best_fit is None or abs(f["r"]) > abs(best_fit["r"]):
                 best, best_fit, best_xy, best_join = c, f, (xs, ys), join
@@ -715,10 +1403,10 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                                  for c, j in cands
                                  if (j is not None or _col_kind(intel, table, c) == "numeric")})
         if not numeric_tested:
-            reason = (f"'{metric}' is the only measurable column reachable from {table} — "
+            reason = (f"{_disp(metric)} is the only measurable column reachable from {table} — "
                       f"there are no other numbers in your data to test as drivers.")
         else:
-            reason = (f"ARIA tested {', '.join(numeric_tested[:6])} against {metric} "
+            reason = (f"ARIA tested {', '.join(numeric_tested[:6])} against {_disp(metric)} "
                       f"({fit_n_total} usable rows) but found no relationship strong enough "
                       f"(need |r|≥0.30, p<0.05) to justify an intervention.")
         from core.semantic import humanize as _hz
@@ -736,8 +1424,8 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                   if join_used else None)
     driver_table = join_used[0] if join_used else table
     if not driver:
-        auto_note = (f"ARIA selected {driver_used} automatically as the strongest evidence-backed driver"
-                     + (f" (across the {join_label} link)." if join_label else "."))
+        auto_note = (f"ARIA selected {humanize(driver_used)} automatically as the strongest evidence-backed driver"
+                     + (f" (measured {_join_phrase(join_used)})." if join_used else "."))
     # Controllability is judged on the driver wherever it lives.
 
     # 3) Controllability gate (§8) — typed by the DRIVER's own table,
@@ -753,19 +1441,89 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
         if inv0:
             return _investigate_response(inv0, metric, table, _hg(metric), priors)
         return {"ok": True, "success": True, "status": "no_prescription",
-                "reason": (f"ARIA found a {control_level} pattern involving {driver_used}, "
+                "reason": (f"ARIA found a {control_level} pattern involving {_disp(driver_used)}, "
                            f"but the available data does not contain a controllable factor that can be "
                            f"reliably evaluated as an intervention. {control_reason}"),
                 "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
                 "metric": metric, "driver": driver_used, "table": table,
                 "evidence": {"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]}}
 
-    # 4) Improvement direction + candidates (§9).
+    # 4) Improvement direction + candidates (§9, hyp.txt §12).
+    # Directionality is validated, never generically assumed: unknown
+    # direction → no recommendation. The metric gate above already refuses
+    # technical/system outcomes; this is the structural backstop.
     up_better, up_assump = improvement_up(metric)
+    if up_better is None:
+        return {"ok": True, "success": True, "status": "no_prescription",
+                "reason": (f"ARIA cannot establish whether higher or lower values of {_disp(metric)} "
+                           f"are desirable ({up_assump}). Without a justified direction, no actionable "
+                           f"recommendation can be generated — the association stays supporting evidence only."),
+                "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "metric": metric, "driver": driver_used, "table": table,
+                "evidence": {"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]}}
+    # Explicit fallback assumption (no recognized outcome semantics): the
+    # recommendation is allowed for business-plausible metrics but carries
+    # capped confidence — the assumption is recorded, never silent.
+    _dir_fallback = up_assump.startswith("no outcome semantics")
+    # Full actionability verdict (§6): correlation + controllability +
+    # outcome + justified direction. Correlation alone never suffices.
+    _metric_role = classify_semantic_role(metric, "numeric")
+    _lever_role = classify_semantic_role(driver_used, _driver_kind or "numeric")
+    _gate = assess_actionability(driver_used, _lever_role, control_level,
+                                 metric_role=_metric_role,
+                                 direction_known=(up_better is not None),
+                                 has_evidence=True)
+    if not _gate["actionable"]:
+        from core.semantic import humanize as _hg2
+        inv0b = _investigate_cands(engine, dialect, intel, table, metric, _hg2(metric),
+                                   review=review, review_basis=review_basis)
+        if inv0b:
+            return _investigate_response(inv0b, metric, table, _hg2(metric), priors)
+        return {"ok": True, "success": True, "status": "no_prescription",
+                "reason": (f"{_disp(driver_used)} does not clear the actionability bar "
+                           f"({'; '.join(_gate['notes']) or 'unmet conditions'}). The association with "
+                           f"{_disp(metric)} stays supporting evidence only."),
+                "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "metric": metric, "driver": driver_used, "table": table,
+                "evidence": {"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]}}
     # Move the driver so the metric improves: sign = +1 means increase driver.
     move = 1 if ((fit["slope"] > 0) == up_better) else -1
     verb = "increase" if move > 0 else "reduction"
-    pcts = [5 * move, 10 * move, 15 * move]
+    # Preset sizes from the driver's OWN typical movement — never fixed
+    # percentages. Sized as fractions of one standard deviation of the
+    # observed driver values (0.25σ / 0.5σ / 1σ), clamped to the observed
+    # in-range maximum so conservative+recommended stay interpolations
+    # (green) and only stretch may extrapolate (amber). Absolute ceilings
+    # mirror the ±50% refusal boundary; they are safety rails, not findings.
+    _xs = np.asarray(best_xy[0], dtype=float) if best_xy else np.asarray([], dtype=float)
+    _xmean = float(_xs.mean()) if len(_xs) else fit["x_mean"]
+    _xstd = float(_xs.std()) if len(_xs) > 1 else 0.0
+    if not _xmean or not _xstd:
+        return {"ok": True, "success": True, "status": "no_prescription",
+                "reason": (f"Cannot compute scenario: driver '{humanize(driver_used)}' "
+                           f"has zero mean or zero variance in the observed data."),
+                "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "metric": metric, "driver": driver_used, "table": table,
+                "evidence": {"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]}}
+    _typical = abs(_xstd / _xmean * 100) if _xmean else 10.0
+    _edge = ((fit["x_max"] - _xmean) / abs(_xmean) * 100) if move > 0 else ((_xmean - fit["x_min"]) / abs(_xmean) * 100)
+    _edge = max(0.0, min(50.0, _edge if _edge == _edge else 0.0))  # NaN-safe
+    def _size(k, floor, ceil):
+        raw = _typical * k
+        raw = min(raw, _edge) if _edge > 0 else raw
+        return round(min(ceil, max(floor, raw)), 1)
+    pcts = [_size(0.25, 1.0, 10.0) * move, _size(0.5, 2.0, 20.0) * move,
+            _size(1.0, 5.0, 45.0) * move]
+    # Dedupe (flat data can collapse sizes) while preserving order.
+    seen, _uniq = set(), []
+    for _p in pcts:
+        if abs(_p) not in seen:
+            seen.add(abs(_p))
+            _uniq.append(_p)
+    while len(_uniq) < 3:
+        _grow = min(45.0, abs(_uniq[-1]) * 1.5 + 1.0)
+        _uniq.append(round(_grow, 1) * (1 if move > 0 else -1))
+    pcts = _uniq[:3]
     m_h, d_h = humanize(metric), humanize(driver_used)
 
     # Targeted variant (§10 segment analysis): weakest group headroom.
@@ -783,19 +1541,50 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
         scen = scenario_for_pct(fit, pct)
         rlvl, rreasons = risk_level(fit, pct, abs(fit["r"]))
         score, comps = _score(fit, pct, control_level)
-        label = ("conservative" if abs(pct) == 5 else
-                 "recommended" if abs(pct) == 10 else "aggressive")
-        title = (f"Test a {abs(pct)}% {verb} in {d_h}"
-                 + (f" for {targeted['value']}" if targeted and abs(pct) == 10 else ""))
+        # Labels from evidence order, not fixed sizes: smallest supported
+        # change, strongest-evidence change, largest (highest-uncertainty).
+        ordered_idx = sorted(range(len(pcts)), key=lambda k: abs(pcts[k]))
+        label = ("conservative" if i == ordered_idx[0]
+                 else "stretch" if i == ordered_idx[-1] else "recommended")
+        # NOTE (hyp.txt §8): this title template is emitted ONLY here —
+        # after the engine explicitly established controllability (§8 gate),
+        # a semantic business outcome (§10 gate), a justified direction
+        # (§12 gate), a measured baseline (scen["baseline"] from the fit),
+        # and a modeled calculation (OLS slope via scenario_for_pct). A
+        # bare correlation can never reach this line (gates above refuse
+        # first with "No supported actionable scenario" / no_prescription).
+        title = (f"Test a {abs(pct):g}% {verb} in {d_h}"
+                 + (f" for {targeted['value']}" if targeted and label == "recommended" else ""))
+        # Association is supporting evidence: the r/n observation stands,
+        # the direction basis is the validated one from improvement_up —
+        # never a generic "higher is better" assumption.
         why = (f"{m_h} is associated with {d_h} (r={fit['r']:+.2f}, n={fit['n']:,}); "
-               f"moving {d_h} {'up' if move > 0 else 'down'} points the metric toward improvement "
-               f"({up_assump}).")
+               f"moving {d_h} {'up' if move > 0 else 'down'} is modeled to move the metric "
+               f"toward improvement ({up_assump}). "
+               f"An association in past data is not proof the change would produce the result.")
+        _conf = ("moderate" if (fit["r"] > 0) != (fit["spearman_r"] > 0)
+                 or abs(fit["r"] - fit["spearman_r"]) > 0.4 else
+                 "high" if fit["p_value"] < 0.01 and fit["n"] >= 100 else
+                 "moderate" if fit["p_value"] < 0.05 else "low")
+        if _dir_fallback and _conf == "high":
+            _conf = "moderate"
         cands_out.append({
             "id": f"rx_{metric}_{driver_used}_{abs(pct)}",
             "rank": 0, "title": title, "summary": why,
             "action_type": "scenario", "scenario_label": label,
-            "confidence": ("high" if fit["p_value"] < 0.01 and fit["n"] >= 100 else
-                           "moderate" if fit["p_value"] < 0.05 else "low"),
+            # hyp §13 decision type: a validated scenario lever is an
+            # evidence-backed area worth considering (opportunity), unless
+            # the modeled risk is HIGH — then it is a risk worth
+            # considering. The supported action text is the
+            # Recommendation; what_to_consider is the Consideration.
+            # control_level is stamped so downstream quality/priority gates
+            # reuse the judged value instead of re-deriving it.
+            "decision_type": "risk" if rlvl.lower() == "high" else "opportunity",
+            "control_level": control_level,
+            # Rank/linear conflict caps confidence: when Pearson and Spearman
+            # disagree on direction or strength, the link is fragile.
+            # An explicit fallback direction assumption also caps at moderate.
+            "confidence": _conf,
             "risk": rlvl.lower(), "risk_reasons": rreasons,
             "score": score, "score_breakdown": comps,
             "evidence": {"metric": metric, "driver": driver_used, "table": table,
@@ -803,6 +1592,8 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                          "effect_r": fit["r"], "spearman_r": fit["spearman_r"],
                          "p_value": fit["p_value"], "n": fit["n"],
                          "slope": round(fit["slope"], 4),
+                         "rank_consistent": bool((fit["r"] > 0) == (fit["spearman_r"] > 0)
+                                                 and abs(fit["r"] - fit["spearman_r"]) <= 0.4),
                          "segment": targeted},
             "success_metric": {"metric": metric,
                                "direction": "increase" if up_better else "decrease",
@@ -818,6 +1609,13 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                        "range": [round(scen["range"][0], 2), round(scen["range"][1], 2)],
                        "driver_pct": pct,
                        "driver_value": round(scen["driver_value"], 3),
+                       # Observed-range evidence (generic: from this fit's data).
+                       # supported = inside observed driver range (green),
+                       # limited = outside it (amber). Refusal stays ±50%.
+                       "in_historical_range": scen["in_historical_range"],
+                       "range_status": ("supported" if scen["in_historical_range"] else "limited"),
+                       "observed": {"min": fit["x_min"], "max": fit["x_max"],
+                                    "mean": round(fit["x_mean"], 4)},
                        "labels": {"baseline": "OBSERVED", "scenario": "SIMULATED"}},
             "assumptions": [up_assump,
                             "Linear response estimated from historical data (slope "
@@ -832,23 +1630,47 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
     for i, c in enumerate(cands_out):
         c["rank"] = i + 1
     # Recommended = best tradeoff, not the biggest number (§12): prefer the
-    # highest-scoring candidate without HIGH risk.
+    # highest-scoring candidate without HIGH risk. Labels are relative to
+    # the evidence pick — never fixed percentages.
     rec = next((c for c in cands_out if c["risk"] in ("low", "medium")), cands_out[0])
+    _rec_pct = abs(rec["impact"]["driver_pct"])
     for c in cands_out:
         ap = abs(c["impact"]["driver_pct"])
         c["scenario_label"] = ("recommended" if c["id"] == rec["id"]
-                               else "conservative" if ap <= 5 else "aggressive")
-    # Investigate-type follow-ons round out the shortlist (max 5 total).
-    if len(cands_out) < 5:
-        inv = _investigate_cands(engine, dialect, intel, table, metric, m_h,
-                                 review=review, review_basis=review_basis)
-        for c in inv[:5 - len(cands_out)]:
-            c["rank"] = len(cands_out) + 1
-            cands_out.append(c)
+                               else "conservative" if ap < _rec_pct else "stretch")
+    # hyp §§16-17 ONE finding → ONE decision: the scenario variants computed
+    # above (+conservative/+recommended/+stretch) are NOT Decision Center
+    # cards. They travel INSIDE the single decision as `scenario_options`
+    # for the detail What-If experience (downstream of the validated
+    # decision, §32) — never as separate "Test 20% ..." / "Test 45% ..." cards.
+    rec["scenario_options"] = [
+        {"scenario_label": c["scenario_label"],
+         "driver_pct": c["impact"]["driver_pct"],
+         "driver_value": c["impact"]["driver_value"],
+         "baseline": c["impact"]["baseline"],
+         "scenario": c["impact"]["scenario"],
+         "delta": c["impact"]["delta"],
+         "rel_pct": c["impact"]["rel_pct"],
+         "range": c["impact"]["range"],
+         "risk": c["risk"],
+         "in_historical_range": c["impact"]["in_historical_range"]}
+        for c in cands_out[:3]
+    ]
+    pres = [rec]
+    # Investigate-type follow-ons are different findings (different driver /
+    # basis), so they may accompany the decision — capped, ranked after it.
+    inv = _investigate_cands(engine, dialect, intel, table, metric, m_h,
+                             review=review, review_basis=review_basis)
+    for c in inv[:4]:
+        c["rank"] = len(pres) + 1
+        pres.append(c)
+    for i, c in enumerate(pres):
+        c["rank"] = i + 1
 
-    story = (f"{m_h} moves with {d_h} (r={fit['r']:+.2f} over {fit['n']:,} observations"
-             + (f", across the {join_label} link" if join_label else "")
-             + f"). A tested {verb} in {d_h} is the most evidence-backed lever available.")
+    story = (f"{m_h} is associated with {d_h} (r={fit['r']:+.2f} over {fit['n']:,} observations"
+             + (f", measured {_join_phrase(join_used)}" if join_used else "")
+             + f"). A tested {verb} in {d_h} is the most evidence-backed driver available. "
+               f"An association in past data is not proof the change would produce the result.")
     # Bounded evidence sample for the scatter chart (never the full dump).
     _sxs, _sys = best_xy or ([], [])
     _idx = sorted(set(int(i) for i in np.linspace(0, max(0, len(_sxs) - 1), min(len(_sxs), 200))))
@@ -868,23 +1690,56 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                             "points": scatter,
                             "trend": {"slope": round(fit["slope"], 4),
                                       "intercept": round(fit["intercept"], 3)}},
-           "prescriptions": cands_out[:5],
+            "prescriptions": pres,
            "signals": {"supporting": 1 + (1 if (priors.get("evidence")) else 0),
                        "priors_origin": priors.get("origin")},
            "story": story,
-           "summary_plain": _plain_summary(m_h, d_h, fit, rec, join_label)}
+            "summary_plain": _plain_summary(m_h, d_h, fit, rec, _join_phrase(join_used))}
     return out
 
 
 def run_scenario(engine, dialect, intel, table, metric, driver, changes, filt=None,
                  join=None):
-    """Scenario engine (§27): read-only recompute. changes=[{field, operation,
+    """Scenario engine (§27, hyp.txt §9): read-only recompute. changes=[{field, operation,
     value}], filt=(field, value) equals on a dimension. join=(other_table,
-    self_col, other_col) across one declared edge for cross-table drivers."""
+    self_col, other_col) across one declared edge for cross-table drivers.
+
+    Never invents levers: a driver/metric that fails semantic-role +
+    actionability validation returns SCENARIO_UNSUPPORTED with the honest
+    "No supported actionable scenario" state instead of fabricating a
+    numeric projection."""
+    # hyp.txt §§4-6, §9: scenario variables must be legitimate business
+    # levers with a real outcome — determined semantically, never assumed
+    # from "numeric therefore movable".
+    _spks = {p.lower() for p in intel.get_pk(table)}
+    _sfks = {f[0].lower() for f in intel.get_fks(table)}
+    _skeys = _join_key_cols(intel, table)
+    if metric in intel.get_numeric_cols(table):
+        _smrole = classify_semantic_role(
+            metric, "numeric", is_pk=(metric.lower() in _spks),
+            is_fk=(metric.lower() in _sfks),
+            is_join_key=(metric.lower() in _skeys))
+        if _smrole in NON_OUTCOME_ROLES:
+            return _fail(CODE_SCENARIO_UNSUPPORTED,
+                         f"{NO_SUPPORTED_SCENARIO}: '{metric}' is a "
+                         f"{_smrole.lower().replace('_', ' ')}, not a business outcome ARIA can model.")
+    derived_stay = (driver == "length_of_stay")
+    if not derived_stay and driver in intel.get_numeric_cols(table):
+        _sdrole = classify_semantic_role(
+            driver, "numeric", is_pk=(str(driver).lower() in _spks),
+            is_fk=(str(driver).lower() in _sfks),
+            is_join_key=(str(driver).lower() in _skeys))
+        if _sdrole in NON_LEVER_ROLES:
+            return _fail(CODE_SCENARIO_UNSUPPORTED,
+                         f"{NO_SUPPORTED_SCENARIO}: '{driver}' is a "
+                         f"{_sdrole.lower().replace('_', ' ')}, not a controllable business driver.")
+        _slevel, _swhy = classify_driver(driver, "numeric")
+        if _slevel in ("not_controllable", "segmentation"):
+            return _fail(CODE_SCENARIO_UNSUPPORTED,
+                         f"{NO_SUPPORTED_SCENARIO}: '{driver}' cannot be moved as an intervention. {_swhy}")
     measures = _usable_measures(intel, table)
     if metric not in measures:
         return _fail(CODE_INVALID_METRIC, f"'{metric}' is not a measurable metric here.")
-    derived_stay = (driver == "length_of_stay")
     if join is not None:
         ot, sc, oc = join
         if (ot, sc, oc) not in _edge_neighbors(intel, table):
@@ -950,6 +1805,11 @@ def run_scenario(engine, dialect, intel, table, metric, driver, changes, filt=No
                         "delta": round(scen["delta"], 2),
                         "rel_pct": round(scen["rel_pct"], 2),
                         "range": [round(scen["range"][0], 2), round(scen["range"][1], 2)],
+                        "driver_value": round(scen["driver_value"], 3),
+                        "in_historical_range": scen["in_historical_range"],
+                        "range_status": ("supported" if scen["in_historical_range"] else "limited"),
+                        "observed": {"min": fit["x_min"], "max": fit["x_max"],
+                                     "mean": round(fit["x_mean"], 4)},
                         "risk": rlvl.lower(), "labels": {"baseline": "OBSERVED", "scenario": "SIMULATED"}})
     return {"ok": True, "success": True, "metric": metric, "driver": driver,
             "table": table, "segment": filt_t, "n": fit["n"],
@@ -1043,6 +1903,9 @@ def analyze_document(chunks, question, doc_name):
             "title": title,
             "summary": f"Passage from {doc_name}" + (f" (page {page})" if page else "") + " reads: “" + quote + "”",
             "action_type": "qualitative", "scenario_label": "qualitative",
+            # hyp §13: a cited passage is a Finding (an observed pattern),
+            # never an Opportunity — there is no measured lever behind it.
+            "decision_type": "finding",
             "confidence": "low", "risk": "medium",
             "risk_reasons": ["Text evidence only — strength cannot be quantified."],
             "score": round(10 + len(set(_doc_terms(text)) & qterms), 1),
@@ -1069,7 +1932,7 @@ def analyze_document(chunks, question, doc_name):
                                           "label": "Ask ARIA to dig into this passage further."},
         })
     story = (f"{doc_name} speaks to your question in {len(top)} passage(s). "
-             f"These are qualitative leads with citations — confirm them with numbers before acting.")
+              f"These are qualitative leads with citations — confirm them with numbers before acting.")
     return {"ok": True, "success": True, "status": "completed",
             "analysis_id": f"rxd_{abs(hash(doc_name)) % 10**8}",
             "document": doc_name, "metric": None, "driver": None, "table": None,
@@ -1080,3 +1943,84 @@ def analyze_document(chunks, question, doc_name):
                 f"We read {doc_name} for passages about your question and found "
                 f"{len(top)} relevant one(s). The top lead is: {recs[0]['title']}. "
                 f"Each card quotes its source passage — these are leads to verify, not measured effects.")}
+
+
+# ---------------------------------------------------------------------------
+# PHASE 10-11 Decision Center integration helpers (additive, no behavior change
+# to analyze/run_scenario). Existing engine stays the single recommendation +
+# scenario backend: these wrappers only validate + shape Decision payloads.
+# ---------------------------------------------------------------------------
+def recommendation_for_decision(decision: dict):
+    """Supported recommendation text for a validated Decision, else None.
+
+    Never returns the finding title. Never an LLM-only action: the text must
+    already come from the engine-produced prescription; this wrapper only
+    validates business_relevance + actionability + outcome + direction +
+    evidence (via quality_gate + semantic roles) and returns None when
+    unsupported.
+    """
+    d = decision if isinstance(decision, dict) else {}
+    raw = d.get("recommendation")
+    raw = raw.strip() if isinstance(raw, str) else None
+    title = d.get("title") if isinstance(d.get("title"), str) else ""
+    if raw and title and raw.strip().lower() == title.strip().lower():
+        return None
+    if not raw:
+        return None
+    ev = d.get("evidence")
+    items = ev if isinstance(ev, list) else ([ev] if ev else [])
+    stem = items[0] if items and isinstance(items[0], dict) else {}
+    probe = gate_input_from_prescription(
+        {"metric": d.get("metric"), "driver": d.get("driver"),
+         "evidence": stem, "impact": d.get("impact") or {},
+         "confidence": d.get("confidence"),
+         "control_level": d.get("control_level"),
+         "action_type": d.get("action_type")},
+        require_baseline=(str(d.get("action_type") or "").lower() == "scenario"))
+    gate = quality_gate(probe, require_baseline=(str(d.get("action_type") or "").lower() == "scenario"))
+    if not gate.get("pass"):
+        return None
+    metric = d.get("metric") or ""
+    driver = d.get("driver") or d.get("dimension") or ""
+    try:
+        if classify_semantic_role(metric, "numeric") in NON_OUTCOME_ROLES:
+            return None
+        if driver and classify_semantic_role(driver, "numeric") in NON_LEVER_ROLES:
+            return None
+    except Exception:
+        return None
+    if driver:
+        try:
+            level, _why = classify_driver(driver, "numeric")
+        except Exception:
+            return None
+        if level in ("not_controllable", "segmentation"):
+            return None
+    try:
+        up_better, _why = improvement_up(metric) if metric else (None, "no metric")
+    except Exception:
+        return None
+    if str(d.get("action_type") or "").lower() == "scenario" and up_better is None:
+        return None
+    return raw
+
+
+def scenario_supported_range(impact: dict | None):
+    """Backend-derived supported range for What-If (never hardcoded ±%).
+
+    Returns the observed {min, max, mean} frozen in the impact payload, or
+    None when the backend never measured one.
+    """
+    imp = impact if isinstance(impact, dict) else {}
+    obs = imp.get("observed")
+    if not isinstance(obs, dict):
+        return None
+    try:
+        lo = float(obs.get("min")) if obs.get("min") is not None else None
+        hi = float(obs.get("max")) if obs.get("max") is not None else None
+        mean = float(obs.get("mean")) if obs.get("mean") is not None else None
+    except (TypeError, ValueError):
+        return None
+    if lo is None or hi is None:
+        return None
+    return {"min": lo, "max": hi, "mean": mean}

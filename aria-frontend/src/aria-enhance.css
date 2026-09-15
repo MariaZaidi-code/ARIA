@@ -452,21 +452,10 @@ h4 {
   height: 7px;
   border-radius: 50%;
   background: #34d399;
-  box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.55);
-  animation: aria-pulse-dot 2.4s infinite;
 }
 
-@keyframes aria-pulse-dot {
-  0% {
-    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.45);
-  }
-  70% {
-    box-shadow: 0 0 0 7px rgba(52, 211, 153, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0);
-  }
-}
+/* Static status dots: connection state is carried by color + label, never by
+   looping animation. Loading spinners (Loader2) cover in-progress states. */
 
 .nav-section-label {
   margin: 24px 8px 8px;
@@ -1033,21 +1022,7 @@ h4 {
   box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.14);
 }
 
-.status-dot.connected {
-  animation: aria-pulse-dot-green 2.4s infinite;
-}
-
-@keyframes aria-pulse-dot-green {
-  0% {
-    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4);
-  }
-  70% {
-    box-shadow: 0 0 0 6px rgba(34, 197, 94, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0);
-  }
-}
+/* Connection dot is static — state shown via color/label, not motion. */
 
 .dashboard-source-status strong {
   font-size: 14px;
@@ -1795,26 +1770,8 @@ h4 {
   transform: translateY(0) scale(0.99);
 }
 
-.copilot-launcher::before {
-  content: "";
-  position: absolute;
-  inset: -4px;
-  border-radius: 44px;
-  background: linear-gradient(150deg, rgba(47, 106, 229, 0.5), rgba(124, 92, 224, 0.5));
-  z-index: -1;
-  animation: aria-launcher-ring 2.6s ease-out infinite;
-}
-
-@keyframes aria-launcher-ring {
-  0% {
-    opacity: 0.7;
-    transform: scale(1);
-  }
-  100% {
-    opacity: 0;
-    transform: scale(1.18);
-  }
-}
+/* No looping ring around the launcher: attention comes from placement and
+   the has-result state change, never from continuous motion. */
 
 .copilot-launcher-icon {
   font-size: 17px;
@@ -1826,8 +1783,6 @@ h4 {
   height: 8px;
   border-radius: 50%;
   background: #4ade80;
-  box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.5);
-  animation: aria-pulse-dot 2.4s infinite;
 }
 
 /* Launcher text (Ask ARIA / Insight ready) */
@@ -1947,7 +1902,6 @@ h4 {
   height: 7px;
   border-radius: 50%;
   background: #4ade80;
-  animation: aria-pulse-dot 2.2s infinite;
 }
 
 .copilot-close {
@@ -2175,13 +2129,8 @@ h4 {
   height: 7px;
   border-radius: 50%;
   background: var(--aria-accent);
-  animation: aria-blink 1s ease-in-out infinite;
-}
-
-@keyframes aria-blink {
-  50% {
-    opacity: 0.35;
-  }
+  /* Static active marker — step progress is shown by done/active/pending
+     state changes, never by a blinking loop. */
 }
 
 .copilot-step.pending .copilot-step-state {
@@ -2367,28 +2316,17 @@ h4 {
   height: 7px;
   border-radius: 50%;
   background: #a9b7d2;
-  animation: aria-typing 1.2s infinite ease-in-out;
+  opacity: 0.5;
+  /* Static dots — the staged AIProcessingIndicator carries live progress;
+     no bouncing loop. */
 }
 
 .copilot-typing-dot:nth-child(2) {
-  animation-delay: 0.15s;
+  opacity: 0.75;
 }
 
 .copilot-typing-dot:nth-child(3) {
-  animation-delay: 0.3s;
-}
-
-@keyframes aria-typing {
-  0%,
-  60%,
-  100% {
-    transform: translateY(0);
-    opacity: 0.5;
-  }
-  30% {
-    transform: translateY(-4px);
-    opacity: 1;
-  }
+  opacity: 1;
 }
 
 /* Composer */
@@ -2685,8 +2623,7 @@ h4 {
 
 .dashboard-status-indicator.connected {
   background: #22c55e;
-  box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5);
-  animation: aria-pulse-dot-green 2.4s infinite;
+  /* Static — connected state shown via color + label, not motion. */
 }
 
 .dashboard-status-row div {
@@ -3310,8 +3247,8 @@ h4 {
   top: 3%;
   width: 178px;
   padding: 16px 18px;
-  animation: aria-login-float-in 0.55s 0.32s ease both,
-    aria-login-drift-a 9s ease-in-out 1.4s infinite;
+  /* Entrance only — no ambient drift loop. */
+  animation: aria-login-float-in 0.55s 0.32s ease both;
 }
 
 .login-page--signin .login-kpi-value {
@@ -3342,8 +3279,7 @@ h4 {
   top: 24%;
   width: 224px;
   padding: 16px 18px 14px;
-  animation: aria-login-float-in 0.55s 0.44s ease both,
-    aria-login-drift-b 11s ease-in-out 1.8s infinite;
+  animation: aria-login-float-in 0.55s 0.44s ease both;
 }
 
 .login-page--signin .login-chart-svg {
@@ -3366,8 +3302,9 @@ h4 {
 
 .login-page--signin .login-chart-dot {
   fill: var(--login-accent);
+  /* Parked at the line end — no looping ride. */
   offset-path: path("M0 36 L26 30 L48 32 L74 15 L100 19 L140 6");
-  animation: aria-login-dot-ride 4.5s 1.2s linear infinite;
+  offset-distance: 100%;
 }
 
 /* Insight card — appears after the visualization */
@@ -3376,8 +3313,7 @@ h4 {
   bottom: 0;
   width: 206px;
   padding: 15px 18px;
-  animation: aria-login-float-in 0.55s 0.56s ease both,
-    aria-login-drift-c 13s ease-in-out 2.2s infinite;
+  animation: aria-login-float-in 0.55s 0.56s ease both;
 }
 
 .login-page--signin .login-float-tag {
@@ -3420,7 +3356,8 @@ h4 {
   line-height: 1;
   color: #ffffff;
   background: linear-gradient(150deg, var(--login-accent) 0%, #7c5ce0 100%);
-  animation: aria-login-focal-glow 5s ease-in-out infinite;
+  /* Static premium shadow — no glow loop. */
+  box-shadow: 0 14px 34px rgba(28, 56, 135, 0.5);
 }
 
 .login-page--signin .login-focal-ring {
@@ -3428,7 +3365,7 @@ h4 {
   inset: -12px;
   border-radius: 26px;
   border: 1px solid rgba(255, 255, 255, 0.16);
-  animation: aria-login-ring-breathe 6s ease-in-out infinite;
+  opacity: 0.8;
 }
 
 /* Data subtly flowing toward and away from the ✦ */
@@ -3458,14 +3395,14 @@ h4 {
   content: "";
   position: absolute;
   top: 50%;
-  left: -2px;
+  left: calc(100% - 2px);
   width: 4px;
   height: 4px;
   margin-top: -2px;
   border-radius: 50%;
   background: #f4f8ff;
-  box-shadow: 0 0 10px rgba(124, 92, 240, 0.9);
-  animation: aria-login-signal-travel 2.8s linear infinite;
+  opacity: 0.85;
+  /* Static endpoint marker — no travelling loop. */
 }
 
 /* Left bottom: features + footer */
@@ -3575,97 +3512,15 @@ h4 {
   }
 }
 
-/* ─── SUBTLE FLOATING MOTION (1–3px, slow, per-element) ─── */
-@keyframes aria-login-drift-a {
-  0%,
-  100% {
-    transform: translate3d(0, 0, 0);
-  }
-  50% {
-    transform: translate3d(0, -3px, 0);
-  }
-}
+/* ─── ENTRANCE-ONLY MOTION (one-shot; no ambient loops) ─── */
+/* Removed continuous loops (drift-a/b/c, focal-glow, ring-breathe, dot-ride,
+   signal-travel): all loop keyframes deleted so nothing on this page can
+   animate forever. Entrances (float-in, focal-in, chart-draw) run once. */
 
-@keyframes aria-login-drift-b {
-  0%,
-  100% {
-    transform: translate3d(0, 0, 0);
-  }
-  50% {
-    transform: translate3d(3px, -4px, 0);
-  }
-}
-
-@keyframes aria-login-drift-c {
-  0%,
-  100% {
-    transform: translate3d(0, 0, 0);
-  }
-  50% {
-    transform: translate3d(-2px, -3px, 0);
-  }
-}
-
-@keyframes aria-login-focal-glow {
-  0%,
-  100% {
-    box-shadow: 0 14px 34px rgba(28, 56, 135, 0.5);
-  }
-  50% {
-    box-shadow: 0 16px 44px rgba(28, 56, 135, 0.68);
-  }
-}
-
-@keyframes aria-login-ring-breathe {
-  0%,
-  100% {
-    transform: scale(1);
-    opacity: 0.8;
-  }
-  50% {
-    transform: scale(1.06);
-    opacity: 0.5;
-  }
-}
-
-/* ─── DATA ANIMATION ─── */
+/* ─── DATA ANIMATION (one-shot line draw; dot parked, no ride) ─── */
 @keyframes aria-login-chart-draw {
   to {
     stroke-dashoffset: 0;
-  }
-}
-
-@keyframes aria-login-dot-ride {
-  0% {
-    offset-distance: 0%;
-    opacity: 0;
-  }
-  10% {
-    opacity: 1;
-  }
-  90% {
-    opacity: 1;
-  }
-  100% {
-    offset-distance: 100%;
-    opacity: 0;
-  }
-}
-
-@keyframes aria-login-signal-travel {
-  0% {
-    left: -2px;
-    opacity: 0;
-  }
-  12% {
-    opacity: 0.95;
-  }
-  85% {
-    opacity: 0.95;
-  }
-  100% {
-    left: calc(100% - 2px);
-    opacity: 0;
   }
 }
 
@@ -4081,4 +3936,90 @@ h4 {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* =========================================================
+   A11Y APPENDIX (keyboard + screen-reader + low-vision)
+   Appended rules only — no existing rule above is modified.
+   ========================================================= */
+
+/* Table captions: data tables should render a <caption> as their accessible
+   name (announced by screen readers, visible heading for sighted users). */
+.analytics-data-table caption {
+  caption-side: top;
+  text-align: left;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--aria-text);
+  padding: 10px 12px 4px;
+}
+.analytics-data-table caption small {
+  display: block;
+  font-weight: 400;
+  color: var(--aria-muted);
+  font-size: 11.5px;
+  margin-top: 2px;
+}
+
+/* Visible keyboard focus rings on every interactive element (3px ring with
+   offset survives light and dark surfaces; never outline: none alone). */
+.nav-item:focus-visible,
+.app-chip:focus-visible,
+.app-icon-button:focus-visible,
+.app-profile-button:focus-visible,
+.app-profile-menu-item:focus-visible,
+.app-search-item:focus-visible,
+.primary-button:focus-visible,
+.connect-button:focus-visible,
+.disconnect-button:focus-visible,
+.file-select-button:focus-visible,
+.suggestion-item:focus-visible,
+.copilot-launcher:focus-visible,
+.copilot-chip:focus-visible,
+.copilot-close:focus-visible,
+.history-open-button:focus-visible,
+.history-save-button:focus-visible,
+.login-button:focus-visible,
+.register-login-link:focus-visible,
+.llm-select-button:focus-visible {
+  outline: 3px solid var(--aria-accent);
+  outline-offset: 2px;
+  border-radius: 10px;
+}
+
+/* Status is never color-only: badges pair color with an explicit text
+   icon so meaning survives monochrome / color-blind rendering. */
+.history-status-badge::before { content: "● "; }
+.analytics-ready-badge::before,
+.insight-ready-badge::before { content: "✓ "; font-weight: 800; }
+.goal-status-badge::before { content: "◆ "; }
+.status-dot { position: relative; }
+.status-dot::after {
+  /* Text fallback for dot-only indicators (overridden per-state by the
+     label text already rendered next to the dot in the shell). */
+  content: "";
+}
+
+/* Scroll regions keep visible, keyboard-operable scrollbars. The global
+   reset no longer hides scrollbars; these rules guarantee the key panes
+   always expose a perceivable scroll affordance. */
+.copilot-body,
+.app-search-results,
+.main-content {
+  scrollbar-width: thin;
+  scrollbar-color: #c9d3e6 transparent;
+}
+.copilot-body::-webkit-scrollbar,
+.app-search-results::-webkit-scrollbar,
+.main-content::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.copilot-body::-webkit-scrollbar-thumb,
+.app-search-results::-webkit-scrollbar-thumb,
+.main-content::-webkit-scrollbar-thumb {
+  background: #c9d3e6;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }

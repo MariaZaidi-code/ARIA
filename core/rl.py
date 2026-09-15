@@ -165,3 +165,19 @@ def load_recent_events(user_id: str | int, limit: int = 200, base_dir: Path | No
 def as_action(action_type: str, value: Any, **meta: Any) -> dict:
     """Build an extensible action dict for the RL action space."""
     return {"type": action_type, "value": value, **meta}
+
+
+def log_decision_activity(user_id: str | int, decision_id: str, event: str,
+                          detail: str = "", **extra: Any) -> None:
+    """PHASE 14: persisted decision activity (status/scenario/monitor events).
+
+    Thin wrapper over record_event with the decision action space. Never
+    stores raw datasets — decision_id + event + short detail only.
+    """
+    record_event(
+        user_id,
+        event=f"decision_{str(event)[:48]}",
+        state={"decision_id": str(decision_id)[:80]},
+        action={"detail": str(detail)[:160], **{k: v for k, v in extra.items()}},
+        outcome={},
+    )

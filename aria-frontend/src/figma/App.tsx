@@ -1,49 +1,75 @@
-import { createContext, useContext, useState, useEffect, useRef } from "react";
+import { createContext, useContext, useState, useEffect, useRef, lazy, Suspense } from "react";
 import type { ReactNode } from "react";
 import "./index.css";
 import "../aria-enhance.css";
 import AppShell from "./components/AppShell";
 import ErrorBoundary from "./components/ErrorBoundary";
 import Login from "./pages/Login";
-import LLMSelection from "./pages/LLMSelection";
-import Dashboard from "./pages/Dashboard";
-import AIAnalytics from "./pages/AIAnalytics";
-import Insights from "./pages/Insights";
-import Predictive from "./pages/Predictive";
-import Prescription from "./pages/Prescription";
-import Hypothesis from "./pages/Hypothesis";
-import Data from "./pages/Data";
-import Copilot from "./pages/Copilot";
-import Documents from "./pages/Documents";
-import History from "./pages/History";
-import Settings from "./pages/Settings";
+// Route pages are code-split: each hash route loads its own chunk on
+// first visit (vendor/charts/motion stay in shared manualChunks — see
+// vite.config.js). The hash router itself is untouched.
+const LLMSelection = lazy(() => import("./pages/LLMSelection"));
+const Dashboard = lazy(() => import("./pages/Dashboard"));
+const AIAnalytics = lazy(() => import("./pages/AIAnalytics"));
+const Insights = lazy(() => import("./pages/Insights"));
+const Predictive = lazy(() => import("./pages/Predictive"));
+const Intelligence = lazy(() => import("./pages/Intelligence"));
+const Data = lazy(() => import("./pages/Data"));
+const Copilot = lazy(() => import("./pages/Copilot"));
+const Documents = lazy(() => import("./pages/Documents"));
+const History = lazy(() => import("./pages/History"));
+const Settings = lazy(() => import("./pages/Settings"));
+function PageFallback() {
+  return (
+    <div className="p-6 max-w-screen-xl mx-auto" aria-busy="true" aria-label="Loading page">
+      <div className="rounded-2xl border border-border bg-card p-6 animate-pulse" aria-hidden>
+        <div className="h-4 w-40 rounded bg-secondary" />
+        <div className="mt-3 h-6 w-2/3 rounded bg-secondary" />
+        <div className="mt-4 h-40 rounded bg-secondary" />
+      </div>
+    </div>
+  );
+}
 import {
   connectDatabase,
   fetchSchema,
   analyzeQuestion,
   generateAnalyticsResult,
-  generateInsights,
   fetchSessionStatus,
   disconnectSource,
+  apiFetch,
 } from "../services/api";
-import {
-  clearAuthSession,
-  getAuthToken,
-  getAuthUser,
-} from "../utils/authStorage";
+import { clearAuthSession, getAuthUser } from "../utils/authStorage";
+import { KEYS, storage } from "../utils/storage";
+import { ToastProvider } from "../components/Toast";
 
 export type Page =
   | "dashboard"
   | "analytics"
   | "insights"
   | "predictive"
-  | "prescription"
-  | "hypothesis"
+  | "intelligence"
   | "data"
   | "documents"
   | "copilot"
   | "history"
   | "settings";
+
+const VALID_PAGES: Page[] = ["dashboard","analytics","insights","predictive","intelligence","data","documents","copilot","history","settings"];
+
+// Legacy aliases: "hypothesis" -> AI Analytics (the standalone Hypothesis
+// page was removed; its capability surfaces as Possible drivers inside
+// AI Analytics / Insights / Forecast). Old #/hypothesis hashes land on
+// analytics harmlessly.
+const normalizePage = (h: string): Page | null => {
+  if (h === "hypothesis") return "analytics";
+  return (VALID_PAGES as string[]).includes(h) ? (h as Page) : null;
+};
+
+const parseHash = (hash: string): Page | null => {
+  const h = (hash || "").replace(/^#\/?/, "");
+  return normalizePage(h.split("?")[0]);
+};
 
 type AppStage = "login" | "llm-selection" | "app";
 
@@ -71,14 +97,11 @@ export default function App() {
 
   // ---- Theme ----
   const [isDark, setIsDark] = useState(() => {
-    return localStorage.getItem("aria_theme") === "dark";
+    return storage.getString(KEYS.theme, "light") === "dark";
   });
   const [page, setPageState] = useState<Page>(() => {
-    const h = (window.location.hash || "").replace(/^#\/?/, "") as Page;
-    const valid: Page[] = ["dashboard","analytics","insights","predictive","prescription","hypothesis","data","documents","copilot","history","settings"];
-    return valid.includes(h) ? h : "dashboard";
+    return parseHash(window.location.hash) || "dashboard";
   });
-
   const setPage = (p: Page) => {
     setPageState(p);
     try {
@@ -88,9 +111,8 @@ export default function App() {
 
   useEffect(() => {
     const onHash = () => {
-      const h = (window.location.hash || "").replace(/^#\/?/, "") as Page;
-      const valid: Page[] = ["dashboard","analytics","insights","predictive","prescription","hypothesis","data","documents","copilot","history","settings"];
-      if (valid.includes(h)) setPageState(h);
+      const parsed = parseHash(window.location.hash);
+      if (parsed) setPageState(parsed);
     };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
@@ -98,49 +120,57 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", isDark);
-    localStorage.setItem("aria_theme", isDark ? "dark" : "light");
+    storage.set(KEYS.theme, isDark ? "dark" : "light");
   }, [isDark]);
 
-  // Validate any stored session on mount: a stale localStorage token must not
-  // skip login (audit BUG_REPORT 2026-09-07). Force login stage on 401/expired.
-  // Transient network errors keep the cached session (retry) instead of wiping it.
+  // Cookie auth: the session lives in the httpOnly `aria_token` cookie.
+  // On mount, probe the live backend session (credentials:include). 401
+  // forces login; network blips keep the current stage (pages retry).
+  // Also listen for centralized "aria:unauthorized" (any 401) to sign out.
   useEffect(() => {
+    const toLogin = () => {
+      clearAuthSession();
+      setCurrentUser(null);
+      setAppStage("login");
+    };
+    const onUnauthorized = () => toLogin();
+    window.addEventListener("aria:unauthorized", onUnauthorized);
     (async () => {
-      const token = localStorage.getItem("aria_auth_token");
-      if (!token) {
-        setAppStage("login");
-        return;
-      }
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 10000);
       try {
-        const parts = token.split(".");
-        if (parts.length === 3) {
-          const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
-          if (payload.exp && Date.now() / 1000 > payload.exp) {
-            clearAuthSession();
-            setCurrentUser(null);
-            setAppStage("login");
-            return;
-          }
-        }
-      } catch { /* fall through to server probe */ }
-      try {
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), 10000);
-        const res = await fetch("/api/session/status", {
-          headers: { Authorization: `Bearer ${token}` },
-          signal: ctrl.signal,
+        // Single client: apiFetch carries credentials + 401 cleanup.
+        // A 10s caller signal keeps the boot probe snappy; slower
+        // failures stay AbortErrors so blips never log the user out.
+        const body: any = await apiFetch("/session/status", { signal: ctrl.signal }).catch((e: any) => {
+          if (e?.status === 401) throw e;
+          return null;
         });
-        clearTimeout(t);
-        if (res.status === 401) {
-          clearAuthSession();
-          setCurrentUser(null);
-          setAppStage("login");
+        if (!body) return;
+        // Restore connection state from the live server session so a page
+        // reload does not drop every page to "Connect a data source" while
+        // the backend still holds the connection (connectionStatus is
+        // memory-only state and otherwise resets on each load).
+        if (body?.connection_status === "connected" || body?.display_state === "ready") {
+          if (body?.display_state === "schema-loading" || body?.schema_status === "pending") {
+            setConnectionStatus("schema-loading");
+          } else if (body?.display_state === "error" || body?.schema_status === "failed" || body?.schema_status === "empty") {
+            setConnectionStatus("error");
+          } else {
+            setConnectionStatus("connected");
+          }
+          if (body.db_name) setDbName(body.db_name);
+          if (body.source_type) setSelectedSourceType(body.source_type);
         }
-      } catch {
-        // Backend blip/offline: keep cached session so a flaky network
-        // does not log the user out. Pages will surface retry states.
+      } catch (e: any) {
+        // 401 returns to login; blips/offline keep the current stage so
+        // a flaky network does not log the user out. Pages retry.
+        if (e?.status === 401) toLogin();
+      } finally {
+        clearTimeout(t);
       }
     })();
+    return () => window.removeEventListener("aria:unauthorized", onUnauthorized);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -198,23 +228,23 @@ export default function App() {
 
   const handleLLMSelect = async (mode: string, apiKey?: string) => {
     setSelectedLLM(mode);
-    localStorage.setItem("aria_llm_mode", mode);
+    storage.set(KEYS.llmMode, mode);
     // Materialize the choice server-side so the session provider matches
     // the UI immediately (prevents "choose an LLM provider" right after).
     // Provider isolation: the Groq key is sent ONLY when Cloud is selected;
     // Local AI switches keyless and never touches stored keys.
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      const res = await fetch("/api/provider/switch", {
+      await apiFetch("/provider/switch", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token || ""}` },
         body: JSON.stringify(mode === "cloud" && apiKey ? { provider: mode, api_key: apiKey } : { provider: mode }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data?.detail || `Could not switch to ${mode}.`);
-      }
     } catch (err: any) {
+      if (err?.status === 401) {
+        clearAuthSession();
+        setCurrentUser(null);
+        setAppStage("login");
+        throw new Error("Session expired. Please sign in again.");
+      }
       // Surface the failure so the user knows the switch did not happen.
       throw new Error(err?.message || `Could not switch to ${mode}.`);
     }
@@ -232,19 +262,21 @@ export default function App() {
           // Load schema directly (skip extraction) when reconnecting so the
           // Data section never shows "pending" — the DB was never disconnected.
           try {
-            const token = localStorage.getItem("aria_auth_token");
-            const res = await fetch("/api/schema", {
-              headers: { Authorization: `Bearer ${token || ""}` },
-            });
-            const schemaJson = await res.json();
-            if (res.ok && schemaJson?.ok && schemaJson.schema) {
+            const schemaJson: any = await apiFetch("/schema");
+            if (schemaJson?.ok && schemaJson.schema) {
               setSchemaData(schemaJson.schema);
               setSchemaStatus("success");
             } else {
               setSchemaStatus("idle");
               setSchemaData(null);
             }
-          } catch {
+          } catch (e: any) {
+            if (e?.status === 401) {
+              clearAuthSession();
+              setCurrentUser(null);
+              setAppStage("login");
+              return;
+            }
             setSchemaStatus("idle");
             setSchemaData(null);
           }
@@ -255,16 +287,13 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
-    const token = getAuthToken();
-    if (token) {
-      try {
-        await fetch("/api/auth/logout", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}` },
-        });
-      } catch {
-        // Clear the local session even when the server is unavailable.
-      }
+    try {
+      await apiFetch("/auth/logout", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+    } catch {
+      // Clear the local session even when the server is unavailable.
     }
     clearAuthSession();
     setCurrentUser(null);
@@ -284,9 +313,44 @@ export default function App() {
   // =========================================================
   // CONNECTION HANDLER
   // =========================================================
+  // P3 §19: Disconnected/Connecting/Connected/Schema-loading/Ready/Error
+  // reflect GET /api/session/status (backend truth), never button success
+  // alone. "connected" is kept as the canonical ready value so existing
+  // pages (`=== "connected"`) keep working; "ready" is normalized to it.
+
+  const refreshConnectionFromBackend = async () => {
+    try {
+      const st = await fetchSessionStatus();
+      const body: any = (st as any)?.data || {};
+      const display = body?.display_state || body?.connection_status || "";
+      const schemaSt = body?.schema_status || "";
+      if (display === "ready" || body?.connection_status === "connected") {
+        if (schemaSt === "pending" || display === "schema-loading") {
+          setConnectionStatus("schema-loading");
+        } else {
+          setConnectionStatus("connected");
+        }
+        if (body.db_name) setDbName(body.db_name);
+        if (body.source_type) setSelectedSourceType(body.source_type);
+        return "connected";
+      }
+      if (display === "schema-loading") {
+        setConnectionStatus("schema-loading");
+        return "schema-loading";
+      }
+      if (display === "error") {
+        setConnectionStatus("error");
+        return "error";
+      }
+      return display || "not-connected";
+    } catch {
+      return null;
+    }
+  };
 
   const handleConnect = async (details: any) => {
     setConnectionError("");
+    setConnectionStatus("connecting");
     try {
       const result = await connectDatabase(details);
       if (result?.success) {
@@ -295,10 +359,18 @@ export default function App() {
         setSelectedSourceType("relational");
         // Auto-fetch schema after connect
         await handleSchemaFetch();
+        // Verify against backend truth; downgrade to error when the
+        // server reports empty/failed schema instead of staying "connected".
+        const verified = await refreshConnectionFromBackend();
+        if (verified === "error") {
+          setConnectionError("Connected, but schema extraction returned no usable tables. Check the schema/database selection, then retry.");
+        }
       } else {
+        setConnectionStatus("error");
         setConnectionError(result?.message || "Connection failed");
       }
     } catch (err: any) {
+      setConnectionStatus("error");
       setConnectionError(err?.message || "Connection failed");
     }
   };
@@ -318,19 +390,23 @@ export default function App() {
 
   const handleSchemaFetch = async () => {
     setSchemaStatus("loading");
+    setConnectionStatus((prev) => (prev === "connected" || prev === "error" ? "schema-loading" : prev));
     setSchemaError("");
     try {
       const result = await fetchSchema();
       if (result?.success) {
         setSchemaData(result?.data || null);
         setSchemaStatus("success");
+        setConnectionStatus((prev) => (prev === "schema-loading" ? "connected" : prev));
       } else {
         setSchemaError("Failed to fetch schema");
         setSchemaStatus("error");
+        setConnectionStatus("error");
       }
     } catch (err: any) {
       setSchemaError(err?.message || "Schema fetch failed");
       setSchemaStatus("error");
+      setConnectionStatus("error");
     }
   };
 
@@ -342,29 +418,46 @@ export default function App() {
     const file = selectedFile;
     if (!file) return;
     setConnectionError("");
+    setConnectionStatus("connecting");
     try {
       const formData = new FormData();
       formData.append("file", file);
       formData.append("provider", selectedLLM || "local");
       
-      const token = localStorage.getItem("aria_auth_token");
-      let url = sourceType === 'csv' ? '/api/connect_file' : (sourceType === 'pdf' ? '/api/connect_pdf' : `/api/connect_${sourceType}`);
-      const res = await fetch(url, {
+      let path = sourceType === 'csv' ? `/connect_file` : (sourceType === 'pdf' ? `/connect_pdf` : `/connect_${sourceType}`);
+      const data: any = await apiFetch(path, {
         method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
         body: formData,
+      }).catch((e: any) => {
+        if (e?.status === 401) {
+          clearAuthSession();
+          setCurrentUser(null);
+          setAppStage("login");
+          setConnectionStatus("error");
+          setConnectionError("Session expired. Please sign in again.");
+          return { __handled401: true };
+        }
+        throw e;
       });
-      const data = await res.json();
+      if ((data as any)?.__handled401) return;
+      if (!data) {
+        setConnectionStatus("error");
+        setConnectionError("File upload failed");
+        return;
+      }
       if (data.ok) {
         // After successful file connect, fetch schema and mark connected
+        setConnectionStatus("schema-loading");
         await handleSchemaFetch();
         setConnectionStatus("connected");
         setDbName(data?.table || data?.file || file.name.replace(/\.[^.]+$/, ""));
         setSelectedSourceType(data?.source_type || "semi-structured");
       } else {
+        setConnectionStatus("error");
         setConnectionError(data?.message || "File upload failed");
       }
     } catch (err: any) {
+      setConnectionStatus("error");
       setConnectionError(err?.message || "File upload failed");
     }
   };
@@ -389,7 +482,7 @@ export default function App() {
       const result = await analyzeQuestion(q, selectedLLM, {
         sourceType: selectedSourceType,
         dbName,
-      }, multiTurnContext, { signal: controller.signal });
+      }, multiTurnContext as any, { signal: controller.signal });
       if (controller.signal.aborted) return;
       if (result?.success) {
         setGoalResult(result?.data || null);
@@ -415,26 +508,9 @@ export default function App() {
   };
 
   // =========================================================
-  // INSIGHT HANDLER
+  // INSIGHT STATE (populated by GET /api/insights inside the Insights page;
+  // the legacy POST /api/insight retry was removed — Refresh re-analyzes.)
   // =========================================================
-
-  const handleInsightRetry = async () => {
-    setInsightStatus("loading");
-    setInsightError("");
-    try {
-      const result = await generateInsights(goalResult, analysisResult);
-      if (result?.success) {
-        setInsightResult(result?.data || null);
-        setInsightStatus("success");
-      } else {
-        setInsightStatus("error");
-        setInsightError(result?.message || "Insight generation failed");
-      }
-    } catch (err: any) {
-      setInsightStatus("error");
-      setInsightError(err?.message || "Insight generation failed");
-    }
-  };
 
   // =========================================================
   // COPILOT HANDOFF (page isolation rule)
@@ -473,11 +549,18 @@ export default function App() {
   }
 
   if (appStage === "llm-selection") {
-    return <LLMSelection onSelectLLM={handleLLMSelect} />;
+    return (
+      <Suspense fallback={<PageFallback />}>
+        <LLMSelection onSelectLLM={handleLLMSelect} />
+      </Suspense>
+    );
   }
 
   return (
     <ThemeContext.Provider value={{ isDark, toggleTheme, page, setPage }}>
+      {/* ToastProvider mounts the toast region: figma/pages/Documents.tsx
+          already calls useToast(), which throws without a provider. */}
+      <ToastProvider>
       <AppShell
         user={currentUser}
         selectedLLM={selectedLLM}
@@ -485,7 +568,7 @@ export default function App() {
         onChangeLLM={() => setAppStage("llm-selection")}
         onSignOut={handleSignOut}
       >
-        {wrapPage(page, (() => {
+        <div key={page} className="page-enter"><Suspense fallback={<PageFallback />}>{wrapPage(page, (() => {
           switch (page) {
             case "dashboard":
               return (
@@ -510,6 +593,8 @@ export default function App() {
                   goalResult={goalResult}
                   goalError={goalError}
                   loading={loading}
+                  onNavigate={(p) => setPage(p as Page)}
+                  onAskCopilot={goCopilot}
                 />
               );
             case "insights":
@@ -524,22 +609,8 @@ export default function App() {
               );
             case "predictive":
               return <Predictive insightResult={insightResult} goalResult={goalResult} connectionStatus={connectionStatus} />;
-            case "prescription":
-              return (
-                <Prescription
-                  insightResult={insightResult}
-                  connectionStatus={connectionStatus}
-                  onAskQuestion={goCopilot}
-                />
-              );
-            case "hypothesis":
-              return (
-                <Hypothesis
-                  insightResult={insightResult}
-                  onAskQuestion={goCopilot}
-                  connectionStatus={connectionStatus}
-                />
-              );
+            case "intelligence":
+              return <Intelligence connectionStatus={connectionStatus} onAskCopilot={goCopilot} />;
             case "data":
               return (
                 <Data
@@ -584,10 +655,10 @@ export default function App() {
                 <Settings
                   selectedLLM={selectedLLM}
                   onChangeLLM={() => setAppStage("llm-selection")}
-                  onProviderSwitched={(p) => {
-                    setSelectedLLM(p);
-                    localStorage.setItem("aria_llm_mode", p);
-                  }}
+                   onProviderSwitched={(p) => {
+                     setSelectedLLM(p);
+                     storage.set(KEYS.llmMode, p);
+                   }}
                   user={currentUser}
                   connectionStatus={connectionStatus}
                   dbName={dbName}
@@ -597,8 +668,9 @@ export default function App() {
             default:
               return null;
           }
-        })())}
+        })())}</Suspense></div>
       </AppShell>
+      </ToastProvider>
     </ThemeContext.Provider>
   );
 }

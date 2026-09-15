@@ -147,6 +147,68 @@ def check_default_db():
         }
 
 
+def check_shared_store():
+    """Report multi-worker shared-store readiness (sessions + rate limits).
+
+    Info-only: ok=False when workers > 1 without ARIA_REDIS_URL (sessions
+    diverge per-process, rate limits are per-process). Never raises; Redis
+    reachability is best-effort with a short timeout.
+    """
+    workers = 1
+    for var in ("ARIA_WORKERS", "WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        try:
+            n = int(os.getenv(var, "1") or 1)
+            if n > workers:
+                workers = n
+        except (TypeError, ValueError):
+            continue
+    redis_url = (os.getenv("ARIA_REDIS_URL", "") or "").strip()
+    require_shared = (os.getenv("ARIA_REQUIRE_SHARED_STORE", "0") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    store = (os.getenv("ARIA_RATE_LIMIT_STORE", "memory") or "memory").strip().lower()
+    if (not store or store == "memory") and redis_url:
+        store = "redis"
+    reachable = None
+    detail = ""
+    if redis_url:
+        try:
+            import redis as _redis_mod  # type: ignore
+
+            try:
+                _client = _redis_mod.StrictRedis.from_url(
+                    redis_url, decode_responses=True,
+                    socket_connect_timeout=2, socket_timeout=2,
+                )
+                _client.ping()
+                reachable = True
+                detail = f"shared store reachable (workers={workers}, store={store})"
+            except Exception as exc:
+                reachable = False
+                detail = f"ARIA_REDIS_URL set but unreachable: {type(exc).__name__}"
+        except ImportError:
+            reachable = False
+            detail = "ARIA_REDIS_URL set but 'redis' package missing (pip install redis)"
+    else:
+        if workers > 1:
+            detail = (
+                f"{workers} workers without ARIA_REDIS_URL: sessions/rate limits "
+                "are per-process (set ARIA_REDIS_URL for production)"
+            )
+        else:
+            detail = f"single worker (workers={workers}, store={store}); file/memory stores ok"
+    ok = True if (workers <= 1 or redis_url) else False
+    return {
+        "workers": workers,
+        "redis_configured": bool(redis_url),
+        "redis_reachable": reachable,
+        "require_shared": require_shared,
+        "store": store,
+        "ok": ok,
+        "detail": detail,
+    }
+
+
 def run_checks():
     """Aggregate all checks into one dict for /api/health and the CLI."""
     install = check_install()
@@ -157,6 +219,7 @@ def run_checks():
         "env": env,
         "ollama": check_ollama(),
         "default_db": check_default_db(),
+        "shared_store": check_shared_store(),
         "critical": install["missing_required"],
     }
 
@@ -181,6 +244,12 @@ def _format_report(report):
     lines.append("")
     lines.append(f"Ollama:  {report['ollama']['detail']}")
     lines.append(f"Default DB: {report['default_db']['detail']}")
+    try:
+        _ss = report.get("shared_store") or {}
+        if _ss.get("detail"):
+            lines.append(f"Shared store: {_ss.get('detail')}")
+    except Exception:
+        pass
     lines.append("")
     if report["env"]["notes"]:
         lines.append("Notes:")

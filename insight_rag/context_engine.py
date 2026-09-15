@@ -246,7 +246,13 @@ class ContextEngineer:
             unique.append(doc)
 
         if prefer_tables:
-            unique.sort(key=lambda doc: doc.metadata.get("content_type") != "table")
+            # Summary chunks carry full-table aggregates for any table size,
+            # so they lead; remaining table chunks keep retrieval order, then
+            # text. Deterministic and source-agnostic (no dataset awareness).
+            unique.sort(key=lambda doc: (
+                not bool(doc.metadata.get("table_summary")),
+                doc.metadata.get("content_type") != "table",
+            ))
         max_docs = 8 if broad_query or cross_document else (6 if prefer_tables else 5)
         chosen: list[Document] = []
         chosen_ids: set[int] = set()

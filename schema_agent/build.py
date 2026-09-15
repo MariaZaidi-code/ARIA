@@ -38,7 +38,87 @@ except ImportError:
 
 from core.config import SCHEMA_DIR
 
+try:
+    from core.data_intelligence import build_data_intelligence, detect_capabilities
+except ImportError:  # pragma: no cover
+    build_data_intelligence = detect_capabilities = None
+
 logger = logging.getLogger("aria.schema_agent")
+
+
+def attach_semantic_roles(mapping):
+    """hyp.txt PHASE 1: annotate every column with its canonical field role.
+
+    Additive only (extra ``semantic_role`` key per column dict). Uses
+    core.semantic.classify_field_role with declared PK/FK metadata so
+    ``room_id`` -> FOREIGN_KEY/IDENTIFIER, ``Total Amt`` -> MEASURE family
+    and telemetry -> TECHNICAL_MEASURE via generic semantics. Never uses
+    per-column exclusions.
+    """
+    try:
+        from core.semantic import classify_field_role as _cfr
+    except Exception:
+        return mapping
+    try:
+        tables = mapping.get("tables") or {}
+        declared = {(r.get("table_name"), r.get("column_name"))
+                    for r in (mapping.get("declared_relationships") or [])
+                    if isinstance(r, dict)}
+        declared |= {(r.get("table"), r.get("column"))
+                     for r in (mapping.get("inferred_relationships") or [])
+                     if isinstance(r, dict) and r.get("relationship_state") in (
+                         "CONFIRMED", "PROBABLE")}
+        for tname, info in tables.items():
+            if not isinstance(info, dict):
+                continue
+            pks = set(info.get("primary_key") or [])
+            for col in (info.get("columns") or []):
+                if not isinstance(col, dict) or col.get("semantic_role"):
+                    continue
+                cname = col.get("column")
+                try:
+                    col["semantic_role"] = _cfr(
+                        cname or "", col.get("data_type") or "",
+                        is_pk=bool(cname in pks),
+                        is_fk=bool((tname, cname) in declared),
+                    )
+                except Exception:
+                    col["semantic_role"] = "UNKNOWN"
+    except Exception as exc:
+        logger.debug("semantic role attach failed: %s", exc, exc_info=True)
+    return mapping
+
+
+def attach_data_intelligence(mapping):
+    """Attach row counts + the universal Data Intelligence Layer (n.txt 11/12).
+
+    Shared by the single-schema, multi-schema and CSV mapping paths so 1
+    table, 2-10 tables and many tables all get the same contract. Zero
+    relationships is valid (single-table datasets) and yields
+    relational_analysis == False downstream instead of an error.
+    """
+    tables = mapping.setdefault("tables", {})
+    for _tname, _info in tables.items():
+        if not isinstance(_info, dict):
+            continue
+        if not isinstance(_info.get("row_count"), int):
+            _total = None
+            for _stats in (_info.get("null_stats") or {}).values():
+                if isinstance(_stats, dict) and isinstance(_stats.get("total_rows"), int):
+                    _total = _stats["total_rows"]
+                    break
+            if _total is not None:
+                _info["row_count"] = _total
+    if build_data_intelligence is not None:
+        try:
+            _intel = build_data_intelligence(mapping)
+            mapping["data_intelligence"] = _intel
+            if detect_capabilities is not None:
+                mapping["capabilities"] = detect_capabilities(_intel)
+        except (ValueError, KeyError, TypeError, AttributeError, ImportError) as exc:
+            logger.debug("data intelligence attach failed: %s", exc, exc_info=True)
+    attach_semantic_roles(mapping)
+    return mapping
 
 JSON_INDENT = 2
 K = 2
@@ -337,11 +417,42 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
 
     _canonicalize_mapping(mapping)
 
+    # Single-table rule: a 1-table Postgres/MySQL DB is treated like a CSV
+    # dataset (profiling + PK-composite + FK-none + relationship-empty +
+    # no-join). Generic only — no table/column literals. Native column
+    # types and declared PKs/indexes are preserved; only the shape is
+    # aligned with the CSV contract (composite split out, edges emptied).
+    try:
+        from core.relational import normalize_single_table_mapping
+        if len(mapping.get("tables") or {}) == 1:
+            mapping = normalize_single_table_mapping(mapping)
+    except (ValueError, KeyError, TypeError, AttributeError, ImportError) as exc:
+        logger.debug("single-table normalization failed: %s", exc, exc_info=True)
+
     # Item 9: build the explicit relationship graph (per-table outgoing and
     # incoming relationships) ARIA can consume directly for SQL generation /
     # RAG / query planning. Also detects many-to-many via junction tables
-    # (item 2).
-    mapping["relationship_graph"] = _build_relationship_graph(mapping)
+    # (item 2). Single-table mappings keep their isolated single node.
+    if len(mapping.get("tables") or {}) == 1 and mapping.get("single_table_as_csv"):
+        _sole = next(iter(mapping["tables"]))
+        _info = mapping["tables"][_sole] or {}
+        if not isinstance(mapping.get("relationship_graph"), dict) or \
+                not isinstance(mapping["relationship_graph"].get(_sole), dict):
+            mapping["relationship_graph"] = {
+                _sole: {
+                    "primary_key": list(
+                        _info.get("primary_key") or
+                        _info.get("inferred_primary_key") or
+                        _info.get("inferred_composite_primary_key") or []),
+                    "columns": [c["column"] for c in (_info.get("columns") or [])
+                                if isinstance(c, dict) and c.get("column")],
+                    "outgoing_relationships": [],
+                    "incoming_relationships": [],
+                    "many_to_many": [],
+                }
+            }
+    else:
+        mapping["relationship_graph"] = _build_relationship_graph(mapping)
 
     # Rich health report (drives the UI dashboard / QA checks).
     # Strong vs weak uses the STRUCTURED state (PART 12); the legacy confidence
@@ -401,6 +512,8 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
     # benchmarking even though they never enter the relationship lists.
     from schema_engine.serializer import serialize_rejected
     mapping["rejected_candidates"] = serialize_rejected(registry) if registry is not None else []
+
+    attach_data_intelligence(mapping)
 
     # Item 5: schema drift vs the previous run of this database (when supplied).
     if previous_mapping:
@@ -704,7 +817,16 @@ def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name
     _infer_cross_schema_relationships(mapping, conn, db_type)
 
     _canonicalize_mapping(mapping)
-    mapping["relationship_graph"] = _build_relationship_graph(mapping)
+    # Single-table rule (multi-schema merge that yields one table): same
+    # CSV-like treatment, generic with no hardcoded names.
+    try:
+        from core.relational import normalize_single_table_mapping as _norm_single
+        if len(mapping.get("tables") or {}) == 1:
+            mapping = _norm_single(mapping)
+    except (ValueError, KeyError, TypeError, AttributeError, ImportError) as exc:
+        logger.debug("single-table normalization failed (all): %s", exc, exc_info=True)
+    if not (len(mapping.get("tables") or {}) == 1 and mapping.get("single_table_as_csv")):
+        mapping["relationship_graph"] = _build_relationship_graph(mapping)
 
     inferred = mapping.get("inferred_relationships", [])
     strong = [r for r in inferred if r.get("confidence") in
@@ -777,6 +899,8 @@ def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name
 
     if previous_mapping:
         mapping["drift"] = detect_schema_drift(previous_mapping, mapping)
+
+    attach_data_intelligence(mapping)
 
     mapping.pop("_cross_schema_review", None)
     return mapping

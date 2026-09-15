@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "omniroute/free-best",
+  "model": "omniroute/free",
   "provider": {
     "deepseek": {
       "name": "DeepSeek",

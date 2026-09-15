@@ -538,6 +538,31 @@ class AdvancedInsightAgent(BaseInsightAgent):
         if not base:
             base = "ARIA analysed the result but did not find a strong signal worth highlighting."
 
+        # Evidence gate FIRST (parity with InsightAgent): rows < 10 -> honest
+        # deterministic insufficient state WITHOUT calling the LLM.
+        try:
+            from core.evidence import insufficient_narrative as _insuf
+            _rows = processed_data.get("row_count", len(processed_data.get("data", []) or []))
+            try:
+                _rows = int(_rows)
+            except (TypeError, ValueError):
+                _rows = 0
+            if _rows < 10:
+                _cols = list(processed_data.get("columns", []) or [])
+                if not _cols and isinstance(processed_data.get("data"), list) \
+                        and processed_data["data"]:
+                    _first = processed_data["data"][0]
+                    if isinstance(_first, dict):
+                        _cols = list(_first.keys())
+                _fb = _insuf(_rows, "narrative",
+                             dataset_name=processed_data.get("user_goal"),
+                             columns=_cols)
+                self.last_story_status = "INSUFFICIENT_EVIDENCE"
+                return _fb["text"]
+        except Exception:
+            pass
+        self.last_story_status = "SUCCESS"
+
         # Build context with user goal and analytics data
         context = {
             "goal": processed_data.get("user_goal"),
@@ -561,6 +586,13 @@ class AdvancedInsightAgent(BaseInsightAgent):
             context["analytics_trends"] = analytics_result.get("trends", [])
             context["analytics_kpis"] = analytics_result.get("kpis", [])
 
+        # STRICT EVIDENCE PAYLOAD (parity with InsightAgent): the polish must
+        # only use computed facts; validated below with the shared base logic
+        # (numbers/entities/period/direction, rounding-aware).
+        from core.validation import clean_llm_text as _clean
+        claims = self._build_story_claims(
+            processed_data, kpis, trends, anomalies, hypotheses, predictions
+        )
         prompt = f"""
 You are ARIA's retail and sales Insight Agent. Rewrite the draft for a busy,
 non-technical manager.
@@ -571,8 +603,15 @@ DRAFT:
 VERIFIED FACTS:
 {json.dumps(context, indent=2, default=str)}
 
+STRICT EVIDENCE PAYLOAD — the story may ONLY use these computed facts.
+Do not invent numbers, segments, entities, or periods outside this list:
+{json.dumps(claims, indent=2, default=str)}
+
 Rules:
-- Keep every claim grounded in the supplied facts.
+- Keep every claim grounded in the numbers given; do not invent facts.
+- Every numeric value must come from the evidence payload (formatting/rounding only).
+- Every named segment/entity/period must appear in the evidence payload.
+- Direction words (increased/decreased) must match the sign of the computed change.
 - Use short, easy sentences.
 - Start with the most important finding and explain why it matters.
 - Never claim that correlation or association proves a cause.
@@ -589,9 +628,31 @@ Rules:
                 timeout=35,
             )
             polished = (polished or "").strip()
-            if 40 <= len(polished) <= 1400:
-                return polished
+            if not polished:
+                self.last_story_status = "LLM_EMPTY"
+                log.warning("Advanced story LLM returned empty; using deterministic narrative.")
+                return base
+            text, reason = _clean(polished)
+            if not text:
+                self.last_story_status = "INVALID_LLM_RESPONSE"
+                log.warning("Advanced story LLM output rejected (%s); using deterministic narrative.",
+                            reason or "empty after cleaning")
+                return base
+            if not (40 <= len(text) <= 1200):
+                self.last_story_status = "INVALID_LLM_RESPONSE"
+                log.warning("Advanced story LLM output rejected (bad length); using deterministic narrative.")
+                return base
+            # Shared base validator: numbers/entities/period/direction,
+            # rounding-aware. Length alone is never sufficient.
+            ok, fail_reason = self._validate_polished_story(
+                text, processed_data, kpis, trends, anomalies, hypotheses, predictions)
+            if ok:
+                return self._plain_english_story(text)
+            self.last_story_status = "INVALID_LLM_RESPONSE"
+            log.warning("Advanced story LLM output rejected (%s); using deterministic narrative.",
+                        fail_reason or reason or "ungrounded numbers")
         except Exception as exc:
+            self.last_story_status = "LLM_UNAVAILABLE"
             log.warning("Advanced story LLM failed; deterministic story used: %s", exc)
         return base
 

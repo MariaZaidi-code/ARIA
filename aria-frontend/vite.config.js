@@ -20,4 +20,26 @@ export default defineConfig({
   preview: {
     port: 5173,
   },
+  build: {
+    // Route-level React.lazy() splits pages into per-route chunks; the
+    // shared libs below stay in stable manualChunks so repeat visits and
+    // deploys re-download less.
+    chunkSizeWarningLimit: 900,
+    rollupOptions: {
+      output: {
+        // Vite 8 (rolldown) requires the function form of manualChunks.
+        // Route-level React.lazy() splits pages into per-route chunks;
+        // the shared libs below stay in stable named chunks so repeat
+        // visits and deploys re-download less.
+        manualChunks: (id) => {
+          if (id.includes("node_modules")) {
+            if (id.includes("recharts")) return "charts";
+            if (id.includes("framer-motion")) return "motion";
+            if (/node_modules[\\/](react|react-dom|scheduler)($|[\\/])/.test(id)) return "vendor";
+          }
+          return undefined;
+        },
+      },
+    },
+  },
 })

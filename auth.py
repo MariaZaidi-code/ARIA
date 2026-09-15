@@ -22,19 +22,60 @@ JWT_ALGO = "HS256"
 
 
 def _token_ttl_days() -> int:
+    """Resolve JWT lifetime in days from ``TOKEN_TTL_DAYS``.
+
+    Env contract (documented):
+      - ``TOKEN_TTL_DAYS``: integer ``1..7`` days, default ``1``.
+      - Unset or empty/whitespace -> ``1`` (intended default).
+      - Out-of-range integers are clamped to ``1..7``.
+      - Non-integer values raise ``ValueError`` (fail clearly, no silent
+        fallback to an unsafe value).
+    """
+    raw = os.getenv("TOKEN_TTL_DAYS")
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return 1
     try:
-        return min(30, max(1, int(os.getenv("TOKEN_TTL_DAYS", "7"))))
+        value = int(str(raw).strip())
     except (TypeError, ValueError):
-        return 7
+        raise ValueError(
+            f"Invalid TOKEN_TTL_DAYS={raw!r}: must be an integer 1..7 days."
+        )
+    return min(7, max(1, value))
 
 
 TOKEN_TTL_DAYS = _token_ttl_days()
 PBKDF2_ITERATIONS = 120_000
 
-_USERNAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
+_USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]+")
+
+
+def _is_production() -> bool:
+    """Production mode flag (existing convention: ARIA_ENV=production)."""
+    return (os.getenv("ARIA_ENV") or "").strip().lower() == "production"
 
 
 def _load_secret() -> str:
+    # JWT_SECRET env override wins (container/prod secret injection); the
+    # file fallback preserves existing single-machine deployments.
+    env_secret = (os.getenv("JWT_SECRET") or "").strip()
+    if _is_production():
+        # Fail fast in production: never autogenerate/persist a secret and
+        # never fall back to a known/default value. Inject JWT_SECRET.
+        if not env_secret:
+            raise RuntimeError(
+                "JWT_SECRET is required when ARIA_ENV=production. "
+                "Inject a strong random secret (e.g. 64 hex chars) via the "
+                "JWT_SECRET environment variable."
+            )
+        if len(env_secret) < 32:
+            raise RuntimeError(
+                "JWT_SECRET is too short for ARIA_ENV=production "
+                f"({len(env_secret)} chars; need >= 32). Inject a strong "
+                "random secret."
+            )
+        return env_secret
+    if env_secret:
+        return env_secret
     secret_path = BASE_DIR / "data" / ".jwt_secret"
     secret_path.parent.mkdir(parents=True, exist_ok=True)
     if secret_path.exists():
@@ -49,12 +90,19 @@ def _load_secret() -> str:
 
 
 SECRET = _load_secret()
+# Previous secret accepted for verification only (rotation: set JWT_SECRET to
+# the new value and JWT_SECRET_PREVIOUS to the old one until tokens expire).
+SECRET_PREVIOUS = (os.getenv("JWT_SECRET_PREVIOUS") or "").strip() or None
 
 
-def _get_db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+_SCHEMA_READY_PATHS: set[str] = set()
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create auth tables once per database path (not on every request)."""
+    key = str(DB_PATH)
+    if key in _SCHEMA_READY_PATHS:
+        return
     conn.execute(
         """CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +134,24 @@ def _get_db() -> sqlite3.Connection:
         )"""
     )
     conn.commit()
+    _SCHEMA_READY_PATHS.add(key)
+
+
+def _decode_token(token: str):
+    """Decode with the current secret, falling back to the previous secret."""
+    try:
+        return jwt.decode(token, SECRET, algorithms=[JWT_ALGO])
+    except jwt.InvalidSignatureError:
+        if SECRET_PREVIOUS:
+            return jwt.decode(token, SECRET_PREVIOUS, algorithms=[JWT_ALGO])
+        raise
+
+
+def _get_db() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
     return conn
 
 
@@ -163,7 +229,9 @@ def issue_token(user_id: int, username: str) -> str:
 
 def verify_token(token: str) -> dict | None:
     try:
-        payload = jwt.decode(token, SECRET, algorithms=[JWT_ALGO])
+        if not token or not isinstance(token, str):
+            return None
+        payload = _decode_token(token)
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
         conn = _get_db()
         try:
@@ -174,15 +242,31 @@ def verify_token(token: str) -> dict | None:
             conn.close()
         if revoked:
             return None
-        return {"user_id": int(payload["sub"]), "username": payload.get("username")}
-    except jwt.PyJWTError:
+        # Strict `sub` validation: accept only a positive int user id or a
+        # digit string (never bool/float/None/injection strings). int(True)
+        # == 1 and int(3.5) == 3 would otherwise alias to another user.
+        sub = payload.get("sub")
+        if isinstance(sub, bool):
+            return None
+        if isinstance(sub, int):
+            user_id = sub
+        elif isinstance(sub, str) and sub.strip().isdigit():
+            user_id = int(sub.strip())
+        else:
+            return None
+        if user_id <= 0:
+            return None
+        return {"user_id": user_id, "username": payload.get("username")}
+    except (jwt.PyJWTError, KeyError, TypeError, ValueError):
         return None
 
 
 def revoke_token(token: str) -> None:
     """Invalidate this JWT until its own expiry without storing the token itself."""
     try:
-        payload = jwt.decode(token, SECRET, algorithms=[JWT_ALGO], options={"verify_exp": False})
+        payload = _decode_token(token)
+        if isinstance(payload, dict) and payload.get("exp") is None:
+            return
         expires_at = datetime.fromtimestamp(int(payload["exp"]), timezone.utc).isoformat()
     except (jwt.PyJWTError, KeyError, TypeError, ValueError):
         return

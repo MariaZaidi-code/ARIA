@@ -34,7 +34,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from .conversation import ConversationMemory
+from .conversation import ConversationMemory, dataset_fingerprint
 from .intent import (
     ANOMALY,
     COMBINED,
@@ -50,6 +50,12 @@ from .intent import (
     classify,
 )
 from .retriever import SchemaRetriever, RetrievedContext
+from .grounded_context import (
+    GroundedCtxView,
+    build_grounded_db_context,
+    decide_knowledge_source,
+)
+from .answer_grounding import check_answer_grounding
 from .schema_index import build_schema_index
 from .sql_engine import SqlEngine, clean_sql
 
@@ -75,6 +81,7 @@ class CopilotAnswer:
     attempts: int = 1
     provider: str | None = None
     intent: str | None = None
+    grounding: dict | None = None
 
     def to_public(self, include_rows: int = 50) -> dict:
         """The user-facing payload. Never leaks schema dumps or internals."""
@@ -92,6 +99,8 @@ class CopilotAnswer:
             out["error"] = self.error
         if self.intent:
             out["intent"] = self.intent
+        if self.grounding:
+            out["grounding"] = self.grounding
         return out
 
 
@@ -192,6 +201,17 @@ class CopilotPipeline:
         self.document_id = document_id
         self.linked = linked or {}
         self.memory = ConversationMemory(user_id)
+        # Dataset scope for conversation memory (t.txt §13/26): every turn
+        # is tagged with this fingerprint, so a dataset switch invalidates
+        # stale schema/tables/SQL instead of reusing them. The fingerprint
+        # covers column names+types per table, the edge set, document ids
+        # and row-count buckets — so even a same-named source with different
+        # columns isolates cleanly. Secret-free (names/types/buckets only,
+        # never the URI, credentials or values) and provider-independent.
+        self.dataset_fp = dataset_fingerprint(
+            mapping=schema_mapping or {}, document_id=document_id,
+            linked=linked or {},
+        )
         self.index = build_schema_index(schema_mapping or {}, dialect=self.dialect)
         self.retriever = SchemaRetriever(self.index, embedder=embedder)
         self.sql_engine = SqlEngine(db_uri, dialect=self.dialect)
@@ -204,7 +224,7 @@ class CopilotPipeline:
         if not question or not question.strip():
             return CopilotAnswer(ok=False, answer="Please ask a question.",
                                  provider=self.provider_name)
-        resolved = self.memory.resolve(question)
+        resolved = self.memory.resolve(question, dataset=self.dataset_fp)
         route = classify(resolved)
 
         # Schema-less intents run without a relational mapping (t.txt §14):
@@ -238,10 +258,11 @@ class CopilotPipeline:
     # -- intent branches -------------------------------------------------
 
     def _remember(self, question: str, context: dict, answer: str,
-                  sql: str | None, intent: str) -> None:
+                   sql: str | None, intent: str) -> None:
         try:
             self.memory.append(question=question, context=context,
-                               answer=answer, sql=sql)
+                               answer=answer, sql=sql,
+                               dataset=self.dataset_fp)
         except TypeError:
             # Older ConversationMemory.append without extra kwargs.
             self.memory.append(question=question, context=context,
@@ -373,7 +394,8 @@ class CopilotPipeline:
             from insight_rag.storage import RAGMetadataStore
             docs = RAGMetadataStore(self.user_id).list_documents()
             return [str(d.get("document_id")) for d in docs if d.get("document_id")][:3]
-        except Exception:
+        except Exception as exc:
+            log.warning("Failed to list recent documents: %s", exc)
             return []
 
     def _retrieve_document_text(self, question: str, doc_id: str | None):
@@ -415,9 +437,9 @@ class CopilotPipeline:
                 f"DOCUMENT EVIDENCE: {doc_bits or '(none)'}\n"
             )
             text = self.llm.complete("story", prompt, temperature=0.2,
-                                     num_predict=260, timeout=150)
+                                     num_predict=200)
             text = strip_text(text)
-            if text and len(text) >= 8:
+            if text and len(text) >= 3:
                 return text
         except Exception as exc:
             log.info("Copilot combined narration LLM failed (%s).", exc)
@@ -483,7 +505,8 @@ class CopilotPipeline:
             for tid in targets:
                 try:
                     chunks = store.load_chunks(tid)
-                except Exception:
+                except Exception as exc:
+                    log.warning("Failed to load chunks for %s: %s", tid, exc)
                     continue
                 meta = store.get_document(tid) or {}
                 fname = str(meta.get("filename") or meta.get("original_filename")
@@ -525,9 +548,9 @@ class CopilotPipeline:
                 f"QUESTION: {question.strip()}"
             )
             text = self.llm.complete("story", prompt, temperature=0.2,
-                                     num_predict=180, timeout=120)
+                                     num_predict=180)
             text = strip_text(text)
-            if text and len(text) >= 8:
+            if text and len(text) >= 3:
                 self._remember(question, {"tables": [], "intent": intent},
                                text, None, intent)
                 return CopilotAnswer(ok=True, answer=text,
@@ -539,9 +562,79 @@ class CopilotPipeline:
         return CopilotAnswer(ok=False, answer=answer,
                              provider=self.provider_name, intent=intent)
 
+    def _grounded_view(self, question: str, ctx):
+        """Wrap retrieved context in the bounded grounded view (n.txt §5).
+
+        Never raises; falls back to the raw retriever context so SQL
+        generation always has a usable prompt and never the whole DB.
+        """
+        try:
+            grounded = build_grounded_db_context(
+                question, ctx, self.mapping,
+                db_uri=self.db_uri, dialect=self.dialect,
+            )
+            return GroundedCtxView(ctx, grounded), grounded
+        except Exception as exc:
+            log.info("Grounded context unavailable (%s); raw context.", exc)
+            return ctx, None
+
+    @staticmethod
+    def _retrieved_columns(ctx, mapping: dict) -> list[str]:
+        cols: list[str] = []
+        try:
+            for t in (ctx.tables or []):
+                for bucket in ("measures", "dimensions", "dates", "keys"):
+                    cols.extend((getattr(ctx, bucket, None) or {}).get(t, []) or [])
+        except Exception as exc:
+            log.warning("Failed to extract retrieved columns: %s", exc, exc_info=True)
+        return cols
+
+    def _verify_narrative(self, question: str, narrative: str, ctx,
+                          result, rows: list[dict], intent: str,
+                          fallback: str) -> tuple[str, dict]:
+        """Answer-grounding check (n.txt §6): SQL authoritative, fail-closed.
+
+        Returns (final_narrative, grounding_payload). On numeric mismatch the
+        deterministic fallback (built from executed rows) replaces the LLM
+        text so invented numbers never reach the UI.
+        """
+        try:
+            check = check_answer_grounding(
+                question=question, answer=narrative,
+                retrieved_tables=list(ctx.tables or []),
+                retrieved_columns=self._retrieved_columns(ctx, self.mapping),
+                sql=result.sql if result else None,
+                rows=rows, columns=(result.columns if result else []),
+                intent=intent,
+            )
+        except Exception as exc:
+            log.info("Grounding verification error (%s).", exc)
+            check = {"verdict": "needs_review", "reason": "check_error",
+                     "checks": {}, "quality": {}}
+        if check.get("verdict") == "ungrounded":
+            log.info("Copilot grounding failed (%s); deterministic fallback.",
+                     check.get("reason"))
+            try:
+                final = check_answer_grounding(
+                    question=question, answer=fallback,
+                    retrieved_tables=list(ctx.tables or []),
+                    retrieved_columns=self._retrieved_columns(ctx, self.mapping),
+                    sql=result.sql if result else None,
+                    rows=rows, columns=(result.columns if result else []),
+                    intent=intent,
+                )
+            except Exception as exc:
+                log.info("Second grounding check failed (%s); using first check.", exc)
+                final = check
+            payload = {**final, "repaired": True,
+                       "original_verdict": check.get("verdict"),
+                       "original_reason": check.get("reason")}
+            return fallback, payload
+        return narrative, {**check, "repaired": False}
+
     def _answer_data(self, question: str, resolved: str, intent: str) -> CopilotAnswer:
         """Classic lookup path: retrieve -> SQL -> validate -> execute -> narrate."""
-        followup_ctx = (self.memory.last() or {}).get("context") if resolved != question else None
+        followup_ctx = (self.memory.last(dataset=self.dataset_fp) or {}).get("context") if resolved != question else None
 
         ctx = self.retriever.retrieve(resolved, followup_context=followup_ctx)
         if ctx.is_empty():
@@ -553,8 +646,9 @@ class CopilotPipeline:
                 intent=intent,
             )
 
+        view, grounded = self._grounded_view(resolved, ctx)
         result = self.sql_engine.generate_and_run(
-            resolved, ctx, self.llm, tables=self.index.tables, model_role="sql",
+            resolved, view, self.llm, tables=self.index.tables, model_role="sql",
         )
 
         if not result.ok and resolved != question:
@@ -576,6 +670,10 @@ class CopilotPipeline:
         rows = _sanitize_rows(result.rows)
         narrative = self._narrate(question, result, rows)
         chart = infer_chart(result.columns, rows, question)
+        narrative, grounding = self._verify_narrative(
+            question, narrative, ctx, result, rows, intent,
+            fallback=_summarize_rows(result.columns, rows),
+        )
 
         self._remember(question, ctx.to_state(), narrative, result.sql, intent)
 
@@ -591,11 +689,12 @@ class CopilotPipeline:
             attempts=result.attempts,
             provider=self.provider_name,
             intent=intent,
+            grounding=grounding,
         )
 
     def _answer_analytical(self, question: str, resolved: str, intent: str) -> CopilotAnswer:
         """Multi-step path: SQL evidence -> analysis -> grounded reasoning."""
-        followup_ctx = (self.memory.last() or {}).get("context") if resolved != question else None
+        followup_ctx = (self.memory.last(dataset=self.dataset_fp) or {}).get("context") if resolved != question else None
 
         ctx = self.retriever.retrieve(resolved, followup_context=followup_ctx)
         if ctx.is_empty():
@@ -607,8 +706,9 @@ class CopilotPipeline:
                 intent=intent,
             )
 
+        view, grounded = self._grounded_view(resolved, ctx)
         result = self.sql_engine.generate_and_run(
-            resolved, ctx, self.llm, tables=self.index.tables, model_role="sql",
+            resolved, view, self.llm, tables=self.index.tables, model_role="sql",
         )
 
         if not result.ok and resolved != question:
@@ -642,6 +742,10 @@ class CopilotPipeline:
         else:
             narrative = self._narrate_analytical(question, result, rows, analysis, intent)
         chart = infer_chart(result.columns, rows, question)
+        narrative, grounding = self._verify_narrative(
+            question, narrative, ctx, result, rows, intent,
+            fallback=_fallback_analytical(question, analysis, intent),
+        )
 
         self._remember(question, ctx.to_state(), narrative, result.sql, intent)
 
@@ -657,6 +761,7 @@ class CopilotPipeline:
             attempts=result.attempts,
             provider=self.provider_name,
             intent=intent,
+            grounding=grounding,
         )
 
     # -- follow-up repair --------------------------------------------------
@@ -665,10 +770,12 @@ class CopilotPipeline:
         """Re-execute the previous turn's validated SQL (read-only).
 
         Returns the SqlResult, or None when there is no previous SQL.
-        Never raises; validation + execution are both bounded.
+        Only same-dataset turns are eligible: after a dataset switch
+        there is no previous SQL to re-run. Never raises; validation +
+        execution are both bounded.
         """
         try:
-            prev = self.memory.last() or {}
+            prev = self.memory.last(dataset=self.dataset_fp) or {}
             sql = prev.get("sql")
             if not sql:
                 return None
@@ -678,15 +785,20 @@ class CopilotPipeline:
             return None
 
     def _previous_context(self, ctx):
-        """Prefer the previous turn's retrieved context for continuity."""
+        """Prefer the previous turn's retrieved context for continuity.
+
+        Only same-dataset turns are eligible, so a follow-up after a
+        dataset switch never inherits stale tables.
+        """
         try:
-            prev = self.memory.last() or {}
+            prev = self.memory.last(dataset=self.dataset_fp) or {}
             saved = (prev.get("context") or {})
             tables = saved.get("tables") or []
             if tables:
                 ctx.tables = list(tables)
             return ctx
-        except Exception:
+        except Exception as exc:
+            log.warning("Failed to restore previous context: %s", exc)
             return ctx
 
     # -- deterministic forecast history (no LLM needed) --------------------
@@ -761,13 +873,15 @@ class CopilotPipeline:
                 f"{json.dumps(preview, default=str)[:2000]}\n"
             )
             text = self.llm.complete("story", prompt, temperature=0.2,
-                                     num_predict=200, timeout=150)
+                                     num_predict=200)
             text = strip_text(text)
-            if text and len(text) >= 8:
+            if text and len(text) >= 3:
                 return text
+            log.info("Copilot narration LLM empty (LLM_EMPTY); using deterministic answer.")
         except Exception as exc:
             log.info("Copilot narration LLM failed (%s); using deterministic answer.", exc)
-        return fallback
+        return (f"ARIA identified the following data pattern, but the AI explanation "
+                f"is currently unavailable. {fallback}")
 
     # -- analytical reasoning over SQL evidence (t.txt §§24, 27) ---------
 
@@ -812,13 +926,15 @@ class CopilotPipeline:
                 f"{json.dumps(preview, default=str)[:2000]}\n"
             )
             text = self.llm.complete("story", prompt, temperature=0.2,
-                                     num_predict=220, timeout=150)
+                                     num_predict=220)
             text = strip_text(text)
-            if text and len(text) >= 8:
+            if text and len(text) >= 3:
                 return text
+            log.info("Copilot analytical narration LLM empty (LLM_EMPTY).")
         except Exception as exc:
             log.info("Copilot analytical narration LLM failed (%s).", exc)
-        return _fallback_analytical(question, analysis, intent)
+        return (f"ARIA identified the following data pattern, but the AI explanation "
+                f"is currently unavailable. {_fallback_analytical(question, analysis, intent)}")
 
     # -- forecasting via the prediction engine (t.txt §27) ----------------
 
@@ -834,23 +950,23 @@ class CopilotPipeline:
             from prediction.agent import PredictionAgent
         except Exception as exc:
             log.info("Copilot forecast engine unavailable (%s); trend fallback.", exc)
-            return None
+            return f"Forecast unavailable: {exc}"
         try:
             payload = PredictionAgent().forecast(
                 {"data": rows, "user_goal": question})
         except Exception as exc:
             log.info("Copilot forecast run failed (%s); trend fallback.", exc)
-            return None
+            return f"Forecast run failed: {exc}"
         if not isinstance(payload, dict) or not payload.get("valid"):
-            return None
+            return "Forecast returned invalid or empty result."
         points = payload.get("points") or []
         if not points:
-            return None
+            return "Forecast returned no data points."
         try:
             return self._forecast_narrative(question, payload, analysis)
         except Exception as exc:
             log.info("Copilot forecast narration failed (%s); trend fallback.", exc)
-            return None
+            return f"Forecast narration failed: {exc}"
 
     def _forecast_narrative(self, question: str, payload: dict,
                             analysis: dict) -> str:
@@ -861,8 +977,8 @@ class CopilotPipeline:
         proj = payload.get("projected_pct_change")
         acc = payload.get("accuracy_pct")
         rel = str(payload.get("reliability") or "").lower()
-        conf = ("High" if rel in ("excellent", "good") else "Moderate"
-                if rel == "fair" else "Low")
+        conf = ("High" if rel in ("excellent", "good", "high") else "Moderate"
+                if rel in ("fair", "moderate") else "Low")
         first, last = pts[0], pts[-1]
         trend = ""
         if isinstance(proj, (int, float)):
@@ -885,9 +1001,9 @@ class CopilotPipeline:
                 f"VALIDATED OUTLOOK: {det}\n"
             )
             text = self.llm.complete("story", prompt, temperature=0.2,
-                                     num_predict=200, timeout=150)
+                                     num_predict=200)
             text = strip_text(text)
-            if text and len(text) >= 8:
+            if text and len(text) >= 3:
                 return text
         except Exception as exc:
             log.info("Copilot forecast LLM polish failed (%s).", exc)
@@ -981,19 +1097,28 @@ def _analyze_rows(columns: list[str], rows: list[dict], intent: str) -> dict:
                 + (f" ({share:.0f}% of the total)" if len(vals) > 1 else ""))
     if numeric_cols and len(rows) >= 4:
         m = numeric_cols[-1]
-        try:
-            seq = [float(str(r.get(m)).replace(",", "")) for r in rows]
-            half = len(seq) // 2
-            early = sum(seq[:half]) / max(1, half)
-            late = sum(seq[half:]) / max(1, len(seq) - half)
-            if early:
-                pct = (late - early) / abs(early) * 100
-                out["momentum_pct"] = pct
-                direction = "up" if pct > 1 else "down" if pct < -1 else "flat"
-                out["findings"].append(
-                    f"recent {m} trends {direction} ({pct:+.0f}% second half vs first half)")
-        except (TypeError, ValueError, ZeroDivisionError):
-            pass
+        # Momentum is only meaningful on a time axis: require a date-like
+        # column and sort by it first. On ranked/grouped return order the
+        # "second half vs first half" comparison is just sort order, not a
+        # trend — report None instead of a fabricated direction.
+        date_keys = [k for k in (rows[0].keys() if rows else []) if _datetime_name(k)]
+        if not date_keys:
+            out["momentum_pct"] = None
+        else:
+            try:
+                ordered = sorted(rows, key=lambda r: str(r.get(date_keys[0])))
+                seq = [float(str(r.get(m)).replace(",", "")) for r in ordered]
+                half = len(seq) // 2
+                early = sum(seq[:half]) / max(1, half)
+                late = sum(seq[half:]) / max(1, len(seq) - half)
+                if early:
+                    pct = (late - early) / abs(early) * 100
+                    out["momentum_pct"] = pct
+                    direction = "up" if pct > 1 else "down" if pct < -1 else "flat"
+                    out["findings"].append(
+                        f"recent {m} trends {direction} ({pct:+.0f}% second half vs first half)")
+            except (TypeError, ValueError, ZeroDivisionError):
+                out["momentum_pct"] = None
     if len(rows) < 2:
         out["thin"] = True
         out["findings"].append("limited evidence — a single data point")

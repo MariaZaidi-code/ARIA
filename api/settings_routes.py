@@ -25,6 +25,9 @@ PROVIDER_ALIASES = {
     "deepseek": "deepseek",
     "omniroute": "omniroute",
     "universal": "omniroute",
+    "grok": "grok",
+    "xai": "grok",
+    "x-ai": "grok",
 }
 
 
@@ -66,7 +69,7 @@ async def save_provider(req: ProviderConfigRequest, _user: dict = Depends(get_cu
     if not name:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported provider '{req.provider}'. Choose from: local, cloud, deepseek, omniroute.",
+            detail=f"Unsupported provider '{req.provider}'. Choose from: local, cloud, deepseek, omniroute, grok.",
         )
     key = (req.api_key or "").strip()
     if name != "local" and not key:
@@ -142,7 +145,7 @@ async def providers_status(_user: dict = Depends(get_current_user)):
                         "reason": f"Ollama is not reachable ({exc}). Start Ollama and try again."}
         key = resolve_provider_key(name, saved)
         if not key:
-            label = {"cloud": "Groq", "deepseek": "DeepSeek", "omniroute": "OmniRoute"}.get(name, name)
+            label = {"cloud": "Groq", "deepseek": "DeepSeek", "omniroute": "OmniRoute", "grok": "Grok"}.get(name, name)
             return {"provider": name, "available": False,
                     "reason": f"No {label} API key saved. Add one to use {label}."}
         try:
@@ -152,7 +155,7 @@ async def providers_status(_user: dict = Depends(get_current_user)):
             return {"provider": name, "available": False,
                     "reason": f"Key rejected or unreachable ({exc}). Check the key and retry."}
 
-    names = ["local", "cloud"]
+    names = ["local", "cloud", "deepseek", "omniroute", "grok"]
     results = await _asyncio.gather(*[_check(n) for n in names])
     return {"ok": True, "providers": results,
             "active": session.get("provider_name")}
@@ -183,9 +186,9 @@ def _ping_hosted(name: str, key: str, timeout: int) -> None:
 @router.post("/api/settings/general")
 async def save_general_settings(req: GeneralSettingsRequest, _user: dict = Depends(get_current_user)):
     """Save general settings (theme, language)."""
-    if req.language not in {"en", "ur"} and len(req.language) > 12:
+    if req.language not in {"en", "ur"}:
         raise HTTPException(status_code=400, detail="Unsupported language.")
-    if req.theme not in {"light", "dark", "system"} and len(req.theme) > 12:
+    if req.theme not in {"light", "dark", "system"}:
         raise HTTPException(status_code=400, detail="Unsupported theme.")
     session = get_session(_user["user_id"])
     session["settings"] = {

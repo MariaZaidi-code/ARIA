@@ -15,18 +15,81 @@
 // Every function returns the same shape the UI already expects
 // ({ success, data }) so pages did not need to change.
 
-import { getAuthToken } from "../utils/authStorage";
+// Centralized API base (respects VITE_API_BASE, defaults to /api so the
+// Vite dev proxy /api -> :8000 keeps working). Import API_BASE from here
+// everywhere instead of hardcoding "/api".
+export const API_BASE = (import.meta?.env?.VITE_API_BASE || "/api").replace(/\/$/, "");
 
-const API_BASE = (import.meta?.env?.VITE_API_BASE || "/api").replace(/\/$/, "");
+// Versioned storage (aria.v1.*) with legacy-key fallback. Static import is
+// cycle-safe: storage.js is dependency-free.
+import { storage as versionedStorage } from "../utils/storage.js";
 
-const REQUEST_TIMEOUT_MS = Number(import.meta?.env?.VITE_API_TIMEOUT_MS || 30000);
+const storageHelperGet = (key, fallback) => {
+  try {
+    return versionedStorage.getString(key, fallback) ?? fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+// Consistent 401 handling: clear the (cookie-based) session markers and
+// notify the app to return to login. Pages listen for "aria:unauthorized".
+export const handleUnauthorized = () => {
+  try {
+    localStorage.removeItem("aria_auth_token"); // legacy JWT, cookie auth now
+    localStorage.removeItem("aria_auth_user");
+  } catch { /* ignore */ }
+  try {
+    window.dispatchEvent(new Event("aria:unauthorized"));
+  } catch { /* ignore */ }
+};
+
+// request ids: generated per request, sent as X-Request-ID and echoed
+// back on errors. Prefer the backend's value when present.
+const newRequestId = () => {
+  try {
+    if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  } catch { /* fall through */ }
+  return `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+};
+
+// Normalize a caller path to a single `/api/*` URL. API_BASE already ends
+// with `/api` (or a custom VITE_API_BASE), so a caller passing the full
+// `/api/copilot` prefix would double it to `/api/api/copilot` — strip the
+// duplicate. Bare `copilot` gains its leading slash.
+const resolvePath = (path) => {
+  let p = String(path || "");
+  if (!p.startsWith("/")) p = `/${p}`;
+  const base = API_BASE.replace(/\/$/, "");
+  if (p === "/api" || p.startsWith("/api/")) {
+    const suffix = p.slice("/api".length) || "/";
+    if (base === "/api" || base.endsWith("/api")) return `${base}${suffix}`;
+  }
+  return `${base}${p}`;
+};
+
+// Unified client timeout: 60s floor / 120s ceiling (heavy LLM + forecast
+// calls need headroom; chatty reads stay snappy). Single knob for the
+// whole frontend — services/api.js and figma/lib/decisionCenterApi.ts
+// share it via apiFetch (VITE_API_TIMEOUT_MS overrides, then clamped).
+const RAW_TIMEOUT_MS = Number(import.meta?.env?.VITE_API_TIMEOUT_MS || 90000);
+const REQUEST_TIMEOUT_MS = Math.max(60000, Math.min(120000, RAW_TIMEOUT_MS));
+export const API_TIMEOUT_MS = REQUEST_TIMEOUT_MS;
 
 // =========================================================
 // LLM MODE (chosen on the LLM Selection screen)
 // =========================================================
 
 const getLLMMode = () => {
-  return localStorage.getItem("aria_llm_mode") || "local";
+  try {
+    const v = storageHelperGet("aria.v1.ui.llm_mode", null);
+    if (v) return v;
+  } catch { /* fall through to legacy key */ }
+  try {
+    return localStorage.getItem("aria_llm_mode") || "local";
+  } catch {
+    return "local";
+  }
 };
 
 // =========================================================
@@ -37,71 +100,185 @@ const getLLMMode = () => {
 // error payloads ({ "detail": "..." }) into thrown Errors.
 // =========================================================
 
+// Cookie auth: the backend sets an httpOnly `aria_token` cookie on
+// login/register. No Authorization header is sent (omitted entirely —
+// never `Bearer null`/empty); every request uses credentials:include so
+// the cookie travels automatically. On 401 the session is cleared and the
+// app is asked to return to login.
 const request = async (path, options = {}) => {
+  const { signal: externalSignal, ...rest } = options || {};
   const headers = {
-    ...(options.headers || {}),
+    ...(rest.headers || {}),
   };
-
-  const token = getAuthToken();
-
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
+  // Strip any legacy Authorization header callers may still pass.
+  delete headers["Authorization"];
+  delete headers["authorization"];
 
   const isJsonBody =
-    options.body &&
-    !(options.body instanceof FormData) &&
+    rest.body &&
+    !(rest.body instanceof FormData) &&
     !headers["Content-Type"];
 
   if (isJsonBody) {
     headers["Content-Type"] = "application/json";
   }
 
+  // X-Request-ID: trace every request; backend echoes it on errors.
+  const requestId = headers["X-Request-ID"] || headers["x-request-id"] || newRequestId();
+  headers["X-Request-ID"] = requestId;
+
   const controller = new AbortController();
+  const onExternalAbort = () => {
+    try {
+      controller.abort(externalSignal?.reason);
+    } catch {
+      try { controller.abort(); } catch { /* ignore */ }
+    }
+  };
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      const aborted = new Error("The operation was aborted.");
+      aborted.name = "AbortError";
+      throw aborted;
+    }
+    try {
+      externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+    } catch { /* ignore */ }
+  }
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let response;
   try {
-    response = await fetch(`${API_BASE}${path}`, {
-      ...options,
+    response = await fetch(resolvePath(path), {
+      ...rest,
 
       headers,
+      credentials: "include",
       signal: controller.signal,
     });
   } catch (err) {
     clearTimeout(timeout);
+    try {
+      externalSignal?.removeEventListener?.("abort", onExternalAbort);
+    } catch { /* ignore */ }
+    // A caller-cancelled request (refresh/double-click race) must stay an
+    // AbortError so UI race guards can ignore it — never a timeout.
+    if (err?.name === "AbortError" && externalSignal?.aborted) throw err;
     if (err?.name === "AbortError") {
-      throw new Error(`Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`);
+      const error = new Error(`Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`);
+      error.status = 0;
+      error.code = "TIMEOUT";
+      error.requestId = requestId;
+      throw error;
     }
-    throw new Error("Network error: backend unreachable.");
+    const error = new Error("Network error: backend unreachable.");
+    error.status = 0;
+    error.code = "NETWORK_ERROR";
+    error.requestId = requestId;
+    throw error;
   }
   clearTimeout(timeout);
+  try {
+    externalSignal?.removeEventListener?.("abort", onExternalAbort);
+  } catch { /* ignore */ }
 
   let data;
+  let jsonOk = true;
 
   try {
     data = await response.json();
   } catch {
+    jsonOk = false;
     data = {};
   }
 
   if (!response.ok) {
-    const detail = data?.detail;
+    // Never turn failures into empty dashboards: surface a real Error.
+    // 401 clears the cookie session and routes back to login.
+    if (response.status === 401) {
+      handleUnauthorized();
+    }
+    const norm = normalizeApiError(data, response.status, response.headers);
 
-    const message =
-      (typeof detail === "string" && detail) ||
-      (Array.isArray(detail) && detail.map((item) => item?.msg).join("; ")) ||
-      data?.message ||
-      `Request failed (${response.status}).`;
-
-    throw new Error(message);
+    const error = new Error(norm.message);
+    error.status = response.status;
+    error.code = norm.code;
+    error.requestId = norm.requestId || requestId;
+    throw error;
   }
 
   return data;
 };
 
+// Public centralized client for pages that still need raw fetch semantics.
+// Wraps request() so every call uses API_BASE + credentials:include, full
+// res.ok handling (2xx/401/403/404/422/429/5xx/invalid JSON), and 401
+// session cleanup. Prefer this over raw fetch("/api/...").
+export const apiFetch = (path, options = {}) => request(path, options);
+
+// =========================================================
+// CENTRALIZED ERROR NORMALIZATION (single shared client layer)
+// =========================================================
+//
+// Backend response -> standard frontend error object:
+//   { message, code, requestId, status } -> UI.
+// Pages/components must source the object centrally via normalizeApiError()
+// or the thrown Error's .code/.requestId/.status fields, and may keep their
+// own copy while rendering a concise message + Request ID (never stacks).
+export const normalizeApiError = (data, status = 0, headers = null) => {
+  const body = data && typeof data === "object" ? data : {};
+  let raw = "";
+  const detail = body?.detail;
+  if (typeof detail === "string" && detail) raw = detail;
+  else if (Array.isArray(detail))
+    raw = detail.map((item) => item?.msg || item?.detail || JSON.stringify(item)).join("; ");
+  else raw = body?.message || body?.error?.message || "";
+  // Sanitize: never surface SQL / traces / raw JSON to the UI.
+  let message = String(raw || "").trim();
+  if (!message || /select\s.+\sfrom|traceback|exception|stack trace/i.test(message)) {
+    message = status === 401 ? "Session expired. Please sign in again."
+      : status === 403 ? "Read-only on this device."
+      : status === 404 ? "Not found."
+      : status === 429 ? "Too many requests. Try again shortly."
+      : status >= 500 ? "Server error. Try again."
+      : `Request failed (${status || "network"}).`;
+  }
+  message = message.slice(0, 200);
+  let headerId = "";
+  try {
+    headerId = (typeof headers?.get === "function" ? headers.get("X-Request-ID") : headers?.["X-Request-ID"]) || "";
+  } catch { headerId = ""; }
+  const requestId = body?.request_id || body?.requestId || body?.error?.request_id || headerId || "";
+  const code = body?.code || body?.error?.code
+    || (status === 401 ? "UNAUTHORIZED" : status === 403 ? "FORBIDDEN"
+      : status === 404 ? "NOT_FOUND" : status === 429 ? "RATE_LIMITED"
+      : status >= 500 ? "SERVER_ERROR" : status === 0 ? "NETWORK_ERROR" : "REQUEST_FAILED");
+  return { message, code, requestId, status };
+};
+
 // =========================================================
 // VALUE HELPERS
 // =========================================================
+//
+// P3 §27/§47 contract: every backend payload (connect, schema, ask,
+// insights, forecast, prediction, prescription, hypothesis,
+// decision-center, copilot, RAG) is consumed defensively — null, missing,
+// empty arrays, errors, and partial results all render as "—" or a useful
+// empty state, never undefined/null/NaN/blank/raw exceptions.
+
+export const safeList = (v) => (Array.isArray(v) ? v : []);
+
+export const safeText = (v, fallback = "—") => {
+  if (v === null || v === undefined) return fallback;
+  const s = String(v).trim();
+  return s === "" || s.toLowerCase() === "undefined" || s.toLowerCase() === "null" || s.toLowerCase() === "nan"
+    ? fallback
+    : String(v);
+};
+
+export const safeNumberText = (v, fallback = "—") => {
+  const n = toNumber(v);
+  return n === null || Number.isNaN(n) ? fallback : formatValue(n);
+};
 
 const toNumber = (value) => {
   if (typeof value === "number") {
@@ -241,12 +418,33 @@ export const disconnectSource = async () => {
 };
 
 export const connectDatabase = async (databaseDetails = {}) => {
+  // LLM mode (local/cloud/...) and DB provider (postgresql/mysql/...) are
+  // independent. Backend ConnectRequest.provider = LLM mode, db_type = DB
+  // engine. Never derive one from the other.
+  const LLM_MODES = ["local", "cloud", "deepseek", "omniroute", "grok"];
+  const DB_TYPES = ["postgresql", "mysql"];
+  const pickLlmMode = () => {
+    if (LLM_MODES.includes(databaseDetails?.llmMode)) return databaseDetails.llmMode;
+    if (LLM_MODES.includes(databaseDetails?.provider)) return databaseDetails.provider;
+    return getLLMMode();
+  };
+  const pickDbType = () => {
+    if (DB_TYPES.includes(databaseDetails?.dbType)) return databaseDetails.dbType;
+    if (DB_TYPES.includes(databaseDetails?.dbProvider)) return databaseDetails.dbProvider;
+    // sourceType may carry the DB engine ("postgresql"/"mysql") from the
+    // Data page; file kinds ("csv"/"pdf") must NOT leak into db_type.
+    if (DB_TYPES.includes(databaseDetails?.sourceType)) return databaseDetails.sourceType;
+    if (DB_TYPES.includes(databaseDetails?.provider) && !LLM_MODES.includes(databaseDetails?.provider)) {
+      return databaseDetails.provider;
+    }
+    return "postgresql";
+  };
   const payload = {
-    provider: databaseDetails?.provider || getLLMMode(),
+    provider: pickLlmMode(),
 
     source_type: "relational",
 
-    db_type: databaseDetails?.dbType || databaseDetails?.sourceType || "postgresql",
+    db_type: pickDbType(),
 
     host: databaseDetails?.host || "localhost",
 
@@ -377,6 +575,18 @@ export const retryDocument = async (documentId) => {
 // =========================================================
 
 export const fetchSchema = async () => {
+  // P3 §32 performance: reuse cached metadata; only run extraction when the
+  // cached schema is missing/empty so we never re-extract, re-embed, or
+  // reload unchanged datasets on every call.
+  try {
+    const cached = await request("/schema");
+    const tables = cached?.schema?.tables || cached?.tables || {};
+    if (cached?.schema && Object.keys(tables).length > 0) {
+      return { success: true, data: cached?.schema || cached || {}, cached: true };
+    }
+  } catch {
+    // Fall through to extraction when no usable cache exists.
+  }
   // Run an extraction if needed; ignore failures for sources whose
   // schema mapping was already written by the connect step.
   try {
@@ -471,8 +681,6 @@ const deriveGoalType = (data) => {
 export const analyzeQuestion = async (question, llmMode, sourceContext = {}, multiTurnContext = null, options = {}) => {
   void llmMode;
 
-  void sourceContext;
-
   const body = { goal: String(question || "") };
   if (multiTurnContext?.previousGoal) {
     body.previous_goal = multiTurnContext.previousGoal;
@@ -483,6 +691,39 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
   if (multiTurnContext?.conversationId) {
     body.conversation_id = multiTurnContext.conversationId;
   }
+  // Context-aware analytics context (metric/time_range/filters/grouping/
+  // dataset/previous_context). Carried from the shared cross-module context
+  // so "this period / previous period" resolves dynamically server-side.
+  const ctx = sourceContext || {};
+  for (const k of ["metric", "time_range", "filters", "grouping", "dataset", "previous_context"]) {
+    if (ctx[k] !== undefined && ctx[k] !== null && ctx[k] !== "") body[k] = ctx[k];
+  }
+  // Shared-context fallback (never overrides explicit call-site context).
+  // Reads the session handoff key first, then the established localStorage
+  // cross-module key (aria_analysis_context: metric/dataset/date/filters/
+  // dimension), so "this period / previous period" resolves dynamically.
+  try {
+    let shared = {};
+    try { shared = JSON.parse(sessionStorage.getItem("aria_shared_context") || "{}") || {}; } catch { shared = {}; }
+    if (!shared || typeof shared !== "object" || Object.keys(shared).length === 0) {
+      try { shared = JSON.parse(localStorage.getItem("aria_analysis_context") || "{}") || {}; } catch { shared = {}; }
+    }
+    if (shared && typeof shared === "object") {
+      if (!body.metric && shared.metric) body.metric = shared.metric;
+      if (!body.grouping && (shared.dimensions || shared.dimension)) {
+        body.grouping = shared.dimensions || shared.dimension;
+      }
+      if (!body.time_range && (shared.period || shared.date || shared.granularity)) {
+        body.time_range = {
+          ...(typeof shared.period === "string" ? { label: shared.period } : {}),
+          ...(shared.date ? { start: shared.date } : {}),
+          ...(shared.granularity ? { granularity: shared.granularity } : {}),
+        };
+      }
+      if (!body.filters && shared.filters) body.filters = shared.filters;
+      if (!body.dataset && shared.dataset) body.dataset = shared.dataset;
+    }
+  } catch { /* best-effort */ }
 
   const data = await request("/ask", {
     method: "POST",
@@ -562,6 +803,27 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
     consistency: data?.consistency || null,
     // Server-defined display metadata (t.txt-5): render as-is, never recompute.
     display: data?.display || null,
+    // Stable analytics contract (AI-Analytics 1-8, 17-20): rendered as-is,
+    // never fabricated client-side. Missing keys render as empty states.
+    interpretedIntent: data?.interpreted_intent || null,
+    answer: data?.answer || data?.message || "",
+    findings: Array.isArray(data?.findings) ? data.findings : [],
+    evidence: Array.isArray(data?.evidence) ? data.evidence : [],
+    visualization: data?.visualization || null,
+    limitations: Array.isArray(data?.limitations) ? data.limitations : [],
+    possibleDrivers: Array.isArray(data?.possible_drivers) ? data.possible_drivers : [],
+    hypothesis: data?.hypothesis || null,
+    recommendations: Array.isArray(data?.recommendations) ? data.recommendations : [],
+    followUpQuestions: Array.isArray(data?.follow_up_questions)
+      ? data.follow_up_questions
+      : (data?.suggested_questions || []),
+    comparisonPeriod: data?.comparison_period || null,
+    resultStatus: data?.result_status || data?.status || "success",
+    resultMessage: data?.result_message || "",
+    metric: data?.metric ?? null,
+    dimensions: Array.isArray(data?.dimensions) ? data.dimensions : [],
+    filters: data?.filters ?? null,
+    timeRange: data?.time_range ?? null,
   };
 
   return {
@@ -943,84 +1205,228 @@ const adaptPredictions = (predictions) => {
   return [];
 };
 
-export const generateInsights = async (goalResult, analyticsResult) => {
-  void goalResult;
+// NOTE: the legacy POST /api/insight client (generateInsights) was removed.
+// Insights re-analyze via GET /api/insights from the Insights page.
 
-  void analyticsResult;
+// =========================================================
+// DAY 8 - FEEDBACK AGENT
+// =========================================================
+//
+// The backend has no feedback endpoint yet; feedback is recorded
+// in the local history session so it is not lost.
+// =========================================================
 
-  const data = await request("/insight", {
-    method: "POST",
+// =========================================================
+// INTELLIGENCE MODULE (Explore / Hypotheses / Goals / What-If / Reports)
+// =========================================================
+//
+// Frontend renders backend truth only: every helper below forwards to
+// GET/POST /api/intelligence/* via apiFetch (credentials:include,
+// 60-120s clamped timeout, centralized 401 handling). List endpoints
+// accept server-side search/filter/sort/pagination params — never load
+// everything and filter client-side. No confidence/priority/impact math
+// lives in React; the backend computes, the UI formats and displays.
 
-    body: JSON.stringify({}),
-  });
-
-  const insights = data?.insights || {};
-
-  const keyInsights = [];
-
-  for (const kpi of (insights.kpis || []).slice(0, 3)) {
-    const hasValue = kpi?.sum !== null && kpi?.sum !== undefined;
-
-    keyInsights.push({
-      title: `Total ${humanize(kpi?.column)}`,
-
-      description: hasValue
-        ? `Sum of ${humanize(kpi.column)} is ${formatValue(kpi.sum)}${
-            kpi.mean !== null && kpi.mean !== undefined
-              ? ` with an average of ${formatValue(kpi.mean)}`
-              : ""
-          }${kpi.count ? ` across ${kpi.count} rows` : ""}.`
-        : `${humanize(kpi?.column)} has ${kpi?.count || 0} values${
-            kpi?.max !== null && kpi?.max !== undefined
-              ? `, peaking at ${formatValue(kpi.max)}`
-              : ""
-          }.`,
-
-      impact: "high",
-    });
+const intelQuery = (params = {}) => {
+  const parts = [];
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v === undefined || v === null || v === "") continue;
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        if (item !== undefined && item !== null && item !== "") {
+          parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(item))}`);
+        }
+      }
+    } else {
+      parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`);
+    }
   }
+  return parts.length ? `?${parts.join("&")}` : "";
+};
 
-  const firstTrend = (insights.trends || [])[0];
+export const intelligenceApi = {
+  // ---- Explore ----
+  // GET /api/intelligence/meta -> { metrics, breakdowns, time_grains,
+  //   comparisons, date_ranges, ... } — populates every dropdown.
+  getMeta: async () => {
+    const data = await request("/intelligence/meta");
+    return { success: true, data: data?.data || data || {} };
+  },
 
-  if (firstTrend) {
-    keyInsights.push({
-      title: `${humanize(firstTrend?.dimension || "data")} trend`,
-
-      description: adaptTrends([firstTrend])[0]?.description || "",
-
-      impact: "medium",
+  // POST /api/intelligence/explore { metric, breakdown, secondary_breakdown,
+  //   time_grain, comparison, date_range, filters } -> { trend, observation,
+  //   breakdown_rows, ... } — all numbers computed server-side.
+  runExplore: async (payload = {}) => {
+    const data = await request("/intelligence/explore", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
     });
-  }
+    return { success: true, data: data?.data || data || {} };
+  },
 
-  const recommendations = (
-    insights.prescriptions?.actions || []
-  ).slice(0, 5).map((action, index) => ({
-    title: action,
+  // ---- Hypotheses ----
+  // GET /api/intelligence/hypotheses with server-side search/filter/sort/
+  // pagination. Never show "schema-discovered lever" or FK-as-driver rows:
+  // the backend must not send them; the UI additionally drops them.
+  listHypotheses: async (params = {}) => {
+    const data = await request(`/intelligence/hypotheses${intelQuery(params)}`);
+    return {
+      success: true,
+      data: data?.data || data?.items || [],
+      total: data?.total ?? data?.count ?? null,
+      page: data?.page ?? params.page ?? null,
+      pageSize: data?.page_size ?? params.page_size ?? null,
+    };
+  },
 
-    description: action,
+  getHypothesis: async (id) => {
+    const data = await request(`/intelligence/hypotheses/${encodeURIComponent(id)}`);
+    return { success: true, data: data?.data || data || {} };
+  },
 
-    priority: ["high", "medium", "low"][index % 3],
-  }));
+  // ---- Goals (CRUD, status persists server-side) ----
+  listGoals: async (params = {}) => {
+    const data = await request(`/intelligence/goals${intelQuery(params)}`);
+    return {
+      success: true,
+      data: data?.data || data?.items || [],
+      total: data?.total ?? data?.count ?? null,
+    };
+  },
 
-  return {
-    success: true,
+  createGoal: async (payload = {}) => {
+    const data = await request("/intelligence/goals", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
 
-    data: {
-      keyInsights: keyInsights.slice(0, 3),
+  updateGoal: async (id, payload = {}) => {
+    const data = await request(`/intelligence/goals/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
 
-      trends: adaptTrends(insights.trends),
+  deleteGoal: async (id) => {
+    const data = await request(`/intelligence/goals/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
 
-      anomalies: adaptAnomalies(insights.anomalies),
+  // ---- What-If (slider range + results both from backend) ----
+  // GET /api/intelligence/what-if/meta -> { variables, change_types,
+  //   ranges: { [variable]: { min, max, step, ... } }, apply_targets }
+  getWhatIfMeta: async () => {
+    const data = await request("/intelligence/what-if/meta");
+    return { success: true, data: data?.data || data || {} };
+  },
 
-      hypotheses: adaptHypotheses(insights.hypotheses),
+  // POST /api/intelligence/what-if/run { variable, change_type,
+  //   change_value, apply_to } -> { projected_impact, comparison_series,
+  //   summary, assumptions } — the ONLY source of scenario results.
+  runWhatIf: async (payload = {}) => {
+    const data = await request("/intelligence/what-if/run", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
 
-      recommendations,
+  listScenarios: async (params = {}) => {
+    const data = await request(`/intelligence/what-if/scenarios${intelQuery(params)}`);
+    return { success: true, data: data?.data || data?.items || [] };
+  },
 
-      predictions: adaptPredictions(insights.predictions),
+  saveScenario: async (payload = {}) => {
+    const data = await request("/intelligence/what-if/scenarios", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
 
-      businessStory: insights.business_story || "",
-    },
-  };
+  // ---- Saved analyses ----
+  listAnalyses: async (params = {}) => {
+    const data = await request(`/intelligence/analyses${intelQuery(params)}`);
+    return {
+      success: true,
+      data: data?.data || data?.items || [],
+      total: data?.total ?? data?.count ?? null,
+    };
+  },
+
+  saveAnalysis: async (payload = {}) => {
+    const data = await request("/intelligence/analyses", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
+
+  // ---- Reports ----
+  listReports: async (params = {}) => {
+    const data = await request(`/intelligence/reports${intelQuery(params)}`);
+    return { success: true, data: data?.data || data?.items || [] };
+  },
+
+  listReportTemplates: async () => {
+    const data = await request("/intelligence/reports/templates");
+    return { success: true, data: data?.data || data?.items || [] };
+  },
+
+  // POST /api/intelligence/reports/generate { name, description, date_range,
+  //   sections, template } -> { report_url | html | ... } used by Generate PDF.
+  generateReport: async (payload = {}) => {
+    const data = await request("/intelligence/reports/generate", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
+
+  saveReportTemplate: async (payload = {}) => {
+    const data = await request("/intelligence/reports/templates", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
+
+  deleteAnalysis: async (id) => {
+    const data = await request(`/intelligence/analyses/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
+
+  deleteScenario: async (id) => {
+    const data = await request(`/intelligence/what-if/scenarios/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
+
+  deleteReport: async (id) => {
+    const data = await request(`/intelligence/reports/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
+
+  getReport: async (id) => {
+    const data = await request(`/intelligence/reports/${encodeURIComponent(id)}`);
+    return { success: true, data: data?.data || data || {} };
+  },
+
+  // ---- Coverage (which datasets/metrics the module can reason about) ----
+  getCoverage: async () => {
+    const data = await request("/intelligence/coverage");
+    return { success: true, data: data?.data || data || {} };
+  },
 };
 
 // =========================================================

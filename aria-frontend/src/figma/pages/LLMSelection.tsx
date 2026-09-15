@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { Zap, Shield, CheckCircle2 } from "lucide-react";
+import { API_BASE } from "../../services/api";
 
 interface LLMSelectionProps {
   onSelectLLM: (mode: string, apiKey?: string) => Promise<void> | void;
@@ -39,9 +40,8 @@ export default function LLMSelection({ onSelectLLM }: LLMSelectionProps) {
   const loadStatus = async () => {
     setStatusLoading(true);
     try {
-      const token = localStorage.getItem("aria_auth_token");
-      const res = await fetch("/api/providers/status", {
-        headers: { Authorization: `Bearer ${token || ""}` },
+      const res = await fetch(`${API_BASE}/providers/status`, {
+        credentials: "include",
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && Array.isArray(data.providers)) {

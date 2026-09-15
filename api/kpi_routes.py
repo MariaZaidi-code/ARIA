@@ -5,6 +5,8 @@ Zero hardcoded table/column names. Uses SchemaIntelligence for all decisions.
 """
 
 import json
+import logging
+import sqlite3
 import os
 import re
 import types
@@ -17,11 +19,13 @@ from sqlalchemy import create_engine, text
 
 from core.config import get_session, SCHEMA_DIR
 from core.deps import require_data, get_current_user, reject_document_sql
+from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, log_and_sanitize
 from core.secret_box import decrypt as _decrypt_secret
 from core.semantic import humanize, kpi_label
 from api.schema_intel import SchemaIntelligence, _safe_name, _run_sql
 
 router = APIRouter()
+from services.kpi_service import (_fmt, _is_currency_col, _safe, _validate_schema_ident, _bound_limit, _recommend_chart, _profile_numeric, _rollback, _variation, _score_kpi, _time_grain_expr, _parse_full_date, _parse_date_to_month, _pretty_month, _pretty_date, _discover_special_columns, _fetch_time_series, _holiday_lift, _retail_candidates_for_table, _SERIES_FALLBACK_MAX, _CHART_BY_INTENT, DASHBOARD_MIN_SCORE, _AMOUNT_HINTS, _ENTITY_HINTS, _DATE_HINTS, _STORE_HINTS, _HOLIDAY_HINTS, _SALES_HINTS, _DATE_PARSE_FORMATS, _MONTH_NAMES)  # noqa: F401,E402  # thin-wrapper re-export
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -46,8 +50,8 @@ def _build_engine(session):
     if db_config.get("password"):
         try:
             db_config["password"] = _decrypt_secret(db_config["password"])
-        except Exception:
-            pass
+        except (ValueError, KeyError, TypeError) as exc:
+            logging.getLogger("aria.kpi").debug("kpi secret decrypt skipped: %s", exc)
 
     schema = db_config.get("db_schema", "public")
     if db_type == "mysql":
@@ -63,244 +67,6 @@ def _build_engine(session):
     return create_engine(uri, pool_pre_ping=True,
                          connect_args={"connect_timeout": 10}), db_type, db_type
 
-
-def _fmt(v, is_currency=False):
-    if v is None:
-        return "N/A"
-    if is_currency:
-        if abs(v) >= 1_000_000:
-            return f"${v/1_000_000:,.1f}M"
-        if abs(v) >= 1_000:
-            return f"${v/1_000:,.0f}K"
-        return f"${v:,.0f}"
-    if abs(v) >= 1_000_000:
-        return f"{v/1_000_000:,.1f}M"
-    if abs(v) >= 1_000:
-        return f"{v/1_000:,.0f}K"
-    return f"{v:,.0f}"
-
-
-def _is_currency_col(col_name: str) -> bool:
-    from api.schema_intel import AMOUNT_HINTS
-    cl = col_name.lower()
-    return any(k in cl for k in AMOUNT_HINTS)
-
-
-def _safe(val):
-    """SQL-escape a string value."""
-    if val is None:
-        return "NULL"
-    return str(val).replace("'", "''")
-
-
-# ── Chart Selection Intelligence ────────────────────────────────────────
-# Section 45 of spec: choose chart based on analytical intent, cardinality,
-# measure type, time dimension, etc. Deterministic — no LLM needed.
-
-_CHART_BY_INTENT = {
-    "time_series": "line",
-    "category_comparison": "bar",
-    "distribution": "histogram",
-    "correlation": "scatter",
-    "composition": "stacked_bar",
-    "hierarchy": "treemap",
-    "geographic": "map",
-    "flow": "sankey",
-    "financial": "waterfall",
-}
-
-
-def _recommend_chart(columns: list, data: list, col_types: dict = None) -> dict:
-    """Recommend best chart type based on data characteristics.
-
-    Returns {chart_type, reason, compatible_types}.
-    Never overrides analytical correctness — only selects presentation.
-    """
-    if not columns or not data:
-        return {"chart_type": "table", "reason": "No data", "compatible_types": ["table"]}
-
-    col_types = col_types or {}
-    num_cols = [c for c in columns if col_types.get(c) == "numeric" or
-                col_types.get(c.lower()) == "numeric" or
-                (data and isinstance(data[0].get(c), (int, float)))]
-    cat_cols = [c for c in columns if c not in num_cols and
-                (col_types.get(c, col_types.get(c.lower(), "")) in ("text", "category", "")
-                 or (data and data[0].get(c) is not None))]
-    time_cols = [c for c in columns if any(k in c.lower() for k in
-                 ("date", "time", "year", "month", "day", "created", "updated"))]
-
-    # Time series detection
-    if time_cols and num_cols:
-        return {
-            "chart_type": "line",
-            "reason": f"Time dimension ({time_cols[0]}) with numeric measure",
-            "compatible_types": ["line", "area", "bar"],
-        }
-
-    # Single category + single numeric → bar
-    if len(cat_cols) == 1 and len(num_cols) == 1:
-        cardinality = len(set(str(row.get(cat_cols[0])) for row in data[:100]))
-        if cardinality <= 20:
-            return {
-                "chart_type": "bar",
-                "reason": f"Categorical comparison ({cardinality} categories)",
-                "compatible_types": ["bar", "horizontal_bar", "pie"],
-            }
-        else:
-            return {
-                "chart_type": "bar",
-                "reason": f"High cardinality category ({cardinality} values)",
-                "compatible_types": ["bar", "horizontal_bar"],
-            }
-
-    # Two numerics → scatter
-    if len(num_cols) >= 2 and len(cat_cols) <= 2:
-        return {
-            "chart_type": "scatter",
-            "reason": "Two numeric measures for correlation",
-            "compatible_types": ["scatter", "bubble", "line"],
-        }
-
-    # Multiple categories + numeric → stacked or grouped bar
-    if len(cat_cols) >= 2 and len(num_cols) >= 1:
-        return {
-            "chart_type": "stacked_bar",
-            "reason": "Multi-dimensional comparison",
-            "compatible_types": ["stacked_bar", "grouped_bar", "heatmap"],
-        }
-
-    # Single numeric only → histogram/distribution
-    if len(num_cols) == 1 and len(cat_cols) == 0:
-        return {
-            "chart_type": "histogram",
-            "reason": "Distribution of single numeric",
-            "compatible_types": ["histogram", "box", "density"],
-        }
-
-    # Default: table for complex cases
-    return {
-        "chart_type": "table",
-        "reason": "Complex data structure",
-        "compatible_types": ["table", "bar"],
-    }
-
-
-# ── Schema loading ───────────────────────────────────────────────────────
-
-# ── Dynamic dashboard composition (spec: profile → score → dedupe → select) ──
-# Relevance > completeness > quantity. Threshold configurable via env (§17).
-
-DASHBOARD_MIN_SCORE = float(os.getenv("DASHBOARD_MIN_SCORE", "0.35"))
-
-_AMOUNT_HINTS = ("amount", "revenue", "sales", "profit", "price", "cost", "total",
-                 "value", "payment", "expense", "income", "salary", "turnover", "billing")
-_ENTITY_HINTS = ("customer", "user", "client", "member", "employee", "product",
-                 "order", "account", "patient", "student", "ticket")
-_DATE_HINTS = ("date", "time", "day", "month", "year", "created", "updated",
-               "timestamp", "period")
-
-
-def _profile_numeric(conn, tname: str, col: str, dialect: str) -> dict | None:
-    """One-query profile of a numeric column (spec §1)."""
-    try:
-        row = conn.execute(text(
-            f"SELECT COUNT(*) AS n, COUNT({_safe_name(col, dialect)}) AS nn, "
-            f"COUNT(DISTINCT {_safe_name(col, dialect)}) AS d, "
-            f"SUM({_safe_name(col, dialect)}) AS s, AVG({_safe_name(col, dialect)}) AS a, "
-            f"MIN({_safe_name(col, dialect)}) AS mi, MAX({_safe_name(col, dialect)}) AS ma "
-            f"FROM {_safe_name(tname, dialect)}"
-        )).fetchone()
-        if not row or not row[0]:
-            return None
-        n = float(row[0])
-        return {"n": n, "nn": float(row[1] or 0), "distinct": float(row[2] or 0),
-                "sum": row[3], "avg": row[4], "min": row[5], "max": row[6]}
-    except Exception:
-        _rollback(conn)
-        return None
-
-
-def _rollback(conn) -> None:
-    """Reset a poisoned transaction so later queries on the same connection work.
-
-    PostgreSQL aborts the whole transaction on one failed statement (e.g. SUM
-    over a text column); without an explicit rollback every subsequent query
-    on that connection fails too — which once blanked the entire dashboard.
-    """
-    try:
-        conn.rollback()
-    except Exception:
-        pass
-
-
-def _variation(mean, lo, hi) -> float:
-    try:
-        mean, lo, hi = float(mean), float(lo), float(hi)
-    except (TypeError, ValueError):
-        return 0.0
-    if mean == 0 or hi == lo:
-        return 0.0
-    return max(0.0, min(1.0, (hi - lo) / abs(mean)))
-
-
-def _score_kpi(kind: str, col: str, prof: dict, has_date: bool, is_currency: bool) -> tuple[float, str]:
-    """Spec §2 relevance score + human-readable reason (§18)."""
-    coverage = (prof["nn"] / prof["n"]) if prof["n"] else 0.0
-    null_pct = 1.0 - coverage
-    var = _variation(prof["avg"], prof["min"], prof["max"])
-    low = col.lower()
-    semantic = 0.10
-    why = [f"covers {coverage:.0%} of records"]
-    if kind == "outcome":
-        semantic = 0.30 if any(h in low for h in _AMOUNT_HINTS) else 0.20
-        why.append("additive business measure" if any(h in low for h in _AMOUNT_HINTS) else "summable measure")
-    elif kind == "entity":
-        semantic = 0.25
-        why.append("unique-entity count")
-    elif kind == "efficiency":
-        semantic = 0.20
-        why.append("per-unit efficiency view")
-    elif kind == "volume":
-        semantic = 0.15
-        why.append("dataset volume")
-    business = 0.15 if is_currency else (0.10 if kind in ("outcome", "entity") else 0.05)
-    trend = 0.10 if has_date else 0.0
-    if has_date:
-        why.append("trend comparable over time")
-    score = (semantic + coverage * 0.25 + var * 0.20 + business + trend
-             - null_pct * 0.50)
-    if var == 0:
-        why.append("no variation detected")
-        score -= 0.15
-    return round(score, 3), "; ".join(why)
-
-
-def _time_grain_expr(col: str, dialect: str, span_days: float) -> tuple[str, str]:
-    """Pick time grain from span (§6): daily / weekly / monthly / quarterly."""
-    c = _safe_name(col, dialect)
-    if dialect == "sqlite":
-        if span_days < 62:
-            return f"strftime('%Y-%m-%d', {c})", "day"
-        if span_days < 200:
-            return f"strftime('%Y-W%W', {c})", "week"
-        if span_days < 1200:
-            return f"strftime('%Y-%m', {c})", "month"
-        return f"strftime('%Y', {c}) || '-Q' || ((CAST(strftime('%m', {c}) AS INTEGER) + 2) / 3)", "quarter"
-    if dialect == "mysql":
-        if span_days < 62:
-            return f"DATE_FORMAT({c}, '%Y-%m-%d')", "day"
-        if span_days < 200:
-            return f"DATE_FORMAT({c}, '%Y-u%v')", "week"
-        if span_days < 1200:
-            return f"DATE_FORMAT({c}, '%Y-%m')", "month"
-        return f"CONCAT(YEAR({c}), '-Q', QUARTER({c}))", "quarter"
-    if span_days < 62:
-        return f"TO_CHAR({c}, 'YYYY-MM-DD')", "day"
-    if span_days < 200:
-        return f"TO_CHAR({c}, 'IYYY-\"W\"IW')", "week"
-    if span_days < 1200:
-        return f"TO_CHAR({c}, 'YYYY-MM')", "month"
-    return f"TO_CHAR({c}, 'YYYY') || '-Q' || TO_CHAR({c}, 'Q')", "quarter"
 
 def _load_schema(session, user_id=None):
     """Load the schema mapping and build SchemaIntelligence."""
@@ -329,10 +95,16 @@ def _load_schema(session, user_id=None):
         if user_default.exists() and user_default != default_path:
             mapping = json.loads(user_default.read_text(encoding="utf-8"))
             return SchemaIntelligence(mapping)
-    # Last resort: try to trigger auto-extraction from the session DB info
+    # Last resort: try to trigger auto-extraction from the session DB info.
+    # Canonical stack is schema_engine/; schema_agent/ is legacy and used here
+    # only as a backward-compat fallback (new code must NOT import it).
     if session.get("db") and session.get("db_type") in ("postgresql", "mysql"):
         try:
-            import schema_agent
+            import warnings as _warnings
+            import schema_agent  # noqa: DEPRECATED legacy fallback only
+            _warnings.warn(
+                "kpi_routes legacy schema_agent fallback in use; prefer schema_engine.",
+                DeprecationWarning, stacklevel=2)
             config = dict(session.get("db", {}))
             if "password" in config and config.get("password"):
                 try:
@@ -451,7 +223,8 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
                     row = result.fetchone()
                     if row:
                         total += row[0]
-                except Exception:
+                except DB_ERRORS as exc:
+                    logging.getLogger("aria.kpi").debug("kpi total-records skipped for %s: %s", tname, exc)
                     continue
             if total > 0:
                 kpis.append({
@@ -480,7 +253,7 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
                         f"SELECT SUM({_safe_name(measure, dialect)}) FROM {_safe_name(tname, dialect)}"
                     ))
                     row = result.fetchone()
-                    if row and row[0] is not None:
+                    if row and row[0] is not None:  # noqa: SIM108 (typed guard below)
                         val = float(row[0])
                         tdesc = intel.tables[tname].get("description", tname)
                         kpis.append({
@@ -516,6 +289,77 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
                 except Exception:
                     continue
 
+            # 3b. Retail-aware KPIs from real execution (single-table safe).
+            # Surfaces store count, date range and holiday lift, and attaches
+            # real spark series to the sales total/average. Never mocked:
+            # every number comes from executed SQL on the actual table.
+            try:
+                _have_labels = {str(k.get("label", "")).lower() for k in kpis}
+                for tname in list(intel.tables.keys())[:3]:
+                    if intel.tables[tname].get("empty"):
+                        continue
+                    for cand in _retail_candidates_for_table(conn, intel, tname, dialect):
+                        agg, col = cand["agg"], cand["column"]
+                        if agg in ("SUM", "AVG") and "__" not in col:
+                            # Enrich the matching generic KPI with a spark
+                            # instead of duplicating it.
+                            for k in kpis:
+                                if (col.lower() in str(k.get("label", "")).lower()
+                                        and k.get("period") == ("Total" if agg == "SUM" else "Average")
+                                        and not k.get("spark") and cand.get("spark")):
+                                    k["spark"] = cand["spark"]
+                                    if cand.get("trend"):
+                                        k["trend"] = cand["trend"]
+                            continue
+                        if agg == "DISTINCT":
+                            label = kpi_label("DISTINCT", col)
+                        elif agg == "RANGE":
+                            label = str(cand.get("label_override") or "Date Range")
+                        elif agg == "LIFT":
+                            label = str(cand.get("label_override") or "Holiday Lift")
+                        else:
+                            continue
+                        if label.lower() in _have_labels:
+                            continue
+                        if agg == "RANGE":
+                            kpis.append({
+                                "label": label,
+                                "value": cand.get("value_override") or _fmt(cand["value"]),
+                                "rawValue": cand["value"],
+                                "change": None,
+                                "prefix": "",
+                                "period": cand.get("period_override") or "All data",
+                                "format": "text",
+                            })
+                        elif agg == "LIFT":
+                            kpis.append({
+                                "label": label,
+                                "value": f"{cand['value']:+.1f}%",
+                                "rawValue": cand["value"],
+                                "change": cand.get("change_override", cand["value"]),
+                                "prefix": "",
+                                "period": cand.get("period_override") or "Holiday vs non-holiday",
+                                "format": "percent",
+                                "spark": cand.get("spark") or [],
+                            })
+                        else:
+                            kpis.append({
+                                "label": label,
+                                "value": _fmt(cand["value"]),
+                                "rawValue": cand["value"],
+                                "change": None,
+                                "prefix": "",
+                                "period": "All data",
+                                "spark": cand.get("spark") or [],
+                            })
+                        _have_labels.add(label.lower())
+                        if len(kpis) >= 8:
+                            break
+                    if len(kpis) >= 8:
+                        break
+            except Exception:
+                pass
+
             # 4. Time-series chart: find a table with datetime + measure
             for tname in list(intel.tables.keys())[:14]:
                 if intel.tables[tname].get("empty"):
@@ -526,36 +370,23 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
                     continue
 
                 try:
-                    if dialect == "sqlite":
-                        time_expr = f"strftime('%Y-%m', {_safe_name(dt_col, dialect)})"
-                    elif dialect == "mysql":
-                        time_expr = f"DATE_FORMAT({_safe_name(dt_col, dialect)}, '%Y-%m')"
-                    else:
-                        time_expr = f"TO_CHAR({_safe_name(dt_col, dialect)}, 'YYYY-MM')"
-
-                    result = conn.execute(text(
-                        f"SELECT {time_expr} AS period, "
-                        f"SUM({_safe_name(measure, dialect)}) AS val "
-                        f"FROM {_safe_name(tname, dialect)} "
-                        f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
-                        f"GROUP BY period ORDER BY period LIMIT 30"
-                    ))
-                    rows = result.fetchall()
-                    if rows:
-                        chart_data = [{"period": str(r[0]), "value": float(r[1])} for r in rows if r[1] is not None]
-                        if chart_data:
-                            tdesc = intel.tables[tname].get("description", tname)
-                            is_curr = _is_currency_col(measure)
-                            charts.append({
-                                "title": f"{measure} over time ({tdesc[:15]})",
-                                "type": "area",
-                                "data": chart_data,
-                                "dataKey": "value",
-                                "xKey": "period",
-                                "format": "currency" if is_curr else "number",
-                            })
-                            if len(charts) >= 3:
-                                break
+                    # Grain-aware series from real SQL; falls back to raw
+                    # pairs bucketed in Python for non-ISO date text.
+                    _grain, chart_data = _fetch_time_series(
+                        conn, tname, dt_col, measure, dialect, limit=30, intel=intel)
+                    if chart_data:
+                        tdesc = intel.tables[tname].get("description", tname)
+                        is_curr = _is_currency_col(measure)
+                        charts.append({
+                            "title": f"{measure} over time ({tdesc[:15]})",
+                            "type": "area",
+                            "data": chart_data,
+                            "dataKey": "value",
+                            "xKey": "period",
+                            "format": "currency" if is_curr else "number",
+                        })
+                        if len(charts) >= 3:
+                            break
                 except Exception:
                     continue
 
@@ -599,8 +430,44 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
                     except Exception:
                         continue
 
-    except Exception:
-        pass
+    except DB_ERRORS as exc:
+        logging.getLogger("aria.kpi").exception(
+            "dashboard kpis query phase failed request_id=%s: %s",
+            get_request_id(request), exc)
+
+    # Last-resort fallback: a connected 1-table source must never return [].
+    # Per-table row counts from real SQL so KPIs are always present on data.
+    if not kpis:
+        try:
+            if engine is not None:
+                with engine.connect() as _conn:
+                    for tname in list(intel.tables.keys())[:5]:
+                        try:
+                            _r = _conn.execute(text(
+                                f"SELECT COUNT(*) FROM {_safe_name(tname, dialect)}")).fetchone()
+                            if _r and _r[0]:
+                                _tdesc = intel.tables[tname].get("description", tname)
+                                kpis.append({
+                                    "label": f"{_tdesc} Records",
+                                    "value": _fmt(int(_r[0])),
+                                    "rawValue": int(_r[0]),
+                                    "change": None,
+                                    "prefix": "",
+                                    "period": "All data",
+                                })
+                                if len(kpis) >= 5:
+                                    break
+                        except DB_ERRORS as exc:
+                            logging.getLogger("aria.kpi").debug(
+                                "kpi fallback row-count skipped for %s: %s", tname, exc)
+                            try:
+                                _conn.rollback()
+                            except DB_ERRORS as rb_exc:
+                                logging.getLogger("aria.kpi").debug(
+                                    "kpi fallback rollback skipped: %s", rb_exc)
+                            continue
+        except Exception:
+            pass
 
     # Summary
     db_name = session.get("db_name", "")
@@ -945,7 +812,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                 for tname, measure in tables_with_measures[:5]:
                     if intel.tables[tname].get("empty"):
                         continue
-                    prof = _profile_numeric(conn, tname, measure, dialect)
+                    prof = _profile_numeric(conn, tname, measure, dialect, intel=intel)
                     if not prof or not prof["nn"]:
                         continue
                     is_curr = _is_currency_col(measure)
@@ -998,6 +865,22 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                             _rollback(conn)
                             pass
 
+                # Retail-aware candidates from real execution (single-table
+                # safe): sales total/avg (with spark), store count, date
+                # range, holiday lift. Scored via the same _score_kpi and
+                # prepended so the diversity pass below considers them
+                # first — dupes by (column, agg) are admitted once.
+                _retail_cands: list[dict] = []
+                try:
+                    for tname in tables_list[:3]:
+                        if intel.tables[tname].get("empty"):
+                            continue
+                        _retail_cands.extend(
+                            _retail_candidates_for_table(conn, intel, tname, dialect))
+                except Exception:
+                    pass
+                kpi_candidates = _retail_cands + kpi_candidates
+
                 # Diversity pass: best of each kind first, then fill by score.
                 # Redundancy: same (column, agg) admitted once; ≤2 KPIs per table.
                 picked: list[dict] = []
@@ -1029,8 +912,10 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
 
                 for c in picked:
                     is_curr = c["is_currency"]
-                    change = None
-                    period = "Total" if c["agg"] == "SUM" else ("Average" if c["agg"] == "AVG" else "All data")
+                    change = c.get("change_override")
+                    period = c.get("period_override") or (
+                        "Total" if c["agg"] == "SUM"
+                        else ("Average" if c["agg"] == "AVG" else "All data"))
                     # Period comparison (§4): current vs previous grain period.
                     if c["agg"] == "SUM" and c["date_col"]:
                         try:
@@ -1053,13 +938,29 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         except Exception:
                             _rollback(conn)
                             pass
-                    label = kpi_label(c["agg"], c["column"])
+                        # Non-ISO date text makes SQL grouping return NULL —
+                        # fall back to the real-SQL trend series instead.
+                        if change is None and len(c.get("trend") or []) >= 2:
+                            try:
+                                tvals = [float(p["value"]) for p in c["trend"][-2:]]
+                                if tvals[0] != 0:
+                                    change = round(((tvals[1] - tvals[0]) / abs(tvals[0])) * 100, 1)
+                                    period = "vs prev period"
+                            except Exception:
+                                pass
+                    label = c.get("label_override") or kpi_label(c["agg"], c["column"])
+                    if c["agg"] == "RANGE":
+                        disp_value = c.get("value_override") or _fmt(c["value"], is_curr)
+                    elif c["agg"] == "LIFT":
+                        disp_value = f"{c['value']:+.1f}%"
+                    else:
+                        disp_value = _fmt(c["value"], is_curr)
                     metrics.append({
                         "id": f"{c['agg'].lower()}_{c['table']}_{c['column']}",
                         "label": label,
-                        "value": _fmt(c["value"], is_curr),
+                        "value": disp_value,
                         "rawValue": c["value"],
-                        "format": "currency" if is_curr else "number",
+                        "format": c.get("format_override") or ("currency" if is_curr else "number"),
                         "period": period,
                         "icon": "trending-up" if c["agg"] == "SUM" else "bar-chart",
                         "color": "#059669" if is_curr else "#2F6FAD",
@@ -1068,6 +969,67 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     })
                     if change is not None:
                         metrics[-1]["change"] = change
+                    if c.get("spark"):
+                        metrics[-1]["spark"] = c["spark"]
+                    if c.get("trend"):
+                        metrics[-1]["trend"] = c["trend"]
+
+                # Guarantee: retail specials (store count, date range,
+                # holiday lift) that passed the score threshold are surfaced
+                # even when the per-table diversity cap crowded them out.
+                try:
+                    _picked_keys = {(p["column"].lower(), p["agg"]) for p in picked}
+                    for c in _retail_cands:
+                        if len(metrics) >= 6:
+                            break
+                        if c["agg"] not in ("DISTINCT", "RANGE", "LIFT"):
+                            continue
+                        if (c["column"].lower(), c["agg"]) in _picked_keys:
+                            continue
+                        if c["score"] < DASHBOARD_MIN_SCORE:
+                            continue
+                        _picked_keys.add((c["column"].lower(), c["agg"]))
+                        if c["agg"] == "RANGE":
+                            _mv = c.get("value_override") or _fmt(c["value"])
+                            _mf = "text"
+                        elif c["agg"] == "LIFT":
+                            _mv = f"{c['value']:+.1f}%"
+                            _mf = "percent"
+                        else:
+                            _mv = _fmt(c["value"])
+                            _mf = "number"
+                        _m = {
+                            "id": f"{c['agg'].lower()}_{c['table']}_{c['column']}",
+                            "label": c.get("label_override") or kpi_label(c["agg"], c["column"]),
+                            "value": _mv,
+                            "rawValue": c["value"],
+                            "format": _mf,
+                            "period": c.get("period_override") or "All data",
+                            "icon": "bar-chart",
+                            "color": "#2F6FAD",
+                            "score": c["score"],
+                            "reason": f"Selected ({c['kind']}, score {c['score']}): {c['reason']}.",
+                        }
+                        if c.get("change_override") is not None:
+                            _m["change"] = c["change_override"]
+                        if c.get("spark"):
+                            _m["spark"] = c["spark"]
+                        metrics.append(_m)
+                except Exception:
+                    pass
+
+                # Last-resort fallback: never return zero metrics on data.
+                if not metrics and total_rows > 0:
+                    metrics.append({
+                        "id": "total_records",
+                        "label": "Total Records",
+                        "value": _fmt(total_rows),
+                        "rawValue": total_rows,
+                        "format": "number",
+                        "period": "All data",
+                        "icon": "database",
+                        "color": "#2F6FAD",
+                    })
 
                 # ── Scored chart candidates (spec §5-12, §15, §17) ──
                 # Grain-aware time series + Top-N categoricals, deduped, capped at 4.
@@ -1091,6 +1053,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     if measure not in intel.get_numeric_cols(tname):
                         continue
                     try:
+                        # Real-SQL profile for variation scoring.
                         srow = conn.execute(text(
                             f"SELECT MIN({_safe_name(dt_col, dialect)}), "
                             f"MAX({_safe_name(dt_col, dialect)}), "
@@ -1103,33 +1066,17 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         )).fetchone()
                         if not srow or srow[0] is None:
                             continue
-                        try:
-                            span_days = max(
-                                0.0,
-                                (datetime.fromisoformat(str(srow[1])[:19])
-                                 - datetime.fromisoformat(str(srow[0])[:19])).total_seconds() / 86400,
-                            )
-                        except Exception:
-                            span_days = 365.0
-                        time_expr, grain = _time_grain_expr(dt_col, dialect, span_days)
-                        limit_n = 60 if grain == "day" else 30
-                        result = conn.execute(text(
-                            f"SELECT {time_expr} AS period, "
-                            f"SUM({_safe_name(measure, dialect)}) AS val "
-                            f"FROM {_safe_name(tname, dialect)} "
-                            f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
-                            f"GROUP BY period ORDER BY period LIMIT {limit_n}"
-                        ))
-                        rows = result.fetchall()
-                        chart_data = [{"period": str(r[0]), "value": float(r[1])}
-                                      for r in rows if r[1] is not None]
+                        # Grain-aware series from real SQL; handles non-ISO
+                        # date text via a raw-pair Python bucketing fallback.
+                        grain, chart_data = _fetch_time_series(
+                            conn, tname, dt_col, measure, dialect, limit=30, intel=intel)
                         if len(chart_data) >= 2:
                             var = _variation(srow[3], srow[4], srow[5])
                             chart_candidates.append({
                                 "kind": "time", "table": tname, "column": measure,
                                 "score": _chart_score(len(chart_data), var),
-                                "grain": grain, "data": chart_data,
-                                "reason": (f"{len(chart_data)} {grain} periods with "
+                                "grain": grain or "month", "data": chart_data,
+                                "reason": (f"{len(chart_data)} {grain or 'month'} periods with "
                                            f"{'strong' if var > 0.5 else 'moderate' if var > 0.15 else 'low'} variation."),
                             })
                     except Exception:
@@ -1154,7 +1101,6 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         for _c in intel.get_text_cols(tname):
                             if _c not in dim_candidates:
                                 dim_candidates.append(_c)
-                        chart_done = False
                         # Rank candidate dims by cardinality first (cheap): prefer
                         # compact breakdowns (Region, Category) over near-unique
                         # columns (IDs, dates). One data query for the winner.
@@ -1176,8 +1122,6 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                                 continue
                         ranked_dims.sort(key=lambda x: x[0])
                         for _, dim in ranked_dims[:2]:
-                            if chart_done:
-                                break
                             try:
                                 result = conn.execute(text(
                                     f"SELECT {_safe_name(dim, dialect)} AS dim_val, "
@@ -1204,10 +1148,44 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                                             "reason": (f"Top-{len(chart_data)} {dim} comparison with "
                                                        f"{'clear' if var > 0.4 else 'moderate'} spread."),
                                         })
-                                        chart_done = True
                             except Exception:
                                 _rollback(conn)
                                 continue
+
+                # Scatter chart: for tables with 2+ numeric columns, compare two measures.
+                if len(charts) < 2:
+                    for tname in tables_list[:6]:
+                        if intel.tables[tname].get("empty"):
+                            continue
+                        num_cols = intel.get_numeric_cols(tname)
+                        if len(num_cols) < 2:
+                            continue
+                        m1 = num_cols[0]
+                        m2 = num_cols[1]
+                        try:
+                            result = conn.execute(text(
+                                f"SELECT {_safe_name(m1, dialect)} AS x, "
+                                f"{_safe_name(m2, dialect)} AS y "
+                                f"FROM {_safe_name(tname, dialect)} "
+                                f"WHERE {_safe_name(m1, dialect)} IS NOT NULL "
+                                f"AND {_safe_name(m2, dialect)} IS NOT NULL "
+                                f"LIMIT 200"
+                            ))
+                            rows = result.fetchall()
+                            if len(rows) >= 10:
+                                scatter_data = [{"x": float(r[0]), "y": float(r[1])}
+                                                for r in rows if r[0] is not None and r[1] is not None]
+                                if scatter_data:
+                                    chart_candidates.append({
+                                        "kind": "scatter", "table": tname,
+                                        "column": m1, "dim": m2,
+                                        "score": 0.5,
+                                        "data": scatter_data,
+                                        "reason": f"Relationship between {m1} and {m2}.",
+                                    })
+                        except Exception:
+                            _rollback(conn)
+                            continue
 
                 # Diversity: one time + one category per measure first, then fill.
                 chart_candidates.sort(key=lambda c: -c["score"])
@@ -1226,12 +1204,25 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         charts.append({
                             "id": f"ts_{c['table']}_{c['column']}",
                             "title": f"{humanize(c['column'])} Over Time",
-                            "subtitle": f"{len(c['data'])} {c['grain']} periods",
+                            "subtitle": f"{len(c['data'])} {c.get('grain', 'period')} periods",
                             "type": "area",
                             "data": c["data"],
                             "dataKey": "value",
                             "xKey": "period",
                             "format": "currency" if is_curr else "number",
+                            "score": c["score"],
+                            "reason": c["reason"],
+                        })
+                    elif c["kind"] == "scatter":
+                        charts.append({
+                            "id": f"scatter_{c['table']}_{c['column']}",
+                            "title": f"{humanize(c['column'])} vs {humanize(c['dim'])}",
+                            "subtitle": f"{len(c['data'])} data points",
+                            "type": "scatter",
+                            "data": c["data"],
+                            "xKey": "x",
+                            "yKey": "y",
+                            "format": "number",
                             "score": c["score"],
                             "reason": c["reason"],
                         })

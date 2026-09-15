@@ -1,4 +1,13 @@
-"""Persistent PDF metadata, conversation history, and LangChain PGVector access."""
+"""Persistent PDF metadata, conversation history, and LangChain PGVector access.
+
+Consistency contract: the vector index (PGVector) and the filesystem
+(manifest + chunk JSON + PDF bytes) are two stores with no distributed
+transaction. Callers (see ``InsightPDFRAG._ingest_pdf``) own the
+write-then-commit order and must roll both back together on any failure,
+failing loudly (raise, never report partial as healthy). Helpers here never
+swallow errors: read/write/delete failures raise so partial state cannot
+look healthy.
+"""
 
 from __future__ import annotations
 
@@ -36,6 +45,7 @@ def _read_json(path: Path, default):
 def _atomic_write(path: Path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = None
+    _replaced = False
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          suffix=".tmp", delete=False) as handle:
@@ -44,8 +54,9 @@ def _atomic_write(path: Path, payload) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
+        _replaced = True
     finally:
-        if temp is not None:
+        if temp is not None and not _replaced:
             temp.unlink(missing_ok=True)
 
 
@@ -244,11 +255,14 @@ class UserPGVectorStore:
         )
 
     def add_documents(self, documents: list[Document]) -> list[str]:
+        # Loud on failure: the caller rolls back the filesystem side too.
         ids = [str(doc.metadata["chunk_id"]) for doc in documents]
         self.store.add_documents(documents=documents, ids=ids)
         return ids
 
     def delete_chunks(self, chunk_ids: list[str]) -> None:
+        # Loud on failure: incomplete cleanup must raise so the caller can
+        # fail loudly instead of reporting a partial index as healthy.
         if chunk_ids:
             self.store.delete(ids=chunk_ids)
 

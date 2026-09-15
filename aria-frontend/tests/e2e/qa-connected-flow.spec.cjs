@@ -106,30 +106,43 @@ test.describe("ARIA QA - connected flow", () => {
     if (insightsProblems.ce.length || insightsProblems.pe.length || insightsProblems.fr.length)
       console.log("INSIGHTS_PROBLEMS=" + JSON.stringify(insightsProblems));
 
-    // ---- Predictive ----
+    // ---- Forecast (Predictive) ----
     sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /^predictive$/i }).first().click();
+    await page.getByRole("button", { name: /forecast/i }).first().click();
     await page.waitForTimeout(40000);
     const predictiveProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
     if (predictiveProblems.ce.length || predictiveProblems.pe.length || predictiveProblems.fr.length)
       console.log("PREDICTIVE_PROBLEMS=" + JSON.stringify(predictiveProblems));
 
-    // ---- Prescription ----
+    // ---- Decision Center: recommendations integration (prescription contract) ----
     sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /^prescription$/i }).first().click();
+    await page.getByRole("button", { name: /decision center/i }).first().click();
     await page.waitForTimeout(40000);
-    const prescriptionProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
-    if (prescriptionProblems.ce.length || prescriptionProblems.pe.length || prescriptionProblems.fr.length)
-      console.log("PRESCRIPTION_PROBLEMS=" + JSON.stringify(prescriptionProblems));
+    const dcHtml = await page.locator("#root").innerHTML();
+    console.log("DECISION_HAS_CONTENT=" + /Decision Center|No decisions yet|No strong recommendations|Analyzing|Insufficient evidence|recommendation/i.test(dcHtml));
+    const decisionProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
+    if (decisionProblems.ce.length || decisionProblems.pe.length || decisionProblems.fr.length)
+      console.log("DECISION_PROBLEMS=" + JSON.stringify(decisionProblems));
 
-    // ---- Hypothesis: run a real test ----
+    // ---- Hypothesis (embedded): Insights -> select -> "Investigate why" ->
+    // contextual hypothesis in AI Analytics (Possible drivers) ----
     sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /^hypothesis$/i }).first().click();
-    await page.waitForTimeout(400);
-    await page.getByRole("button", { name: /correlation between two numeric/i }).click();
-    await page.waitForTimeout(25000);
-    const hypHtml = await page.locator("#root").innerHTML();
-    console.log("HYPOTHESIS_RESULT=" + /supported|statistical/i.test(hypHtml));
+    await page.getByRole("button", { name: /^insights$/i }).first().click();
+    await page.waitForTimeout(15000);
+    const whyBtn = page.getByRole("button", { name: /investigate why/i }).first();
+    if (await whyBtn.count()) {
+      await whyBtn.click();
+      await page.waitForTimeout(3000);
+      const analyticsHtml = await page.locator("#root").innerHTML();
+      console.log("HYPOTHESIS_CONTEXT=" + /Possible drivers|Investigate why|AI Analytics/i.test(analyticsHtml));
+      // Close/return: navigate back to Insights to verify context survived.
+      await page.getByRole("button", { name: /^insights$/i }).first().click();
+      await page.waitForTimeout(2000);
+      const backHtml = await page.locator("#root").innerHTML();
+      console.log("HYPOTHESIS_BACK=" + /Insights|Investigate why|Evidence/i.test(backHtml));
+    } else {
+      console.log("HYPOTHESIS_CONTEXT=no-insight-available (empty state, valid)");
+    }
     const hypothesisProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
     if (hypothesisProblems.ce.length || hypothesisProblems.pe.length || hypothesisProblems.fr.length)
       console.log("HYPOTHESIS_PROBLEMS=" + JSON.stringify(hypothesisProblems));

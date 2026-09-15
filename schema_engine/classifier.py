@@ -58,16 +58,23 @@ def classify(profiler: Optional[ValueProfiler],
         rel["ambiguous"] = True
 
     # Cardinality: source distinct values (data available) vs referenced key.
+    # Samples use different caps (MAX_SAMPLE vs MAX_PK_SAMPLE), so a raw
+    # len(src)/len(tgt) ratio is a sampling artifact when either side is
+    # truncated. Only infer when neither side hit its cap; otherwise leave
+    # cardinality unset (UNKNOWN) instead of guessing.
     if profiler is not None and isinstance(col_name, str) and isinstance(ref_col, str):
         src_vals = profiler.source_values(table_name, col_name)
         tgt_vals = profiler._pk_values(candidate_table)
         if src_vals is not None and len(tgt_vals) > 0:
-            ratio = len(src_vals) / len(tgt_vals)
-            rel["cardinality"] = (
-                "one-to-one" if ratio >= 0.9
-                else "one-to-many" if ratio > 1.1
-                else "many-to-one"
-            )
+            src_truncated = len(src_vals) >= getattr(profiler, "MAX_SAMPLE", 500)
+            tgt_truncated = len(tgt_vals) >= getattr(profiler, "MAX_PK_SAMPLE", 100000)
+            if not (src_truncated or tgt_truncated):
+                ratio = len(src_vals) / len(tgt_vals)
+                rel["cardinality"] = (
+                    "one-to-one" if ratio >= 0.9
+                    else "one-to-many" if ratio > 1.1
+                    else "many-to-one"
+                )
 
     evidence: List[str] = []
     score = 0.0
@@ -221,6 +228,27 @@ def classify(profiler: Optional[ValueProfiler],
             rel["evidence"] = evidence
 
     return rel, ambiguous
+
+
+def field_semantic_role(col_name, data_type="", *, is_pk=False,
+                        is_fk=False) -> str:
+    """hyp.txt PHASE 1 role annotation for a relationship endpoint.
+
+    Additive helper (does not alter classify() scoring): exposes the
+    canonical Decision-eligibility role so downstream layers treat foreign
+    keys as join context only, never as drivers. Generic semantics only.
+    """
+    try:
+        from core.semantic import classify_field_role as _cfr
+        return _cfr(col_name or "", data_type or "",
+                    is_pk=bool(is_pk), is_fk=bool(is_fk))
+    except Exception:
+        return "UNKNOWN"
+
+
+def is_join_context_only_role(role: str) -> bool:
+    """True for FOREIGN_KEY/IDENTIFIER roles (join context, never a lever)."""
+    return str(role or "").upper() in ("FOREIGN_KEY", "IDENTIFIER")
 
 
 def _singularize_base(col_name) -> str:

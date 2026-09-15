@@ -30,6 +30,20 @@ AMOUNT_HINTS = (
     "turnover", "billing", "charge", "fee", "rate",
 )
 
+# Store-like entity column hints (retail: Store/branch/outlet counts).
+# Used to surface entity KPIs on single-table sources where the store column
+# is numeric (INTEGER) rather than TEXT.
+STORE_HINTS = (
+    "store", "shop", "branch", "outlet", "location", "site",
+    "warehouse", "depot",
+)
+
+# Holiday/flag column hints (retail: Holiday_Flag lift analysis).
+HOLIDAY_HINTS = (
+    "holiday", "is_holiday", "holiday_flag", "festival",
+    "event_flag", "promo_flag", "is_promo",
+)
+
 
 def classify_type(data_type: str) -> str:
     """Classify a database column type into a semantic category."""
@@ -238,6 +252,13 @@ class SchemaIntelligence:
         """Pick the most descriptive text column for grouping (skip IDs)."""
         texts = self.get_text_cols(table)
         if not texts:
+            # Single-table retail sources (e.g. Walmart CSV): the entity
+            # column (Store) is numeric, not text. Fall back to a store-like
+            # numeric column so entity counts and breakdowns still work.
+            for c in self.get_numeric_cols(table):
+                low = c.lower()
+                if any(h in low for h in STORE_HINTS):
+                    return c
             return None
         pks = set(self.get_pk(table))
         fk_cols = set(fk[0] for fk in self.get_fks(table))
@@ -252,15 +273,60 @@ class SchemaIntelligence:
             return non_pk[0]
         return texts[0] if texts else None
 
+    def find_store_column(self, table: str):
+        """Find a low-cardinality store-like entity column (any type).
+
+        Checks text columns first, then numeric columns with store-like
+        names (retail CSVs store Store as INTEGER). Returns None when no
+        store-like column exists — never guesses an unrelated column.
+        """
+        texts = self.get_text_cols(table)
+        pks = set(self.get_pk(table))
+        for c in texts:
+            if any(h in c.lower() for h in STORE_HINTS) and c not in pks:
+                return c
+        for c in self.get_numeric_cols(table):
+            low = c.lower()
+            if low in pks or low == "id" or low.endswith("_id"):
+                continue
+            if any(h in low for h in STORE_HINTS):
+                return c
+        return None
+
+    def find_holiday_column(self, table: str):
+        """Find a holiday/flag column for lift analysis (any type).
+
+        Returns None when no holiday-like column exists.
+        """
+        for t in (self.get_numeric_cols(table), self.get_text_cols(table)):
+            for c in t:
+                if any(h in c.lower() for h in HOLIDAY_HINTS):
+                    return c
+        # Generic boolean-ish flag fallback: 0/1 integer columns whose name
+        # suggests a flag but which were not claimed as measures.
+        for c in self.get_numeric_cols(table):
+            low = c.lower()
+            if low in ("id",) or low.endswith("_id"):
+                continue
+            if "flag" in low or low.startswith("is_") or low.startswith("has_"):
+                return c
+        return None
+
     def find_all_dimensions(self, table: str):
-        """Return all usable text dimension columns."""
+        """Return all usable text dimension columns.
+
+        Measure-like names (amount/price/total/...) are never segments —
+        even when the source types them as TEXT (CSV money arrives as TEXT
+        in SQLite). See hyp.txt §4: a numeric measure is not a segment.
+        """
         texts = self.get_text_cols(table)
         pks = set(self.get_pk(table))
         fk_cols = set(fk[0] for fk in self.get_fks(table))
         return [c for c in texts
                 if c not in pks and c not in fk_cols
                 and not c.lower().endswith("_id")
-                and not c.lower() == "id"]
+                and not c.lower() == "id"
+                and not any(h in c.lower() for h in AMOUNT_HINTS)]
 
     def find_best_datetime(self, table: str):
         """Pick the most analytically useful datetime column."""

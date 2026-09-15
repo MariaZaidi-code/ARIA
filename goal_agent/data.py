@@ -2,6 +2,7 @@
 
 import difflib
 import json
+import os
 import re
 import logging
 import sys
@@ -30,10 +31,10 @@ logger = logging.getLogger(__name__)
 
 class DataMixin:
     # Bounded budget for each LLM repair call. Without this a slow/unavailable
-    # local model (Ollama) defaults to a 900s timeout and a repair loop can
-    # block a request for many minutes. Repairs that exceed this are abandoned
-    # and the caller degrades gracefully instead of hanging.
-    _REPAIR_TIMEOUT = 12
+    # local model (Ollama) call (capped at 120s in llm_provider) inside a
+    # repair loop can block a request for many minutes. Repairs that exceed
+    # this are abandoned and the caller degrades gracefully instead of hanging.
+    _REPAIR_TIMEOUT = int(os.getenv("ARIA_REPAIR_TIMEOUT", "60"))
 
     # ---- _execute_with_retry (_execute_with_retry) ----
 
@@ -41,22 +42,44 @@ class DataMixin:
                             ir=None, join_plan=None):
         """Execute the SQL with a validation layer + LLM repair.
 
+        Bounded retry policy: at most `retries` repair attempts (never raised
+        to force queries to pass). Tracks generation time, validation
+        failures, repair count, and outcome in logs. Final failure returns a
+        structured "ARIA could not safely construct a query" note.
+
         Returns (records, final_sql, note). note is None on success, or a dict
         {"message": str} explaining a graceful empty outcome so the UI never
         shows a bare "no data" for a valid-but-empty query.
         """
+        # Hard cap: callers may pass a lower bound, never a higher one.
+        retries = min(int(retries if retries is not None else 6), 6)
+        _t_start = time.monotonic()
+        _repair_count = 0
+        _validation_failures: list = []
+        _SAFE_FAIL = "ARIA could not safely construct a query for this request."
         if raw_sql is None:
             # raw_sql was None -> the model could not produce a query (provider
             # outage, rate limit, or a controlled non-SELECT* failure for an
             # aggregating goal); degrade gracefully instead of crash-looping.
-            return [], None, {
-                "failed": True,
-                "message": (
-                    "The model could not produce a valid query for this goal "
-                    "right now. Please try again shortly or switch the model provider."
-                ),
-            }
+            logger.warning(
+                "SQL retry: generation_time_ms=%d validation_failures=[] "
+                "repair_count=0 outcome=generation_failed goal=%.120s",
+                int((time.monotonic() - _t_start) * 1000), (user_goal or "")[:120])
+            return [], None, {"failed": True, "message": _SAFE_FAIL}
         current_sql = self._clean_sql(raw_sql)
+        # Fail-closed allowlist gate: read-only + unknown tables/columns must
+        # pass before EVERY execution (enforced at the execution point below,
+        # after repairs). Resolves via SqlMixin when composed in GoalAgent,
+        # else falls back to the shared core.validation guard directly.
+        try:
+            _enforce = self._enforce_execution_guards  # type: ignore[attr-defined]
+        except AttributeError:
+            from core.validation import enforce_readonly_guards as _core_enforce
+            _tables = getattr(self, "tables", {}) or {}
+            _enforce = lambda s: _core_enforce(  # noqa: E731
+                s, {n: list((i.get("columns", {}) or {})) for n, i in _tables.items()})
+        # Entry check is read-only ONLY: unknown tables/columns are repaired
+        # by the loop below, so the full allowlist gate runs at execution.
         if not self._is_read_only_sql(current_sql):
             raise RuntimeError(
                 "The generated SQL is not read-only. Only read-only SELECT "
@@ -254,6 +277,46 @@ Return only the corrected SQL query. No explanations, no markdown.
                         f"({', '.join(nested)}) and could not be repaired."
                     )
 
+            # Validation layer: reject SUM/AVG over incompatible datatypes
+            # (e.g. SUM(name) on a TEXT column). Deterministic; repair via LLM.
+            bad_types = self._find_incompatible_aggregations(current_sql)
+            if bad_types:
+                if attempt >= retries:
+                    raise RuntimeError(
+                        f"Generated SQL aggregates incompatible datatype(s) "
+                        f"({', '.join(bad_types)}) and could not be repaired."
+                    )
+                logger.warning(
+                    f"SQL aggregates incompatible datatype(s) {bad_types} on attempt {attempt + 1}. "
+                    f"Asking LLM to repair."
+                )
+                fix_prompt = f"""
+The SQL below applies an aggregate to an incompatible datatype: {', '.join(bad_types)}.
+SUM/AVG require a numeric column; use COUNT(*) for row counts or pick the real
+numeric measure from the schema below.
+
+User goal:
+{user_goal}
+
+Schema:
+{self._build_schema_ddl(join_path, full=False)}
+
+Broken SQL:
+{current_sql}
+
+Return only the corrected SQL query. No explanations, no markdown.
+"""
+                try:
+                    raw = self.llm.complete("sql", fix_prompt, temperature=0.1,
+                                            num_predict=500, timeout=self._REPAIR_TIMEOUT)
+                    current_sql = self._clean_sql(raw)
+                    continue
+                except Exception:
+                    raise RuntimeError(
+                        f"Generated SQL aggregates incompatible datatype(s) "
+                        f"({', '.join(bad_types)}) and could not be repaired."
+                    )
+
             # Validation layer: reject joins that equate the PRIMARY KEYS of two
             # different tables, or that join an FK column to a table it does not
             # actually reference. In a normalized schema both are wrong
@@ -405,6 +468,9 @@ No explanations, no markdown.
                             + " and could not be repaired."
                         )
 
+            # Fail-closed gate before EVERY execution: repaired SQL is
+            # re-validated here so no path reaches the DB unchecked.
+            current_sql = _enforce(current_sql)
             try:
                 _t0 = time.monotonic()
                 _MAX_ROWS = 10_000
@@ -450,6 +516,9 @@ No explanations, no markdown.
                 for col in df.select_dtypes(include=['float64', 'int64']).columns:
                     df[col] = df[col].astype(float)
                 records = df.to_dict(orient="records")
+                # Result validation (n.txt item 2): never hand a broken frame
+                # to the UI — confirm shape/emptiness is genuine first.
+                self._validate_result_shape(user_goal, current_sql, records, cols)
                 note = None
                 if truncated:
                     note = {
@@ -459,16 +528,28 @@ No explanations, no markdown.
                             f"narrow the result set."
                         )
                     }
+                logger.info(
+                    "SQL retry: generation_time_ms=%d repair_count=%d outcome=success "
+                    "rows=%d goal=%.120s",
+                    int((time.monotonic() - _t_start) * 1000), attempt,
+                    len(records), (user_goal or "")[:120])
                 return records, current_sql, note
             except Exception as exc:
+                _validation_failures.append(f"exec:{str(exc)[:120]}")
                 if attempt >= retries:
                     # Give up on the LLM SQL, but never fail the request: try a
                     # safe generic query on the join-path tables first.
+                    # Bounded like the main path: never fetchall() an
+                    # unbounded result into the JSON payload.
                     try:
                         safe_sql = self._fallback_sql(join_path)
+                        safe_sql = _enforce(safe_sql)
                         with self.engine.connect() as conn:
                             result = conn.execute(text(safe_sql))
-                            rows = result.fetchall()
+                            rows = result.fetchmany(_MAX_ROWS + 1)
+                            truncated = len(rows) > _MAX_ROWS
+                            if truncated:
+                                rows = rows[:_MAX_ROWS]
                             cols = list(result.keys())
                         df = pd.DataFrame(rows, columns=cols)
                         df = df.where(pd.notnull(df), None)
@@ -480,17 +561,23 @@ No explanations, no markdown.
                             # A raw `SELECT *` fallback would be misleading for an
                             # aggregating goal (it charts IDs, not the breakdown the
                             # user asked for). Explain instead of guessing.
-                            return [], safe_sql, {
-                                "failed": True,
-                                "message": (
-                                    "The model could not produce a working aggregate "
-                                    "query for this goal. The raw table data is not a "
-                                    "valid substitute for the grouped/aggregated answer "
-                                    "requested. Please rephrase or try the other model provider."
-                                ),
-                            }
+                            logger.warning(
+                                "SQL retry: generation_time_ms=%d repair_count=%d "
+                                "outcome=safe_fail detail=aggregate_fallback_refused goal=%.120s",
+                                int((time.monotonic() - _t_start) * 1000), attempt,
+                                (user_goal or "")[:120])
+                            return [], safe_sql, {"failed": True, "message": _SAFE_FAIL}
                         logger.warning("LLM SQL exhausted retries (%s); returning safe fallback.", exc)
-                        return df.to_dict(orient="records"), safe_sql, None
+                        _fb_note = None
+                        if truncated:
+                            _fb_note = {
+                                "message": (
+                                    f"Results were truncated to {_MAX_ROWS:,} rows "
+                                    f"(the query returned more). Add filters or a LIMIT to "
+                                    f"narrow the result set."
+                                )
+                            }
+                        return df.to_dict(orient="records"), safe_sql, _fb_note
                     except Exception as safe_exc:
                         raise RuntimeError(
                             f"Could not build a working query for this goal after retrying "
@@ -519,10 +606,13 @@ Fix it and return only the corrected SQL query. No explanations, no markdown.
                 except Exception:
                     continue
 
-        return [], current_sql, {
-            "failed": True,
-            "message": "Could not produce a working query for this goal after retrying.",
-        }
+        logger.warning(
+            "SQL retry: generation_time_ms=%d repair_count=%d outcome=safe_fail "
+            "validation_failures=%s goal=%.120s",
+            int((time.monotonic() - _t_start) * 1000), retries,
+            _validation_failures[-3:] if _validation_failures else [],
+            (user_goal or "")[:120])
+        return [], current_sql, {"failed": True, "message": _SAFE_FAIL}
 
     # ---- _clean_data (_clean_data) ----
 
@@ -629,4 +719,68 @@ Fix it and return only the corrected SQL query. No explanations, no markdown.
                 if isinstance(value, datetime):
                     record[key] = value.strftime("%Y-%m-%d %H:%M:%S")
         return records
+
+    # ---- _validate_result_shape (_validate_result_shape) ----
+
+    def _validate_result_shape(self, user_goal, sql, records, cols):
+        """Post-execution result validation (n.txt item 2).
+
+        Confirms the frame is safe for chart/KPI/NL stages: non-empty columns,
+        no all-NULL frame, aggregation goals return grouped (not raw *-dump)
+        rows. Zero rows are NOT auto-repaired (spec §14) — they are logged and
+        returned honestly. Raises only on structurally broken frames.
+        """
+        cols = list(cols or [])
+        shape = {"rows": len(records or []), "columns": cols}
+        if not cols:
+            raise RuntimeError("Execution returned rows with no columns; refusing to visualize.")
+        if records and all(all(v is None for v in r.values()) for r in records):
+            raise RuntimeError("Execution returned only NULL rows; refusing to visualize.")
+        if self._goal_asks_for_aggregation(user_goal) and records:
+            bare = self._find_bare_select_star(sql or "")
+            if bare:
+                logger.warning("Result validation: aggregating goal returned bare SELECT * shape.")
+        logger.info(
+            "Result validation: question=%r rows=%d cols=%s sql=%.120s",
+            (user_goal or "")[:160], shape["rows"], cols, (sql or "")[:120],
+        )
+        return shape
+
+    # ---- _log_pipeline_diagnostic (_log_pipeline_diagnostic) ----
+
+    def _log_pipeline_diagnostic(self, trace: dict):
+        """Internal diagnostic log for the query-generation pipeline.
+
+        P3 §31 contract (internal only, never returned to the UI):
+        request_id, session_id, dataset_id, question, intent, tables,
+        columns, sql, validation, exec_status, result_shape, context,
+        model, latency, final_status. One structured INFO line; values are
+        truncated so logs stay bounded.
+        """
+        def _t(v, n=300):
+            s = str(v if v is not None else "")
+            return s[:n]
+        logger.info(
+            "pipeline trace: request_id=%s session_id=%s dataset_id=%s "
+            "question=%r intent=%s tables=%s columns=%s sql=%r "
+            "validation=%s exec_status=%s result_shape=%s context=%s "
+            "model=%s latency_ms=%s final_status=%s answer=%r",
+            _t(trace.get("request_id"), 64),
+            _t(trace.get("session_id"), 64),
+            _t(trace.get("dataset_id"), 128),
+            _t(trace.get("question"), 160),
+            _t(trace.get("intent"), 64),
+            trace.get("tables"),
+            trace.get("columns"),
+            _t(trace.get("sql"), 300),
+            trace.get("validation"),
+            trace.get("exec_status", trace.get("exec_ms")),
+            trace.get("result_shape", trace.get("shape")),
+            _t(trace.get("context"), 200),
+            _t(trace.get("model"), 64),
+            trace.get("latency_ms", trace.get("exec_ms")),
+            trace.get("final_status"),
+            _t(trace.get("answer"), 200),
+        )
+        self._last_pipeline_trace = dict(trace)
 

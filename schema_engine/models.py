@@ -100,6 +100,28 @@ class Column:
         or a member of any declared uniqueness constraint."""
         return self.is_primary_key or self.is_part_of_unique_constraint
 
+    def semantic_role(self) -> str:
+        """hyp.txt PHASE 1 canonical field role (additive, deterministic).
+
+        Delegates to core.semantic.classify_field_role with generic
+        signals only (never per-column exclusions). Declared FK wins over
+        name heuristics so ``room_id`` resolves to FOREIGN_KEY when it is
+        a real reference and IDENTIFIER otherwise.
+        """
+        try:
+            from core.semantic import classify_field_role as _cfr
+            return _cfr(
+                self.name, self.data_type or self.normalized_type or "",
+                is_pk=bool(self.is_primary_key),
+                is_fk=bool(self.declared_foreign_key is not None),
+            )
+        except Exception:
+            return "UNKNOWN"
+
+    def is_join_context_only(self) -> bool:
+        """True when this column is join/relational context, never a driver."""
+        return self.semantic_role() in ("FOREIGN_KEY", "IDENTIFIER")
+
 
 @dataclass
 class Table:

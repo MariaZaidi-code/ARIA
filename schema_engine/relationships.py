@@ -189,26 +189,39 @@ def _composite_pass(profiler, tables, primary_keys, table_pk, declared_fks,
 
 
 def _composite_containment(profiler, src_table, matched, target_table, target_pk):
-    """Fraction of source (matched...) tuples present in the target composite key."""
+    """Fraction of source (matched...) tuples present in the target composite key.
+
+    Counts DISTINCT source tuples (not single-column values) with a matching
+    target tuple, so overlap on one column alone can never confirm a composite.
+    """
     try:
         matched_cols = [profiler.quote(c) for c in matched]
-        tgt_cols = [profiler.quote(c) for c in target_pk]
+        # matched names equal target names (matched ⊆ target_pk); join on names.
         join_sql = " AND ".join(
-            f"s.{mc} = t.{tc}" for mc, tc in zip(matched_cols, tgt_cols)
+            f"s.{mc} = t.{mc}" for mc in matched_cols
         )
-        if profiler.db_type == "mysql":
+        not_null = " AND ".join(f"s.{mc} IS NOT NULL" for mc in matched_cols)
+        distinct_list = ", ".join(f"s0.{mc}" for mc in matched_cols)
+        first_mc = matched_cols[0]
+        if profiler.db_type in ("mysql", "sqlite"):
+            src_ref = profiler.rel_table(src_table)
+            tgt_ref = profiler.rel_table(target_table)
             q = (
-                f"SELECT COUNT(DISTINCT CASE WHEN t.{tgt_cols[0]} IS NOT NULL THEN s.{matched_cols[0]} END) "
-                f"/ NULLIF(COUNT(DISTINCT s.{matched_cols[0]}),0) AS ratio "
-                f"FROM {profiler.quote(src_table)} s "
-                f"LEFT JOIN {profiler.quote(target_table)} t ON {join_sql}"
+                f"SELECT COUNT(CASE WHEN t.{first_mc} IS NOT NULL THEN 1 END) "
+                f"/ NULLIF(COUNT(*),0) AS ratio "
+                f"FROM (SELECT DISTINCT {distinct_list} FROM {src_ref} s0 "
+                f"WHERE {not_null}) s "
+                f"LEFT JOIN {tgt_ref} t ON {join_sql}"
             )
         else:
+            src_ref = profiler.rel_table(src_table)
+            tgt_ref = profiler.rel_table(target_table)
             q = (
-                f"SELECT COUNT(DISTINCT CASE WHEN t.{tgt_cols[0]} IS NOT NULL THEN s.{matched_cols[0]} END)::float "
-                f"/ NULLIF(COUNT(DISTINCT s.{matched_cols[0]}),0) AS ratio "
-                f"FROM {profiler.quote(profiler.schema)}.{profiler.quote(src_table)} s "
-                f"LEFT JOIN {profiler.quote(profiler.schema)}.{profiler.quote(target_table)} t ON {join_sql}"
+                f"SELECT COUNT(CASE WHEN t.{first_mc} IS NOT NULL THEN 1 END)::float "
+                f"/ NULLIF(COUNT(*),0) AS ratio "
+                f"FROM (SELECT DISTINCT {distinct_list} FROM {src_ref} s0 "
+                f"WHERE {not_null}) s "
+                f"LEFT JOIN {tgt_ref} t ON {join_sql}"
             )
         with profiler._dict_cursor() as cur:
             cur.execute(q)

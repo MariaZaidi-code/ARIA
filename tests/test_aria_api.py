@@ -23,31 +23,68 @@ class TestAuthFlow(unittest.TestCase):
         self.addCleanup(setattr, auth, "DB_PATH", self._orig_db)
 
     def test_register_login_me(self):
+        import os
         from fastapi.testclient import TestClient
         import app as app_module
 
-        c = TestClient(app_module.app, raise_server_exceptions=False)
-        user = f"apitest_{int(time.time() * 1000) % 1000000}"
-        r = c.post("/api/auth/register", json={"username": user, "password": "Secret123!"})
-        self.assertEqual(r.status_code, 200, r.text[:200])
-        token = r.json()["token"]
-        self.assertTrue(token)
+        # Explicit local-HTTP dev opt-out: TestClient runs over plain HTTP,
+        # so Secure cookies would not round-trip without this. Production
+        # defaults remain Secure (see api/auth_routes._cookie_secure).
+        _prev_cookie_secure = os.environ.get("ARIA_COOKIE_SECURE")
+        os.environ["ARIA_COOKIE_SECURE"] = "0"
+        try:
+            c = TestClient(app_module.app, raise_server_exceptions=False)
+            user = f"apitest_{int(time.time() * 1000) % 1000000}"
+            r = c.post("/api/auth/register", json={"username": user, "password": "Secret123!"})
+            self.assertEqual(r.status_code, 200, r.text[:200])
+            body = r.json()
+            self.assertTrue(body.get("ok"))
+            self.assertEqual(body.get("username"), user)
+            # HttpOnly cookie flow: raw JWT must NOT be exposed in JSON.
+            self.assertNotIn("token", body)
 
-        r = c.post("/api/auth/login", json={"username": user, "password": "Secret123!"})
-        self.assertEqual(r.status_code, 200)
+            # Cookie was set on the client jar (dev name: aria_token).
+            token = c.cookies.get("aria_token") or c.cookies.get("__Host-aria_token")
+            self.assertTrue(token)
 
-        r = c.post("/api/auth/login", json={"username": user, "password": "wrong"})
-        self.assertEqual(r.status_code, 401)
+            r = c.post("/api/auth/login", json={"username": user, "password": "Secret123!"})
+            self.assertEqual(r.status_code, 200)
+            self.assertNotIn("token", r.json())
+            token = c.cookies.get("aria_token") or c.cookies.get("__Host-aria_token")
+            self.assertTrue(token)
 
-        r = c.post("/api/auth/register", json={"username": user, "password": "Secret123!"})
-        self.assertEqual(r.status_code, 400)
+            r = c.post("/api/auth/login", json={"username": user, "password": "wrong"})
+            self.assertEqual(r.status_code, 401)
 
-        r = c.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["username"], user)
+            r = c.post("/api/auth/register", json={"username": user, "password": "Secret123!"})
+            self.assertEqual(r.status_code, 400)
 
-        r = c.get("/api/auth/me")
-        self.assertEqual(r.status_code, 401)
+            # Cookie flow: /me works without an explicit Authorization header.
+            r = c.get("/api/auth/me")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["username"], user)
+
+            # Bearer flow still works (token extracted from cookie jar).
+            from fastapi.testclient import TestClient as _TC2
+            c2 = _TC2(app_module.app, raise_server_exceptions=False)
+            r = c2.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["username"], user)
+
+            # Unauthenticated fresh client (no cookie/header) => 401.
+            r = c2.get("/api/auth/me")
+            self.assertEqual(r.status_code, 401)
+
+            # Malformed/invalid/empty tokens => 401, never 500.
+            r = c2.get("/api/auth/me", headers={"Authorization": "Bearer not-a-jwt"})
+            self.assertEqual(r.status_code, 401)
+            r = c2.get("/api/auth/me", headers={"Authorization": "Bearer null"})
+            self.assertEqual(r.status_code, 401)
+        finally:
+            if _prev_cookie_secure is None:
+                os.environ.pop("ARIA_COOKIE_SECURE", None)
+            else:
+                os.environ["ARIA_COOKIE_SECURE"] = _prev_cookie_secure
 
     def test_ttl_env_parsing(self):
         import importlib
@@ -58,7 +95,36 @@ class TestAuthFlow(unittest.TestCase):
             self.assertEqual(auth._token_ttl_days(), 1)
         finally:
             del os.environ["TOKEN_TTL_DAYS"]
-        self.assertEqual(auth._token_ttl_days(), 7)
+        self.assertEqual(auth._token_ttl_days(), 1)
+        # Empty/unset -> intended default 1.
+        os.environ["TOKEN_TTL_DAYS"] = ""
+        try:
+            self.assertEqual(auth._token_ttl_days(), 1)
+        finally:
+            del os.environ["TOKEN_TTL_DAYS"]
+        os.environ["TOKEN_TTL_DAYS"] = "   "
+        try:
+            self.assertEqual(auth._token_ttl_days(), 1)
+        finally:
+            del os.environ["TOKEN_TTL_DAYS"]
+        # Out-of-range clamps to 1..7.
+        os.environ["TOKEN_TTL_DAYS"] = "99"
+        try:
+            self.assertEqual(auth._token_ttl_days(), 7)
+        finally:
+            del os.environ["TOKEN_TTL_DAYS"]
+        os.environ["TOKEN_TTL_DAYS"] = "0"
+        try:
+            self.assertEqual(auth._token_ttl_days(), 1)
+        finally:
+            del os.environ["TOKEN_TTL_DAYS"]
+        # Invalid non-integer fails clearly (no silent unsafe fallback).
+        os.environ["TOKEN_TTL_DAYS"] = "abc"
+        try:
+            with self.assertRaises(ValueError):
+                auth._token_ttl_days()
+        finally:
+            del os.environ["TOKEN_TTL_DAYS"]
 
 
 class TestHypothesisSqlite(unittest.TestCase):

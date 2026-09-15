@@ -2,12 +2,15 @@ import { useState, useEffect } from "react";
 import { useTheme } from "../App";
 import type { Page } from "../App";
 import {
-  LayoutDashboard, Sparkles, Lightbulb, TrendingUp, Target,
-  FlaskConical, Database, Bot, Clock, Settings, FileText,
-  Bell, Sun, Moon, Menu,
+  LayoutDashboard, Sparkles, Lightbulb, TrendingUp,
+  Database, Bot, Clock, Settings, FileText,
+  Sun, Moon, Menu, Compass,
   Search, LogOut, ChevronDown,
 } from "lucide-react";
 
+// The standalone Hypothesis page was removed: hypothesis is an investigation
+// capability surfacing as Possible drivers inside AI Analytics / Insights /
+// Forecast. Old #/hypothesis hashes alias to analytics.
 const navGroups: { label: string; items: { id: Page; label: string; icon: React.ElementType }[] }[] = [
   {
     label: "Analytics",
@@ -15,9 +18,8 @@ const navGroups: { label: string; items: { id: Page; label: string; icon: React.
       { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
       { id: "analytics", label: "AI Analytics", icon: Sparkles },
       { id: "insights", label: "Insights", icon: Lightbulb },
+      { id: "intelligence", label: "Intelligence", icon: Compass },
       { id: "predictive", label: "Forecast", icon: TrendingUp },
-      { id: "prescription", label: "Prescription", icon: Target },
-      { id: "hypothesis", label: "Hypothesis", icon: FlaskConical },
     ],
   },
   {
@@ -41,9 +43,8 @@ const pageTitles: Record<Page, string> = {
   dashboard: "Dashboard",
   analytics: "AI Analytics",
   insights: "Insights",
+  intelligence: "Intelligence",
   predictive: "Forecast",
-  prescription: "Prescription",
-  hypothesis: "Hypothesis",
   data: "Data",
   documents: "Documents",
   copilot: "Copilot",
@@ -204,15 +205,14 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
             {isDark ? <Sun size={14} /> : <Moon size={14} />}
           </button>
 
-          {/* Notifications */}
+          {/* Settings shortcut (was a dead Notifications bell with a dot) */}
           <button
             onClick={() => setPage("settings")}
-            aria-label="Notifications"
-            className="relative p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-all"
-            title="Notifications"
+            aria-label="Settings"
+            className="p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-all"
+            title="Settings"
           >
-            <Bell size={14} />
-            <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-primary ring-2 ring-card" />
+            <Settings size={14} />
           </button>
 
           {/* Profile */}

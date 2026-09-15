@@ -64,7 +64,8 @@ class TestFullE2E(unittest.TestCase):
         r = self.client.post("/api/auth/register",
                              json={"username": user, "password": "Secret123!"})
         self.assertEqual(r.status_code, 200, r.text[:300])
-        token = r.json()["token"]
+        token = self.client.cookies.get("aria_token") or self.client.cookies.get("__Host-aria_token")
+        self.assertTrue(token, f"Auth cookie missing: {r.json()} cookies={dict(self.client.cookies)}")
         return {"Authorization": f"Bearer {token}"}
 
     def _connect_csv(self, headers):

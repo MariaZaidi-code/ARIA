@@ -267,31 +267,44 @@ class IsolationCase(unittest.TestCase):
         except Exception:
             self.skipTest("fastapi.testclient unavailable")
             return
+        import os
+        import tempfile
+        from pathlib import Path
+        import auth as _auth
+        # Hermetic auth DB: never pollute the real data/aria.db.
+        _tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(_tmp.cleanup)
+        _orig_db = _auth.DB_PATH
+        _auth.DB_PATH = Path(_tmp.name) / "test_rxiso_auth.db"
+        self.addCleanup(setattr, _auth, "DB_PATH", _orig_db)
+        # Plain-HTTP TestClient needs the Secure-cookie opt-out (production
+        # default stays Secure). Cookie-only flow: no token in JSON.
+        _prev = os.environ.get("ARIA_COOKIE_SECURE")
+        os.environ["ARIA_COOKIE_SECURE"] = "0"
+        self.addCleanup(os.environ.__setitem__, "ARIA_COOKIE_SECURE", _prev) if _prev is not None else self.addCleanup(os.environ.pop, "ARIA_COOKIE_SECURE", None)
         import app as _app
-        client = TestClient(_app.app)
         import random as _rng
-        toks = []
+        clients = []
         for u in ("rxiso%s" % _rng.randint(1000000, 9999999),
                   "rxiso%s" % _rng.randint(1000000, 9999999)):
-            r = client.post("/api/auth/register",
-                            json={"username": u, "password": "password123"})
+            c = TestClient(_app.app, raise_server_exceptions=False)
+            r = c.post("/api/auth/register",
+                       json={"username": u, "password": "password123"})
             self.assertEqual(r.status_code, 200, r.text[:200])
-            toks.append(r.json()["token"])
+            self.assertNotIn("token", r.json())
+            self.assertTrue(c.cookies.get("aria_token") or c.cookies.get("__Host-aria_token"))
+            clients.append(c)
         rx = {"id": "x", "title": "T", "action_type": "scenario"}
-        r = client.post("/api/prescriptions/save", headers={"Authorization": f"Bearer {toks[0]}"},
-                        json={"prescription": rx, "question": "q"})
+        r = clients[0].post("/api/prescriptions/save",
+                            json={"prescription": rx, "question": "q"})
         self.assertTrue(r.json().get("ok"), r.text[:200])
-        other = client.get("/api/prescriptions/saved",
-                           headers={"Authorization": f"Bearer {toks[1]}"}).json()
+        other = clients[1].get("/api/prescriptions/saved").json()
         self.assertEqual(other.get("saved"), [])
-        own = client.get("/api/prescriptions/saved",
-                         headers={"Authorization": f"Bearer {toks[0]}"}).json()
+        own = clients[0].get("/api/prescriptions/saved").json()
         self.assertEqual(len(own.get("saved")), 1)
         sid = own["saved"][0]["id"]
-        client.delete(f"/api/prescriptions/saved/{sid}",
-                      headers={"Authorization": f"Bearer {toks[0]}"})
-        own2 = client.get("/api/prescriptions/saved",
-                          headers={"Authorization": f"Bearer {toks[0]}"}).json()
+        clients[0].delete(f"/api/prescriptions/saved/{sid}")
+        own2 = clients[0].get("/api/prescriptions/saved").json()
         self.assertEqual(own2.get("saved"), [])
 
 
