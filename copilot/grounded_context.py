@@ -176,8 +176,9 @@ def _sample_values(db_uri: str | None, dialect: str, table: str,
         from sqlalchemy import create_engine, text as _text
 
         quote = "`" if dialect == "mysql" else '"'
+        _cargs = {} if "sqlite" in str(db_uri) else {"connect_timeout": 5}
         engine = create_engine(db_uri, pool_pre_ping=True,
-                               connect_args={"timeout": 5} if "sqlite" not in str(db_uri) else {})
+                               connect_args=_cargs)
         try:
             with engine.connect() as conn:
                 for col in columns[:MAX_SAMPLE_COLUMNS_PER_TABLE]:

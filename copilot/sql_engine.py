@@ -180,6 +180,123 @@ def _dialect_rules(dialect: str) -> str:
     )
 
 
+def _text_number_rule(dialect: str) -> str:
+    """Prompt rule: aggregate TEXT-stored numbers via the safe coercion.
+
+    Generic (no table/column names): unseen databases routinely store
+    numbers as TEXT with currency symbols, thousand separators or '%'.
+    A bare CAST(col AS NUMERIC) crashes on those values; the coercion
+    strips formatting and yields NULL for unparsable values instead.
+    """
+    try:
+        from core.text_numeric import coercion_sql as _coerce
+        _expr = _coerce(dialect, '"COLUMN"')
+    except Exception:
+        _expr = None
+    if not _expr:
+        return ("- Never use bare CAST(text_col AS NUMERIC): TEXT columns may "
+                "hold formatted numbers (currency symbols, commas, %). "
+                "Strip formatting to NULL-safe numbers instead.")
+    return ("- TEXT columns may store formatted numbers (currency symbols "
+            "like \u20b9, thousand separators, %): NEVER use bare "
+            "CAST(col AS NUMERIC/INTEGER) on them — it crashes on the first "
+            "formatted value. For SUM/AVG/MIN/MAX over a TEXT column use "
+            f"this safe coercion instead: {_expr} (replace \"COLUMN\" with "
+            "the real column reference).")
+
+
+_CAST_NUMERIC_RE = None
+
+
+def _bare_cast_pattern():
+    """CAST("col" AS <numeric type>) — the crash pattern on TEXT columns."""
+    global _CAST_NUMERIC_RE
+    if _CAST_NUMERIC_RE is None:
+        import re as _re
+        _CAST_NUMERIC_RE = _re.compile(
+            r"CAST\s*\(\s*((?:\"[^\"]+\"|`[^`]+`|\[[^\]]+\]|\w+)"
+            r"(?:\s*\.\s*(?:\"[^\"]+\"|`[^`]+`|\[[^\]]+\]|\w+))?)"
+            r"\s+AS\s+(NUMERIC|INTEGER|INT|BIGINT|SMALLINT|FLOAT|REAL"
+            r"|DOUBLE(?:\s+PRECISION)?|DECIMAL(?:\s*\([^)]*\))?|NUMERIC"
+            r"(?:\s*\([^)]*\))?)\s*\)",
+            _re.IGNORECASE)
+    return _CAST_NUMERIC_RE
+
+
+def _text_columns_of(tables: dict | None) -> set[str]:
+    """Lowercased TEXT column names (qualified and bare) from the mapping."""
+    out: set[str] = set()
+    try:
+        for t, info in (tables or {}).items():
+            cols = (info or {}).get("columns", [])
+            items = cols.values() if isinstance(cols, dict) else cols
+            for c in items or []:
+                name = (c.get("column") if isinstance(c, dict) else c) or ""
+                dtype = (c.get("data_type") if isinstance(c, dict) else "") or ""
+                dt = str(dtype).lower()
+                if not str(name):
+                    continue
+                if dt == "text" or "varchar" in dt or "char" in dt:
+                    out.add(str(name).strip().lower())
+                    out.add(f"{t}.{name}".lower())
+    except Exception:
+        pass
+    return out
+
+
+def _rewrite_text_casts(sql: str, dialect: str, tables: dict | None) -> str:
+    """Rewrite bare CASTs over TEXT columns into the NULL-safe coercion.
+
+    Fully generic: only fires when the mapping declares the column TEXT
+    (unknown dtypes are left untouched), so numeric columns and intended
+    casts are never rewritten.
+    """
+    if not sql or not tables:
+        return sql
+    _texts = _text_columns_of(tables)
+    if not _texts:
+        return sql
+    try:
+        from core.text_numeric import coercion_sql as _coerce
+    except Exception:
+        return sql
+    import re as _re
+
+    def _fix(m):
+        ref = m.group(1) or ""
+        bare = _re.sub(r'["`\[\]]', "", ref).strip().lower()
+        if bare in _texts:
+            try:
+                return _coerce(dialect, ref)
+            except Exception:
+                return m.group(0)
+        return m.group(0)
+
+    try:
+        return _bare_cast_pattern().sub(_fix, sql)
+    except Exception:
+        return sql
+
+
+_NUMERIC_CAST_FAILURE_RE = None
+
+
+def _is_numeric_cast_failure(error: str | None) -> bool:
+    """True when the DB rejected a bare numeric cast on formatted text."""
+    global _NUMERIC_CAST_FAILURE_RE
+    if _NUMERIC_CAST_FAILURE_RE is None:
+        import re as _re
+        _NUMERIC_CAST_FAILURE_RE = _re.compile(
+            r"invalid input syntax for type numeric|invalid text representation"
+            r"|could not convert|truncated incorrect|incorrect decimal value"
+            r"|invalid number|ORA-01722|conversion failed",
+            _re.IGNORECASE)
+    try:
+        return bool(error and _NUMERIC_CAST_FAILURE_RE.search(error))
+    except Exception:
+        return False
+
+
 def build_sql_prompt(question: str, ctx, dialect: str, feedback: str | None = None) -> str:
     """Compose the SQL-generation prompt from retrieved context only."""
     schema_block = ctx.to_prompt() if hasattr(ctx, "to_prompt") else str(ctx)
@@ -203,6 +320,7 @@ def build_sql_prompt(question: str, ctx, dialect: str, feedback: str | None = No
         "- Lines starting with 'Previous ' are conversation context from an earlier "
         "question, never schema: FROM/JOIN only tables named under SCHEMA CONTEXT.\n"
         "- Add a LIMIT (<= 1000) unless the question is a single summary value.\n"
+        f"{_text_number_rule(dialect)}\n"
         "- Output ONLY the SQL statement, no explanation, no markdown fences.\n"
     )
 
@@ -247,7 +365,11 @@ class SqlEngine:
         if not ok:
             return SqlResult(ok=False, sql=sql, error=reason, dialect=self.dialect)
 
-        safe_sql = sql
+        # Deterministic safety net (any provider, incl. weak local models):
+        # a bare CAST over a mapping-declared TEXT column crashes on the
+        # first formatted value ('₹399') — rewrite to the NULL-safe
+        # coercion before hitting the database.
+        safe_sql = _rewrite_text_casts(sql, self.dialect, tables)
         # Row cap without rewriting grouped/aggregate semantics: only append
         # SQL LIMIT to plain row queries. Grouped/aggregate queries keep their
         # grain; fetchmany() still bounds returned rows.
@@ -304,5 +426,18 @@ class SqlEngine:
             # name gets replaced instead of repeated.
             if tables and "Unknown table" in (result.error or ""):
                 feedback += f" Valid tables: {', '.join(sorted(tables.keys()))}."
+            # A bare numeric cast just died on formatted TEXT — tell the
+            # repair exactly which coercion to use (provider-independent).
+            if _is_numeric_cast_failure(result.error):
+                try:
+                    from core.text_numeric import coercion_sql as _rc
+                    _coerce_example = _rc(self.dialect, '"COLUMN"')
+                    feedback += (" The CAST failed because a TEXT column holds "
+                                 "formatted numbers (currency/commas/%). Use "
+                                 + _coerce_example + " instead of CAST for "
+                                 "every TEXT column (replace \"COLUMN\" with "
+                                 "the real column).")
+                except Exception:
+                    pass
             log.info("Copilot SQL attempt %d failed: %s", attempt, result.error)
         return last
