@@ -58,19 +58,88 @@ def _auth_response(token: str, username: str) -> JSONResponse:
 
 # Brute-force guard: sliding-window per client IP (generous so real users
 # and E2E never trip it; only credential-stuffing bursts get 429).
+# Storage model (P0-3): in-memory per-process, LOCAL/DEV ONLY. Multi-worker
+# production must set ARIA_REDIS_URL + ARIA_REQUIRE_SHARED_STORE=1 (see
+# core/ratelimit._check_shared_store); otherwise each worker enforces its
+# own per-process login budget.
 _LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 _LOGIN_WINDOW_S = 300
 _LOGIN_MAX = 30
+# Bound for the per-process login map: prune entries idle past the window
+# and cap distinct IPs so a long-running server cannot grow unbounded.
+_LOGIN_MAX_IPS = 10_000
+_LOGIN_LAST_PRUNE: float = 0.0
+
+
+def _prune_login_attempts(now: float | None = None) -> int:
+    """Expire stale login entries and enforce the IP cap. Returns removed IPs.
+
+    Drops per-IP timestamps older than _LOGIN_WINDOW_S, removes empty IPs,
+    then evicts oldest-last-seen IPs while over _LOGIN_MAX_IPS. Never raises.
+    """
+    global _LOGIN_LAST_PRUNE
+    try:
+        current = float(now) if now is not None else time.monotonic()
+        removed = 0
+        for ip in list(_LOGIN_ATTEMPTS.keys()):
+            try:
+                hits = [t for t in _LOGIN_ATTEMPTS.get(ip, []) if current - t < _LOGIN_WINDOW_S]
+            except Exception:
+                hits = []
+            if hits:
+                _LOGIN_ATTEMPTS[ip] = hits
+            else:
+                _LOGIN_ATTEMPTS.pop(ip, None)
+                removed += 1
+        if len(_LOGIN_ATTEMPTS) > _LOGIN_MAX_IPS:
+            # Evict oldest-last-seen first (deterministic, bounded memory).
+            try:
+                ordered = sorted(
+                    _LOGIN_ATTEMPTS.items(),
+                    key=lambda kv: max(kv[1]) if kv[1] else 0.0,
+                )
+                excess = len(_LOGIN_ATTEMPTS) - _LOGIN_MAX_IPS
+                for ip, _ in ordered[:excess]:
+                    _LOGIN_ATTEMPTS.pop(ip, None)
+                    removed += 1
+            except Exception:
+                while len(_LOGIN_ATTEMPTS) > _LOGIN_MAX_IPS:
+                    _LOGIN_ATTEMPTS.pop(next(iter(_LOGIN_ATTEMPTS)), None)
+                    removed += 1
+        _LOGIN_LAST_PRUNE = current
+        return removed
+    except Exception:
+        return 0
 
 
 def _check_login_rate_limit(request: Request) -> None:
     now = time.monotonic()
     ip = request.client.host if request.client else "unknown"
+    # Shared enforcement first (multi-worker): Redis sliding window when
+    # ARIA_REDIS_URL is configured. Lazy import avoids a core↔api cycle.
+    # In-memory per-process budget below remains as defense-in-depth.
+    try:
+        from core.ratelimit import _redis_check_limit as _shared_login_check
+        try:
+            if _shared_login_check("login", ip, _LOGIN_MAX, _LOGIN_WINDOW_S):
+                pass
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+    except Exception:
+        pass
     hits = [t for t in _LOGIN_ATTEMPTS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
     if len(hits) >= _LOGIN_MAX:
         raise HTTPException(status_code=429, detail="Too many login attempts. Try again in a few minutes.")
     hits.append(now)
     _LOGIN_ATTEMPTS[ip] = hits
+    # Opportunistic global prune: cheap per-request for this IP is already
+    # done above; run the full sweep periodically or when over the cap so
+    # the map cannot grow unbounded across many distinct IPs.
+    global _LOGIN_LAST_PRUNE
+    if len(_LOGIN_ATTEMPTS) > _LOGIN_MAX_IPS or (now - _LOGIN_LAST_PRUNE) > 60:
+        _prune_login_attempts(now)
 
 
 class AuthRequest(BaseModel):

@@ -442,7 +442,6 @@ export function InsightChart({
         <ResponsiveContainer width="100%" height={h}>
           <PieChart>
             <Tooltip content={<BizTooltip />} />
-            <Legend wrapperStyle={{ fontSize: 11 }} />
             <Pie
               data={spec.data}
               dataKey={spec.y as string}
@@ -450,7 +449,7 @@ export function InsightChart({
               cx="50%" cy="50%"
               outerRadius={Math.max(50, h / 2 - 30)}
               innerRadius={spec.type === "donut" ? Math.max(30, h / 2 - 60) : 0}
-              label={({ name, percent }: any) => `${String(name).slice(0, 14)} ${((percent || 0) * 100).toFixed(0)}%`}
+              label={false}
               labelLine={false}
               onClick={(d: any) => handlePick(d?.payload || d)}
             >
@@ -663,14 +662,20 @@ export function isValidDashboardChart(c: any): boolean {
   const yk = typeof c.dataKey === "string" && c.dataKey ? c.dataKey : null;
   if (!xk || !yk) return false;
   // At least one row must carry both keys with a real numeric value.
+  // Numeric strings ("123.4") count — CSV-backed payloads often encode
+  // numbers as text. Matches api.js isNumericColumn semantics.
+  const asNum = (v: any): number | null => {
+    if (typeof v === "number" && !isNaN(v)) return v;
+    if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) return Number(v);
+    return null;
+  };
   return c.data.some(
     (r: any) =>
       r &&
       typeof r === "object" &&
       r[xk] !== undefined &&
       r[xk] !== null &&
-      typeof r[yk] === "number" &&
-      !isNaN(r[yk]),
+      asNum(r[yk]) !== null,
   );
 }
 

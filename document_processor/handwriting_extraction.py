@@ -52,7 +52,7 @@ class HandwritingExtractor:
     Extracts text from handwritten PDFs using vision LLM.
     
     Requires:
-    - Cloud LLM provider with vision model (Groq qwen/qwen3.6-27b)
+    - Cloud LLM provider with vision model (Groq qwen/qwen3.8-27b)
     - pdf2image for rendering pages
     - PIL for image processing
     """

@@ -33,6 +33,7 @@ function formatSize(bytes?: number) {
 export default function Documents() {
   const [documents, setDocuments] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState("");
   const [deleting, setDeleting] = useState<string | null>(null);
   const [retrying, setRetrying] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -42,10 +43,12 @@ export default function Documents() {
 
   const fetchAll = async () => {
     setLoading(true);
+    setLoadError("");
     try {
       const r: any = await listDocuments();
       if (r.success) setDocuments(r.data || []);
-    } catch (e) {
+    } catch (e: any) {
+      setLoadError(e?.message || "Failed to load documents");
       toastError("Failed to load documents");
     } finally {
       setLoading(false);
@@ -147,11 +150,21 @@ export default function Documents() {
         </div>
       </div>
 
-      {loading && list.length === 0 && (
+      {loading && list.length === 0 && !loadError && (
         <div className="premium-card rounded-2xl p-12 text-center text-sm text-muted-foreground">Loading documents…</div>
       )}
 
-      {!loading && list.length === 0 && (
+      {!loading && loadError && list.length === 0 && (
+        <div className="premium-card rounded-2xl p-12 text-center">
+          <h3 className="text-lg font-semibold mb-1">Documents couldn't be loaded</h3>
+          <p className="text-sm text-muted-foreground">{loadError}</p>
+          <button onClick={fetchAll} className="premium-btn px-5 py-2.5 rounded-xl font-medium text-sm mt-4">
+            Retry
+          </button>
+        </div>
+      )}
+
+      {!loading && !loadError && list.length === 0 && (
         <div className="premium-card rounded-2xl p-12 text-center">
           <div className="text-5xl mb-4">{results ? "🔍" : "📄"}</div>
           <h3 className="text-lg font-semibold mb-1">

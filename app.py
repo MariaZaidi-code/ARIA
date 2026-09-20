@@ -60,6 +60,13 @@ async def lifespan(app: FastAPI):
     # Single-worker safety: multi-worker without a shared store diverges
     # sessions (file) and rate limits (memory). Warn loudly but never crash
     # dev (single worker default). See ARIA_REDIS_URL / ARIA_REQUIRE_SHARED_STORE.
+    # Single-worker storage model (P0-3): in-memory/file stores are LOCAL only.
+    # Choice: fail fast with RuntimeError when workers > 1 without
+    # ARIA_REDIS_URL AND (ARIA_REQUIRE_SHARED_STORE is truthy/not-"0" OR
+    # ARIA_ENV=production without an explicit opt-out). Single-worker
+    # default (workers <= 1) always starts unchanged. An explicit
+    # ARIA_REQUIRE_SHARED_STORE=0/false/no/off opts back into warn-only
+    # mode for non-production dev (e.g. multi-worker toy experiments).
     try:
         _workers = 1
         for _var in ("UVICORN_WORKERS", "WEB_CONCURRENCY", "ARIA_WORKERS"):
@@ -71,6 +78,27 @@ async def lifespan(app: FastAPI):
                 continue
         _redis_url = (os.getenv("ARIA_REDIS_URL", "") or "").strip()
         if _workers > 1 and not _redis_url:
+            # Unset is NOT an opt-out: only an explicit 0/false/no/off
+            # downgrades production to warn-only. Default (unset) in prod
+            # fails fast; in non-prod unset stays warn-only (dev compat).
+            _require_env = os.getenv("ARIA_REQUIRE_SHARED_STORE")
+            _require_raw = (_require_env or "").strip().lower()
+            _explicit_opt_out = _require_raw in {"0", "false", "no", "off"}
+            _require_shared = _require_raw in {"1", "true", "yes", "on"}
+            _is_prod = (os.getenv("ARIA_ENV", "") or "").strip().lower() == "production"
+            _fail_fast = _require_shared or (_is_prod and not _explicit_opt_out)
+            _msg = (
+                f"Multi-worker deployment ({_workers} workers via "
+                "UVICORN_WORKERS/WEB_CONCURRENCY/ARIA_WORKERS) without "
+                "ARIA_REDIS_URL: sessions and rate limits would diverge "
+                "per-process. Set ARIA_REDIS_URL to a shared Redis, or run a "
+                "single worker."
+            )
+            if _fail_fast:
+                raise RuntimeError(
+                    _msg + " (fail-fast: ARIA_REQUIRE_SHARED_STORE=1 or "
+                    "ARIA_ENV=production without explicit opt-out)"
+                )
             logging.getLogger("uvicorn.error").error(
                 "Multi-worker deployment (%d workers via UVICORN_WORKERS/WEB_CONCURRENCY) "
                 "without ARIA_REDIS_URL: sessions and rate limits will diverge "
@@ -78,6 +106,8 @@ async def lifespan(app: FastAPI):
                 "single worker. Set ARIA_REQUIRE_SHARED_STORE=1 to fail closed.",
                 _workers,
             )
+    except RuntimeError:
+        raise
     except Exception:
         pass
     logging.getLogger("uvicorn.error").info("ARIA startup checks complete.")
@@ -104,6 +134,12 @@ try:
     from starlette.middleware.trustedhost import TrustedHostMiddleware as _TrustedHost
     # allow 127.0.0.1/localhost (+ testserver for TestClient) without breaking dev
     app.add_middleware(_TrustedHost, allowed_hosts=_trusted_hosts)
+except Exception:  # pragma: no cover - middleware must never break startup
+    pass
+try:
+    from starlette.middleware.gzip import GZipMiddleware as _GZip
+    # Compress JSON/bundles over 1KB (intelligence payloads, dist assets).
+    app.add_middleware(_GZip, minimum_size=1000)
 except Exception:  # pragma: no cover - middleware must never break startup
     pass
 
@@ -270,17 +306,34 @@ def providers():
 
 # Serve the built React frontend (aria-frontend/dist/) at root
 DIST_DIR = BASE_DIR / "aria-frontend" / "dist"
+# Cache policy: index.html must NEVER cache (it references hashed bundles —
+# a stale shell is why users see old pages after a deploy). Hashed /assets
+# are immutable and cache for a year.
+_INDEX_NO_STORE = {"Cache-Control": "no-store, must-revalidate"}
+
+
+class _ImmutableStatic(StaticFiles):
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        try:
+            if resp.status_code == 200:
+                resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        except Exception:
+            pass
+        return resp
+
+
 # Mount dist contents so /assets/ resolves correctly (vite builds to /assets/)
 # Guarded: missing build dir must not crash the backend (API still works).
 if (DIST_DIR / "assets").exists():
-    app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="assets")
+    app.mount("/assets", _ImmutableStatic(directory=str(DIST_DIR / "assets")), name="assets")
 # Also serve root files (favicon, index.html) via direct response
 @app.get("/")
 def index():
     prod_index = DIST_DIR / "index.html"
     if prod_index.exists():
-        return FileResponse(prod_index)
-    return FileResponse(STATIC_DIR / "index.html")
+        return FileResponse(prod_index, headers=dict(_INDEX_NO_STORE))
+    return FileResponse(STATIC_DIR / "index.html", headers=dict(_INDEX_NO_STORE))
 
 # Fallback: any unmatched non-API route -> index.html (SPA routing).
 # /api/* must never silently return HTML; unknown API paths return the
@@ -304,8 +357,8 @@ def catch_all(full_path: str, request: Request):
                     "detail": "Static file not found.", "request_id": rid})
     prod_index = DIST_DIR / "index.html"
     if prod_index.exists():
-        return FileResponse(prod_index)
-    return FileResponse(STATIC_DIR / "index.html")
+        return FileResponse(prod_index, headers=dict(_INDEX_NO_STORE))
+    return FileResponse(STATIC_DIR / "index.html", headers=dict(_INDEX_NO_STORE))
 
 
 def _resolve_port(start_port: int = 8000, max_tries: int = 20) -> int:

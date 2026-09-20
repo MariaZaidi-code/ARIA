@@ -146,12 +146,13 @@ def test_small_sizes_exact(tmp_path, n):
         # No usable values anywhere: every class is honestly "unknown".
         assert set(tinfo["column_classes"].values()) == {"unknown"}
     elif n == 1:
-        # Degenerate single row: "1" matches the canonical boolean tokens and
-        # the always-null amount has no usable values (pre-existing inference).
-        assert tinfo["column_classes"]["id"] == "boolean"
+        # Degenerate single row: {"1"}/{"true"} alone stay INTEGER/STRING
+        # per the canonical boolean policy (both true and false sides are
+        # required); the always-null amount has no usable values.
+        assert tinfo["column_classes"]["id"] == "numeric"
         assert tinfo["column_classes"]["amount"] == "unknown"
         assert tinfo["column_classes"]["event_date"] == "date"
-        assert tinfo["column_classes"]["flag"] == "boolean"
+        assert tinfo["column_classes"]["flag"] == "text"
     else:
         # Categorical rule (mirrors the contract): low-cardinality text only.
         cat_distinct = len({f"cat{i % 7}" for i in range(n)})
@@ -307,6 +308,11 @@ def test_payload_bounds(tmp_path):
 
 
 def test_upload_guard_stays_100mb():
-    """The 100MB upload guard is a safety limit, not an analytical cap."""
+    """The upload guard scales with ARIA_MAX_UPLOAD_CSV_MB (default 512MB):
+    large files are profiled by the bounded chunked path and processed in
+    a background thread, so the cap is a safety limit, not an analytical one."""
+    import os
     from api.connect_routes import MAX_UPLOAD_BYTES_CSV
-    assert MAX_UPLOAD_BYTES_CSV == 100 * 1024 * 1024
+    expected_mb = int(os.getenv("ARIA_MAX_UPLOAD_CSV_MB", "512"))
+    assert MAX_UPLOAD_BYTES_CSV == expected_mb * 1024 * 1024
+    assert expected_mb >= 200  # 200MB+ datasets must be accepted

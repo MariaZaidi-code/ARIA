@@ -33,6 +33,19 @@ def _clean_currency(value: str) -> str:
             pass
     return stripped
 
+
+def _numeric_clean(series: "pd.Series") -> "pd.Series":
+    """Vectorized _clean_currency: identical results, no per-element calls.
+
+    Strips currency symbols/thousand commas via regex ops, folds trailing %
+    to /100, coerces the rest (unparseable -> NaN, same as before).
+    """
+    s = series.astype("string").str.strip()
+    s = s.str.replace(_CURRENCY_RE, "", regex=True).str.replace(",", "", regex=False)
+    pct = s.str.endswith("%")
+    core = s.where(~pct, s.str.slice(stop=-1))
+    return pd.to_numeric(core, errors="coerce").mask(pct, pd.to_numeric(s.str.slice(stop=-1), errors="coerce") / 100)
+
 import pandas as pd
 from pandas.errors import EmptyDataError, ParserError
 
@@ -94,12 +107,19 @@ class CsvSchemaExtractor:
         file_path: str | Path,
         *,
         sample_values: int = 5,
-        max_file_size_mb: int | None = 100,
+        max_file_size_mb: int | None = None,
         missing_tokens: Iterable[str] | None = None,
     ) -> None:
+        import os as _os
         self.path = Path(file_path)
         self.sample_values = max(1, int(sample_values))
-        self.max_file_size_mb = max_file_size_mb
+        # Default follows ARIA_MAX_UPLOAD_CSV_MB so every construction site
+        # (routes, orchestrator, tests) honors one tunable limit.
+        self.max_file_size_mb = (
+            max_file_size_mb
+            if max_file_size_mb is not None
+            else int(_os.getenv("ARIA_MAX_UPLOAD_CSV_MB", "512"))
+        )
         self.missing_tokens = {
             token.strip().lower()
             for token in (missing_tokens or self.DEFAULT_MISSING_TOKENS)
@@ -114,7 +134,12 @@ class CsvSchemaExtractor:
     # ------------------------------------------------------------------
 
     def extract(self) -> dict[str, Any]:
-        """Parse, validate and return a JSON-serialisable schema profile."""
+        """Parse, validate and return a JSON-serialisable schema profile.
+
+        Row counting rides inside the chunked aggregate pass (no separate
+        full scan): small files take the exact full-frame path, large files
+        the bounded sampled path. Results are identical to before.
+        """
         self._validate_file()
         self._encoding = self._detect_encoding()
         self._dialect = self._detect_dialect(self._encoding)
@@ -203,7 +228,7 @@ class CsvSchemaExtractor:
             ]
             logical, _ = inferred[column_name]
             if logical in {"INTEGER", "DECIMAL"}:
-                numeric = pd.to_numeric(non_missing.map(_clean_currency), errors="coerce")
+                numeric = _numeric_clean(non_missing)
                 sample_medians[column_name] = self._json_number(
                     numeric.median(), rounded=True)
             _ = original_non_missing  # whitespace counts come from the full pass below
@@ -234,14 +259,13 @@ class CsvSchemaExtractor:
 
                 logical = inferred[column_name][0]
                 if logical in {"INTEGER", "DECIMAL"}:
-                    numeric = pd.to_numeric(non_missing.map(_clean_currency), errors="coerce").dropna()
+                    numeric = _numeric_clean(non_missing).dropna()
                     if len(numeric):
-                        vals = numeric.tolist()
                         acc = num_acc.setdefault(column_name, [0.0, 0.0, 0.0, 0.0])
-                        acc[0] += len(vals)
-                        acc[1] += float(sum(vals))
-                        acc[2] = min(vals) if acc[0] == len(vals) else min(acc[2], min(vals))
-                        acc[3] = max(vals) if acc[0] == len(vals) else max(acc[3], max(vals))
+                        acc[0] += len(numeric)
+                        acc[1] += float(numeric.sum())
+                        acc[2] = float(numeric.min()) if acc[0] == len(numeric) else min(acc[2], float(numeric.min()))
+                        acc[3] = float(numeric.max()) if acc[0] == len(numeric) else max(acc[3], float(numeric.max()))
                 elif logical in {"DATE", "DATETIME"}:
                     if len(non_missing):
                         date_cands.setdefault(column_name, []).extend(
@@ -256,13 +280,19 @@ class CsvSchemaExtractor:
                             tracker.clear()
                             break
             # duplicate detection over raw (unstripped) values, like
-            # DataFrame.duplicated() on the full frame. Hashes keep the
-            # working set bounded; the cap flips to a sampled estimate.
+            # DataFrame.duplicated() on the full frame. Stable blake2b-64
+            # hashes (not builtin hash(), which is salted per-process) keep
+            # the working set bounded; the cap flips to a sampled estimate.
             if not duplicates_estimated:
                 try:
                     frozen = chunk.fillna("")
                     for row in frozen.itertuples(index=False, name=None):
-                        h = hash(row)
+                        # blake2b-64: same exactness as sha256 for dedup
+                        # flagging within one run, ~2x faster per row.
+                        h = hashlib.blake2b(
+                            "|".join(map(str, row)).encode("utf-8"),
+                            digest_size=8,
+                        ).hexdigest()
                         if h in seen_rows:
                             duplicate_rows += 1
                         else:
@@ -852,8 +882,7 @@ class CsvSchemaExtractor:
             return None
 
         if inferred_type in {"INTEGER", "DECIMAL"}:
-            cleaned = values.map(_clean_currency)
-            numeric = pd.to_numeric(cleaned, errors="coerce")
+            numeric = _numeric_clean(values)
             return {
                 "min": self._json_number(numeric.min()),
                 "max": self._json_number(numeric.max()),
@@ -967,9 +996,13 @@ class CsvSchemaExtractor:
 
         lowered = {value.casefold() for value in cleaned}
         # Canonical boolean policy (shared with csv_orchestrator._TRUE/_FALSE_TOKENS):
-        # true/yes/y/1 and false/no/n/0. Keeps handler/orchestrator consistent.
+        # true/yes/y/1 and false/no/n/0. Requires BOTH sides present so a
+        # single-token column ({"true"} / {"1"}) does not misfire: {"1"} alone
+        # stays INTEGER, {"true"} alone stays STRING. Keeps handler/orchestrator consistent.
         bool_tokens = {"true", "false", "yes", "no", "y", "n", "1", "0"}
-        if lowered.issubset(bool_tokens) and len(lowered) >= 1:
+        _true_side = {"true", "yes", "y", "1"}
+        _false_side = {"false", "no", "n", "0"}
+        if lowered.issubset(bool_tokens) and (lowered & _true_side) and (lowered & _false_side):
             return "BOOLEAN", None
 
         # Try numeric inference on currency-cleaned values.

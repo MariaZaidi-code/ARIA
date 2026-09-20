@@ -5,7 +5,7 @@ from pathlib import Path
 
 from core.config import DATA_DIR
 
-RAG_PIPELINE_VERSION = "2.0-enterprise"
+RAG_PIPELINE_VERSION = "2.0-enterprise"  # P1: surfaced in query diagnostics (scope_layer + routes)
 
 RAG_ROOT = DATA_DIR / "insight_rag"
 RAG_USERS_DIR = RAG_ROOT / "users"

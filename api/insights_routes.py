@@ -26,7 +26,7 @@ from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, log_and_sanitize
 from core.semantic import humanize
 
 router = APIRouter(tags=["insights"])
-from services.insights_service import (_safe_float, _fmt, _fmt_currency, _fmt_pct, _iqr_bands, _sanitize_spec_rows, _normalize_chart_spec, _confidence_level, _evidence_quality, _capability_flags, _histogram_bins, _build_takeaways, _enrich_insight, _normalize_legacy_insight, _translate_sql_for_sqlite, CHART_SPEC_VOCAB, _MAX_SPEC_ROWS, _MAX_RAW_VALUES)  # noqa: F401,E402  # thin-wrapper re-export
+from services.insights_service import (_safe_float, _fmt, _fmt_currency, _fmt_pct, _iqr_bands, _sanitize_spec_rows, _normalize_chart_spec, _confidence_level, _evidence_quality, _capability_flags, _histogram_bins, _build_takeaways, _enrich_insight, _normalize_legacy_insight, _translate_sql_for_sqlite, build_recommendation_detail, build_explains, CHART_SPEC_VOCAB, _MAX_SPEC_ROWS, _MAX_RAW_VALUES)  # noqa: F401,E402  # thin-wrapper re-export
 
 log = logging.getLogger("aria.insights")
 
@@ -66,6 +66,44 @@ class _SQLiteCompatConnection:
         return getattr(self._conn, name)
 
 
+def _fmtm(v, measure=None):
+    """Measure-aware money formatting (generic, never per-column).
+
+    Currency symbols render only for money-like measures (price/cost/
+    amount/revenue/...); counts, flags and other numerics render as plain
+    comma-separated numbers. Prevents "$6K items" nonsense on any dataset.
+    """
+    try:
+        _ml = str(measure or "").lower()
+        # NOTE: bare "total" is deliberately excluded — Total_Items and
+        # other counts contain it. Money needs a currency-ish token.
+        _money = ("price", "cost", "amount", "revenue", "profit", "salary",
+                  "payment", "spend", "budget", "fee", "fare",
+                  "tuition", "premium", "wage", "income", "expense",
+                  "balance", "sales", "margin")
+        if any(_k in _ml for _k in _money):
+            return _fmt_currency(v)
+        import math as _math
+        try:
+            _f = float(v)
+        except (TypeError, ValueError):
+            return str(v)
+        if _f != _f:
+            return str(v)
+        if abs(_f) >= 1_000_000:
+            return f"{_f / 1_000_000:.1f}M"
+        if abs(_f) >= 10_000:
+            return f"{_f / 1_000:.1f}K"
+        if abs(_f) >= 100:
+            return f"{int(round(_f)):,}"
+        return f"{round(_f, 1)}"
+    except Exception:
+        try:
+            return _fmt_currency(v)
+        except Exception:
+            return str(v)
+
+
 class InsightsEngine:
     """Detect real insights from any connected database. Fully dynamic.
 
@@ -79,6 +117,211 @@ class InsightsEngine:
         self.mapping = mapping
         self.llm = llm
         self.intel = SchemaIntelligence(mapping)
+        # Large-table sampling (generic): tables above _SAMPLE_ROWS_CAP run
+        # detectors against a deterministic ~100k-row TEMP sample instead of
+        # full scans. Metadata (intel) always uses the real table name; only
+        # SQL FROM clauses go through self._t(). TEMP tables die with the
+        # connection, so no cleanup bookkeeping is needed.
+        self._sqlt: dict = {}
+        self.sample_info: dict = {"sampled": False, "tables": {}}
+
+    _SAMPLE_ROWS_CAP = 100_000
+
+    def _dialect(self) -> str:
+        """Connection dialect for date math (generic, never per-database)."""
+        mod = type(self.conn).__module__.lower()
+        if "pymysql" in mod or "mysql" in mod:
+            return "mysql"
+        if "sqlite" in mod or "compat" in mod:
+            return "sqlite"
+        # _SQLiteCompatConnection (defined in this module) speaks SQLite
+        # underneath while accepting PG surface syntax: date math must be
+        # SQLite-native so it runs without translation gaps.
+        try:
+            if isinstance(self.conn, _SQLiteCompatConnection):
+                return "sqlite"
+        except Exception:
+            pass
+        # SQLAlchemy engines expose their dialect directly (a sqlite-backed
+        # engine must not be treated as PostgreSQL).
+        try:
+            _d = getattr(getattr(self.conn, "dialect", None), "name", "")
+            if _d in ("sqlite", "mysql", "postgresql"):
+                return _d
+        except Exception:
+            pass
+        return "postgresql"
+
+    def _col_dtype(self, table: str, col: str) -> str:
+        """Native data_type for a column (either mapping shape)."""
+        try:
+            tinfo = (self.mapping.get("tables") or {}).get(table) or {}
+            cols = tinfo.get("columns", [])
+            if isinstance(cols, dict):
+                m = cols.get(col) or {}
+                return str(m.get("data_type", ""))
+            for c in cols:
+                if isinstance(c, dict) and c.get("column") == col:
+                    return str(c.get("data_type", ""))
+        except Exception:
+            pass
+        return ""
+
+    def _mexpr(self, table: str, col: str) -> str:
+        """Month-truncation expression for the live dialect, TEXT-date safe.
+
+        Native DATE columns use the fast native truncation (unchanged
+        output). TEXT dates (ISO, DD-MM-YYYY, YYYY-MM month grain) go
+        through the shared date parser first — without it strftime/
+        DATE_TRUNC yields NULL and every detector collapses to one NULL
+        group. Output grain is identical either way (%Y-%m-01 / month
+        start) so period labels downstream never change.
+        """
+        q = _safe_name(col)
+        d = self._dialect()
+        dtype = self._col_dtype(table, col).lower()
+        is_text = (not dtype or any(t in dtype for t in
+                    ("char", "text", "varchar", "string", "clob", "uuid")))
+        expr = q
+        if is_text:
+            try:
+                from core.data_intelligence import date_parse_expression as _dpe
+                expr = _dpe(q, d if d in ("mysql", "sqlite") else "postgresql")
+            except Exception:
+                expr = q
+        if d == "mysql":
+            return f"DATE_FORMAT({expr}, '%Y-%m-01')"
+        if d == "sqlite":
+            return f"strftime('%Y-%m-01', {expr})"
+        if is_text:
+            return f"DATE_TRUNC('month', {expr})"
+        return f"DATE_TRUNC('month', {q})"
+
+    def _t(self, table: str) -> str:
+        """SQL table for detectors: TEMP sample when one was built."""
+        return self._sqlt.get(table, table)
+
+    def _sexpr(self, table: str, col: str, qualified_table: str | None = None) -> str:
+        """SUM-safe expression for a measure: TEXT-storage aware.
+
+        Fully schema-agnostic (no table/column literals): when the declared
+        dtype is text-ish (e.g. a relational table holding ``'\\u20b91,299'``
+        or ``'15%'`` in TEXT columns), returns the shared
+        :func:`core.text_numeric.coercion_sql` expression so aggregates
+        yield numbers instead of raising ``function sum(text) does not
+        exist``. Unparsable values become NULL (never invented). Native
+        numerics and unknown dtypes keep the plain quoted column. The
+        qualifier honours TEMP samples; table-qualified refs (correlations)
+        resolve dtypes from their own table. Never raises.
+        """
+        from core.text_numeric import coercion_sql as _cs
+        try:
+            d = self._dialect()
+        except Exception:
+            d = "postgresql"
+        _qd = d if d in ("mysql", "sqlite", "postgresql") else "postgresql"
+        try:
+            base = f"{_safe_name(qualified_table, _qd)}.{_safe_name(col, _qd)}" \
+                if qualified_table else _safe_name(col, _qd)
+        except Exception:
+            base = str(col)
+        try:
+            dtype = self._col_dtype(qualified_table or table, col).lower()
+        except Exception:
+            dtype = ""
+        if any(k in dtype for k in
+               ("char", "text", "varchar", "string", "clob", "uuid")):
+            try:
+                return _cs(_qd, base)
+            except Exception:
+                return base
+        return base
+
+    def _drop_partial_trailing_month(self, table: str, date_col: str, rows: list) -> list:
+        """Drop a trailing partial month (generic incomplete-period guard).
+
+        A month holding only part of its days (data ends mid-month) reads
+        as a collapse against full months. When the table's MAX(date) falls
+        before its month-end AND more than one month exists, the last
+        period is excluded from growth/anomaly reads. Returns filtered rows.
+        """
+        try:
+            if len(rows) < 3:
+                return rows
+            _mr = _run_sql(self.conn, f"SELECT MAX({_safe_name(date_col)}) FROM {_safe_name(self._t(table))} WHERE {_safe_name(date_col)} IS NOT NULL", limit=1)
+            _mrows = _mr[1] if isinstance(_mr, tuple) else []
+            if not _mrows:
+                return rows
+            _first = _mrows[0]
+            # Column name varies by dialect (MAX("Date") vs max) — take
+            # the first value regardless of key.
+            _raw = next(iter(_first.values()), None) if isinstance(_first, dict) else _first[0]
+            _s = str(_raw)[:10]
+            _y, _m, _d = int(_s[:4]), int(_s[5:7]), int(_s[8:10])
+            import calendar as _cal
+            _month_end = _cal.monthrange(_y, _m)[1]
+            if _d >= _month_end:
+                return rows
+            _last = rows[-1].get("period") if isinstance(rows[-1], dict) else None
+            if _last and str(_last)[:7] == f"{_y}-{_m:02d}":
+                return rows[:-1]
+            return rows
+        except Exception:
+            return rows
+
+    def _maybe_sample(self, table: str) -> None:
+        """Build a deterministic ~100k-row TEMP sample for huge tables."""
+        if table in self._sqlt:
+            return
+        try:
+            ti = (self.mapping.get("tables") or {}).get(table) or {}
+            rc = ti.get("row_count")
+            if not isinstance(rc, int) or rc <= self._SAMPLE_ROWS_CAP:
+                return
+            import math as _math
+            k = max(1, int(_math.ceil(rc / self._SAMPLE_ROWS_CAP)))
+            sname = f"aria_smp_{table}"[:60]
+            _real = _safe_name(table)
+            _method = "deterministic-stride"
+            # Detect dialect from the connection object.
+            mod = type(self.conn).__module__.lower()
+            if "psycopg2" in mod or "postgres" in mod:
+                pct = max(0.1, min(100.0, self._SAMPLE_ROWS_CAP * 100.0 / rc))
+                # REPEATABLE seed: same sample every run, not run-to-run flap.
+                ddl = (f'CREATE TEMP TABLE {_safe_name(sname)} AS SELECT * FROM '
+                       f'{_real} TABLESAMPLE SYSTEM ({pct}) REPEATABLE (42)')
+                _method = "system-sample-repeatable-42"
+            elif "pymysql" in mod or "mysql" in mod:
+                # NOTE: MySQL RAND(constant) returns one value per query
+                # (all-or-nothing), so a seeded variant is impossible here.
+                # Unseeded RAND() gives correct volume, honestly labeled.
+                ddl = (f'CREATE TEMPORARY TABLE {_safe_name(sname)} AS SELECT * FROM '
+                       f'{_real} WHERE RAND() < {self._SAMPLE_ROWS_CAP / rc}')
+                _method = "random"
+            else:
+                # sqlite (incl. _SQLiteCompatConnection): deterministic rowid stride.
+                ddl = (f'CREATE TEMP TABLE {_safe_name(sname)} AS SELECT * FROM '
+                       f'{_real} WHERE (rowid % {k}) = 0')
+            cur = self.conn.cursor() if hasattr(self.conn, "cursor") else None
+            if cur is None and hasattr(self.conn, "execute"):
+                self.conn.execute(ddl)
+                try:
+                    self.conn.commit()
+                except Exception:
+                    pass
+            else:
+                cur.execute(ddl)
+                try:
+                    self.conn.commit()
+                except Exception:
+                    pass
+                cur.close()
+            self._sqlt[table] = sname
+            self.sample_info["sampled"] = True
+            self.sample_info["tables"][table] = {"sample_rows": self._SAMPLE_ROWS_CAP,
+                                                 "total_rows": rc, "method": _method}
+        except Exception as exc:
+            log.debug("insights sampling skipped for %s: %s", table, exc)
 
     def _rollback(self) -> None:
         """Reset a poisoned transaction so later detectors keep working."""
@@ -115,6 +358,9 @@ class InsightsEngine:
             if tinfo.get("empty"):
                 continue
 
+            # Bound huge tables to a deterministic sample before detectors.
+            self._maybe_sample(tname)
+
             # Skip tables with no meaningful numeric measures (dimension-only tables)
             measure = self.intel.find_best_measure(tname)
             if not measure:
@@ -124,58 +370,57 @@ class InsightsEngine:
             # shared transaction for every later detector).
             if measure not in self.intel.get_numeric_cols(tname):
                 continue
+            # Coverage across measures (generic): the best measure plus up
+            # to 2 more numeric non-key columns, so wide tables surface
+            # more than one story. Identifier-like columns (PK flags, or
+            # data-driven: distinct == row count, e.g. Transaction_ID) never
+            # qualify — summing an ID is meaningless.
+            _pks = {str(c).lower() for c in (
+                (tinfo.get("primary_key") or []) + (tinfo.get("inferred_primary_key") or []))}
+            _id_name = __import__("re").compile(r"(^|_)(id|key|code|no|number|guid|uuid)($|_)").search
+            _col_flags = {}
+            for _cc in (tinfo.get("columns") or []):
+                if isinstance(_cc, dict) and _cc.get("column"):
+                    if _cc.get("is_primary_key"):
+                        _pks.add(str(_cc.get("column")).lower())
+            def _looks_identifier(_c):
+                if str(_c).lower() in _pks:
+                    return True
+                if not _id_name(str(_c).lower()):
+                    return False
+                try:
+                    _ir = _run_sql(self.conn, f"SELECT COUNT(*) AS n, COUNT(DISTINCT {_safe_name(self._t(tname))}.{_safe_name(_c)}) AS d FROM {_safe_name(self._t(tname))}", limit=1)
+                    _rows = _ir[1] if isinstance(_ir, tuple) else []
+                    if _rows:
+                        _n, _d = _rows[0].get("n"), _rows[0].get("d")
+                        return bool(_n and _d == _n)
+                except Exception:
+                    pass
+                return False
+            _measures = [measure]
+            for _c in self.intel.get_numeric_cols(tname):
+                if _c != measure and len(_measures) < 3 and not _looks_identifier(_c):
+                    _measures.append(_c)
 
-            try:
-                insights.extend(self._detect_growth_decline(tname))
-            except DB_ERRORS as exc:
-                log.debug("insights detector failed for %s: %s", tname, exc)
-                self._rollback()
-            try:
-                insights.extend(self._detect_trends(tname))
-            except DB_ERRORS as exc:
-                log.debug("insights detector failed for %s: %s", tname, exc)
-                self._rollback()
-            try:
-                insights.extend(self._detect_trend_leaderboard(tname))
-            except DB_ERRORS as exc:
-                log.debug("insights detector failed for %s: %s", tname, exc)
-                self._rollback()
-            try:
-                insights.extend(self._detect_anomalies(tname))
-            except DB_ERRORS as exc:
-                log.debug("insights detector failed for %s: %s", tname, exc)
-                self._rollback()
-            try:
-                insights.extend(self._detect_opportunities(tname))
-            except DB_ERRORS as exc:
-                log.debug("insights detector failed for %s: %s", tname, exc)
-                self._rollback()
-            try:
-                insights.extend(self._detect_risks(tname))
-            except DB_ERRORS as exc:
-                log.debug("insights detector failed for %s: %s", tname, exc)
-                self._rollback()
+            def _run(det, *a):
+                for _m in _measures:
+                    try:
+                        insights.extend(det(tname, _m))
+                    except DB_ERRORS as exc:
+                        log.debug("insights detector failed for %s: %s", tname, exc)
+                        self._rollback()
+
+            _run(self._detect_growth_decline)
+            _run(self._detect_trends)
+            _run(self._detect_trend_leaderboard)
+            _run(self._detect_anomalies)
+            _run(self._detect_opportunities)
+            _run(self._detect_risks)
             # Non-temporal detectors (work without date columns)
-            try:
-                insights.extend(self._detect_value_outliers(tname))
-            except DB_ERRORS as exc:
-                log.debug("insights detector failed for %s: %s", tname, exc)
-                self._rollback()
-            try:
-                insights.extend(self._detect_concentration(tname))
-            except DB_ERRORS as exc:
-                log.debug("insights detector failed for %s: %s", tname, exc)
-                self._rollback()
-            try:
-                insights.extend(self._detect_distributions(tname))
-            except DB_ERRORS as exc:
-                log.debug("insights detector failed for %s: %s", tname, exc)
-                self._rollback()
-            try:
-                insights.extend(self._detect_segment_comparison(tname))
-            except DB_ERRORS as exc:
-                log.debug("insights detector failed for %s: %s", tname, exc)
-                self._rollback()
+            _run(self._detect_value_outliers)
+            _run(self._detect_concentration)
+            _run(self._detect_distributions)
+            _run(self._detect_segment_comparison)
 
         # Cross-table correlation
         try:
@@ -203,22 +448,22 @@ class InsightsEngine:
 
     # ── Growth / Decline ──────────────────────────────────────────────────
 
-    def _detect_growth_decline(self, table: str):
+    def _detect_growth_decline(self, table: str, measure: str | None = None):
         insights = []
         date_col = self.intel.find_best_datetime(table)
         if not date_col:
             return []
 
-        measure = self.intel.find_best_measure(table)
+        measure = measure or self.intel.find_best_measure(table)
         if not measure:
             return []
 
         # Get current vs previous period
         sql = f"""
             WITH monthly AS (
-                SELECT date_trunc('month', {_safe_name(date_col)}) AS period,
-                       SUM({_safe_name(measure)}) AS val
-                FROM {_safe_name(table)}
+                SELECT {self._mexpr(table, date_col)} AS period,
+                       SUM({self._sexpr(table, measure)}) AS val
+                FROM {_safe_name(self._t(table))}
                 WHERE {_safe_name(date_col)} IS NOT NULL
                 GROUP BY period
                 ORDER BY period DESC
@@ -227,6 +472,8 @@ class InsightsEngine:
             SELECT period, val FROM monthly ORDER BY period
         """
         _, rows = _run_sql(self.conn, sql, limit=12)
+        # Never compare a trailing partial month against full months.
+        rows = self._drop_partial_trailing_month(table, date_col, rows)
         if len(rows) < 2:
             return []
 
@@ -250,34 +497,35 @@ class InsightsEngine:
         viz_data = [{"period": str(v[0])[:7], "value": v[1]} for v in values]
 
         observations = [
-            f"{humanize(measure)} was {_fmt_currency(previous_val)} in the previous period.",
-            f"{humanize(measure)} is {_fmt_currency(current_val)} in the current period.",
+            f"{humanize(measure)} was {_fmtm(previous_val, measure)} in the previous period.",
+            f"{humanize(measure)} is {_fmtm(current_val, measure)} in the current period.",
             f"This is a {_fmt_pct(change_pct)} change.",
         ]
         if len(values) >= 4:
             avg = statistics.mean([v[1] for v in values])
-            observations.append(f"Typical level across the last {len(values)} periods: {_fmt_currency(avg)}.")
+            observations.append(f"Typical level across the last {len(values)} periods: {_fmtm(avg, measure)}.")
 
         if change_pct > 5:
             insight_type = "Growth"
             severity = self._compute_severity(change_pct, confidence, current_val)
-            title = f"{humanize(measure)} grew {_fmt_pct(change_pct)} to {_fmt_currency(current_val)}"
+            title = f"{humanize(measure)} grew {_fmt_pct(change_pct)} to {_fmtm(current_val, measure)}"
         elif change_pct < -5:
             insight_type = "Decline"
             severity = self._compute_severity(abs(change_pct), confidence, current_val)
-            title = f"{humanize(measure)} fell {_fmt_pct(change_pct)} to {_fmt_currency(current_val)}"
+            title = f"{humanize(measure)} fell {_fmt_pct(change_pct)} to {_fmtm(current_val, measure)}"
         else:
             return []
 
         impact_value = current_val - previous_val
         dims = self.intel.get_text_cols(table)[:3]
+        _move_word = "up" if change_pct > 0 else "down"
 
         insights.append(self._build_insight(
             insight_id=f"gd_{table}_{measure}",
             insight_type=insight_type,
             severity=severity,
             title=title,
-            description=f"{humanize(measure)} moved from {_fmt_currency(previous_val)} to {_fmt_currency(current_val)} ({_fmt_pct(change_pct)}) between {period_label}.",
+            description=f"{humanize(measure)} moved from {_fmtm(previous_val, measure)} to {_fmtm(current_val, measure)} ({_fmt_pct(change_pct)}) between {period_label}. That is {_move_word} {abs(change_pct):.0f}% — a move worth noting.",
             metric=metric_label,
             metric_value=current_val,
             previous_value=previous_val,
@@ -293,7 +541,7 @@ class InsightsEngine:
             change_pct=change_pct,
             impact_value=impact_value,
             impact_direction="positive" if impact_value > 0 else "negative",
-            impact_explanation=f"The {_fmt_pct(change_pct)} move in {humanize(measure).lower()} means {'a gain' if impact_value > 0 else 'a drop'} of {_fmt_currency(abs(impact_value))}.",
+            impact_explanation=f"The {_fmt_pct(change_pct)} move in {humanize(measure).lower()} means {'a gain' if impact_value > 0 else 'a drop'} of {_fmtm(abs(impact_value))}.",
             next_question=f"What caused the {_fmt_pct(change_pct)} {'rise' if change_pct > 0 else 'fall'} in {humanize(measure).lower()}?",
             next_dims=dims,
             viz_type="area",
@@ -306,26 +554,27 @@ class InsightsEngine:
 
     # ── Trends ────────────────────────────────────────────────────────────
 
-    def _detect_trends(self, table: str):
+    def _detect_trends(self, table: str, measure: str | None = None):
         insights = []
         date_col = self.intel.find_best_datetime(table)
         if not date_col:
             return []
 
-        measure = self.intel.find_best_measure(table)
+        measure = measure or self.intel.find_best_measure(table)
         if not measure:
             return []
 
         sql = f"""
-            SELECT date_trunc('month', {_safe_name(date_col)}) AS period,
-                   SUM({_safe_name(measure)}) AS val
-            FROM {_safe_name(table)}
+            SELECT {self._mexpr(table, date_col)} AS period,
+                   SUM({self._sexpr(table, measure)}) AS val
+            FROM {_safe_name(self._t(table))}
             WHERE {_safe_name(date_col)} IS NOT NULL
             GROUP BY period
             ORDER BY period
             LIMIT 24
         """
         _, rows = _run_sql(self.conn, sql, limit=24)
+        rows = self._drop_partial_trailing_month(table, date_col, rows)
         if len(rows) < 6:
             return []
 
@@ -405,7 +654,7 @@ class InsightsEngine:
             affected_period=period_months,
             tags=[table, measure, "trend", direction],
             observations=[
-                f"{humanize(measure)} moved from {_fmt_currency(nums[0])} to {_fmt_currency(nums[-1])} over {len(values)} periods.",
+                f"{humanize(measure)} moved from {_fmtm(nums[0], measure)} to {_fmtm(nums[-1], measure)} over {len(values)} periods.",
                 f"It moved in the same direction in {consistency*100:.0f}% of those periods.",
             ] + ([
                 f"{sum(1 for v in values if _is_unusual(v[1]))} of those periods sit outside the usual range and are highlighted on the chart."
@@ -430,7 +679,7 @@ class InsightsEngine:
 
     # ── Trend leaderboard (idea 8) ──────────────────────────────────────
 
-    def _detect_trend_leaderboard(self, table: str):
+    def _detect_trend_leaderboard(self, table: str, measure: str | None = None):
         """Rank every usable measure in one table by trend speed.
 
         Dynamic: uses whatever numeric measures the schema actually has
@@ -451,15 +700,16 @@ class InsightsEngine:
         n_periods = 0
         for measure in measures[:8]:
             sql = f"""
-                SELECT date_trunc('month', {_safe_name(date_col)}) AS period,
-                       SUM({_safe_name(measure)}) AS val
-                FROM {_safe_name(table)}
+                SELECT {self._mexpr(table, date_col)} AS period,
+                       SUM({self._sexpr(table, measure)}) AS val
+                FROM {_safe_name(self._t(table))}
                 WHERE {_safe_name(date_col)} IS NOT NULL
                 GROUP BY period
                 ORDER BY period
                 LIMIT 24
             """
             _, rows = _run_sql(self.conn, sql, limit=24)
+            rows = self._drop_partial_trailing_month(table, date_col, rows)
             if len(rows) < 6:
                 continue
             values = [_safe_float(r["val"]) for r in rows if _safe_float(r["val"]) is not None]
@@ -522,7 +772,7 @@ class InsightsEngine:
             affected_period=period_label or f"{n_periods} periods",
             tags=[table, "trend", "leaderboard", top_dir],
             observations=[
-                f"Ranked {len(ranked)} measures by sustained per-period change over {n_periods} periods.",
+                f"Compared {len(ranked)} measures by their sustained move each period over {n_periods} periods." ,
                 f"Fastest: {humanize(top['measure'])} at {top['slope_pct']:+.1f}% a period "
                 f"(same direction in {top['consistency']*100:.0f}% of periods).",
                 f"Slowest: {humanize(bottom['measure'])} at {bottom['slope_pct']:+.1f}% a period.",
@@ -545,26 +795,31 @@ class InsightsEngine:
 
     # ── Anomalies ─────────────────────────────────────────────────────────
 
-    def _detect_anomalies(self, table: str):
+    def _detect_anomalies(self, table: str, measure: str | None = None):
         insights = []
         date_col = self.intel.find_best_datetime(table)
         if not date_col:
             return []
 
-        measure = self.intel.find_best_measure(table)
+        measure = measure or self.intel.find_best_measure(table)
         if not measure:
             return []
 
+        # Latest 24 months in chronological order: anomalies must be
+        # judged on recent history — earliest-24 cannot see recent breaks.
         sql = f"""
-            SELECT date_trunc('month', {_safe_name(date_col)}) AS period,
-                   SUM({_safe_name(measure)}) AS val
-            FROM {_safe_name(table)}
-            WHERE {_safe_name(date_col)} IS NOT NULL
-            GROUP BY period
-            ORDER BY period
-            LIMIT 24
+            SELECT period, val FROM (
+                SELECT {self._mexpr(table, date_col)} AS period,
+                       SUM({self._sexpr(table, measure)}) AS val
+                FROM {_safe_name(self._t(table))}
+                WHERE {_safe_name(date_col)} IS NOT NULL
+                GROUP BY period
+                ORDER BY period DESC
+                LIMIT 24
+            ) ORDER BY period
         """
         _, rows = _run_sql(self.conn, sql, limit=24)
+        rows = self._drop_partial_trailing_month(table, date_col, rows)
         if len(rows) < 6:
             return []
 
@@ -605,27 +860,27 @@ class InsightsEngine:
                     insight_type="Anomaly",
                     severity=severity,
                     title=f"{humanize(measure)} was unusually {direction} normal in {period_str}",
-                    description=f"{humanize(measure)} reached {_fmt_currency(val)} in {period_str}, which is {direction} the usual range of {_fmt_currency(lower_bound)} to {_fmt_currency(upper_bound)} seen in past periods.",
+                    description=f"{humanize(measure)} reached {_fmtm(val, measure)} in {period_str}, which is {direction} the usual range of {_fmtm(lower_bound, measure)} to {_fmtm(upper_bound, measure)} seen in past periods.",
                     metric=f"{humanize(measure)}",
                     metric_value=val,
                     previous_value=mean_val,
-                    magnitude=f"{_fmt_currency(val)} ({direction} usual)",
+                    magnitude=f"{_fmtm(val, measure)} ({direction} usual)",
                     confidence=confidence,
                     affected_period=period_str,
                     tags=[table, measure, "anomaly", direction],
                     observations=[
-                        f"Observed value: {_fmt_currency(val)} in {period_str}.",
-                        f"Usual range based on past periods: {_fmt_currency(lower_bound)} to {_fmt_currency(upper_bound)}.",
-                        f"Typical level: around {_fmt_currency(mean_val)}.",
+                        f"Observed value: {_fmtm(val, measure)} in {period_str}.",
+                        f"Usual range based on past periods: {_fmtm(lower_bound, measure)} to {_fmtm(upper_bound, measure)}.",
+                        f"Typical level: around {_fmtm(mean_val, measure)}.",
                     ],
-                    support_metrics=[f"Outside the usual range by {_fmt_currency(abs(val - mean_val))}"],
+                    support_metrics=[f"Outside the usual range by {_fmtm(abs(val - mean_val))}"],
                     sample_size=len(values),
                     baseline=mean_val,
                     current_value=val,
                     change_pct=((val - mean_val) / abs(mean_val) * 100) if mean_val != 0 else 0,
                     impact_value=val - mean_val,
                     impact_direction="positive" if val > mean_val else "negative",
-                    impact_explanation=f"The {direction} normal {humanize(measure).lower()} of {_fmt_currency(val)} in {period_str} may indicate {'an exceptional opportunity' if val > mean_val else 'a potential issue worth investigating'}.",
+                    impact_explanation=f"The {direction} normal {humanize(measure).lower()} of {_fmtm(val, measure)} in {period_str} may indicate {'an exceptional opportunity' if val > mean_val else 'a potential issue worth investigating'}.",
                     next_question=f"What caused {humanize(measure).lower()} to be {direction} normal in {period_str}?",
                     next_dims=dims,
                     viz_type="area",
@@ -656,7 +911,7 @@ class InsightsEngine:
             try:
                 cur = self.conn.cursor()
                 cur.execute(
-                    f"SELECT COUNT(*), COUNT(DISTINCT {_safe_name(dim)}) FROM {_safe_name(table)}"
+                    f"SELECT COUNT(*), COUNT(DISTINCT {_safe_name(dim)}) FROM {_safe_name(self._t(table))}"
                 )
                 row = cur.fetchone()
                 cur.close()
@@ -671,21 +926,21 @@ class InsightsEngine:
         ranked.sort(key=lambda x: x[0])
         return ranked[0][1] if ranked else None
 
-    def _detect_opportunities(self, table: str):
+    def _detect_opportunities(self, table: str, measure: str | None = None):
         insights = []
         dim = self._usable_dimension(table)
         if not dim:
             return []
 
-        measure = self.intel.find_best_measure(table)
+        measure = measure or self.intel.find_best_measure(table)
         if not measure:
             return []
 
         tdesc = self.intel.tables[table].get("description", table)
 
         sql = f"""
-            SELECT {_safe_name(dim)} AS dim_val, SUM({_safe_name(measure)}) AS val
-            FROM {_safe_name(table)}
+            SELECT {_safe_name(dim)} AS dim_val, SUM({self._sexpr(table, measure)}) AS val
+            FROM {_safe_name(self._t(table))}
             WHERE {_safe_name(dim)} IS NOT NULL
             GROUP BY {_safe_name(dim)}
             ORDER BY val DESC
@@ -723,8 +978,8 @@ class InsightsEngine:
                         insight_id=f"op_{table}_{dim}",
                         insight_type="Opportunity",
                         severity=severity,
-                        title=f"{tdesc or table}: Underpenetrated segments in {dim}",
-                        description=f"The top {dim} ({top[0]}) generates {_fmt_currency(top[1])} ({top_share:.1f}%). Bottom segments average {_fmt_currency(bottom_avg)} vs top half {_fmt_currency(top_avg)}, a {gap_ratio:.0f}% gap.",
+                        title=f"{humanize(tdesc or table)}: {humanize(dim)} segments with room to grow",
+                        description=f"Your top {humanize(dim).lower()} ({top[0]}) brings in {_fmtm(top[1], measure)} ({top_share:.1f}% of everything). Weaker segments average {_fmtm(bottom_avg, measure)} against {_fmtm(top_avg, measure)} at the top — a {gap_ratio:.0f}% gap.",
                         metric=f"{measure} ({tdesc or table})",
                         metric_value=total,
                         magnitude=f"{gap_ratio:.0f}% gap",
@@ -732,15 +987,15 @@ class InsightsEngine:
                         affected_period="Current period",
                         tags=[table, dim, "opportunity", "underpenetrated"],
                         observations=[
-                            f"Top {dim}: {top[0]} at {_fmt_currency(top[1])} ({top_share:.1f}% share).",
-                            f"Top half average: {_fmt_currency(top_avg)}. Bottom half: {_fmt_currency(bottom_avg)}. Gap: {gap_ratio:.0f}%.",
+                            f"Top {dim}: {top[0]} at {_fmtm(top[1], measure)} ({top_share:.1f}% share).",
+                            f"Top half average: {_fmtm(top_avg, measure)}. Bottom half: {_fmtm(bottom_avg, measure)}. Gap: {gap_ratio:.0f}%.",
                         ],
                         support_metrics=[f"Concentration: {top_share:.1f}%", f"Gap: {gap_ratio:.0f}%"],
                         sample_size=len(values),
                         impact_value=top_avg - bottom_avg,
                         impact_direction="positive",
-                        impact_explanation=f"Closing the gap could unlock up to {_fmt_currency(top_avg - bottom_avg)} in additional {measure}.",
-                        next_question=f"What is driving the performance gap in {dim}?",
+                        impact_explanation=f"Closing the gap could unlock up to {_fmtm(top_avg - bottom_avg, measure)} in additional {measure}.",
+                        next_question=f"What is behind the gap across {humanize(dim).lower()}?",
                         next_dims=[dim],
                         viz_type="bar",
                         viz_data=viz_data,
@@ -751,12 +1006,15 @@ class InsightsEngine:
         # High-growth dimension
         date_col = self.intel.find_best_datetime(table)
         if date_col and len(values) >= 3:
+            # DBAPI placeholders differ by driver (sqlite uses ?, pg/mysql
+            # use %s) — never hardcode one and let the other dialect fail.
+            _ph = "?" if self._dialect() == "sqlite" else "%s"
             for dv in values[:3]:
                 sql2 = f"""
-                    SELECT date_trunc('month', {_safe_name(date_col)}) AS period,
-                           SUM({_safe_name(measure)}) AS val
-                    FROM {_safe_name(table)}
-                    WHERE {_safe_name(dim)} = %s AND {_safe_name(date_col)} IS NOT NULL
+                    SELECT {self._mexpr(table, date_col)} AS period,
+                           SUM({self._sexpr(table, measure)}) AS val
+                    FROM {_safe_name(self._t(table))}
+                    WHERE {_safe_name(dim)} = {_ph} AND {_safe_name(date_col)} IS NOT NULL
                     GROUP BY period ORDER BY period LIMIT 12
                 """
                 try:
@@ -780,8 +1038,8 @@ class InsightsEngine:
                                 insight_id=f"og_{table}_{dim}_{dv[0]}",
                                 insight_type="Opportunity",
                                 severity="medium",
-                                title=f"{tdesc or table}: High-growth {dim} '{dv[0]}' ({_fmt_pct(growth_pct)})",
-                                description=f"{dim} '{dv[0]}' in {tdesc or table} grew from {_fmt_currency(fv)} to {_fmt_currency(lv)} ({_fmt_pct(growth_pct)}).",
+                                title=f"{humanize(dv[0])} is growing fast ({_fmt_pct(growth_pct)})",
+                                description=f"{humanize(dv[0])} grew from {_fmtm(fv, measure)} to {_fmtm(lv, measure)} ({_fmt_pct(growth_pct)}). Up {abs(growth_pct):.0f}% — a run worth backing.",
                                 metric=f"{measure} ({tdesc or table})",
                                 metric_value=lv,
                                 previous_value=fv,
@@ -789,7 +1047,7 @@ class InsightsEngine:
                                 confidence=confidence,
                                 affected_period="Period-over-period",
                                 tags=[table, dim, "opportunity", "high-growth", str(dv[0])],
-                                observations=[f"{dim} '{dv[0]}' grew from {_fmt_currency(fv)} to {_fmt_currency(lv)} ({_fmt_pct(growth_pct)})."],
+                                observations=[f"{dim} '{dv[0]}' grew from {_fmtm(fv, measure)} to {_fmtm(lv, measure)} ({_fmt_pct(growth_pct)})."],
                                 support_metrics=[f"Growth: {_fmt_pct(growth_pct)}"],
                                 baseline=fv,
                                 current_value=lv,
@@ -811,27 +1069,33 @@ class InsightsEngine:
 
     # ── Risks ─────────────────────────────────────────────────────────────
 
-    def _detect_risks(self, table: str):
+    def _detect_risks(self, table: str, measure: str | None = None):
         insights = []
         date_col = self.intel.find_best_datetime(table)
         if not date_col:
             return []
 
-        measure = self.intel.find_best_measure(table)
+        measure = measure or self.intel.find_best_measure(table)
         if not measure:
             return []
 
+        # Latest 24 months in chronological order: anomalies must be
+        # judged on recent history, not the earliest window.
         sql = f"""
-            SELECT date_trunc('month', {_safe_name(date_col)}) AS period,
-                   SUM({_safe_name(measure)}) AS val
-            FROM {_safe_name(table)}
-            WHERE {_safe_name(date_col)} IS NOT NULL
-            GROUP BY period
-            ORDER BY period
-            LIMIT 12
+            SELECT period, val FROM (
+                SELECT {self._mexpr(table, date_col)} AS period,
+                       SUM({self._sexpr(table, measure)}) AS val
+                FROM {_safe_name(self._t(table))}
+                WHERE {_safe_name(date_col)} IS NOT NULL
+                GROUP BY period
+                ORDER BY period DESC
+                LIMIT 24
+            ) ORDER BY period
         """
-        _, rows = _run_sql(self.conn, sql, limit=12)
-        if len(rows) < 4:
+        # NOTE (anomaly window): earliest-24 cannot see recent breaks.
+        _, rows = _run_sql(self.conn, sql, limit=24)
+        rows = self._drop_partial_trailing_month(table, date_col, rows)
+        if len(rows) < 6:
             return []
 
         values = [(r["period"], _safe_float(r["val"])) for r in rows if _safe_float(r["val"]) is not None]
@@ -861,8 +1125,8 @@ class InsightsEngine:
                 insight_id=f"rk_{table}_{measure}",
                 insight_type="Risk",
                 severity=severity,
-                title=f"{tdesc or table}: Sustained decline — {measure} down {declining_streak} consecutive periods",
-                description=f"{measure} in {tdesc or table} declined for {declining_streak} consecutive periods, from {_fmt_currency(nums[0])} to {_fmt_currency(nums[-1])} ({_fmt_pct(total_decline)}).",
+                title=f"{humanize(measure)} has fallen {declining_streak} periods in a row",
+                description=f"{humanize(measure)} fell {declining_streak} periods in a row — down from {_fmtm(nums[0], measure)} to {_fmtm(nums[-1], measure)} ({_fmt_pct(total_decline)}). Down {abs(total_decline):.0f}% overall.",
                 metric=f"{measure} ({tdesc or table})",
                 metric_value=nums[-1],
                 previous_value=nums[0],
@@ -871,8 +1135,8 @@ class InsightsEngine:
                 affected_period=period_label,
                 tags=[table, measure, "risk", "decline"],
                 observations=[
-                    f"{measure} declined for {declining_streak} consecutive periods.",
-                    f"Total decline: from {_fmt_currency(nums[0])} to {_fmt_currency(nums[-1])} ({_fmt_pct(total_decline)}).",
+                    f"{humanize(measure)} fell for {declining_streak} periods in a row.",
+                    f"Down from {_fmtm(nums[0], measure)} to {_fmtm(nums[-1], measure)} ({_fmt_pct(total_decline)})." ,
                 ],
                 support_metrics=[f"Declining streak: {declining_streak}", f"Total decline: {_fmt_pct(total_decline)}"],
                 sample_size=len(values),
@@ -881,8 +1145,8 @@ class InsightsEngine:
                 change_pct=total_decline,
                 impact_value=nums[-1] - nums[0],
                 impact_direction="negative",
-                impact_explanation=f"Continued decline could result in further losses of {_fmt_currency(abs(nums[-1] - nums[0]))} per period.",
-                next_question=f"What is causing the sustained decline in {measure}?",
+                impact_explanation=f"Continued decline could result in further losses of {_fmtm(abs(nums[-1] - nums[0]))} per period.",
+                next_question=f"What is behind the continued fall in {humanize(measure).lower()}?",
                 next_dims=dims,
                 viz_type="area",
                 viz_data=viz_data,
@@ -907,7 +1171,7 @@ class InsightsEngine:
                         insight_type="Risk",
                         severity="low",
                         title=f"{humanize(measure)} is standing still for {len(values)} periods",
-                        description=f"{humanize(measure)} has barely moved for {len(values)} periods, holding near {_fmt_currency(mean_val)}.",
+                        description=f"{humanize(measure)} has barely moved for {len(values)} periods, holding near {_fmtm(mean_val, measure)}.",
                         metric=f"{humanize(measure)}",
                         metric_value=nums[-1],
                         magnitude="Flat",
@@ -915,7 +1179,7 @@ class InsightsEngine:
                         affected_period=period_label,
                         tags=[table, measure, "risk", "stagnation"],
                         observations=[
-                            f"{humanize(measure)} averaged {_fmt_currency(mean_val)} over {len(values)} periods with almost no movement.",
+                            f"{humanize(measure)} averaged {_fmtm(mean_val, measure)} over {len(values)} periods with almost no movement.",
                         ],
                         support_metrics=[f"Nearly flat for {len(values)} periods"],
                         sample_size=len(values),
@@ -955,10 +1219,18 @@ class InsightsEngine:
 
                 join_clause = self.intel.build_join_clause(join_path)
                 join_on = join_path[-1]  # last join step
+                _dtq = f"{_safe_name(t1)}.{_safe_name(dt1)}"
+                _dd = self._dialect()
+                if _dd == "mysql":
+                    _mline = f"DATE_FORMAT({_dtq}, '%Y-%m-01')"
+                elif _dd == "sqlite":
+                    _mline = f"strftime('%Y-%m-01', {_dtq})"
+                else:
+                    _mline = f"DATE_TRUNC('month', {_dtq})"
                 sql = f"""
-                    SELECT date_trunc('month', {_safe_name(t1)}.{_safe_name(dt1)}) AS period,
-                           SUM({_safe_name(t1)}.{_safe_name(m1)}) AS v1,
-                           SUM({_safe_name(t2)}.{_safe_name(m2)}) AS v2
+                    SELECT {_mline} AS period,
+                           SUM({self._sexpr(t1, m1, qualified_table=t1)}) AS v1,
+                           SUM({self._sexpr(t2, m2, qualified_table=t2)}) AS v2
                     FROM {_safe_name(t1)}
                     {join_clause}
                     WHERE {_safe_name(t1)}.{_safe_name(dt1)} IS NOT NULL
@@ -1028,7 +1300,7 @@ class InsightsEngine:
 
     # ── Non-temporal detectors (work without date columns) ────────────────
 
-    def _detect_value_outliers(self, table: str):
+    def _detect_value_outliers(self, table: str, measure: str | None = None):
         """Detect row-level outliers on numeric columns using IQR."""
         insights = []
         tdesc = self.intel.tables[table].get("description", table)
@@ -1037,7 +1309,7 @@ class InsightsEngine:
             return []
 
         for col in num_cols[:3]:
-            sql = f"SELECT {_safe_name(col)} AS val FROM {_safe_name(table)} WHERE {_safe_name(col)} IS NOT NULL"
+            sql = f"SELECT {self._sexpr(table, col)} AS val FROM {_safe_name(self._t(table))} WHERE {_safe_name(col)} IS NOT NULL"
             _, rows = _run_sql(self.conn, sql, limit=_MAX_RAW_VALUES)
             vals = [_safe_float(r["val"]) for r in rows if _safe_float(r.get("val")) is not None]
             if len(vals) < 10:
@@ -1104,7 +1376,7 @@ class InsightsEngine:
                 source_columns=[col],
                 evidence={
                     "observations": [
-                        f"Normal range: {_fmt(lower)} to {_fmt(upper)} (IQR method; most records).",
+                        f"Normal range: {_fmt(lower)} to {_fmt(upper)} (most records sit inside it).",
                         f"Unusual {high_low} values range from {_fmt(min(outliers))} to {_fmt(max(outliers))}.",
                     ],
                     "supportingMetrics": [f"{len(outliers)} outliers ({pct:.1f}%)"],
@@ -1119,11 +1391,11 @@ class InsightsEngine:
             ))
         return insights
 
-    def _detect_concentration(self, table: str):
+    def _detect_concentration(self, table: str, measure: str | None = None):
         """Detect concentration risk: top N entities dominate total."""
         insights = []
         tdesc = self.intel.tables[table].get("description", table)
-        measure = self.intel.find_best_measure(table)
+        measure = measure or self.intel.find_best_measure(table)
         if not measure:
             return []
         dim = self._usable_dimension(table)
@@ -1131,8 +1403,8 @@ class InsightsEngine:
             return []
 
         sql = f"""
-            SELECT {_safe_name(dim)} AS dim_val, SUM({_safe_name(measure)}) AS val
-            FROM {_safe_name(table)}
+            SELECT {_safe_name(dim)} AS dim_val, SUM({self._sexpr(table, measure)}) AS val
+            FROM {_safe_name(self._t(table))}
             WHERE {_safe_name(dim)} IS NOT NULL
             GROUP BY {_safe_name(dim)}
             ORDER BY val DESC
@@ -1231,7 +1503,7 @@ class InsightsEngine:
             ))
         return insights
 
-    def _detect_distributions(self, table: str):
+    def _detect_distributions(self, table: str, measure: str | None = None):
         """Detect interesting distribution patterns in numeric columns."""
         insights = []
         tdesc = self.intel.tables[table].get("description", table)
@@ -1240,7 +1512,7 @@ class InsightsEngine:
             return []
 
         for col in num_cols[:3]:
-            sql = f"SELECT {_safe_name(col)} AS val FROM {_safe_name(table)} WHERE {_safe_name(col)} IS NOT NULL"
+            sql = f"SELECT {self._sexpr(table, col)} AS val FROM {_safe_name(self._t(table))} WHERE {_safe_name(col)} IS NOT NULL"
             _, rows = _run_sql(self.conn, sql, limit=_MAX_RAW_VALUES)
             vals = [_safe_float(r["val"]) for r in rows if _safe_float(r.get("val")) is not None]
             if len(vals) < 20:
@@ -1265,7 +1537,7 @@ class InsightsEngine:
                         f"Range: {_fmt(min(vals))} to {_fmt(max(vals))}.",
                         f"Typical level: {_fmt(mean_val)} (spread {_fmt(stdev_val)}).",
                     ],
-                    support_metrics=[f"CV={cv:.2f}", f"Range={_fmt(max(vals) - min(vals))}"],
+                    support_metrics=["Wide spread across individual rows", f"Values run from {_fmt(min(vals))} to {_fmt(max(vals))}"],
                     sample_size=len(vals),
                     impact_value=cv,
                     impact_direction="negative",
@@ -1279,9 +1551,9 @@ class InsightsEngine:
                     evidence={
                         "observations": [
                             f"Range: {_fmt(min(vals))} to {_fmt(max(vals))}.",
-                            f"Coefficient of variation: {cv:.2f} (high spread).",
+                            f"Values are spread widely around the typical level." ,
                         ],
-                        "supportingMetrics": [f"CV={cv:.2f}", f"Range={_fmt(max(vals) - min(vals))}"],
+                        "supportingMetrics": ["Wide spread across individual rows"],
                         "sampleSize": len(vals),
                     },
                 ))
@@ -1304,7 +1576,7 @@ class InsightsEngine:
                             f"Typical value: {_fmt(median_val)}; overall level: {_fmt(mean_val)}.",
                             f"Most values cluster around the {'lower' if direction == 'right' else 'higher'} end.",
                         ],
-                        support_metrics=[f"Skew={skew_ratio:.2f}"],
+                        support_metrics=["Most values sit at one end of the range"],
                         sample_size=len(vals),
                         impact_value=abs(skew_ratio),
                         impact_direction="neutral",
@@ -1317,20 +1589,20 @@ class InsightsEngine:
                         source_columns=[col],
                         evidence={
                             "observations": [
-                                f"Skewness ratio: {skew_ratio:.2f}.",
+                                f"Values pile up at one end of the range." ,
                                 f"Most values cluster around the {'lower' if direction == 'right' else 'higher'} end.",
                             ],
-                            "supportingMetrics": [f"Skew={skew_ratio:.2f}"],
+                            "supportingMetrics": ["Most values sit at one end of the range"],
                             "sampleSize": len(vals),
                         },
                     ))
         return insights
 
-    def _detect_segment_comparison(self, table: str):
+    def _detect_segment_comparison(self, table: str, measure: str | None = None):
         """Compare average metrics across categorical segments."""
         insights = []
         tdesc = self.intel.tables[table].get("description", table)
-        measure = self.intel.find_best_measure(table)
+        measure = measure or self.intel.find_best_measure(table)
         if not measure:
             return []
         num_cols = self.intel.get_numeric_cols(table)
@@ -1338,7 +1610,7 @@ class InsightsEngine:
 
         for dim in text_cols[:2]:
             # Check cardinality
-            sql_count = f"SELECT COUNT(DISTINCT {_safe_name(dim)}) AS cnt FROM {_safe_name(table)} WHERE {_safe_name(dim)} IS NOT NULL"
+            sql_count = f"SELECT COUNT(DISTINCT {_safe_name(dim)}) AS cnt FROM {_safe_name(self._t(table))} WHERE {_safe_name(dim)} IS NOT NULL"
             _, count_rows = _run_sql(self.conn, sql_count, limit=1)
             distinct_count = _safe_float(count_rows[0].get("cnt")) if count_rows else 0
             if not distinct_count or distinct_count < 3 or distinct_count > 30:
@@ -1346,9 +1618,9 @@ class InsightsEngine:
 
             sql = f"""
                 SELECT {_safe_name(dim)} AS seg,
-                       AVG({_safe_name(measure)}) AS avg_val,
+                       AVG({self._sexpr(table, measure)}) AS avg_val,
                        COUNT(*) AS cnt
-                FROM {_safe_name(table)}
+                FROM {_safe_name(self._t(table))}
                 WHERE {_safe_name(dim)} IS NOT NULL
                 GROUP BY {_safe_name(dim)}
                 ORDER BY avg_val DESC
@@ -1696,6 +1968,8 @@ def get_insights(request: Request, user: dict = Depends(require_writable)):
         log.info("insights done user=%s count=%d elapsed=%.2fs",
                  user.get("user_id"), len(insights), time.time() - _t0)
         _payload = {"ok": True, "insights": insights, "count": len(insights)}
+        if getattr(engine, "sample_info", {}).get("sampled"):
+            _payload["sampling"] = engine.sample_info
         # Additive supported state so the frontend can render evidence
         # uniformly (Insights.tsx empty branch already handles []).
         if _ev is not None:

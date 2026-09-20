@@ -27,6 +27,19 @@ _SCOPE_ALIASES = {
 }
 
 
+def normalize_null_arrays(payload):
+    """Explicit null->[] normalisation for router array fields (P1 cleanup).
+
+    Converts ``None`` -> ``[]`` for ``document_keys`` / ``target_pages`` /
+    ``table_operations`` plus scope-alias canonicalisation. Call this
+    explicitly wherever a provider payload enters validation instead of
+    relying on the import-time monkey-patches below. ``chat_structured``
+    callers may also invoke it on the decoded JSON before Pydantic
+    validation; behaviour is identical to the legacy patched path.
+    """
+    return _normalise_provider_payload(payload)
+
+
 def _normalise_provider_payload(payload):
     if not isinstance(payload, dict):
         return payload
@@ -41,7 +54,16 @@ def _normalise_provider_payload(payload):
 
 
 def apply_provider_stability_patches() -> None:
-    """Apply narrow cloud-output compatibility fixes once per Python process."""
+    """Apply narrow cloud-output compatibility fixes once per Python process.
+
+    Patch order (must stay): provider_stability FIRST (normalises null->[]
+    arrays + scope aliases before SemanticRouter/LLMProvider are imported),
+    then answer_stability, verification_stability, summary_retry (see
+    ``insight_rag/__init__.py``). P1 direction: prefer calling
+    :func:`normalize_null_arrays` explicitly in ``llm_provider.chat_structured``
+    consumers / router validation over adding new import-time patches.
+    Existing patches stay for backward compat so the pipeline never breaks.
+    """
     global _PATCHED
     if _PATCHED:
         return

@@ -10,7 +10,7 @@ import {
   ChevronUp, Download, MoreHorizontal, Copy, Trash2,
 } from "lucide-react";
 
-import { API_BASE } from "../../services/api";
+import { apiFetch } from "../../services/api";
 
 type SourceType = "postgresql" | "mysql" | "csv" | "pdf" | "";
 type Tab = "sources" | "schema" | "preview" | "quality";
@@ -29,50 +29,13 @@ const TABS: { id: Tab; label: string; icon: typeof Database }[] = [
   { id: "quality", label: "Data Quality", icon: Shield },
 ];
 
-const api = async (path: string, opts?: RequestInit) => {
-  // Centralized base + cookie auth (no Authorization header). Full res.ok
-  // handling: 401 clears session + notifies app; other failures throw.
-  // Callers pass "/api/..." paths; they are rebased onto API_BASE so
-  // VITE_API_BASE keeps working (dev proxy /api -> :8000 by default).
-  const url = path.startsWith("http") ? path : `${API_BASE}${path.replace(/^\/api/, "") || "/"}`;
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 30000);
-  let res: Response;
-  try {
-    const headers: Record<string, string> = { "Content-Type": "application/json", ...((opts?.headers as Record<string, string>) || {}) };
-    delete (headers as any)["Authorization"];
-    delete (headers as any)["authorization"];
-    res = await fetch(url, {
-      ...opts,
-      headers,
-      credentials: "include",
-      signal: ctrl.signal,
-    });
-  } catch (err: any) {
-    clearTimeout(t);
-    throw new Error(err?.name === "AbortError" ? "Request timed out after 30s." : "Network error: backend unreachable.");
-  }
-  clearTimeout(t);
-  let data: any = {};
-  try {
-    data = await res.json();
-  } catch (err) {
-    console.debug("[ARIA] non-JSON response:", err);
-    if (!res.ok) throw new Error(`HTTP ${res.status}: server returned a non-JSON error`);
-    return data;
-  }
-  if (res.status === 401) {
-    try { window.dispatchEvent(new Event("aria:unauthorized")); } catch { /* ignore */ }
-    throw new Error("Session expired. Please sign in again.");
-  }
-  if (!res.ok) {
-    const detail = (data as any)?.detail ?? (data as any)?.message ?? `HTTP ${res.status}`;
-    throw new Error(Array.isArray(detail) ? detail.map((d: any) => d?.msg || JSON.stringify(d)).join("; ") : detail);
-  }
-  return data;
-};
-
-const apiGet = (path: string) => api(path);
+// Single HTTP client (P0-2): all requests go through apiFetch from
+// src/services/api.js (API_BASE + credentials:include + X-Request-ID +
+// centralized 401 handling). Timeout uses the central default (60-120s
+// clamped REQUEST_TIMEOUT_MS; apiFetch supports an external `signal`
+// but no per-call timeout option).
+const api = apiFetch;
+const apiGet = (path: string) => apiFetch(path);
 
 interface Props {
   connectionStatus?: string;
@@ -402,7 +365,7 @@ export default function Data({
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <Field label="Host" id="db-host" value={lHost} onChange={setLHost} placeholder="localhost" disabled={connecting} />
                 <Field label="Port" id="db-port" value={lPort} onChange={setLPort} placeholder={sourceType === "mysql" ? "3306" : "5432"} disabled={connecting} />
-                <Field label="Database Name" id="db-name" value={lDbName} onChange={setLDbName} placeholder="northwind" disabled={connecting} />
+                <Field label="Database Name" id="db-name" value={lDbName} onChange={setLDbName} placeholder="my_database" disabled={connecting} />
                 <Field label="Username" id="db-user" value={lUser} onChange={setLUser} placeholder={sourceType === "mysql" ? "root" : "postgres"} disabled={connecting} />
               </div>
               <Field label="Password" id="db-pass" type="password-show" value={lPass} onChange={setLPass} placeholder="Enter password" disabled={connecting}>

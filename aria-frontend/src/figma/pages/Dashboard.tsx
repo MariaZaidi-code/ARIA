@@ -248,7 +248,7 @@ function storeDrillContext(ctx: Record<string, any>) {
   } catch { /* private mode: navigation still works */ }
 }
 
-function MetricCard({ kpi, index = 0, onDrill }: { kpi: any; index?: number; onDrill: (kpi: any) => void }) {
+function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy }: { kpi: any; index?: number; onDrill: (kpi: any) => void; onAsk?: (q: string) => void; onWhy?: (metric: string) => void }) {
   const tint = tintFor(kpi);
   const Icon = iconFor(kpi);
   const isText = kpi?.format === "text";
@@ -284,12 +284,20 @@ function MetricCard({ kpi, index = 0, onDrill }: { kpi: any; index?: number; onD
   const periodText = /prev/i.test(String(kpi?.period || "")) ? "Compared with previous period" : (kpi?.period || "All time");
 
   return (
-    <button
+    <div
       onClick={() => onDrill(kpi)}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onDrill(kpi); } }}
+      role="button"
+      tabIndex={0}
       title={kpi?.reason ? `${kpi.label} — ${kpi.reason} Select for deeper analysis.` : `${kpi.label} — select for deeper analysis.`}
-      className="bg-white border border-slate-200/80 rounded-2xl p-5 flex flex-col gap-3 text-left cursor-pointer shadow-[0_1px_2px_rgba(15,36,64,0.05)] hover:shadow-[0_10px_28px_rgba(47,111,173,0.14)] hover:border-blue-200 hover:-translate-y-0.5 transition-all duration-200 min-w-0"
+      className="relative overflow-hidden bg-white border border-slate-200/80 rounded-2xl p-5 flex flex-col gap-3 text-left cursor-pointer shadow-[0_1px_2px_rgba(15,36,64,0.05)] hover:shadow-[0_10px_28px_rgba(47,111,173,0.14)] hover:border-blue-200 hover:-translate-y-0.5 transition-all duration-200 min-w-0"
       style={{ animationDelay: `${Math.min(index, 5) * 60}ms` }}
     >
+      <span
+        aria-hidden
+        className="absolute inset-x-0 top-0 h-1"
+        style={{ background: `linear-gradient(90deg, ${tint.accent}, ${tint.accent}55)` }}
+      />
       <div className="flex items-center gap-2.5 min-w-0">
         <span
           className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
@@ -337,7 +345,25 @@ function MetricCard({ kpi, index = 0, onDrill }: { kpi: any; index?: number; onD
       {showChange && (
         <p className="text-[11px] text-slate-400 truncate">{periodText}</p>
       )}
-    </button>
+      {onAsk && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onAsk(`What should I know about ${kpi?.label || "this metric"}?`); }}
+          className="self-start text-[11px] font-semibold text-blue-600 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
+          aria-label={`Ask ARIA about ${kpi?.label || "this metric"}`}
+        >
+          Ask about this →
+        </button>
+      )}
+      {onWhy && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onWhy(String(kpi?.label || "")); }}
+          className="self-start text-[11px] font-medium text-slate-500 hover:text-blue-700 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded -mt-2"
+          aria-label={`Why did ${kpi?.label || "this metric"} move?`}
+        >
+          Why did this move?
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -593,6 +619,37 @@ function selectDashboardViz(charts: any[], insights: any[], anomalies: any[]): [
   return [viz1, toSelectedViz(second.c, second.kind, insights, anomalies)];
 }
 
+/* Map a live /intelligence/explore breakdown into a dashboard card so a
+   clicked insight/anomaly swaps in a real re-computed visualization
+   (same shape VizCard renders). Defensive key picking: first known
+   label/value keys, else first string/numeric keys. */
+function exploreToFocusViz(rows: any[], metric: string, dim: string, insightTitle: string): SelectedViz | null {
+  if (!rows.length) return null;
+  const r0 = rows[0] || {};
+  const keys = Object.keys(r0);
+  const xKey = ["category", "label", "name", "segment", "group"].find((k) => k in r0)
+    || keys.find((k) => typeof (r0 as any)[k] === "string") || keys[0];
+  const yKey = ["current", "value", "total", "current_value"].find((k) => typeof (r0 as any)[k] === "number")
+    || keys.find((k) => typeof (r0 as any)[k] === "number");
+  if (!xKey || !yKey) return null;
+  const data = rows.slice(0, 12).map((r: any) => ({ [xKey]: String(r?.[xKey] ?? ""), [yKey]: Number(r?.[yKey]) || 0 }));
+  if (!data.length) return null;
+  const measure = humanize(metric);
+  const dimLabel = humanize(dim);
+  const peak = peakOf(data, xKey, yKey);
+  const format = /revenue|sales|profit|cost|price|amount|payment|budget|spend|expense|income|money/i.test(metric) ? "currency" : "number";
+  return {
+    key: `focus:${metric}:${dim}`, kind: "category", chartType: "bar",
+    title: `${measure} by ${dimLabel}`,
+    subtitle: `Focused view · ${insightTitle.slice(0, 90)}`,
+    data, xKey, yKey, format, measure, dim: dimLabel, grain: "", periodLabel: "",
+    current: Number(data[0]?.[yKey]) || null, trendPct: trendOf(data, yKey),
+    peakLabel: peak.label, peakValue: peak.value,
+    annotation: peak.label ? `Focused from this insight — ${peak.label} leads.` : "Focused from this insight.",
+    annotationFromBackend: false, emptyReason: "", sourceId: "focus",
+  };
+}
+
 /* ---------------- business tooltip: value + % change + supporting context ---------------- */
 
 function DashTooltip({ active, payload, label, viz, total }: {
@@ -705,6 +762,9 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
 
   const mine = selection && selection.chart === viz.title ? selection : null;
   const prefix = viz.format === "currency" ? "$" : "";
+  /* Per-measure color so time/scatter charts differ by metric instead of
+     all rendering the same blue. */
+  const measureColor = colorForName(String(viz.measure || viz.title || "metric"));
 
   if (viz.kind === "empty" || viz.data.length === 0) {
     return (
@@ -862,7 +922,7 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
               <YAxis dataKey="y" type="number" name={viz.yKey || "y"} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={56} />
               <ZAxis range={[40, 40]} />
               <Tooltip cursor={{ strokeDasharray: "3 3" }} />
-              <Scatter data={viewData} fill="#2F6FAD" fillOpacity={0.6} />
+              <Scatter data={viewData} fill={measureColor} fillOpacity={0.6} onClick={(d: any) => handlePick(d?.payload || d)} />
             </ScatterChart>
           ) : isTime ? (
             <AreaChart
@@ -873,12 +933,12 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
               <XAxis dataKey={viz.xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} minTickGap={28} tickFormatter={(v: string) => fmtPeriod(v)} />
               <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={56} tickFormatter={(v: number) => fmtBiz(v)} />
               <Tooltip content={<DashTooltip viz={viz} total={total} />} />
-              <Area type="monotone" dataKey={viz.yKey} stroke="#2F6FAD" strokeWidth={2.5} fill="#2F6FAD" fillOpacity={0.14} dot={false} activeDot={{ r: 5 }} isAnimationActive={false} />
+              <Area type="monotone" dataKey={viz.yKey} stroke={measureColor} strokeWidth={2.5} fill={measureColor} fillOpacity={0.14} dot={false} activeDot={{ r: 5 }} isAnimationActive={false} />
               {showTrend && <Line type="monotone" dataKey="__trend" stroke="#0D9488" strokeWidth={1.5} strokeDasharray="5 4" dot={false} activeDot={false} isAnimationActive={false} />}
               {peakIdx >= 0 && peakIdx < viewData.length && (
                 <ReferenceDot
                   x={viewData[peakIdx]?.[viz.xKey]} y={Number(viewData[peakIdx]?.[viz.yKey]) || 0}
-                  r={5} fill="#2F6FAD" stroke="#ffffff" strokeWidth={2}
+                  r={5} fill={measureColor} stroke="#ffffff" strokeWidth={2}
                 />
               )}
               <Brush dataKey={viz.xKey} height={20} travellerWidth={8} tickFormatter={(v: string) => fmtPeriod(String(v))} />
@@ -973,10 +1033,27 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
   const [selection, setSelection] = useState<DrillSelection | null>(null);
   const [resetKey, setResetKey] = useState(0);
   const [activeFilter, setActiveFilter] = useState<string>("all");
+  const [, setAnomDismiss] = useState(0);
   const [sessionInfo, setSessionInfo] = useState<{ dbName: string; sourceType: string }>({ dbName: "", sourceType: "" });
   const inputRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<any>(null);
   const configBusy = useRef(false);
+  const prevDashDb = useRef<string | null>(null);
+
+  /* Insight-focus state: clicking an insight/anomaly swaps in a live
+     re-computed focus card (POST /intelligence/explore scoped to it). */
+  const [focusViz, setFocusViz] = useState<SelectedViz | null>(null);
+  const [focusTitle, setFocusTitle] = useState("");
+  const [focusLoading, setFocusLoading] = useState(false);
+  const [focusError, setFocusError] = useState("");
+  const focusAbort = useRef<AbortController | null>(null);
+  const clearFocus = () => {
+    focusAbort.current?.abort();
+    setFocusViz(null); setFocusTitle(""); setFocusLoading(false); setFocusError("");
+  };
+  const scrollToCharts = () => {
+    try { document.getElementById("dash-charts")?.scrollIntoView({ behavior: "smooth", block: "start" }); } catch { /* ignore */ }
+  };
 
   const grid = "#E5E7EB";
   const axis = "#9CA3AF";
@@ -1028,10 +1105,17 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
 
   useEffect(() => {
     if (connectionStatus === "connected") {
+      if (prevDashDb.current !== null && prevDashDb.current !== (dbName || "")) {
+        // Dataset switched: drop the stale overview + focus state so the
+        // previous database never lingers on screen.
+        setConfig(null); setSelection(null); clearFocus();
+        setActiveFilter("all"); setResetKey((k) => k + 1);
+      }
       fetchConfig();
       fetchAutocomplete("");
     }
-  }, [connectionStatus, fetchConfig, fetchAutocomplete]);
+    prevDashDb.current = dbName || "";
+  }, [connectionStatus, dbName, fetchConfig, fetchAutocomplete]);
 
   /* Real session source for the connected-data card (props first). */
   useEffect(() => {
@@ -1047,6 +1131,56 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
       } catch { /* card falls back to config summary labels */ }
     })();
   }, [connectionStatus, dbName]);
+
+  /* Morning brief: 3 lines from live engines (alerts + inaction + top
+     prescription). Fetched once per connected source. */
+  const [brief, setBrief] = useState<any>(null);
+  const briefFor = useRef<string>("");
+  useEffect(() => {
+    if (connectionStatus !== "connected") return;
+    const firstMetric: string = String(
+      (config?.metrics || [])[0]?.name || (config?.metrics || [])[0]?.label || "",
+    );
+    const key = `${dbName}|${firstMetric}`;
+    if (!firstMetric || briefFor.current === key) return;
+    briefFor.current = key;
+    let cancelled = false;
+    // Defer: let KPIs/charts paint first; the brief fills in after.
+    // Hard 25s budget so a huge dataset never holds the page hostage.
+    const timer: any = setTimeout(() => {
+      if (cancelled) return;
+      const ctrl = new AbortController();
+      const killer: any = setTimeout(() => { try { ctrl.abort(); } catch {} }, 25000);
+      (async () => {
+        try {
+          const { prescriptionApi } = await import("../../services/api");
+          const opts: any = { signal: ctrl.signal };
+          const [a, b, c] = await Promise.all([
+            (prescriptionApi as any).alerts(opts).catch(() => ({ data: { alerts: [] } })),
+            firstMetric
+              ? (prescriptionApi as any).inaction({ metric: firstMetric }, opts).catch(() => ({ data: null }))
+              : Promise.resolve({ data: null }),
+            firstMetric
+              ? (prescriptionApi as any).analyze({ metric: firstMetric }, opts).catch(() => ({ data: null }))
+              : Promise.resolve({ data: null }),
+          ]);
+          if (!cancelled) {
+            const alerts = (a as any)?.data?.alerts || [];
+            const pres = ((c as any)?.data?.prescriptions || [])[0] || null;
+            setBrief({ alert: alerts[0] || null, burn: (b as any)?.data || null, action: pres });
+          }
+        } catch {
+          if (!cancelled) setBrief(null);
+        } finally {
+          clearTimeout(killer);
+        }
+      })();
+    }, 4000);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [connectionStatus, dbName, config]);
 
   useEffect(() => {
     if (connectionStatus !== "connected") return;
@@ -1070,6 +1204,11 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
   };
 
   if (connectionStatus !== "connected") {
+    // App.tsx connection states: not-connected | connecting | connected |
+    // schema-loading | error. Transient states show loading (never a stale
+    // "Connect" prompt); "error" surfaces the real failure + retry.
+    const isTransitional = connectionStatus === "connecting" || connectionStatus === "schema-loading";
+    const hasFailed = connectionStatus === "error" || connectionStatus === "failed";
     return (
       <div className="min-h-full bg-[#F6F8FC] text-[#0F2440]">
         <div className="p-6 max-w-screen-xl mx-auto">
@@ -1078,14 +1217,18 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
               <Search size={24} className="text-white" />
             </div>
             <h2 className="text-2xl font-semibold tracking-tight mb-2">
-              {connectionStatus === "failed" ? "Connection Failed" : "Connect a Data Source"}
+              {isTransitional ? "Connecting…" : hasFailed ? "Connection Failed" : "Connect a Data Source"}
             </h2>
             <p className="text-sm text-slate-500 mb-4 max-w-sm mx-auto">
-              {connectionStatus === "failed" && connectionError ? businessError(connectionError) : "Get started by connecting your database to unlock AI-powered insights."}
+              {isTransitional
+                ? "ARIA is reaching your data source — this takes a moment."
+                : hasFailed && connectionError ? businessError(connectionError) : "Get started by connecting your database to unlock AI-powered insights."}
             </p>
+            {!isTransitional && (
             <button onClick={() => setPage("data")} className="px-6 py-2.5 rounded-xl text-sm font-semibold text-white transition-all bg-gradient-to-br from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700">
-              Connect Now
+              {hasFailed ? "Retry Connection" : "Connect Now"}
             </button>
+            )}
           </div>
         </div>
       </div>
@@ -1137,10 +1280,76 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
   const recentInsights = filteredPool.slice(0, 6);
 
   const [viz1, viz2] = selectDashboardViz(charts, rawInsights, anomalies);
+  /* Chart range toggle (honest subsetting): Last 6 / Last 12 / All points
+     of time-kind charts. Category charts are unaffected. */
+  const [chartRange, setChartRange] = useState<"all" | "12" | "6">("all");
+  const rangeViz = (v: any) => {
+    if (!v || v.kind !== "time" || chartRange === "all" || !Array.isArray(v.data)) return v;
+    const n = chartRange === "6" ? 6 : 12;
+    if (v.data.length <= n) return v;
+    return { ...v, data: v.data.slice(-n) };
+  };
+  const rviz1 = rangeViz(viz1);
+  const rviz2 = rangeViz(viz2);
 
   const drillKpi = (kpi: any) => {
     storeDrillContext({ kind: "kpi", metric: kpi?.label || "Metric", value: kpi?.rawValue ?? kpi?.value ?? null, period: kpi?.period || "" });
     setPage("analytics");
+  };
+  const askAbout = (q: string) => {
+    const question = (q || "").trim();
+    if (!question) return;
+    if (onAsk) {
+      onAsk(question);
+      return;
+    }
+    try {
+      sessionStorage.setItem("aria_copilot_context", JSON.stringify({ origin: "dashboard", question }));
+    } catch { /* best-effort */ }
+    setPage("copilot");
+  };
+  const askWhy = (metricLabel: string) => {
+    const m = (metricLabel || "").trim();
+    if (!m) return;
+    try {
+      sessionStorage.setItem("aria_hypothesis_prefill", JSON.stringify({ metric: m }));
+    } catch { /* best-effort */ }
+    try {
+      window.location.hash = "#/intelligence?tab=hypotheses";
+    } catch {
+      setPage("intelligence");
+    }
+  };
+  /* On-demand prescription line per insight row (real engine call). */
+  const [rxFor, setRxFor] = useState<string | null>(null);
+  const [rxAns, setRxAns] = useState<Record<string, string>>({});
+  const [rxBusy, setRxBusy] = useState<string | null>(null);
+  const askPrescription = async (ins: any) => {
+    const id = String(ins.id || ins.title);
+    if (rxFor === id) {
+      setRxFor(null);
+      return;
+    }
+    setRxFor(id);
+    if (rxAns[id]) return;
+    setRxBusy(id);
+    try {
+      const { prescriptionApi } = await import("../../services/api");
+      const q = `What should I consider for ${ins.title || "this finding"}?`;
+      const r = await (prescriptionApi as any).analyze({ question: q });
+      const d: any = (r as any)?.data ?? null;
+      const top = (d?.prescriptions || [])[0];
+      setRxAns((s) => ({
+        ...s,
+        [id]: top
+          ? String(top?.display?.action_text || top?.title || "")
+          : String(d?.refusal?.headline || d?.reason || "Nothing qualified — the evidence bar held."),
+      }));
+    } catch {
+      setRxAns((s) => ({ ...s, [id]: "ARIA couldn't answer that just now." }));
+    } finally {
+      setRxBusy(null);
+    }
   };
 
   const drillFromChart = (target: Page) => {
@@ -1150,8 +1359,80 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     setPage(target);
   };
 
+  /* Highlight the chart point matching a metric/segment (used when an
+     insight has no structured breakdown to re-run). */
+  const highlightVizFor = (metric: string, label: string): boolean => {
+    const target = normMeasure(metric);
+    const all = [viz1, viz2].filter((v: any) => v && v.data && v.data.length);
+    const match = all.find((v: any) => normMeasure(v.measure) === target) || all[0];
+    if (!match) return false;
+    const rows = match.data as any[];
+    const row = (label && rows.find((r) => normMeasure(String(r?.[match.xKey] ?? "")) === normMeasure(label)))
+      || rows.reduce((best: any, r: any) => (!best || Number(r?.[match.yKey]) > Number(best?.[match.yKey])) ? r : best, null);
+    if (!row) return false;
+    setSelection({ chart: match.title, measure: match.measure, label: String(row?.[match.xKey] ?? label), value: row?.[match.yKey] ?? null });
+    return true;
+  };
+
+  /* Click an insight/anomaly: re-run analysis scoped to it and swap in a
+     live focus card. Falls back to highlighting the related chart point
+     when the insight carries no structured metric/dimension. */
+  const focusInsight = async (p: any) => {
+    const raw = (p && p.raw) || {};
+    // Backend metric labels carry table suffixes ("Sales (sample_superstore)")
+    // and stray spaces — strip to the bare column name for re-querying.
+    const cleanMetric = String(raw.metric || raw.column || raw.measure || "")
+      .replace(/\s*\(.*?\)\s*$/, "").trim();
+    const recDims = (raw.recommendedNextAnalysis && (raw.recommendedNextAnalysis as any).dimensions) || [];
+    const dim = String(
+      (Array.isArray(recDims) ? recDims[0] : recDims)
+      || raw.segment || raw.dimension || raw.breakdown || "",
+    ).trim();
+    const title = String(p?.title || "Insight");
+    const metric = cleanMetric;
+    if (!metric || !dim) {
+      // Unstructured insight: highlight by measure token found in its text.
+      const hay = normMeasure(`${p?.title || ""} ${p?.description || ""}`);
+      const all = [viz1, viz2].filter((v: any) => v && v.measure);
+      const byText = all.find((v: any) => {
+        const tok = normMeasure(v.measure).split(" ").filter((w) => w.length >= 3)[0];
+        return tok && hay.includes(tok);
+      });
+      if (byText) highlightVizFor(byText.measure, "");
+      else if (metric) highlightVizFor(metric, dim);
+      scrollToCharts();
+      return;
+    }
+    focusAbort.current?.abort();
+    const ctrl = new AbortController(); focusAbort.current = ctrl;
+    setFocusLoading(true); setFocusError(""); setFocusTitle(title);
+    try {
+      const { intelligenceApi } = await import("../../services/api");
+      const r: any = await intelligenceApi.runExplore({ metric, breakdown: dim });
+      if (ctrl.signal.aborted) return;
+      const rd: any = r?.data ?? r;
+      if (rd && rd.ok === false) throw new Error(rd.detail || rd.message || "Explore failed");
+      const rows: any[] = Array.isArray(rd?.rows) ? rd.rows
+        : Array.isArray(rd?.breakdown) ? rd.breakdown
+        : Array.isArray(rd?.table) ? rd.table : [];
+      const fv = exploreToFocusViz(rows, metric, dim, title);
+      if (!fv) throw new Error("No plottable rows returned.");
+      setFocusViz(fv);
+      const top = fv.data[0];
+      if (top) setSelection({ chart: fv.title, measure: fv.measure, label: String(top?.[fv.xKey] ?? ""), value: top?.[fv.yKey] ?? null });
+    } catch (e: any) {
+      if (ctrl.signal.aborted) return;
+      setFocusError(e?.message || "Couldn't focus this insight.");
+      if (metric) highlightVizFor(metric, dim);
+    } finally {
+      if (focusAbort.current === ctrl) setFocusLoading(false);
+    }
+    scrollToCharts();
+  };
+
   const globalReset = () => {
     setSelection(null);
+    clearFocus();
     setResetKey((k) => k + 1);
   };
 
@@ -1209,18 +1490,27 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                 <span className="text-[11px] text-slate-400">Updated {new Date(lastUpdated).toLocaleTimeString()}</span>
               )}
             </div>
-            {/* Functional filter pills — concise overview selection only */}
+            {/* Functional filter pills — counts, scroll to results, disabled when empty */}
             <div className="mt-4 flex items-center gap-2 flex-wrap">
               {PILLS.map((p) => {
                 const on = activeFilter === p.id;
+                const n = p.id === "all" ? pool.length : pool.filter((x) => matchesFilter(x.type, p.id)).length;
+                const empty = pool.length === 0;
                 return (
                   <button
                     key={p.id}
-                    onClick={() => setActiveFilter(p.id)}
+                    onClick={() => {
+                      setActiveFilter(p.id);
+                      try {
+                        document.getElementById("dash-insights")?.scrollIntoView({ behavior: "smooth", block: "start" });
+                      } catch { /* best-effort */ }
+                    }}
+                    disabled={empty}
                     aria-pressed={on}
-                    className={`text-[11px] font-semibold px-3.5 py-1.5 rounded-full border transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${on ? "bg-blue-700 text-white border-blue-700 shadow-md" : "bg-white text-slate-500 border-slate-200 hover:border-blue-300 hover:text-[#0F2440] hover:shadow-sm"}`}
+                    title={empty ? "No insights loaded yet" : `${n} item${n === 1 ? "" : "s"}`}
+                    className={`text-[11px] font-semibold px-3.5 py-1.5 rounded-full border transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-40 ${on ? "bg-blue-700 text-white border-blue-700 shadow-md" : "bg-white text-slate-500 border-slate-200 hover:border-blue-300 hover:text-[#0F2440] hover:shadow-sm"}`}
                   >
-                    {p.label}
+                    {p.label}{!empty && p.id !== "all" ? ` (${n})` : ""}
                   </button>
                 );
               })}
@@ -1259,6 +1549,111 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           </div>
         </section>
 
+        {/* ---- Morning brief: 30-second read from live engines ---- */}
+        {brief && (brief.alert || (brief.burn && brief.burn.monthly_burn > 0) || brief.action) && (
+          <section className="rounded-2xl border border-slate-200 bg-gradient-to-br from-blue-50/70 via-white to-indigo-50/50 p-4 md:p-5 shadow-sm dash-card-in">
+            <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">MORNING BRIEF</p>
+            <div className="mt-2 space-y-1.5">
+              {brief.alert && (
+                <p className="text-[13px] text-[#0F2440] leading-relaxed"><span className="font-semibold text-blue-700">Moved:</span> {String(brief.alert.headline || "")}</p>
+              )}
+              {brief.burn && brief.burn.monthly_burn > 0 && (
+                <p className="text-[13px] text-[#0F2440] leading-relaxed"><span className="font-semibold text-rose-700">At stake:</span> {String(brief.burn.headline || "")}</p>
+              )}
+              {brief.action && (
+                <p className="text-[13px] text-[#0F2440] leading-relaxed"><span className="font-semibold text-emerald-700">Next:</span> <span className="font-semibold">{String(brief.action?.display?.action_text || brief.action?.title || "")}</span></p>
+              )}
+            </div>
+          </section>
+        )}
+
+        {/* ---- Tracked numbers: KPIs pinned from Analytics ---- */}
+        {(() => {
+          let tracked: any[] = [];
+          try {
+            const v = JSON.parse(localStorage.getItem("aria_tracked_numbers") || "[]");
+            if (Array.isArray(v)) tracked = v.slice(0, 6);
+          } catch { /* best-effort */ }
+          if (!tracked.length) return null;
+          return (
+            <section className="rounded-2xl border border-slate-200 bg-white p-4 md:p-5 shadow-sm dash-card-in">
+              <div className="flex items-center justify-between">
+                <h2 className="text-[14px] font-semibold tracking-tight">Tracked numbers</h2>
+                <button
+                  onClick={() => { try { localStorage.removeItem("aria_tracked_numbers"); } catch {} window.location.reload(); }}
+                  className="text-[11px] font-medium text-slate-400 hover:text-rose-600"
+                  aria-label="Clear tracked numbers"
+                >
+                  Clear
+                </button>
+              </div>
+              <div className="mt-2 grid grid-cols-2 md:grid-cols-3 gap-2">
+                {tracked.map((t: any, i: number) => (
+                  <div key={i} className="rounded-xl bg-slate-50 border border-slate-100 px-3 py-2">
+                    <p className="text-[11px] text-slate-500 truncate">{String(t?.label || "Metric")}</p>
+                    <p className="text-[18px] font-bold text-[#0F2440] tabular-nums">
+                      {typeof t?.value === "number" ? t.value.toLocaleString(undefined, { maximumFractionDigits: 1 }) : "—"}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </section>
+          );
+        })()}
+
+        {/* ---- Anomaly banner: severe flags stay visible until dismissed ---- */}
+        {(() => {
+          const sev = pool.filter((p) => {
+            const t = String(p.type || "").toLowerCase();
+            if (!(t.includes("anomal") || t.includes("outlier"))) return false;
+            const s = String((p.raw as any)?.severity || "").toLowerCase();
+            return s.includes("high") || s.includes("severe") || s.includes("critical");
+          });
+          if (!sev.length) return null;
+          const top = sev[0];
+          const dismissed: string[] = (() => {
+            try {
+              return JSON.parse(sessionStorage.getItem("aria_anom_dismissed") || "[]");
+            } catch {
+              return [];
+            }
+          })();
+          if (dismissed.includes(String(top.id))) return null;
+          return (
+            <section className="rounded-2xl border border-rose-200 bg-gradient-to-r from-rose-50/80 to-white p-4 flex items-center gap-3 shadow-sm" role="alert">
+              <span className="inline-flex items-center justify-center w-9 h-9 rounded-full bg-rose-100 text-rose-700 flex-shrink-0">
+                <AlertTriangle size={16} />
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="text-[13px] font-semibold text-[#0F2440] truncate">
+                  {sev.length} anomal{sev.length === 1 ? "y" : "ies"} flagged{sev.length > 1 ? ` — latest: ${top.title}` : `: ${top.title}`}
+                </p>
+                <p className="text-[11px] text-slate-500 truncate">{String(top.description || "Unusual movement detected in your data.")}</p>
+              </div>
+              <button
+                onClick={() => focusInsight(top)}
+                className="flex-shrink-0 text-[12px] font-semibold px-3.5 py-2 rounded-xl bg-rose-600 text-white hover:bg-rose-700 transition-colors"
+                title="Show this anomaly in the charts below"
+              >
+                Investigate
+              </button>
+              <button
+                onClick={() => {
+                  try {
+                    const cur = JSON.parse(sessionStorage.getItem("aria_anom_dismissed") || "[]");
+                    sessionStorage.setItem("aria_anom_dismissed", JSON.stringify([...cur, String(top.id)]));
+                  } catch { /* best-effort */ }
+                  setAnomDismiss((n) => n + 1);
+                }}
+                className="flex-shrink-0 text-[11px] font-medium text-slate-400 hover:text-slate-600"
+                aria-label="Dismiss anomaly banner"
+              >
+                Dismiss
+              </button>
+            </section>
+          );
+        })()}
+
         {/* ---- Business-worded error (never raw fetch text) ---- */}
         {error && (
           <div className="rounded-2xl border border-rose-200 bg-white p-4 flex gap-3 shadow-sm">
@@ -1291,18 +1686,28 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                 </div>
               ))}
             </div>
-          ) : metrics.length > 0 ? (
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-              {metrics.slice(0, 4).map((kpi: any, i: number) => (
-                <MetricCard key={kpi.id || kpi.label || i} kpi={kpi} index={i} onDrill={drillKpi} />
-              ))}
-            </div>
-          ) : !error ? (
-            <div className="bg-white border border-dashed border-slate-300 rounded-2xl p-6 text-center shadow-sm">
-              <p className="text-[13px] font-medium">No KPIs available for this dataset yet.</p>
-              <p className="text-[11px] text-slate-500 mt-1">ARIA shows a KPI only when the data supports a meaningful measure — nothing is fabricated.</p>
-            </div>
-          ) : null}
+          ) : (() => {
+            // Date/range/period labels are metadata, not KPIs — drop them
+            // and backfill from further real metrics so all 4 cards stay
+            // useful on every dataset.
+            const isDateCard = (k: any) =>
+              /date|range|period|calendar|time\b/i.test(String(k?.label || "")) &&
+              (k?.rawValue === null || k?.rawValue === undefined);
+            const useful = metrics.filter((k: any) => !isDateCard(k));
+            const cards = (useful.length ? useful : metrics).slice(0, 4);
+            return cards.length > 0 ? (
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                {cards.map((kpi: any, i: number) => (
+                  <MetricCard key={kpi.id || kpi.label || i} kpi={kpi} index={i} onDrill={drillKpi} onAsk={askAbout} onWhy={askWhy} />
+                ))}
+              </div>
+            ) : !error ? (
+              <div className="bg-white border border-dashed border-slate-300 rounded-2xl p-6 text-center shadow-sm">
+                <p className="text-[13px] font-medium">No KPIs available for this dataset yet.</p>
+                <p className="text-[11px] text-slate-500 mt-1">ARIA shows a KPI only when the data supports a meaningful measure — nothing is fabricated.</p>
+              </div>
+            ) : null;
+          })()}
         </section>
 
         {/* ---- Executive summary strip ---- */}
@@ -1319,11 +1724,22 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
         <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_300px] gap-5 items-start min-w-0">
           <div className="min-w-0 space-y-5">
             {/* Key Visualizations */}
-            <section className="space-y-3 min-w-0">
+            <section id="dash-charts" className="space-y-3 min-w-0 scroll-mt-4">
               <div className="flex items-center gap-2">
                 <Sparkles size={14} className="text-blue-600" />
                 <h2 className="text-[14px] font-semibold tracking-tight">Key Visualizations</h2>
                 <div className="ml-auto flex items-center gap-2">
+                  {(["all", "12", "6"] as const).map((r) => (
+                    <button
+                      key={r}
+                      onClick={() => setChartRange(r)}
+                      aria-pressed={chartRange === r}
+                      className={`text-[11px] font-medium px-2 py-1 rounded-md border transition-colors ${chartRange === r ? "border-blue-300 text-[#0F2440] bg-blue-50" : "border-slate-200 text-slate-400 hover:text-[#0F2440]"}`}
+                      title={r === "all" ? "Show full history" : `Show last ${r} points of time charts`}
+                    >
+                      {r === "all" ? "All" : `Last ${r}`}
+                    </button>
+                  ))}
                   {selection && (
                     <button onClick={() => setSelection(null)} className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-[#0F2440] transition-colors" title="Clear chart selection">
                       <X size={11} /> Clear selection
@@ -1348,22 +1764,60 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                   ))}
                 </div>
               ) : (
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 min-w-0">
+                <>
+                  {/* Insight focus: live re-computed card for the clicked insight/anomaly */}
+                  {(focusViz || focusLoading || focusError) && (
+                    <div className="rounded-2xl border border-blue-200 bg-blue-50/60 p-3 shadow-sm">
+                      <div className="flex items-center gap-2 mb-2 px-1">
+                        <Sparkles size={13} className="text-blue-600 flex-shrink-0" />
+                        <p className="text-[12px] font-semibold text-[#0F2440] truncate">
+                          Insight focus{focusTitle ? `: ${focusTitle}` : ""}
+                        </p>
+                        <button
+                          onClick={() => { clearFocus(); setSelection(null); }}
+                          className="ml-auto inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 hover:text-[#0F2440] transition-colors flex-shrink-0"
+                          aria-label="Clear insight focus"
+                        >
+                          <X size={12} /> Back to overview
+                        </button>
+                      </div>
+                      {focusLoading && (
+                        <div className="bg-white border border-blue-100 rounded-xl p-5" aria-busy="true">
+                          <div className="h-4 bg-slate-200 rounded w-40 mb-2 animate-pulse" />
+                          <div className="h-[220px] bg-slate-100 rounded-xl w-full animate-pulse" />
+                        </div>
+                      )}
+                      {!focusLoading && focusError && (
+                        <p className="text-[12px] text-rose-600 bg-white border border-rose-100 rounded-xl px-4 py-3">{focusError}</p>
+                      )}
+                      {!focusLoading && focusViz && (
+                        <VizCard
+                          viz={focusViz} grid={grid} axis={axis} resetKey={resetKey} onDrill={drillFromChart}
+                          selection={selection}
+                          onSelect={(sel) => setSelection(sel)}
+                          contextChip={selection && selection.chart !== focusViz.title ? `${selection.label} = ${typeof selection.value === "number" ? fmtExact(selection.value) : selection.value ?? "—"}` : ""}
+                          onClearContext={() => setSelection(null)}
+                        />
+                      )}
+                    </div>
+                  )}
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 min-w-0">
                   <VizCard
-                    viz={viz1} grid={grid} axis={axis} resetKey={resetKey} onDrill={drillFromChart}
+                    viz={rviz1} grid={grid} axis={axis} resetKey={resetKey} onDrill={drillFromChart}
                     selection={selection}
                     onSelect={(sel) => setSelection(sel)}
                     contextChip={selection && selection.chart !== viz1.title ? `${selection.label} = ${typeof selection.value === "number" ? fmtExact(selection.value) : selection.value ?? "—"}` : ""}
                     onClearContext={() => setSelection(null)}
                   />
                   <VizCard
-                    viz={viz2} grid={grid} axis={axis} resetKey={resetKey} onDrill={drillFromChart}
+                    viz={rviz2} grid={grid} axis={axis} resetKey={resetKey} onDrill={drillFromChart}
                     selection={selection}
                     onSelect={(sel) => setSelection(sel)}
                     contextChip={selection && selection.chart !== viz2.title ? `${selection.label} = ${typeof selection.value === "number" ? fmtExact(selection.value) : selection.value ?? "—"}` : ""}
                     onClearContext={() => setSelection(null)}
                   />
                 </div>
+                </>
               )}
             </section>
 
@@ -1391,7 +1845,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                     const meta = CAT_META[primaryCategory(ins.type)];
                     const Icon = meta.Icon;
                     return (
-                      <button key={ins.id} onClick={() => setPage("insights")} className="w-full text-left py-2.5 flex items-center gap-2.5 group min-w-0">
+                      <button key={ins.id} onClick={() => focusInsight(ins)} className="w-full text-left py-2.5 flex items-center gap-2.5 group min-w-0" title="Show this insight in the charts above">
                         <span className={`inline-flex items-center justify-center w-8 h-8 rounded-full flex-shrink-0 ${meta.iconWrap}`}>
                           <Icon size={14} />
                         </span>
@@ -1464,7 +1918,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           </div>
 
           {/* Right rail: Recent Insights + Quick Actions */}
-          <aside className="min-w-0 space-y-4 xl:sticky xl:top-4">
+          <aside id="dash-insights" className="min-w-0 space-y-4 xl:sticky xl:top-4 scroll-mt-4">
             <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
               <div className="flex items-center gap-2 px-4 pt-3.5 pb-2.5 border-b border-slate-100">
                 <Sparkles size={14} className="text-blue-600" />
@@ -1485,13 +1939,25 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                   </div>
                 )}
                 {!analyzing && recentInsights.length === 0 && (
-                  <p className="px-4 py-5 text-[11px] text-slate-400">No insights under the current filter.</p>
+                  <p className="px-4 py-5 text-[11px] text-slate-400">
+                    {activeFilter !== "all"
+                      ? `No ${activeFilter} insights right now — try All or another category.`
+                      : "No insights loaded yet — connect data and they will appear here."}
+                  </p>
                 )}
                 {!analyzing && recentInsights.map((ins: any) => {
                   const meta = CAT_META[primaryCategory(ins.type)];
                   const Icon = meta.Icon;
                   return (
-                    <button key={ins.id} onClick={() => setPage("insights")} className="w-full text-left px-4 py-2.5 flex items-center gap-2.5 hover:bg-blue-50/50 transition-colors group min-w-0">
+                    <div
+                      key={ins.id}
+                      onClick={() => focusInsight(ins)}
+                      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); focusInsight(ins); } }}
+                      role="button"
+                      tabIndex={0}
+                      title="Show this insight in the charts above"
+                      className="w-full text-left px-4 py-2.5 flex items-center gap-2.5 hover:bg-blue-50/50 transition-colors group min-w-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                    >
                       <span className={`inline-flex items-center justify-center w-7 h-7 rounded-full flex-shrink-0 ${meta.iconWrap}`}>
                         <Icon size={13} />
                       </span>
@@ -1500,10 +1966,29 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                         <span className="mt-0.5 flex items-center gap-1.5">
                           <span className={`text-[10px] font-semibold px-1.5 py-px rounded-full border ${meta.pill}`}>{meta.label}</span>
                           {ins.detectedAt && <span className="text-[10px] text-slate-400">{fmtWhen(ins.detectedAt)}</span>}
+                          <button
+                            onClick={(e) => { e.stopPropagation(); askAbout(`Explain this finding: ${ins.title}`); }}
+                            className="text-[10px] font-semibold text-blue-600 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
+                            aria-label={`Ask ARIA about ${ins.title}`}
+                          >
+                            Ask
+                          </button>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); void askPrescription(ins); }}
+                            className="text-[10px] font-medium text-slate-500 hover:text-blue-700 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
+                            aria-label={`What should I do about ${ins.title}`}
+                          >
+                            {rxBusy === String(ins.id || ins.title) ? "Checking…" : "What should I do?"}
+                          </button>
                         </span>
+                        {rxFor === String(ins.id || ins.title) && rxAns[String(ins.id || ins.title)] && (
+                          <span className="mt-1 block text-[11px] text-slate-600 leading-snug bg-blue-50/60 border border-blue-100 rounded-lg px-2 py-1.5">
+                            {rxAns[String(ins.id || ins.title)]}
+                          </span>
+                        )}
                       </span>
                       <ChevronRight size={13} className="text-slate-300 group-hover:text-blue-500 flex-shrink-0" />
-                    </button>
+                    </div>
                   );
                 })}
               </div>

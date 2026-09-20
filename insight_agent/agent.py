@@ -111,6 +111,11 @@ def validate_spec_data(rows, limit: int = 500):
 
 
 class InsightAgent:
+    """Base Insight Agent (signal detection, z-score anomalies)."""
+
+    VERSION = "2.0"
+    ANOMALY_METHOD = "zscore"
+
     def __init__(self, provider=None):
         self.llm = provider or create_provider()
         self.prediction = PredictionAgent()
@@ -476,8 +481,12 @@ class InsightAgent:
         # business measures, never row IDs or foreign keys, unless those are the
         # only numeric columns available.
         def _is_id_like(name):
-            low = name.lower().strip()
-            return low.endswith("_id") or low.endswith("_key") or low in ("id", "key", "code", "codeid")
+            try:
+                from core.identifiers import is_id_like as _canon
+                return bool(_canon(name))
+            except Exception:
+                low = str(name or "").lower().strip()
+                return low.endswith("_id") or low.endswith("_key") or low in ("id", "key", "code", "codeid")
 
         measures_all = [c for c in numeric_cols if not _is_id_like(c)] or numeric_cols
 
@@ -699,10 +708,37 @@ class InsightAgent:
         # Identifier-like columns are keys, not measures: hypotheses must talk
         # about real business measures, never about row IDs or foreign keys.
         def _is_id_like(name):
-            low = name.lower().strip()
-            return low.endswith("_id") or low.endswith("_key") or low in ("id", "key", "code", "codeid")
+            try:
+                from core.identifiers import is_id_like as _canon
+                return bool(_canon(name))
+            except Exception:
+                low = str(name or "").lower().strip()
+                return low.endswith("_id") or low.endswith("_key") or low in ("id", "key", "code", "codeid")
 
         measures = [c for c in numeric_cols if not _is_id_like(c)] or numeric_cols
+
+        def _human_name(name):
+            try:
+                from core.semantic import humanize as _hz
+                return _hz(str(name or ""))
+            except Exception:
+                return str(name or "").replace("_", " ").strip() or str(name or "")
+
+        def _human_scale(v):
+            try:
+                n = float(v)
+            except (TypeError, ValueError):
+                return str(v)
+            a = abs(n)
+            if a >= 1_000_000:
+                return f"{n / 1_000_000:.1f}M"
+            if a >= 1_000:
+                return f"{n / 1_000:.1f}K"
+            if a >= 100:
+                return f"{round(n):,}"
+            if a >= 1:
+                return f"{round(n, 1)}"
+            return f"{round(n, 2)}"
 
         # 1) Across every numeric measure x every category dimension: who
         #    dominates, and is the value concentrated in a few groups?
@@ -725,17 +761,20 @@ class InsightAgent:
                 if top_share >= 20:
                     confidence = "high" if top_share >= 60 else ("medium" if top_share >= 35 else "low")
                     add(
-                        f"'{top}' in {dim} contributes about {top_share:.0f}% of {col}, "
-                        f"making it the dominant {dim} segment.",
-                        f"Ranked every {dim} group by its share of total {col}.",
+                        f"'{top}' leads {_human_name(dim).lower()} — about {top_share:.0f}% "
+                        f"of all {_human_name(col).lower()}. It is the standout to watch.",
+                        f"Compared every {_human_name(dim).lower()} group by its share of "
+                        f"{_human_name(col).lower()}.",
                         confidence, 10 + top_share / 10,
                     )
                 top3_share = float(grp.head(3).sum()) / total * 100.0
                 if top3_share >= 60 and len(grp) > 3:
                     add(
-                        f"The top three {dim} groups together hold {top3_share:.0f}% of {col}, "
-                        f"so {col} is heavily concentrated in a few {dim} groups.",
-                        f"Measured how much of {col} sits in the three largest {dim} groups.",
+                        f"The top three {_human_name(dim).lower()} groups together hold "
+                        f"{top3_share:.0f}% of {_human_name(col).lower()} — so it is "
+                        f"concentrated in a few names.",
+                        f"Measured how much {_human_name(col).lower()} sits in the three "
+                        f"largest {_human_name(dim).lower()} groups.",
                         "medium", 7,
                     )
 
@@ -751,17 +790,17 @@ class InsightAgent:
                 vol_col, vol = max(cv, key=lambda x: x[1])
                 if vol > 0.5:
                     add(
-                        f"{vol_col} swings the most relative to its average, so it is the "
-                        f"measure that most deserves close monitoring.",
-                        "Compared how much each measure varies relative to its own average.",
+                        f"{_human_name(vol_col)} moves around the most — up and down "
+                        f"against its own average. It deserves the closest watch.",
+                        "Compared how much each measure moves against its own average.",
                         "medium", 6,
                     )
                 stable_col, stab = min(cv, key=lambda x: x[1])
                 if stab < 0.15 and len(cv) > 1:
                     add(
-                        f"{stable_col} stays very close to its average throughout, making it "
-                        f"the most predictable measure in the data.",
-                        "Compared how much each measure varies relative to its own average.",
+                        f"{_human_name(stable_col)} stays close to its average throughout — "
+                        f"the steadiest measure here.",
+                        "Compared how much each measure moves against its own average.",
                         "low", 4,
                     )
 
@@ -774,19 +813,18 @@ class InsightAgent:
         for col, items in list(by_col.items())[:2]:
             n = len(items)
             add(
-                f"{col} contains {n} {'observation' if n == 1 else 'observations'} that "
-                f"{'stands' if n == 1 else 'stand'} well apart from the typical range and "
-                f"{'is' if n == 1 else 'are'} worth investigating.",
-                "Flagged the rows whose value is far outside the normal spread of the column.",
+                f"{_human_name(col)} has {n} {'value' if n == 1 else 'values'} well "
+                f"outside the usual range — worth a closer look.",
+                "Flagged the rows sitting far outside the usual spread.",
                 "medium", 6 + n,
             )
 
         # 4) Time dimension present.
         if datetime_cols:
             add(
-                f"The figures change over time (along {datetime_cols[0]}), which may explain "
-                f"recent moves in the key numbers.",
-                "Detected a time axis and checked how the measures move along it.",
+                f"Things move over time here — recent shifts in the key numbers "
+                f"may come from that.",
+                "Found dated records and checked how the numbers move along them.",
                 "low", 4,
             )
 
@@ -794,9 +832,10 @@ class InsightAgent:
         if kpis:
             top = max(kpis, key=lambda k: k.get("mean") or 0)
             add(
-                f"On average, {top['column']} sits around {top['mean']:,.2f}, typically "
-                f"ranging from {top.get('min')} to {top.get('max')}.",
-                "Summarised the descriptive statistics of each measure.",
+                f"On average, {_human_name(top['column']).lower()} is about "
+                f"{_human_scale(top['mean'])}, usually between "
+                f"{_human_scale(top.get('min'))} and {_human_scale(top.get('max'))}.",
+                "Summarised the typical level of each measure.",
                 "high", 5,
             )
 
@@ -1190,7 +1229,7 @@ Rules:
             (r"\bMAE\b", "average error"),
             (r"\bp-?value\b", "reliability"),
             (r"\bcoefficient\b", "relationship"),
-            (r"\bregression\b", "trend analysis"),
+            (r"\bregression\b|\bOLS\b", "trend analysis"),
             (r"\bconfidence interval\b", "expected range"),
             (r"\bcorrelation\b", "relationship"),
             (r"\banomaly score\b", "unusual activity"),
@@ -1198,9 +1237,14 @@ Rules:
             (r"\bstandard deviation\b", "typical variation"),
             (r"\bstandard deviations\b", "typical variations"),
             (r"\bmedian\b", "middle value"),
-            (r"\bcoefficient of variation\b", "relative variation"),
+            (r"\bcoefficient of variation\b|\bCV\b", "relative variation"),
             (r"\bdispersion\b", "spread"),
-            (r"\bz-scores?\b", "unusual pattern"),
+            (r"\bz-scores?\b|\bz score\b", "unusual pattern"),
+            (r"\bIQR\b|\binterquartile\b", "usual range"),
+            (r"\bSpearman\b|\bPearson\b|\bKruskal\b", "checked pattern"),
+            (r"\bFK\b|\bforeign key\b", "linked records"),
+            (r"\br-squared\b", "pattern strength"),
+            (r"\bstd\.?\b", "typical variation"),
             (r"\bstats\b", "statistics"),
         ]
         out = text
@@ -1213,18 +1257,25 @@ Rules:
     def _narrative_story(self, processed_data, kpis, trends, anomalies, hypotheses,
                          predictions=None):
         """Deterministic, plain-English narrative assembled from the findings.
-        Always available and identical for every provider."""
+        Always available and identical for every provider. Conversational:
+        short sentences, human-scale numbers, humanized names — every number
+        traceable to the computed evidence, never invented."""
+        def _hz(name):
+            try:
+                from core.semantic import humanize as _h
+                return _h(str(name or ""))
+            except Exception:
+                return str(name or "").replace("_", " ").strip() or str(name or "")
         goal = (processed_data.get("user_goal") or "the business question").strip()
         rows = processed_data.get("row_count", 0)
         parts = []
         if goal.lower() != "unknown goal":
-            parts.append(f"This analysis answers the question: {goal} — based on "
-                         f"{rows} data {('row' if rows == 1 else 'rows')}.")
+            parts.append(f"Looking at your question - {goal} - across {rows} rows of data.")
         else:
-            parts.append(f"This analysis covers {rows} data {('row' if rows == 1 else 'rows')}.")
+            parts.append(f"This covers {rows} rows of data.")
 
         if hypotheses:
-            parts.append(f"The headline finding is that {hypotheses[0]['hypothesis']}")
+            parts.append(f"The headline: {hypotheses[0]['hypothesis']}")
         if kpis:
             top = max(kpis, key=lambda k: k.get("mean") or 0)
             def _biz(v):
@@ -1243,30 +1294,42 @@ Rules:
                     return f"{round(n, 1)}"
                 return f"{round(n, 2)}"
             parts.append(
-                f"On average, {top['column']} is about {_biz(top['mean'])}, "
-                f"ranging from {_biz(top.get('min'))} to {_biz(top.get('max'))}."
+                f"On average, {_hz(top['column']).lower()} is about {_biz(top['mean'])} - "
+                f"usually between {_biz(top.get('min'))} and {_biz(top.get('max'))}."
             )
         if trends:
             t = trends[0]
+            _cols = [_hz(c).lower() for c in (t.get("columns") or ([t["column"]] if t.get("column") else ["the measure"]))]
+            _direction = str(t.get("direction", "mixed")).lower()
+            _plain_dir = {"increasing": "up", "decreasing": "down"}.get(_direction, _direction)
+            try:
+                _pct = float(str(t["pct_change"]).replace("%", ""))
+                _pct_s = f"{_pct:+.1f}%"
+            except (TypeError, ValueError, KeyError):
+                _pct_s = str(t.get("pct_change", ""))
             parts.append(
-                f"{', '.join(t['columns'])} shows a {t['direction']} movement over time, "
-                f"a change of {t['pct_change']}%."
+                f"{', '.join(_cols)} is heading {_plain_dir} over time - about {_pct_s}."
             )
         for h in hypotheses[1:3]:
-            parts.append(f"We also observe that {h['hypothesis']}")
+            parts.append(f"Also: {h['hypothesis']}")
         if anomalies:
             a = anomalies[0]
             parts.append(
-                f"One value deserves attention: a {a['column']} of {a['value']} sits well "
-                f"outside the usual range and is flagged for a closer look."
+                f"One value stands out: {_hz(a['column']).lower()} hit {a['value']} - "
+                f"well outside the usual range. Worth a closer look."
             )
         if predictions and predictions.get("valid") and predictions.get("points"):
             period_word = predictions.get("period") or "periods"
             if period_word in ("sequence",):
                 period_word = "periods"
+            try:
+                _pp = float(str(predictions['projected_pct_change']).replace("%", ""))
+                _pp_s = f"{_pp:+.1f}%"
+            except (TypeError, ValueError, KeyError):
+                _pp_s = str(predictions.get("projected_pct_change", ""))
             parts.append(
-                f"Looking ahead, {predictions['column']} is projected to change by about "
-                f"{predictions['projected_pct_change']}% over the next "
+                f"Looking ahead, {_hz(predictions['column']).lower()} is expected to move "
+                f"about {_pp_s} over the next "
                 f"{predictions['horizon']} {period_word}."
             )
         story = " ".join(parts)
@@ -1380,6 +1443,8 @@ Rules:
                 )
 
         insights = {
+            "analysis_version": self.VERSION,
+            "anomaly_method": self.ANOMALY_METHOD,
             "generated_at": datetime.now().isoformat(),
             "source_processed_data": processed_data_path,
             "user_goal": processed_data.get("user_goal", "Unknown goal"),

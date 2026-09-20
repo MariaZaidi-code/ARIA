@@ -109,6 +109,74 @@ def _decrypt_api_keys(api_keys):
     return out
 
 
+# Per-process cache of decrypted DB passwords, keyed by the enc blob.
+# Keeps the per-request rebuild in get_session cheap (one DPAPI decrypt per
+# unique blob, then memory hit). Holds plaintext only in memory; never
+# logged or persisted to disk/Redis.
+_PWD_CACHE: dict = {}
+_PWD_CACHE_LOCK = threading.RLock()
+_PWD_CACHE_MAX = 256
+
+
+def _ensure_relational_uri(session):
+    """Rebuild a relational db_uri from the encrypted `db` config (schema-agnostic).
+
+    Only when db_type is postgresql/mysql, db_uri is falsy, and the db
+    config carries host+db. Decrypt failures leave db_uri as None (never a
+    wrong URI). Plaintext (pre-migration) passwords keep working. Never
+    logs or persists secrets; plaintext is cached per-process keyed by the
+    enc blob.
+    """
+    try:
+        if not isinstance(session, dict):
+            return session
+        if session.get("db_type") not in ("postgresql", "mysql"):
+            return session
+        if session.get("db_uri"):
+            return session
+        cfg = session.get("db")
+        if not isinstance(cfg, dict):
+            return session
+        if not (cfg.get("host") and cfg.get("db")):
+            return session
+        pwd = cfg.get("password")
+        if isinstance(pwd, str) and pwd.startswith(PREFIX):
+            try:
+                with _PWD_CACHE_LOCK:
+                    _cached = _PWD_CACHE.get(pwd)
+            except Exception:
+                _cached = None
+            if _cached:
+                pwd = _cached
+            else:
+                try:
+                    from core.secret_box import decrypt as _dec
+                    _plain = _dec(pwd)
+                except Exception:
+                    return session
+                if not _plain:
+                    return session
+                try:
+                    with _PWD_CACHE_LOCK:
+                        if len(_PWD_CACHE) >= _PWD_CACHE_MAX:
+                            _PWD_CACHE.clear()
+                        _PWD_CACHE[pwd] = _plain
+                except Exception:
+                    pass
+                pwd = _plain
+        if not pwd:
+            return session
+        from urllib.parse import quote_plus as _qp, quote as _q
+        scheme = "mysql+pymysql" if session.get("db_type") == "mysql" else "postgresql+psycopg2"
+        session["db_uri"] = (
+            f"{scheme}://{_qp(str(cfg.get('user', '')))}:{_qp(str(pwd))}"
+            f"@{_q(str(cfg.get('host', '')), safe='')}:{cfg.get('port')}/{_qp(str(cfg.get('db', '')))}"
+        )
+    except Exception:
+        pass
+    return session
+
+
 def _decrypt_session_keys(session):
     """Return a copy of session with api_keys decrypted for runtime use."""
     if not isinstance(session, dict):
@@ -117,29 +185,19 @@ def _decrypt_session_keys(session):
     if isinstance(keys, dict):
         session = dict(session)
         session["api_keys"] = _decrypt_api_keys(keys)
-    # Rebuild relational db_uri (no longer persisted to disk) from the
-    # encrypted `db` config so restarted sessions keep working.
+    # Scrub legacy persisted password-bearing URIs (older sessions stored
+    # user:password in db_uri on disk). CSV sqlite URIs carry no secret.
     try:
-        if session.get("db_type") in ("postgresql", "mysql") and not session.get("db_uri"):
-            cfg = session.get("db")
-            if isinstance(cfg, dict) and cfg.get("host") and cfg.get("db"):
-                from core.secret_box import decrypt as _dec
-                pwd = cfg.get("password")
-                if isinstance(pwd, str) and pwd.startswith(PREFIX):
-                    try:
-                        pwd = _dec(pwd)
-                    except Exception:
-                        pwd = None
-                if pwd:
-                    from urllib.parse import quote_plus as _qp, quote as _q
-                    scheme = "mysql+pymysql" if session.get("db_type") == "mysql" else "postgresql+psycopg2"
-                    session["db_uri"] = (
-                        f"{scheme}://{_qp(str(cfg.get('user', '')))}:{_qp(str(pwd))}"
-                        f"@{_q(str(cfg.get('host', '')), safe='')}:{cfg.get('port')}/{_qp(str(cfg.get('db', '')))}"
-                    )
+        _uri = session.get("db_uri")
+        if (isinstance(_uri, str) and "@" in _uri
+                and session.get("db_type") in ("postgresql", "mysql")):
+            session = dict(session)
+            session["db_uri"] = None
     except Exception:
         pass
-    return session
+    # Rebuild relational db_uri (no longer persisted to disk) from the
+    # encrypted `db` config so restarted sessions keep working.
+    return _ensure_relational_uri(session)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
@@ -475,7 +533,16 @@ def _ensure_user_paths(session: dict, user_id) -> dict:
         try:
             cur_s = str(cur) if cur is not None else ""
             # Keep per-user per-DB files already under this user's dir.
-            if cur_s and tag in cur_s:
+            # Segment match (never bare substring: "user_1" is inside
+            # "user_10"). Resolve + verify the parent dir name instead.
+            _keep = False
+            if cur_s:
+                try:
+                    _parent = Path(cur_s).parent.name
+                    _keep = (_parent == tag)
+                except Exception:
+                    _keep = False
+            if _keep:
                 Path(cur_s).parent.mkdir(parents=True, exist_ok=True)
                 continue
             session[key] = default_path
@@ -689,18 +756,34 @@ def _ensure_provider(session):
 
 
 def _copy_session(session):
-    """Shallow-copy the session dict so callers can mutate keys without
-    leaking changes to other requests.  Values like the LLM provider
-    object contain thread locks and cannot be deep-copied."""
-    return dict(session)
+    """Copy the session so callers can mutate without leaking changes.
+
+    Deep-copies nested plain values (db config, api_keys, lists) so
+    concurrent requests never share mutable state. The live LLM provider
+    object holds thread locks and cannot be deep-copied — it is re-attached
+    by reference.
+    """
+    if not isinstance(session, dict):
+        return session
+    prov = session.get("provider")
+    try:
+        import copy as _copy
+        out = _copy.deepcopy({k: v for k, v in session.items() if k != "provider"})
+    except Exception:
+        out = dict(session)
+        out.pop("provider", None)
+    if prov is not None:
+        out["provider"] = prov
+    return out
 
 
 def get_session(user_id=None):
     """Return the current session for a user, or a fresh default copy.
 
-    Returns a shallow copy of the session dict so each request gets its
-    own dict but shares immutable / non-copyable values (LLM provider).
-    Use ``save_session`` to persist modifications back to the store.
+    Returns a copy of the session dict so each request gets its
+    own mutable state (nested configs deep-copied; only the live LLM
+    provider object is shared by reference). Use ``save_session`` to
+    persist modifications back to the store.
 
     NOTE: get_session(None) returns the DEFAULT_SESSION template only and
     must never be used to serve authenticated user data. Per-user sessions
@@ -730,6 +813,7 @@ def get_session(user_id=None):
                 _created, _sess = _redis_hit
                 if now - float(_created) <= SESSION_TTL_SECONDS:
                     _ensure_user_paths(_sess, user_id)
+                    _ensure_relational_uri(_sess)
                     SESSION_STORE[user_id] = (now, _sess)
                     _ensure_provider(_sess)
                     return _copy_session(_sess)
@@ -776,6 +860,7 @@ def get_session(user_id=None):
         else:
             _ensure_user_paths(entry[1], user_id)
             SESSION_STORE[user_id] = (now, entry[1])
+        _ensure_relational_uri(entry[1])
         _ensure_provider(entry[1])
         # Warm the shared store on file/memory hits so the next worker
         # finds this session in Redis (best-effort, never raises).

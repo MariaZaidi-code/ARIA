@@ -78,6 +78,9 @@ interface Insight {
   evidenceQuality?: string;
   associatedFactors?: string[];
   recommendation?: string | { text?: string; title?: string };
+  /* New conversational prose fields (backend-built, evidence-backed). */
+  explains?: string;
+  recommendation_detail?: { title?: string; steps?: string[]; outcome?: string; honest?: boolean };
   scenario?: { available?: boolean; label?: string } | null;
   monitoring?: { available?: boolean; metric?: string; expectedRange?: string; nextReview?: string } | null;
 }
@@ -432,18 +435,48 @@ function limitationLines(ins: Insight): string[] {
   const list = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
   return list
     .filter((l): l is string => typeof l === "string" && l.trim().length > 0)
-    .map((l) => l.trim().slice(0, 200));
+    .map((l) => l.trim().slice(0, 200))
+    .filter((l) => !isRoboticText(l));
+}
+
+/* ---- Robotic-fallback guard: sections hide when content is empty or
+   still carries raw schema / SQL / engine internals. Never shown. ---- */
+function isRoboticText(v: unknown): boolean {
+  if (typeof v !== "string") return true;
+  const s = v.trim();
+  if (s.length < 12) return true;
+  if (/[A-Za-z0-9]+_[A-Za-z0-9]+/.test(s)) return true; // raw snake_case
+  if (/[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*/.test(s)) return true; // table.column
+  // Raw SQL leaks are conventionally UPPERCASE; everyday words like "from"
+  // must survive in conversational prose, so this match is case-sensitive.
+  if (/\b(SELECT|FROM|WHERE|GROUP BY|ORDER BY|JOIN|SQL)\b/.test(s)) return true;
+  if (/\bp-?value\b|\bz-?score\b|\bR\^2\b|\bR-squared\b|\bOLS\b|\bIQR\b|\bCV\s*=\s*[\d.]|\bSkew\s*=/i.test(s)) return true;
+  if (/\bFK\b|\bforeign key\b/i.test(s)) return true;
+  if (/^Ranked \d+ .* by /i.test(s)) return true; // legacy robotic template
+  return false;
 }
 
 /* Key takeaways: backend takeaways when provided; otherwise ONLY items the
    backend actually sent (observations / supporting metrics) — never derived
-   numbers or invented claims. */
+   numbers or invented claims. Robotic or empty lines are dropped so the
+   section hides instead of showing filler. */
 function takeawayLines(ins: Insight): string[] {
   const direct = Array.isArray(ins.takeaways) ? ins.takeaways.filter((t): t is string => typeof t === "string" && t.trim().length > 0) : [];
-  if (direct.length) return direct.slice(0, 4).map((t) => t.trim().slice(0, 240));
+  if (direct.length) return direct.filter((t) => !isRoboticText(t)).slice(0, 4).map((t) => t.trim().slice(0, 240));
   const obs = (ins.evidence?.observations || []).filter((o) => typeof o === "string" && o.trim());
   const sup = (ins.evidence?.supportingMetrics || []).filter((m) => typeof m === "string" && m.trim());
-  return [...obs, ...sup].slice(0, 4).map((t) => t.trim().slice(0, 240));
+  return [...obs, ...sup].filter((t) => !isRoboticText(t)).slice(0, 4).map((t) => t.trim().slice(0, 240));
+}
+
+/* ARIA explains: prefer the backend's conversational `explains` prose.
+   Falls back to a short reading of title + first observation. Returns ""
+   when nothing meaningful exists so the section hides. */
+function explainsTextOf(ins: Insight): string {
+  const direct = typeof (ins as unknown as Record<string, unknown>).explains === "string"
+    ? String((ins as unknown as Record<string, unknown>).explains).trim()
+    : "";
+  if (direct && !isRoboticText(direct)) return direct.slice(0, 600);
+  return "";
 }
 
 function associatedFactorsOf(ins: Insight): string[] {
@@ -459,12 +492,32 @@ function associatedFactorsOf(ins: Insight): string[] {
 }
 
 function recommendationTextOf(ins: Insight): string {
-  if (typeof ins.recommendation === "string" && ins.recommendation.trim()) return ins.recommendation.trim().slice(0, 400);
+  if (typeof ins.recommendation === "string" && ins.recommendation.trim() && !isRoboticText(ins.recommendation)) return ins.recommendation.trim().slice(0, 400);
   if (ins.recommendation && typeof ins.recommendation === "object") {
     const t = (ins.recommendation.text || ins.recommendation.title || "").trim();
-    if (t) return t.slice(0, 400);
+    if (t && !isRoboticText(t)) return t.slice(0, 400);
   }
-  return (ins.recommendedNextAnalysis?.question || "").trim().slice(0, 400);
+  const q = (ins.recommendedNextAnalysis?.question || "").trim();
+  if (q && !isRoboticText(q)) return q.slice(0, 400);
+  const det = ins.recommendation_detail;
+  if (det?.title) {
+    const bits = [det.title, ...(det.steps || []).slice(0, 1)];
+    if (det.outcome) bits.push(`Expected: ${det.outcome}`);
+    const joined = bits.join(" — ");
+    if (!isRoboticText(joined)) return joined.slice(0, 400);
+  }
+  return "";
+}
+
+function recommendationDetailOf(ins: Insight): { title: string; steps: string[]; outcome: string } | null {
+  const det = ins.recommendation_detail;
+  if (!det || typeof det !== "object") return null;
+  const title = typeof det.title === "string" ? det.title.trim() : "";
+  const steps = Array.isArray(det.steps) ? det.steps.filter((s): s is string => typeof s === "string" && s.trim().length > 0).map((s) => s.trim().slice(0, 300)) : [];
+  const outcome = typeof det.outcome === "string" ? det.outcome.trim().slice(0, 300) : "";
+  if (!title && !steps.length && !outcome) return null;
+  if (title && isRoboticText(title) && !steps.length) return null;
+  return { title, steps: steps.slice(0, 2), outcome };
 }
 
 /* ============================ Main page ============================ */
@@ -496,6 +549,7 @@ export default function Insights({
   const [recentTab, setRecentTab] = useState<"recent" | "saved">("recent");
   const [savedIds, setSavedIds] = useState<string[]>([]);
   const [insights, setInsights] = useState<Insight[]>([]);
+  const [samplingNote, setSamplingNote] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [errorRequestId, setErrorRequestId] = useState("");
@@ -530,13 +584,29 @@ export default function Insights({
     };
     try {
       const data: any = await apiFetch("/insights", { signal: ctrl.signal });
-      if (data.ok && data.insights) {
-        setInsights(data.insights);
+      // Accept wrapped or bare payloads; only clear with an explicit error
+      // otherwise so valid-but-unwrapped shapes never read as "no insights".
+      const list = data?.insights ?? data?.data ?? data?.items ?? (Array.isArray(data) ? data : undefined);
+      if (Array.isArray(list)) {
+        setInsights(list);
         setFetchedAt(new Date().toISOString());
         setDrill(null);
+        try {
+          const tables = (data as any)?.sampling?.tables || {};
+          const first = Object.values(tables)[0] as any;
+          setSamplingNote(
+            first && first.total_rows
+              ? `Computed on a ~${Number(first.sample_rows || 0).toLocaleString()}-row sample of ${Number(first.total_rows).toLocaleString()} records`
+              : "",
+          );
+        } catch {
+          setSamplingNote("");
+        }
+        if (!data?.ok && data?.detail) setError(data.detail);
       } else {
         setInsights([]);
-        if (data.detail) setError(data.detail);
+        if (data?.detail) setError(data.detail);
+        else setError("Insights came back in an unexpected shape — retry to reload.");
       }
     } catch (e: any) {
       if (e?.name === "AbortError") return; // cancelled refresh — not an error state
@@ -949,6 +1019,9 @@ export default function Insights({
         <span>Last analyzed</span>
         <span className="font-medium text-slate-600" title={fetchedAt ? fmtWhen(fetchedAt) : undefined}>{fetchedAt ? relTime(fetchedAt) : "—"}</span>
       </div>
+      {samplingNote && (
+        <p className="mt-1.5 text-[10.5px] text-slate-400" title="Large datasets are analyzed on a bounded sample; conclusions are statistical, not row-exact.">{samplingNote} · sample-based</p>
+      )}
       <button onClick={() => setPage?.("data")} className="mt-1.5 text-[11px] font-semibold text-blue-600 hover:underline inline-flex items-center gap-1">
         View data center <ChevronRight size={12} />
       </button>
@@ -1030,6 +1103,8 @@ export default function Insights({
     const takeaways = takeawayLines(selected);
     const factors = associatedFactorsOf(selected);
     const recoText = recommendationTextOf(selected);
+    const recoDetail = recommendationDetailOf(selected);
+    const explains = explainsTextOf(selected);
     const dims = selected.recommendedNextAnalysis?.dimensions || [];
     const affectedSegment = dims[0] || selected.tags?.[0] || "";
     const scenarioAvailable = selected.scenario?.available === true;
@@ -1042,7 +1117,7 @@ export default function Insights({
       { id: "why", label: "Why It Matters" },
       { id: "evidence", label: "Evidence" },
       ...(factors.length ? [{ id: "factors", label: "Associated Factors" }] : []),
-      ...(recoText ? [{ id: "reco", label: "Recommendation" }] : []),
+      ...(recoDetail || recoText ? [{ id: "reco", label: "Recommendation" }] : []),
       { id: "whatif", label: "What If" },
       { id: "monitor", label: "Monitor" },
     ];
@@ -1200,6 +1275,20 @@ export default function Insights({
                   </aside>
                 </div>
 
+                {/* ARIA explains — backend conversational prose (`explains`)
+                    when present; hidden entirely when empty or robotic. */}
+                {explains ? (
+                  <div className="rounded-xl border border-blue-100 bg-blue-50/40 p-4">
+                    <p className="text-[13px] font-semibold flex items-center gap-1.5 text-[#0F2440]">
+                      <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-blue-600 text-white"><Sparkles size={12} /></span>
+                      ARIA explains
+                    </p>
+                    <p className="mt-2 text-[12.5px] text-slate-700 leading-relaxed">
+                      {explains}
+                    </p>
+                  </div>
+                ) : null}
+
                 {/* Tabs — sticky, smooth-scroll aware, no horizontal page overflow */}
                 <div className="sticky top-0 z-10 -mx-5 px-5 bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/85 border-b border-slate-200 flex gap-4 overflow-x-auto scroll-smooth" role="tablist" aria-label="Insight explanation sections">
                   {tabs.map((t) => (
@@ -1322,12 +1411,31 @@ export default function Insights({
                   </div>
                 )}
 
-                {tabId === "reco" && (
+                {tabId === "reco" && (recoDetail || recoText) && (
                   <div className="rounded-xl border border-blue-100 bg-blue-50/50 p-4 max-w-3xl">
                     <p className="text-[12px] font-semibold">What ARIA recommends</p>
-                    <p className="mt-1 text-[13px] text-[#0F2440] leading-relaxed">{recoText}</p>
-                    {selected.source && (
-                      <p className="mt-2 text-[10px] text-slate-400">Evidence from: {(selected.source.tables || []).join(", ") || "connected data"}{selected.source.columns?.length ? ` · ${selected.source.columns.slice(0, 4).map(humanize).join(", ")}` : ""}</p>
+                    {recoDetail ? (
+                      <div className="mt-1">
+                        {recoDetail.title && (
+                          <p className="text-[13px] font-semibold text-[#0F2440] leading-relaxed">{recoDetail.title}</p>
+                        )}
+                        {recoDetail.steps.length > 0 && (
+                          <ul className="mt-2 space-y-1.5">
+                            {recoDetail.steps.map((s, i) => (
+                              <li key={i} className="text-[12.5px] text-slate-700 leading-relaxed">
+                                <span className="font-semibold text-blue-700">{i + 1}. </span>{s}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        {recoDetail.outcome && (
+                          <p className="mt-2 text-[12px] text-slate-600 leading-relaxed">
+                            <span className="font-semibold text-[#0F2440]">Expected outcome: </span>{recoDetail.outcome}
+                          </p>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="mt-1 text-[13px] text-[#0F2440] leading-relaxed">{recoText}</p>
                     )}
                   </div>
                 )}

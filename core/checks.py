@@ -140,10 +140,20 @@ def check_default_db():
             "detail": f"connected to {dbname}@{host}:{port}",
         }
     except Exception as exc:
+        # Sanitize: topology (host/port) is operator config and stays, but
+        # the raw driver error (which can echo DSNs, passwords, paths)
+        # never leaves the server — full text goes to the log only.
+        try:
+            from core.errors import sanitize_error as _san
+            _safe = _san(exc)
+        except Exception:
+            _safe = type(exc).__name__
+        import logging as _logging
+        _logging.getLogger("aria.checks").debug("default_db check failed: %s", exc)
         return {
             "configured": True,
             "ok": False,
-            "detail": f"could not connect to {dbname}@{host}:{port}: {exc}",
+            "detail": f"could not connect to {dbname}@{host}:{port}: {_safe}",
         }
 
 

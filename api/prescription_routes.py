@@ -8,6 +8,7 @@ GET  /api/prescriptions/saved     list saved prescriptions
 DELETE /api/prescriptions/saved/{sid}  remove one
 """
 
+import logging
 import time
 from datetime import datetime
 
@@ -19,6 +20,68 @@ from core.deps import get_current_user, require_writable
 from api.hypothesis_routes import _engine_for_session
 
 router = APIRouter(tags=["prescriptions"])
+
+log = logging.getLogger("aria.prescription")
+
+
+# ---------------------------------------------------------------------------
+# Leak audit: internal keys never leave the server. Cards keep the
+# display-safe allowlist (id/title/summary/action/confidence/
+# confidence_label/risk/display/why_summary/details/impact_note/
+# limitations/assumptions/evidence_pass) plus the operational fields the
+# What-If playground needs (driver/metric/table/rank/score/impact/evidence/
+# scenario_options/success_metric/review_*). Everything stripped is logged
+# server-side via log.debug rather than sent.
+# ---------------------------------------------------------------------------
+_RX_INTERNAL_KEYS = frozenset({
+    "scenario_label", "dedupe_key", "risk_reasons", "score_breakdown",
+    "sql", "query", "debug", "traceback", "trace",
+})
+_TOP_INTERNAL_KEYS = frozenset({"fit", "sql", "query", "debug", "traceback", "trace"})
+
+
+def _strip_prescription_response(out):
+    """Strip internal keys from an analyze/scenario payload (in place).
+
+    Returns (cleaned, stripped_names). Variant labels inside
+    scenario_options are renamed scenario_label -> label so the What-If
+    detail keeps its options without leaking the internal key name.
+    """
+    stripped: list = []
+    if not isinstance(out, dict):
+        return out, stripped
+    for k in list(out.keys()):
+        if k in _TOP_INTERNAL_KEYS or "sql" in str(k).lower():
+            stripped.append(str(k))
+            out.pop(k, None)
+    pres = out.get("prescriptions")
+    if isinstance(pres, list):
+        for r in pres:
+            if not isinstance(r, dict):
+                continue
+            for k in list(r.keys()):
+                if k in _RX_INTERNAL_KEYS or "sql" in str(k).lower():
+                    stripped.append(f"prescription.{k}")
+                    r.pop(k, None)
+            opts = r.get("scenario_options")
+            if isinstance(opts, list):
+                for opt in opts:
+                    if isinstance(opt, dict) and "scenario_label" in opt:
+                        opt["label"] = opt.pop("scenario_label")
+                        stripped.append("prescription.scenario_options.scenario_label->label")
+    scens = out.get("scenarios")
+    if isinstance(scens, list):
+        for s in scens:
+            if not isinstance(s, dict):
+                continue
+            for k in list(s.keys()):
+                if k in _RX_INTERNAL_KEYS or "sql" in str(k).lower():
+                    stripped.append(f"scenario.{k}")
+                    s.pop(k, None)
+    if stripped:
+        log.debug("prescription response stripped internal keys: %s",
+                  sorted(set(stripped)))
+    return out, stripped
 
 
 class SegmentRef(BaseModel):
@@ -333,10 +396,14 @@ def prescription_analyze(req: AnalyzeRequest, request: Request,
         out = _analyze(engine, dialect, intel, table, metric, driver=driver,
                        dimensions=req.dimensions, segment=seg,
                        question=req.question, priors=priors)
+        # NOTE: refusal alternatives are computed inside the engine
+        # (compute_refusal_alternatives with quality-gate probes) and
+        # attached by _finalize_output — never a static list here.
         if out.get("status") == "completed":
             polished = _polish_story(session, out)
             if polished:
                 out["story"] = polished
+        out, _ = _strip_prescription_response(out)
         return sanitize_json(out)
     except Exception:
         import logging as _logging
@@ -435,6 +502,7 @@ def prescription_scenario(req: ScenarioRequest, request: Request,
             join = (req.join.table, req.join.self_col, req.join.other_col)
         out = _scenario(engine, dialect, intel, req.table, req.metric, req.driver,
                         [c.model_dump() for c in req.changes], filt=filt, join=join)
+        out, _ = _strip_prescription_response(out)
         return sanitize_json(out)
     except Exception:
         import logging as _logging
@@ -479,3 +547,229 @@ def prescription_unsave(sid: str, user: dict = Depends(require_writable)):
     session["saved_prescriptions"] = saved
     save_session(user["user_id"], session)
     return {"ok": True, "success": True, "saved": saved}
+
+
+class SavedUpdateRequest(BaseModel):
+    owner: str | None = None
+    priority: str | None = None
+    due: str | None = None
+    review_outcome: str | None = None
+    review_note: str | None = None
+    review_at: str | None = None
+
+
+_RX_SAVED_EDITABLE = ("owner", "priority", "due", "review_outcome",
+                      "review_note", "review_at")
+
+
+@router.patch("/api/prescriptions/saved/{sid}")
+def prescription_saved_update(sid: str, req: SavedUpdateRequest,
+                              user: dict = Depends(require_writable)):
+    """Update business fields of a saved prescription (owner, priority,
+    due date, review outcome). Additive — stored entry otherwise untouched."""
+    session = get_session(user["user_id"])
+    saved = session.get("saved_prescriptions", [])
+    found = False
+    patch = {k: v for k, v in req.model_dump().items()
+             if k in _RX_SAVED_EDITABLE and v is not None}
+    if patch.get("priority") and str(patch["priority"]).lower() not in (
+            "low", "medium", "high", "critical"):
+        return {"ok": False, "success": False, "code": "INVALID_REQUEST",
+                "detail": "Priority must be low, medium, high or critical."}
+    if patch.get("review_outcome") and str(patch["review_outcome"]).lower() not in (
+            "achieved", "missed", "inconclusive"):
+        return {"ok": False, "success": False, "code": "INVALID_REQUEST",
+                "detail": "Review outcome must be achieved, missed or inconclusive."}
+    for s in saved:
+        if isinstance(s, dict) and s.get("id") == sid:
+            s.update(patch)
+            s["updated_at"] = datetime.now().isoformat()
+            found = True
+            break
+    if not found:
+        return {"ok": False, "success": False, "code": "NOT_FOUND",
+                "detail": "Saved prescription not found."}
+    session["saved_prescriptions"] = saved
+    save_session(user["user_id"], session)
+    return {"ok": True, "success": True, "saved": saved}
+
+
+class InactionRequest(BaseModel):
+    metric: str | None = None
+    table: str | None = None
+
+
+@router.post("/api/prescriptions/inaction")
+def prescription_inaction(req: InactionRequest, request: Request,
+                          user: dict = Depends(require_writable)):
+    """Cost of doing nothing: monthly run-rate projection for one metric."""
+    from prescription_engine.engine import inaction_cost, _usable_measures
+    setup, err = _setup(user)
+    if err:
+        return err
+    mapping, tables, engine, dialect, intel, session = setup
+    try:
+        metric, table = req.metric, req.table
+        if table not in tables:
+            table = next((t for t in tables if metric in intel.get_numeric_cols(t)), None) if metric else None
+            if table is None:
+                table = next((t for t in tables if _usable_measures(intel, t)), tables[0] if tables else None)
+        if not metric and table:
+            ms = _usable_measures(intel, table)
+            metric = ms[0] if ms else None
+        if not metric or not table:
+            return {"ok": False, "success": False, "code": "INVALID_METRIC",
+                    "detail": "Pick a metric with dated history first."}
+        out = inaction_cost(engine, dialect, intel, table, metric)
+        return {"ok": True, "success": True, **out}
+    except Exception:
+        import logging as _logging
+        _logging.getLogger("aria.prescription").exception("Inaction failed")
+        return {"ok": False, "success": False, "code": "ANALYSIS_FAILED",
+                "detail": "Could not price inaction from this data."}
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+
+
+@router.get("/api/prescriptions/levers")
+def prescription_levers(request: Request, metric: str | None = None,
+                        table: str | None = None,
+                        user: dict = Depends(require_writable)):
+    """Lever badges: for each numeric column, testable / needs-data /
+    not-a-lever with the reason. Cheap bounded probes only (counts and
+    distincts) — never a full correlation run. Fully data-driven."""
+    from prescription_engine.engine import (
+        _usable_measures, classify_driver, classify_semantic_role,
+        NON_LEVER_ROLES, MIN_N)
+    from sqlalchemy import text as _t
+    setup, err = _setup(user)
+    if err:
+        return err
+    mapping, tables, engine, dialect, intel, session = setup
+    try:
+        if table not in tables:
+            table = next((t for t in tables if metric in intel.get_numeric_cols(t)), None) if metric else None
+            if table is None:
+                table = next((t for t in tables if _usable_measures(intel, t)), tables[0] if tables else None)
+        if not table:
+            return {"ok": False, "success": False, "code": "INVALID_METRIC",
+                    "detail": "Pick a metric with numeric data first."}
+        if not metric:
+            ms = _usable_measures(intel, table)
+            metric = ms[0] if ms else None
+        levers = []
+        try:
+            from api.schema_intel import _safe_name as _qn
+            _cols = intel.get_numeric_cols(table)
+            _counts = {}
+            with engine.connect() as _conn:
+                for _c in _cols[:12]:
+                    try:
+                        _r = _conn.execute(_t(
+                            f"SELECT COUNT({_qn(_c)}) AS n, COUNT(DISTINCT {_qn(_c)}) AS d "
+                            f"FROM {_qn(table)}")).fetchone()
+                        _counts[_c] = (int(_r[0] or 0), int(_r[1] or 0))
+                    except Exception:
+                        continue
+        except Exception:
+            _counts = {}
+        for _c in intel.get_numeric_cols(table)[:12]:
+            if _c == metric:
+                continue
+            try:
+                _level, _ = classify_driver(_c, "numeric")
+            except Exception:
+                _level = "unknown"
+            _role = classify_semantic_role(_c, "numeric")
+            _n, _d = _counts.get(_c, (0, 0))
+            if _role in NON_LEVER_ROLES or _level in ("not_controllable", "segmentation"):
+                levers.append({"column": _c, "status": "not-a-lever",
+                               "reason": "Text, category or system field — it cannot be turned up or down."})
+            elif _n < MIN_N:
+                levers.append({"column": _c, "status": "needs-data",
+                               "reason": f"Only {_n} usable rows — at least {MIN_N} are needed to test it."})
+            elif _d <= 1:
+                levers.append({"column": _c, "status": "needs-data",
+                               "reason": "No variation in the observed values — nothing to model."})
+            else:
+                levers.append({"column": _c, "status": "testable",
+                               "reason": f"{_n} rows, {_d} distinct values — ready to test as a lever."})
+        # Text/dimension columns are never levers — list them so the picker
+        # explains WHY instead of showing nothing.
+        try:
+            _dims = list(intel.find_all_dimensions(table) or [])[:8]
+        except Exception:
+            _dims = []
+        for _c in _dims:
+            if _c == metric or any(l["column"] == _c for l in levers):
+                continue
+            levers.append({"column": _c, "status": "not-a-lever",
+                           "reason": "Category — useful for breaking numbers down, but it cannot be adjusted as an intervention."})
+        return {"ok": True, "success": True, "metric": metric, "table": table, "levers": levers}
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+
+
+@router.get("/api/prescriptions/presets")
+def prescription_presets(request: Request, user: dict = Depends(require_writable)):
+    """One-click starter questions built from the live schema: for each
+    usable measure, 'What should I do about declining {metric}?' Never
+    static — derived from the connected mapping."""
+    from prescription_engine.engine import _usable_measures
+    setup, err = _setup(user)
+    if err:
+        return err
+    mapping, tables, engine, dialect, intel, session = setup
+    try:
+        from core.semantic import humanize as _hz
+        presets = []
+        for t in tables[:6]:
+            for m in _usable_measures(intel, t)[:3]:
+                presets.append({
+                    "question": f"What should I do about {_hz(m).lower()}?",
+                    "metric": m, "table": t,
+                })
+                if len(presets) >= 6:
+                    break
+            if len(presets) >= 6:
+                break
+        return {"ok": True, "success": True, "presets": presets}
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+
+
+@router.get("/api/prescriptions/alerts")
+def prescription_alerts(request: Request, user: dict = Depends(require_writable)):
+    """Alerts that matter: unusual latest-month moves across top measures."""
+    from prescription_engine.engine import detect_alerts
+    setup, err = _setup(user)
+    if err:
+        return err
+    mapping, tables, engine, dialect, intel, session = setup
+    try:
+        alerts = []
+        for t in tables[:4]:
+            try:
+                alerts.extend(detect_alerts(engine, dialect, intel, t))
+            except Exception:
+                continue
+        alerts.sort(key=lambda a: abs(a.get("change_pct") or 0), reverse=True)
+        return {"ok": True, "success": True, "alerts": alerts[:5]}
+    except Exception:
+        import logging as _logging
+        _logging.getLogger("aria.prescription").exception("Alerts failed")
+        return {"ok": True, "success": True, "alerts": []}
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass

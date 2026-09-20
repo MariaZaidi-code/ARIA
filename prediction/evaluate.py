@@ -159,9 +159,21 @@ def backtest_competing(candidates, values, season_period=None, holdout=None):
 
 
 def _make(cls, season_period):
-    """Instantiate a candidate, passing a season period to models that need one."""
+    """Instantiate a candidate, passing a season period to models that need one.
+
+    Models with an *optional* season (e.g. auto_ets, which fits seasonal ETS
+    when ``period`` is given) receive the real validated period too: a
+    seasonal winner must never be validated as seasonal and then refit
+    non-seasonal, which collapses to a flat level line on seasonal history.
+    Classes that do not accept ``period`` fall back to a bare constructor.
+    """
     if getattr(cls, "needs_period", False):
         return cls(period=season_period or 7)
+    if season_period:
+        try:
+            return cls(period=season_period)
+        except TypeError:
+            pass
     try:
         return cls()
     except TypeError:

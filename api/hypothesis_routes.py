@@ -10,9 +10,18 @@ import numpy as np
 
 from core.config import get_session
 from core.deps import require_data, require_writable, get_current_user, reject_document_sql
+from core.errors import sanitize_error as _sanitize_error
 from core.secret_box import decrypt as _decrypt_secret
 
 router = APIRouter()
+
+
+def _safe_detail(prefix: str, exc: Exception, limit: int = 200) -> str:
+    """Client-safe error detail: sanitized (no creds/paths/hosts), truncated."""
+    try:
+        return f"{prefix}: {str(_sanitize_error(exc))[:limit]}"
+    except Exception:
+        return f"{prefix}." if prefix.endswith(".") else f"{prefix}."
 
 
 # Bounded sample for correlation tests (spec §3, deterministic precedent):
@@ -22,14 +31,17 @@ _HYPOTHESIS_SAMPLE_MAX = 2000
 
 
 def _quote_identifier(name, dialect="postgresql"):
+    # Dotted names (schema.table from multi-schema discovery) quote each
+    # part separately: "public"."orders", never the single identifier
+    # "public.orders" which resolves to nothing.
     if dialect == "mysql":
-        return f"`{name.replace('`', '``')}`"
-    return f'"{name.replace(chr(34), chr(34)+chr(34))}"'
+        return ".".join(f"`{p.replace('`', '``')}`" for p in str(name).split("."))
+    return ".".join(f'"{p.replace(chr(34), chr(34)+chr(34))}"' for p in str(name).split("."))
 
 
 class HypothesisRequest(BaseModel):
     hypothesis: str
-    dataset: str = "Sales Database"
+    dataset: str = "Connected dataset"
 
 
 class InvestigateRequest(BaseModel):
@@ -79,7 +91,7 @@ def _linked_hypothesis_setup(session):
                 SchemaIntelligence(mapping)), None
     except Exception as exc:
         return None, {"ok": False, "code": "INVALID_SOURCE",
-                      "detail": f"The linked data could not be read: {str(exc)[:150]}"}
+                      "detail": _safe_detail("The linked data could not be read", exc, 150)}
 
 
 @router.post("/api/hypotheses/investigate")
@@ -118,7 +130,7 @@ def investigate_hypotheses(req: InvestigateRequest, request: Request,
         return sanitize_json({"ok": True, **out})
     except Exception as exc:
         return {"ok": False, "code": "ANALYSIS_FAILED",
-                "detail": f"The investigation could not run: {str(exc)[:200]}"}
+                "detail": _safe_detail("The investigation could not run", exc)}
     finally:
         try:
             engine.dispose()
@@ -160,7 +172,7 @@ def auto_hypotheses(request: Request, user: dict = Depends(get_current_user)):
         return sanitize_json({"ok": True, **out})
     except Exception as exc:
         return {"ok": False, "code": "ANALYSIS_FAILED",
-                "detail": f"Automatic detection could not run: {str(exc)[:200]}"}
+                "detail": _safe_detail("Automatic detection could not run", exc)}
     finally:
         try:
             engine.dispose()
@@ -286,7 +298,7 @@ def analyze_hypothesis(req: AnalyzeRequest, request: Request, user: dict = Depen
         return sanitize_json(out)
     except Exception as exc:
         return {"ok": False, "verdict": "NEEDS MORE DATA", "code": "ANALYSIS_FAILED",
-                "detail": f"The analysis could not run: {str(exc)[:200]}"}
+                "detail": _safe_detail("The analysis could not run", exc)}
     finally:
         try:
             engine.dispose()
@@ -380,7 +392,7 @@ def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depend
             engine = create_engine(engine_url, pool_pre_ping=True)
             return _run_test(engine, dialect, req)
         except Exception as exc:
-            return {"ok": False, "detail": f"Hypothesis test failed: {str(exc)[:200]}"}
+            return {"ok": False, "detail": _safe_detail("Hypothesis test failed", exc)}
         finally:
             try:
                 engine.dispose()
@@ -411,7 +423,8 @@ def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depend
                                connect_args={"connect_timeout": 10})
 
         try:
-            return _run_test(engine, dialect, req)
+            _schema = db_config.get("db_schema") if isinstance(db_config, dict) else None
+            return _run_test(engine, dialect, req, schema=_schema)
         finally:
             try:
                 engine.dispose()
@@ -422,15 +435,15 @@ def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depend
         return {"ok": False, "detail": f"Hypothesis test failed: {str(e)}"}
 
 
-def _run_test(engine, dialect, req):
+def _run_test(engine, dialect, req, schema=None):
     """Shared test body for PG/MySQL/SQLite (honest gating, no fabricated stats)."""
     try:
         with engine.connect() as conn:
-            tables = _get_tables(conn, dialect)
+            tables = _get_tables(conn, dialect, schema=schema)
             if not tables:
                 return {"ok": False, "detail": "No tables found in the connected database"}
 
-            numeric_pairs = _find_numeric_pairs(conn, tables, dialect)
+            numeric_pairs = _find_numeric_pairs(conn, tables, dialect, schema=schema)
             if not numeric_pairs:
                 return {"ok": False, "detail": "No numeric column pairs found suitable for hypothesis testing"}
 
@@ -516,7 +529,7 @@ def _run_test(engine, dialect, req):
         return {"ok": False, "detail": f"Hypothesis test failed: {str(e)}"}
 
 
-def _get_tables(conn, dialect):
+def _get_tables(conn, dialect, schema=None):
     if dialect == "mysql":
         result = conn.execute(text("SHOW TABLES"))
     elif dialect == "sqlite":
@@ -524,15 +537,24 @@ def _get_tables(conn, dialect):
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         ))
     else:
-        result = conn.execute(text(
-            "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'"
-        ))
+        # Schema-qualified discovery (generic): honor the session's schema
+        # instead of assuming public, so custom/multi-schema databases work.
+        if schema:
+            result = conn.execute(
+                text("SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = :s"),
+                {"s": schema},
+            )
+        else:
+            result = conn.execute(text(
+                "SELECT schemaname || '.' || tablename FROM pg_catalog.pg_tables "
+                "WHERE schemaname NOT IN ('pg_catalog', 'information_schema')"
+            ))
     return [row[0] for row in result]
 
 
-def _find_numeric_pairs(conn, tables, dialect):
+def _find_numeric_pairs(conn, tables, dialect, schema=None):
     NUMERIC_TYPES = {"int", "integer", "bigint", "decimal", "numeric", "real",
-                    "double precision", "float", "money", "smallint"}
+                     "double precision", "float", "money", "smallint"}
     pairs = []
     for table in tables[:20]:
         try:
@@ -546,10 +568,24 @@ def _find_numeric_pairs(conn, tables, dialect):
                 cols_result = conn.execute(text(f'PRAGMA table_info("{safe_t}")'))
                 cols = [(row[1], row[2]) for row in cols_result]
             else:
-                cols_result = conn.execute(text(
-                    "SELECT column_name, data_type FROM information_schema.columns "
-                    "WHERE table_name = :t AND table_schema = 'public'"
-                ), {"t": table})
+                # Schema-qualified names from discovery ("public.orders"):
+                # split so table_name matches information_schema exactly.
+                _t_for_lookup, _s_for_lookup = table, schema
+                if "." in str(table):
+                    _maybe_s, _maybe_t = str(table).rsplit(".", 1)
+                    _t_for_lookup = _maybe_t
+                    if _s_for_lookup is None:
+                        _s_for_lookup = _maybe_s
+                if _s_for_lookup:
+                    cols_result = conn.execute(text(
+                        "SELECT column_name, data_type FROM information_schema.columns "
+                        "WHERE table_name = :t AND table_schema = :s"
+                    ), {"t": _t_for_lookup, "s": _s_for_lookup})
+                else:
+                    cols_result = conn.execute(text(
+                        "SELECT column_name, data_type FROM information_schema.columns "
+                        "WHERE table_name = :t AND table_schema NOT IN ('pg_catalog', 'information_schema')"
+                    ), {"t": _t_for_lookup})
                 cols = [(row[0], row[1]) for row in cols_result]
 
             numeric_cols = []

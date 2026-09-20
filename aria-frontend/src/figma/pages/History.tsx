@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { Search, Trash2, Bookmark, ChevronDown, Clock } from "lucide-react";
-import { API_BASE } from "../../services/api";
+import { apiFetch } from "../../services/api";
 
 // Standalone Hypothesis/Prescription pages were removed (hypothesis now
 // surfaces as Possible drivers; prescriptions are historical).
@@ -26,6 +26,7 @@ interface HistoryItem {
   type: string;
   title: string;
   date: string;
+  createdAt?: string;
   source: string;
   summary: string;
   has_insights?: boolean;
@@ -44,6 +45,7 @@ export default function History({ historyRefreshKey = 0, onDeleteHistory }: Prop
   const [saved, setSaved] = useState<string[]>([]);
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState("");
   // Inline detail stays on this page (pages are isolated — no navigation).
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [details, setDetails] = useState<Record<string, any>>({});
@@ -58,12 +60,10 @@ export default function History({ historyRefreshKey = 0, onDeleteHistory }: Prop
     if (details[id]) return;
     setDetailLoading(id);
     try {
-      const res = await fetch(`${API_BASE}/history/${id}`, {
-        credentials: "include",
-      });
-      if (res.status === 401) { try { window.dispatchEvent(new Event("aria:unauthorized")); } catch { /* ignore */ } return; }
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && data?.record) {
+      // Single client: apiFetch handles API_BASE + credentials:include +
+      // X-Request-ID + 401 (handleUnauthorized). Throws on 401/error.
+      const data = await apiFetch(`/history/${id}`);
+      if (data?.record) {
         setDetails((d) => ({ ...d, [id]: data.record }));
       }
     } catch (err) {
@@ -79,26 +79,33 @@ export default function History({ historyRefreshKey = 0, onDeleteHistory }: Prop
 
   const fetchHistory = async () => {
     setLoading(true);
+    setLoadError("");
     try {
-      const res = await fetch(`${API_BASE}/history?limit=100`, {
-        credentials: "include",
-      });
-      if (res.status === 401) { try { window.dispatchEvent(new Event("aria:unauthorized")); } catch { /* ignore */ } return; }
-      if (res.ok) {
-        const data = await res.json().catch(() => ({}));
-        const mapped = (data.items || data.history || []).map((h: any) => ({
-          id: String(h.id),
-          type: h.source_type || "Analytics",
-          title: h.goal || "Untitled analysis",
-          date: h.created_at ? new Date(h.created_at).toLocaleDateString() : "Unknown",
-          source: h.db_name || "Unknown",
-          summary: h.sql_used ? `Query executed (${h.row_count || 0} rows)` : "Analysis completed",
-          has_insights: h.has_insights,
-        }));
-        setItems(mapped);
+      const data = await apiFetch(`/history?limit=100`);
+      // Shared normalizer (sessions|items|history|data): valid payloads in
+      // any of these shapes render; anything else is an error, not empty.
+      const rawList = data?.sessions ?? data?.items ?? data?.history ?? data?.data ?? data;
+      const list = Array.isArray(rawList) ? rawList : [];
+      if (!Array.isArray(rawList)) {
+        setLoadError("History came back in an unexpected shape — retry to reload.");
+        setItems([]);
+        return;
       }
-    } catch (err) {
+      const mapped = list.map((h: any) => ({
+        id: String(h.id),
+        type: h.source_type || "Analytics",
+        title: h.goal || "Untitled analysis",
+        date: h.created_at ? new Date(h.created_at).toLocaleDateString() : "Unknown",
+        createdAt: h.created_at || "",
+        source: h.db_name || "Unknown",
+        summary: h.sql_used ? `Query executed (${h.row_count || 0} rows)` : "Analysis completed",
+        has_insights: h.has_insights,
+      }));
+      setItems(mapped);
+    } catch (err: any) {
       console.error("Failed to fetch history:", err);
+      setLoadError(err?.message || "History couldn't be loaded. Check your connection and retry.");
+      setItems([]);
     } finally {
       setLoading(false);
     }
@@ -113,19 +120,17 @@ export default function History({ historyRefreshKey = 0, onDeleteHistory }: Prop
   });
 
   const sorted = [...filtered].sort((a, b) => {
-    const aNum = parseInt(a.id, 10) || 0;
-    const bNum = parseInt(b.id, 10) || 0;
-    if (sort === "newest") return bNum - aNum;
-    if (sort === "oldest") return aNum - bNum;
+    // created_at desc (id tiebreak): non-numeric IDs sort stably.
+    const aT = Date.parse((a as any).createdAt || "") || 0;
+    const bT = Date.parse((b as any).createdAt || "") || 0;
+    if (sort === "newest") return bT - aT || String(b.id).localeCompare(String(a.id));
+    if (sort === "oldest") return aT - bT || String(a.id).localeCompare(String(b.id));
     return a.type.localeCompare(b.type);
   });
 
   const handleDelete = async (id: string) => {
     try {
-      await fetch(`${API_BASE}/history/${id}`, {
-        method: "DELETE",
-        credentials: "include",
-      });
+      await apiFetch(`/history/${id}`, { method: "DELETE" });
     } catch (err) {
       console.error("Delete failed:", err);
     }
@@ -263,6 +268,12 @@ export default function History({ historyRefreshKey = 0, onDeleteHistory }: Prop
               </div>
             );
           })}
+        </div>
+      ) : loadError ? (
+        <div className="flex flex-col items-center justify-center py-24 text-center">
+          <p className="text-sm font-medium text-foreground">History needs a reload</p>
+          <p className="text-sm text-muted-foreground mt-1">{loadError}</p>
+          <button onClick={() => { setLoadError(""); fetchHistory(); }} className="mt-4 text-xs text-primary hover:underline">Retry</button>
         </div>
       ) : (
         <div className="flex flex-col items-center justify-center py-24 text-center">

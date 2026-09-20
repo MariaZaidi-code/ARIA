@@ -37,6 +37,7 @@ except ImportError:
     _se_relationships = None
 
 from core.config import SCHEMA_DIR
+from core.data_intelligence import is_id_like_name as _is_id_like_name
 from .connection import _qname
 
 logger = logging.getLogger("aria.schema_agent")
@@ -272,7 +273,7 @@ def _pk_candidate_rank(column_name, data_type):
     """
     name = str(column_name or "").lower()
     dtype = str(data_type or "").lower()
-    if name == "id" or name.endswith("_id"):
+    if _is_id_like_name(column_name):
         return 0
     if any(tok in dtype for tok in ("int", "serial", "bigint", "smallint")):
         return 1
@@ -419,7 +420,7 @@ def infer_primary_keys_from_data(conn, tables, schema, db_type, existing_pks, ma
         if existing_pks.get(table_name):
             continue
         id_like = [c["column"] for c in columns
-                   if str(c["column"]).lower().endswith("_id") or str(c["column"]).lower() == "id"]
+                   if _is_id_like_name(str(c["column"]))]
         id_like = [c for c in id_like
                    if (table_name, c) not in exclude_columns
                    # A column whose name matches ANOTHER table (order_id -> orders)

@@ -446,6 +446,42 @@ export default function App() {
         return;
       }
       if (data.ok) {
+        if ((data as any)?.accepted) {
+          /* Large file: backend processes in background. Poll progress
+             (30s cap per round, up to ~20 min) until ready or error. */
+          setConnectionStatus("schema-loading");
+          const deadline = Date.now() + 20 * 60 * 1000;
+          let done = false;
+          while (Date.now() < deadline && !done) {
+            await new Promise((r) => setTimeout(r, 3000));
+            try {
+              const prog: any = await apiFetch("/upload/progress");
+              if (prog?.error) {
+                setConnectionStatus("error");
+                setConnectionError(String(prog.error).slice(0, 200));
+                return;
+              }
+              if (prog?.done && prog?.result) {
+                const res: any = prog.result;
+                await handleSchemaFetch();
+                setConnectionStatus("connected");
+                setDbName(res?.table || res?.file || file.name.replace(/\.[^.]+$/, ""));
+                setSelectedSourceType(res?.source_type || "semi-structured");
+                return;
+              }
+              if (prog?.done) {
+                await handleSchemaFetch();
+                setConnectionStatus("connected");
+                return;
+              }
+            } catch {
+              /* transient poll failure — keep waiting */
+            }
+          }
+          setConnectionStatus("error");
+          setConnectionError("Processing is taking longer than expected — check Data for progress.");
+          return;
+        }
         // After successful file connect, fetch schema and mark connected
         setConnectionStatus("schema-loading");
         await handleSchemaFetch();
@@ -595,6 +631,8 @@ export default function App() {
                   loading={loading}
                   onNavigate={(p) => setPage(p as Page)}
                   onAskCopilot={goCopilot}
+                  connectionStatus={connectionStatus}
+                  dbName={dbName}
                 />
               );
             case "insights":

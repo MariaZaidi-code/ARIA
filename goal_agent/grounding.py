@@ -118,7 +118,21 @@ class GroundingMixin:
     # ---- _get_relevant_tables (_get_relevant_tables) ----
 
     def _get_relevant_tables(self, user_goal, max_tables=3):
-        goal_tokens = self._normalize_tokens(user_goal)
+        # Current question only: history table words must not outrank the
+        # current subject. Elliptical follow-ups ("and which category sells
+        # most?") additionally union history tokens so the prior context
+        # still scopes the tables.
+        try:
+            _cur = self._current_question_text(user_goal)
+        except Exception:
+            _cur = str(user_goal or "")
+        goal_tokens = self._normalize_tokens(_cur)
+        try:
+            _hist = self._history_text(user_goal)
+            if _hist.strip() and self._is_elliptical_followup_text(_cur):
+                goal_tokens = goal_tokens | self._normalize_tokens(_hist)
+        except Exception:
+            pass
         if not goal_tokens:
             goal_tokens = {"data", "summary", "report"}
 
@@ -387,11 +401,17 @@ class GroundingMixin:
             )
             if not child_of_subject:
                 continue
-            name_parts = set(self._normalize_tokens(t))
-            named_in_goal = any(
-                any(tok == part or (tok.endswith("s") and tok[:-1] == part)
-                    for part in name_parts)
-                for tok in goal_tokens
+            # The child must be named as a WHOLE table ("orders" names
+            # `orders`, not `order_details` via a shared "order" prefix).
+            name_parts = [p for p in str(t).lower().split("_") if p]
+            if not name_parts:
+                continue
+            def _tok_matches(tok, part):
+                return (tok == part or (tok.endswith("s") and tok[:-1] == part)
+                        or (part.endswith("s") and part[:-1] == tok))
+            named_in_goal = all(
+                any(_tok_matches(tok, part) for tok in goal_tokens)
+                for part in name_parts
             )
             if named_in_goal:
                 return t
@@ -531,6 +551,282 @@ class GroundingMixin:
         # Intersect with what the goal actually contains so we never invent words.
         return breakdown & tokens
 
+    # ---- generic helpers for unseen-schema grounding (no DB names) ----
+
+    _REVENUE_WORD_RE = r"\b(revenue|revenues|sales|turnover|income|gmv)\b"
+    _AOV_RE = r"\baov\b|average\s+order\s+value|average\s+revenue|average\s+sales"
+    _TREND_RE = (r"\btrend\b|\bover time\b|\bmonthly\b|\bdaily\b|\bweekly\b"
+                 r"|\byearly\b|\bhistory\b|\bhistorical\b|\bchanged?\b"
+                 r"|\bgrowth\b|\btime series\b"
+                 r"|\bdecline[sd]?\b|\bdeclining\b|\bdecrease[sd]?\b"
+                 r"|\bdecreasing\b|\bdrops?\b|\bdropped\b|\bdropping\b"
+                 r"|\bfalls?\b|\bfell\b|\bfalling\b")
+    # Name signals for preferred breakdowns (generic business concepts only).
+    _GEO_CAT_TOKENS = frozenset({
+        "region", "territory", "area", "zone", "district", "country",
+        "city", "state", "province", "location", "category", "department",
+        "division", "segment", "group", "class", "type", "brand",
+        "channel", "market",
+    })
+    _PERSON_NAME_TOKENS = frozenset({
+        "first", "last", "middle", "full", "person", "contact",
+        "customer", "client", "buyer", "employee", "staff", "member",
+    })
+    # Column-name tokens that must never answer a revenue-like question.
+    _REVENUE_EXCLUDED_TOKENS = frozenset({"cost", "fuel", "expense", "tax"})
+
+    def _is_revenue_like_goal(self, goal_l, ir=None):
+        try:
+            if re.search(self._REVENUE_WORD_RE, str(goal_l or "")):
+                return True
+        except Exception:
+            pass
+        try:
+            for m in (ir or {}).get("metrics", []) or []:
+                if str(m.get("concept") or "").lower() in (
+                        "revenue kpi", "sales kpi"):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _is_aov_goal(self, goal):
+        try:
+            return bool(re.search(self._AOV_RE, str(goal or "").lower()))
+        except Exception:
+            return False
+
+    def _is_trend_goal(self, goal_l, ir=None):
+        try:
+            if re.search(self._TREND_RE, str(goal_l or "")):
+                return True
+        except Exception:
+            pass
+        try:
+            if (ir or {}).get("intent") == "trend":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _safe_measure_candidates(self, measures):
+        """Subset of `measures` passing the shared safe-numeric gate."""
+        out = []
+        for m in measures or []:
+            try:
+                if self._is_safe_numeric_measure(m.get("table"), m.get("column")):
+                    out.append(m)
+            except Exception:
+                continue
+        return out
+
+    def _measure_name_tier(self, col_name, monetary_bias):
+        """0 = money total, 1 = money line, 2 = neutral, 3 = quantity-like,
+        10 = excluded for revenue-like (cost/fuel/id/count). Token-based so
+        unit_price/fuel_price variants classify correctly."""
+        low = str(col_name or "").lower()
+        toks = set(re.split(r"[^a-z0-9]+", low)) | {low}
+        parts = set(low.split("_")) | toks
+        if monetary_bias and (parts & self._REVENUE_EXCLUDED_TOKENS):
+            return 10
+        if monetary_bias and ("id" in parts or parts & {"count", "cnt"}):
+            return 10
+        if not monetary_bias:
+            return 2
+        if parts & self._MONETARY_TOTAL_COLS or low in self._MONETARY_TOTAL_COLS:
+            return 0
+        if parts & self._MONETARY_LINE_COLS or low in self._MONETARY_LINE_COLS:
+            return 1
+        if parts & self._QUANTITY_COL_TOKENS:
+            return 3
+        return 2
+
+    def _extract_value_candidates(self, goal):
+        """Quoted phrases + Capitalized tokens that name no column.
+
+        Generic: quoted/capitalized tokens matching a table/column name (or a
+        protected/analytical/metric word) are NOT values; everything else is a
+        candidate cell value to probe for in the data."""
+        cands = []
+        try:
+            raw = str(goal or "")
+            for m in re.finditer(r"'([^']{2,})'|\"([^\"]{2,})|`([^`]{2,})`", raw):
+                v = next((g for g in m.groups() if g), None)
+                if v and v.strip():
+                    cands.append(v.strip())
+            for m in re.finditer(r"\b[A-Z][a-zA-Z0-9_\-]{2,}\b", raw):
+                cands.append(m.group(0).strip())
+            # De-dupe preserving order, drop junk.
+            seen, out = set(), []
+            schema_vocab = set()
+            try:
+                schema_vocab = {t.lower() for t in (self._schema_word_tokens or set())}
+            except Exception:
+                schema_vocab = set()
+            stop = (set(self._ANALYTICAL_GOAL_WORDS) | set(self._METRIC_CONCEPT_WORDS)
+                    | set(self._PROTECTED_GOAL_WORDS) | set(self._COUNT_OBJECT_TOKENS))
+            for c in cands:
+                low = c.lower()
+                if low in seen or len(c.strip()) < 3:
+                    continue
+                if low in schema_vocab or low.rstrip("s") in schema_vocab:
+                    continue
+                if low in stop:
+                    continue
+                if re.fullmatch(r"\d+(\.\d+)?", low):
+                    continue
+                seen.add(low)
+                out.append(c.strip())
+            # Lowercase value words ("revenue for electronics"): goal tokens
+            # naming no table/column/metric/analytical concept are cell-value
+            # candidates too (bounded, generic — never invents values).
+            try:
+                _goal_toks = re.findall(r"[a-z][a-z0-9_\-]{2,}", str(goal or "").lower())
+                for _tok in _goal_toks:
+                    if len(out) >= 3 or _tok in seen:
+                        break
+                    if len(_tok) < 3 or _tok in stop or _tok in schema_vocab:
+                        continue
+                    if _tok.rstrip("s") in schema_vocab or (_tok + "s") in schema_vocab:
+                        continue
+                    if re.fullmatch(r"\d+(\.\d+)?", _tok):
+                        continue
+                    seen.add(_tok)
+                    out.append(_tok)
+            except Exception:
+                pass
+            return out[:3]
+        except Exception:
+            return []
+
+    def _candidate_text_columns(self, tables, limit=3):
+        """Up to `limit` text columns to probe for a cell value.
+
+        Category/geo-like names first (generic signals only), then the rest;
+        deterministic (alphabetical) and never ID/PK/FK columns."""
+        try:
+            scored = []
+            for t in tables or []:
+                info = self.tables.get(t, {}) or {}
+                pk = set(info.get("primary_key", []) or [])
+                fk_cols = {fk.get("column") for fk in info.get("foreign_keys", []) or []}
+                for col in info.get("columns", {}) or {}:
+                    low = str(col).lower()
+                    if col in pk or col in fk_cols or low == "id" or low.endswith("_id"):
+                        continue
+                    try:
+                        if self._classify_column(t, col) != "text":
+                            continue
+                    except Exception:
+                        continue
+                    toks = set(re.split(r"[^a-z0-9]+", low))
+                    pref = 0 if (toks & self._GEO_CAT_TOKENS) else 1
+                    scored.append((pref, t, col))
+            scored.sort(key=lambda x: (x[0], x[1], x[2]))
+            return [(t, c) for _, t, c in scored[:max(1, int(limit))]]
+        except Exception:
+            return []
+
+    def _probe_value_filters(self, goal, tables):
+        """Sample DISTINCT values (bounded: LIMIT 50 per column, max 3
+        columns) to find which column holds a quoted/Capitalized token.
+
+        Returns IR filter dicts with equality predicates. Never raises;
+        returns [] when the engine is unavailable or nothing matches."""
+        found = []
+        try:
+            cands = self._extract_value_candidates(goal)
+            if not cands:
+                return []
+            cols = self._candidate_text_columns(tables, limit=3)
+            if not cols:
+                return []
+            from sqlalchemy import text as _text
+            try:
+                quote = (lambda n: self._quote(n, getattr(self, "dialect", "postgresql")))
+            except Exception:
+                quote = lambda n: f'"{n}"'  # noqa: E731
+            for cand in cands:
+                if len(found) >= 2:
+                    break
+                for (t, c) in cols:
+                    try:
+                        sql = (f"SELECT DISTINCT {quote(c)} FROM {quote(t)} "
+                               f"LIMIT 50")
+                        with self.engine.connect() as conn:
+                            rows = conn.execute(_text(sql)).fetchall()
+                    except Exception:
+                        continue
+                    hit = False
+                    hit_val = None
+                    try:
+                        for r in rows or []:
+                            if str(r[0]).strip().lower() == str(cand).strip().lower():
+                                hit = True
+                                try:
+                                    hit_val = str(r[0]).strip()
+                                except Exception:
+                                    hit_val = str(cand).strip()
+                                break
+                    except Exception:
+                        continue
+                    if hit:
+                        # Preserve the database's own casing ('Electronics',
+                        # not the goal's 'electronics'): equality is
+                        # case-sensitive on SQLite/Postgres, so storing the
+                        # goal casing would filter to zero rows.
+                        _val = hit_val if hit_val else str(cand).strip()
+                        found.append({
+                            "column": f"{t}.{c}",
+                            "operator": "=",
+                            "value": _val,
+                            "confidence": 0.85,
+                            "reason": (f"value '{_val}' found in {t}.{c} "
+                                       "(sampled distinct values)"),
+                        })
+                        break
+        except Exception:
+            return found
+        return found
+
+    def _estimate_column_cardinality(self, table, col, cap=101):
+        """Bounded distinct-value estimate (DISTINCT LIMIT `cap`)."""
+        try:
+            from sqlalchemy import text as _text
+            try:
+                quote = (lambda n: self._quote(n, getattr(self, "dialect", "postgresql")))
+            except Exception:
+                quote = lambda n: f'"{n}"'  # noqa: E731
+            sql = (f"SELECT DISTINCT {quote(col)} FROM {quote(table)} "
+                   f"LIMIT {int(cap)}")
+            with self.engine.connect() as conn:
+                rows = conn.execute(_text(sql)).fetchall()
+            return len(rows or [])
+        except Exception:
+            return None
+
+    def _is_geo_cat_like(self, col):
+        try:
+            return bool(set(re.split(r"[^a-z0-9]+", str(col or "").lower()))
+                        & self._GEO_CAT_TOKENS)
+        except Exception:
+            return False
+
+    def _is_person_name_like(self, table, col):
+        try:
+            toks = set(re.split(r"[^a-z0-9]+", str(col or "").lower()))
+            if not (toks & self._PERSON_NAME_TOKENS) and "name" not in toks:
+                return False
+            # A bare *product/region/category* name is a legit breakdown;
+            # person names live on people tables or carry first/last tokens.
+            if toks & {"product", "region", "territory", "category", "brand"}:
+                return False
+            if toks & {"first", "last", "middle", "full", "person", "contact"}:
+                return True
+            return True
+        except Exception:
+            return False
+
 # ---- _resolve_semantics (_resolve_semantics) ----
 
     def _resolve_semantics(self, goal, ir, join_path):
@@ -547,7 +843,21 @@ class GroundingMixin:
         relevant = [t for t in join_path if t in self.tables]
         if not relevant:
             relevant = [list(self.tables.keys())[0]] if self.tables else []
+        # Current question only: a previous turn's measure words (e.g.
+        # 'average') must not bias monetary/AOV/trend/value grounding. The
+        # inherited IR metrics (elliptical follow-ups) already carry history
+        # measures via their concepts, independent of this text.
+        try:
+            goal = self._current_question_text(goal)
+        except Exception:
+            goal = str(goal or "")
         goal_l = str(goal).lower()
+        # Fresh per-question probe budget for text-numeric coercion (max 3
+        # probed candidate columns; cache hits are free).
+        try:
+            self._coercion_budget = 3
+        except Exception:
+            pass
 
         measures = []
         for table in relevant:
@@ -597,6 +907,13 @@ class GroundingMixin:
         # customer" from dragging orders.ship_name / order_date into GROUP BY.
         for _score, table in subject_tables:
             label_col = self._pick_label_column(table)
+            if not label_col:
+                # No human-readable label on this table (e.g. a pure link
+                # table with only keys/dates): a dimension with a NULL
+                # column would force its table into required_tables and
+                # fail semantic validation even though the SQL can never
+                # emit it. Skip it here.
+                continue
             dims.append({
                 "concept": table,
                 "resolved_table": table,
@@ -610,10 +927,18 @@ class GroundingMixin:
         # "by order status" -> transactions.status). Only from columns that are
         # legitimate dimensions (excludes PK/FK/*_id and pure measures).
         breakdown_tokens = self._explicit_breakdown_tokens(goal_l)
+        _explicit_matched = set()
         if breakdown_tokens:
             breakdown_str = " ".join(sorted(breakdown_tokens))
-            for table in relevant:
-                cols = self._match_dimension_columns(breakdown_str, table)
+            # Search every table (not just the join path) so "by region"
+            # finds a territories/dim table the keyword scorer missed.
+            _search_tables = list(dict.fromkeys(
+                list(relevant) + [t for t in self.tables if t not in relevant]))
+            for table in _search_tables:
+                try:
+                    cols = self._match_dimension_columns(breakdown_str, table)
+                except Exception:
+                    cols = []
                 if cols:
                     label_col = self._pick_label_column(table)
                     for _score, col in cols:
@@ -622,9 +947,37 @@ class GroundingMixin:
                                 "concept": col,
                                 "resolved_table": table,
                                 "resolved_column": col,
-                                "confidence": 0.85,
-                                "reason": "dimension/breakdown column meant in the question",
+                                "confidence": 0.95,
+                                "reason": "explicit breakdown column named in the question",
                             })
+                            _explicit_matched.add((table, col))
+        # Explicit 'by X' outranks in SQL ranking via higher confidence
+        # (0.95) + name-score preference there; subject-label dims are kept
+        # so "by category and model year" still grounds the category table
+        # whose breakdown IS its label column.
+        # Generic segment/breakdown/comparison intent with no specific column
+        # matched: auto-detect all categorical columns as dimensions so queries
+        # like "Compare segments breakdown" produce a real GROUP BY instead of
+        # a single aggregate value.
+        _GENERIC_SEGMENT_WORDS = {
+            "segment", "segments", "breakdown", "category", "categories",
+            "group", "groups", "split", "compare", "comparison",
+        }
+        if not dims and breakdown_tokens & _GENERIC_SEGMENT_WORDS:
+            for table in relevant:
+                for col_name in self.tables.get(table, {}).get("columns", {}):
+                    try:
+                        role = self._classify_column(table, col_name)
+                    except Exception:
+                        continue
+                    if role == "text":
+                        dims.append({
+                            "concept": col_name,
+                            "resolved_table": table,
+                            "resolved_column": col_name,
+                            "confidence": 0.7,
+                            "reason": "generic segment/breakdown intent — auto-detected categorical column",
+                        })
         if not dims and len(relevant) == 1:
             # Single-table fallback (Walmart 'holiday vs non-holiday', bare
             # 'monthly trend' with no by/per): the breakdown may live in the
@@ -643,6 +996,132 @@ class GroundingMixin:
                         "confidence": 0.7,
                         "reason": "single-table dimension named in the question",
                     })
+        # Trend/time intent REQUIRES a datetime GROUP BY: scalar aggregates
+        # are invalid for trends. Detect robustly (regex, not token split,
+        # so "changed over time?" and "history" match) and always ensure a
+        # date dimension exists — even when subject dims already grounded.
+        if self._is_trend_goal(goal_l, ir):
+            _has_date_dim = False
+            try:
+                for d in dims:
+                    if self._classify_column(
+                            d.get("resolved_table"), d.get("resolved_column")) == "date":
+                        _has_date_dim = True
+                        break
+            except Exception:
+                pass
+            if not _has_date_dim:
+                _date_found = None
+                for table in list(relevant) + [t for t in self.tables if t not in relevant]:
+                    for col_name in self.tables.get(table, {}).get("columns", {}):
+                        try:
+                            role = self._classify_column(table, col_name)
+                        except Exception:
+                            continue
+                        if role == "date":
+                            _date_found = (table, col_name)
+                            break
+                    if _date_found:
+                        break
+                if _date_found:
+                    dims.append({
+                        "concept": _date_found[1],
+                        "resolved_table": _date_found[0],
+                        "resolved_column": _date_found[1],
+                        "confidence": 0.85,
+                        "reason": "trend/time intent — datetime grouping is required",
+                    })
+        # --- deterministic dimension pruning (schema-agnostic) ---------
+        # 1) Drop NULL/unknown columns (can never be emitted in SQL).
+        # 2) Scalar summaries (overall aggregate, no ranking/comparison/
+        #    trend/breakdown) carry no GROUP BY: subject-label dims would
+        #    force spurious tables into required_tables and fail semantic
+        #    validation after the SQL correctly narrows to the measure
+        #    home. Clear them.
+        # 3) A single breakdown token matching dozens of columns across
+        #    tables ("region" -> city/country/ship_region/... on every
+        #    table) is capped to ONE best dimension: lowest-cardinality
+        #    geo/category text column on a connected (non-isolated)
+        #    table. Multi-token breakdowns ("by category and model
+        #    year") keep up to one dim per token so genuine multi-dim
+        #    goals still ground.
+        try:
+            dims = [d for d in dims
+                    if d.get("resolved_table") in self.tables
+                    and d.get("resolved_column")]
+        except Exception:
+            pass
+        try:
+            _is_trend_here = bool(self._is_trend_goal(goal_l, ir))
+        except Exception:
+            _is_trend_here = False
+        try:
+            _has_signal = bool(
+                (ir or {}).get("ranking") is not None
+                or (ir or {}).get("comparison") is not None
+                or _explicit_matched
+                or (breakdown_tokens & _GENERIC_SEGMENT_WORDS)
+                or _is_trend_here
+            )
+        except Exception:
+            _has_signal = True
+        if not _has_signal and (ir or {}).get("intent") == "summary":
+            dims = [d for d in dims
+                    if d.get("reason") == "trend/time intent — datetime grouping is required"]
+        elif breakdown_tokens and len(dims) > max(1, len(breakdown_tokens)):
+            # Rank all candidate dims; keep the best N where N = number
+            # of distinct breakdown tokens (single-token "by region" ->
+            # exactly 1; multi-token keeps one per concept).
+            try:
+                _cap_n = max(1, len(set(breakdown_tokens)))
+            except Exception:
+                _cap_n = 1
+            try:
+                _graph = getattr(self, "relationship_graph", {}) or {}
+            except Exception:
+                _graph = {}
+            def _rank_key(d):
+                _t = d.get("resolved_table")
+                _c = d.get("resolved_column") or ""
+                try:
+                    _geo = bool(self._is_geo_cat_like(_c))
+                except Exception:
+                    _geo = False
+                try:
+                    _deg = len(_graph.get(_t, []) or [])
+                except Exception:
+                    _deg = 0
+                _isolated = 1 if _deg == 0 else 0
+                try:
+                    _card = self._estimate_column_cardinality(_t, _c)
+                except Exception:
+                    _card = None
+                _card_v = _card if isinstance(_card, int) else 10 ** 9
+                try:
+                    _conf = float(d.get("confidence") or 0)
+                except Exception:
+                    _conf = 0
+                return (_isolated, 0 if _geo else 1, _card_v,
+                        -_conf, str(_t or ""), str(_c or ""))
+            try:
+                # Keep date dims required by trends outside the cap;
+                # cap only the categorical breakdown candidates.
+                _date_ds = []
+                _cat_ds = []
+                for _d in dims:
+                    try:
+                        _role = self._classify_column(
+                            _d.get("resolved_table"), _d.get("resolved_column"))
+                    except Exception:
+                        _role = None
+                    if _role == "date":
+                        _date_ds.append(_d)
+                    else:
+                        _cat_ds.append(_d)
+                _cat_ds = sorted(_cat_ds, key=_rank_key)[:_cap_n]
+                dims = _date_ds + _cat_ds
+            except Exception:
+                pass
         seen_dims = set()
         for d in dims:
             key = (d["resolved_table"], d["resolved_column"])
@@ -655,6 +1134,33 @@ class GroundingMixin:
         for metric in ir["metrics"]:
             concept = metric["concept"].lower()
             if metric.get("aggregation") == "COUNT" or concept == "row count":
+                # A vague trend goal ("analyze trend over time") names no
+                # measure: tracking the table's real measure over time is the
+                # useful default, not a row count. Only inferred (guessed)
+                # counts are upgraded — an explicit "how many"/"count" stays
+                # COUNT(*). Fully schema-driven, no column names assumed.
+                if metric.get("inferred") and ir.get("intent") == "trend":
+                    upgraded = None
+                    for table in relevant:
+                        try:
+                            col = self._pick_measure_column(table)
+                        except Exception:
+                            col = None
+                        if col:
+                            upgraded = (table, col)
+                            break
+                    if upgraded:
+                        table, col = upgraded
+                        metric["resolved_table"] = table
+                        metric["resolved_column"] = col
+                        metric["resolved_expression"] = f"{table}.{col}"
+                        metric["aggregation"] = "SUM"
+                        metric["confidence"] = 0.7
+                        metric["reason"] = (
+                            "no explicit measure for a trend goal; tracking "
+                            f"the {table}.{col} measure over time"
+                        )
+                        continue
                 fact = self._pick_fact_table(goal_l, relevant, subject)
                 metric["resolved_table"] = fact
                 metric["resolved_column"] = None
@@ -678,8 +1184,38 @@ class GroundingMixin:
             monetary_concepts = {
                 "sales kpi", "revenue kpi", "profit kpi",
             }
-            monetary_bias = concept in monetary_concepts
-            for m in measures:
+            monetary_bias = concept in monetary_concepts or bool(
+                self._is_revenue_like_goal(goal_l, {"metrics": [metric]}))
+            try:
+                if not monetary_bias and self._is_aov_goal(goal):
+                    monetary_bias = True
+            except Exception:
+                pass
+            # "amount/total/value" questions prefer money totals; an explicit
+            # quantity question ("overall quantity") keeps quantity unbiased.
+            # Generic: driven only by the goal wording, never by DB names.
+            try:
+                _qty_explicit = bool(re.search(
+                    r"\bquantity\b|\bqty\b|\bunits?\b|\bvolume\b", goal_l))
+                if concept == "aggregate total" and not _qty_explicit:
+                    monetary_bias = True
+            except Exception:
+                pass
+            # AOV intent = AVG of the money measure (never AVG(cost)).
+            try:
+                if self._is_aov_goal(goal) and not metric.get("inferred"):
+                    metric["aggregation"] = "AVG"
+            except Exception:
+                pass
+            # Candidate pool: verified safe-numeric measures first (shared
+            # gate in goal_agent/sql.py); fall back to all measures only
+            # when nothing safe exists.
+            try:
+                _safe_pool = self._safe_measure_candidates(measures)
+            except Exception:
+                _safe_pool = []
+            _pool = _safe_pool or measures
+            for m in _pool:
                 s = 0
                 col_tokens = self._normalize_tokens(m["column"])
                 col_name = m["column"].lower()
@@ -693,23 +1229,20 @@ class GroundingMixin:
                 # computed-measure path (quantity * unit_price) runs below.
                 if s == 0:
                     continue
-                tier = 2
-                if monetary_bias and col_name in self._MONETARY_TOTAL_COLS:
-                    tier = 0
-                elif monetary_bias and col_name in self._MONETARY_LINE_COLS:
-                    tier = 1
-                elif monetary_bias and col_name in self._QUANTITY_COL_TOKENS:
-                    tier = 3
+                tier = self._measure_name_tier(m["column"], monetary_bias)
+                if tier >= 10:
+                    continue
                 key = (s, -tier, col_name)
                 if key > best_key:
                     best_key = key
                     best = m
             # Goal-name override: if the user explicitly names a column
             # (e.g. "average rating" -> "rating"), prefer it over the
-            # concept-token match which may pick the wrong column.
+            # concept-token match which may pick the wrong column. Never
+            # overrides a revenue-like goal with a cost/fuel/id/count column.
             if not monetary_bias:
                 goal_words = {w for w in goal_l.split() if len(w) >= 3}
-                for m in measures:
+                for m in _pool:
                     col_lower = m["column"].lower()
                     col_base = col_lower.split("_")[0]
                     if col_lower in goal_words or col_base in goal_words:
@@ -720,13 +1253,12 @@ class GroundingMixin:
             # Also prefer the computed expression when monetary_bias is on
             # and the best match is only a per-line price column (tier 1),
             # because revenue/sales should be qty * price * (1-discount).
-            computed = self._find_price_quantity_expression(relevant, tokens)
+            try:
+                computed = self._find_price_quantity_expression(relevant, tokens)
+            except Exception:
+                computed = None
             if best:
-                best_tier = 2
-                if monetary_bias and best["column"].lower() in self._MONETARY_TOTAL_COLS:
-                    best_tier = 0
-                elif monetary_bias and best["column"].lower() in self._MONETARY_LINE_COLS:
-                    best_tier = 1
+                best_tier = self._measure_name_tier(best["column"], monetary_bias)
                 # For monetary concepts, prefer computed expression over a bare
                 # price/line column (tier 1), since revenue = qty * price * (1-disc).
                 if computed and best_tier >= 1 and monetary_bias:
@@ -748,7 +1280,41 @@ class GroundingMixin:
             else:
                 # Spec §3: sales-like concept with no single column -> try a
                 # computed quantity * unit_price expression from the schema.
-                computed = self._find_price_quantity_expression(relevant, tokens)
+                # Search the whole schema (not just the join path) so a
+                # mis-scoped `relevant` set never forces AVG(cost).
+                try:
+                    computed = self._find_price_quantity_expression(relevant, tokens)
+                except Exception:
+                    computed = None
+                if not computed:
+                    try:
+                        _all_tables = [t for t in self.tables if t not in relevant]
+                        computed = self._find_price_quantity_expression(
+                            list(relevant) + _all_tables, tokens)
+                    except Exception:
+                        computed = None
+                if not computed and monetary_bias:
+                    # Money-preferred fallback across the whole schema:
+                    # first safe total/amount/sales-like column, never
+                    # cost/fuel/id/counts. Generic, no DB names.
+                    try:
+                        for t in list(relevant) + [x for x in self.tables if x not in relevant]:
+                            for col in self.tables.get(t, {}).get("columns", {}) or {}:
+                                try:
+                                    if not self._is_safe_numeric_measure(t, col):
+                                        continue
+                                except Exception:
+                                    continue
+                                if self._measure_name_tier(col, True) >= 10:
+                                    continue
+                                toks = self._normalize_tokens(col)
+                                if toks & {"total", "amount", "sales", "revenue", "price", "value"}:
+                                    best = {"table": t, "column": col}
+                                    break
+                            if best:
+                                break
+                    except Exception:
+                        pass
                 if computed:
                     metric["resolved_table"] = computed["table"]
                     metric["resolved_column"] = None
@@ -759,9 +1325,108 @@ class GroundingMixin:
                         f"no single measure column; computed "
                         f"{computed['expression']} from the schema"
                     )
+                elif best:
+                    # Money-preferred fallback hit (whole-schema scan).
+                    metric["resolved_table"] = best["table"]
+                    metric["resolved_column"] = best["column"]
+                    metric["resolved_expression"] = f"{best['table']}.{best['column']}"
+                    metric["confidence"] = 0.75
+                    metric["reason"] = ("money-preferred safe measure "
+                                        "for a revenue-like question")
+
+        # Coerced text-numeric fallback (schema-agnostic): any SUM/AVG/MIN/
+        # MAX metric still unresolved here (all-text schemas have no
+        # dtype-numeric measures, so the pools above stay empty) is bound to
+        # a measure-like TEXT column whose bounded DISTINCT probe shows
+        # >=80% coercible values. Carries its coercion expression; GROUP
+        # BY/WHERE on the column stay raw.
+        try:
+            _unresolved = [
+                m for m in ir.get("metrics", []) or []
+                if not m.get("resolved_table")
+                and str(m.get("aggregation") or "").upper() in (
+                    "SUM", "AVG", "MIN", "MAX")
+                and str(m.get("concept") or "").lower() != "row count"
+            ]
+        except Exception:
+            _unresolved = []
+        if _unresolved:
+            try:
+                _scan_tables = list(dict.fromkeys(
+                    list(relevant) + [t for t in self.tables
+                                      if t not in relevant]))
+            except Exception:
+                _scan_tables = list(relevant)
+            for _metric in _unresolved:
+                try:
+                    _concept = str(_metric.get("concept") or "").lower()
+                    _tokens = concept_tokens.get(_concept, {_concept})
+                    self._resolve_coerced_measure(
+                        _metric, _scan_tables, goal_l, _tokens)
+                except Exception:
+                    continue
+
+        # AOV with no explicit AVG metric (e.g. bare "AOV"): upgrade the
+        # inferred COUNT to AVG over the money measure. Generic, no names.
+        try:
+            if self._is_aov_goal(goal):
+                for metric in ir["metrics"]:
+                    if metric.get("resolved_expression") == "COUNT(*)" and metric.get("inferred"):
+                        _money = None
+                        for t in list(relevant) + [x for x in self.tables if x not in relevant]:
+                            for col in self.tables.get(t, {}).get("columns", {}) or {}:
+                                try:
+                                    if not self._is_safe_numeric_measure(t, col):
+                                        continue
+                                except Exception:
+                                    continue
+                                if self._measure_name_tier(col, True) >= 10:
+                                    continue
+                                if self._normalize_tokens(col) & {
+                                        "total", "amount", "sales", "revenue", "price", "value"}:
+                                    _money = (t, col)
+                                    break
+                            if _money:
+                                break
+                        if _money:
+                            metric["resolved_table"] = _money[0]
+                            metric["resolved_column"] = _money[1]
+                            metric["resolved_expression"] = f"{_money[0]}.{_money[1]}"
+                            metric["aggregation"] = "AVG"
+                            metric["confidence"] = 0.75
+                            metric["reason"] = ("AOV intent — AVG of the money measure")
+        except Exception:
+            pass
+
+        # Value filters ("revenue for electronics"): quoted/Capitalized
+        # tokens naming no column are probed as cell values (bounded
+        # DISTINCT sampling, max 3 columns). Generic, works on any schema.
+        try:
+            _tables_for_values = list(dict.fromkeys(
+                list(relevant) + [d.get("resolved_table") for d in ir.get("dimensions", []) or []
+                                  if d.get("resolved_table")]
+                + [m.get("resolved_table") for m in ir.get("metrics", []) or []
+                   if m.get("resolved_table")]))
+            _tables_for_values = [t for t in _tables_for_values if t in self.tables]
+            if not _tables_for_values:
+                _tables_for_values = list(relevant)
+            _vf = self._probe_value_filters(goal, _tables_for_values)
+            _have = {(str(f.get("column") or "").lower(), str(f.get("value") or "").lower())
+                     for f in ir.get("filters", []) or []}
+            for _f in _vf or []:
+                if (_f.get("column", "").lower(), _f.get("value", "").lower()) not in _have:
+                    ir.setdefault("filters", []).append(_f)
+        except Exception:
+            pass
 
         if ir.get("time"):
             date_col = self._first_date_column(relevant)
+            if date_col is None:
+                try:
+                    date_col = self._first_date_column(
+                        [t for t in self.tables if t not in relevant])
+                except Exception:
+                    date_col = None
             if date_col:
                 ir["time"]["column"] = f"{date_col[0]}.{date_col[1]}"
                 for f in ir["filters"]:
@@ -782,6 +1447,13 @@ class GroundingMixin:
         for d in ir["dimensions"]:
             if d.get("resolved_table"):
                 required.add(d["resolved_table"])
+        for f in ir.get("filters", []) or []:
+            try:
+                _col = str(f.get("column") or "")
+                if "." in _col and _col.split(".")[0] in self.tables:
+                    required.add(_col.split(".")[0])
+            except Exception:
+                pass
         ir["required_tables"] = (sorted(required) if required else list(join_path))
         return ir
 

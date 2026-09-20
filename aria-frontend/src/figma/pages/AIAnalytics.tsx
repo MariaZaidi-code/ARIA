@@ -1,15 +1,38 @@
-import { useState, useRef, useEffect } from "react";
-import { Search, X, Clock, ChevronDown, ChevronUp, Sparkles, ArrowRight,
-Table2, AlertCircle, Database, HelpCircle, BookOpen, TrendingUp, Lightbulb } from "lucide-react";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, LineChart, Line, PieChart, Pie, Cell, ScatterChart, Scatter } from "recharts";
-import { useTheme } from "../App";
-import { colorForName, CATEGORY_COLORS } from "../lib/charts";
-import { BizTooltip } from "../components/charts";
-import AIProcessingIndicator from "../components/AIProcessingIndicator";
-import { saveAnalysisContext, gotoWithContext } from "../lib/analysisContext";
-import { API_BASE } from "../../services/api";
+/* AI Analytics — Dashboard home + inline analysis results.
+   Search bar and popular actions call /api/ask (Goal Agent) and display
+   chart + insights + table directly on the page. No copilot redirect. */
 
-type AnalysisState = "idle" | "processing" | "done" | "clarification" | "error";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import {
+  BarChart3, LineChart as LineChartIcon, TrendingUp, Search, Send,
+  ChevronRight, Plus, Bookmark, Clock, FlaskConical, SlidersHorizontal,
+  Target, FileText, Sparkles, ArrowUpRight, ArrowDownRight, Database,
+  Copy, MoreHorizontal, Brain, Lightbulb, GitCompareArrows, Zap,
+  Compass, Share2, X, Info,
+} from "lucide-react";
+import {
+  BarChart, Bar, LineChart, Line, AreaChart, Area,
+  PieChart, Pie, Cell, ScatterChart, Scatter, ZAxis,
+  RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend,
+  ResponsiveContainer, ReferenceLine,
+} from "recharts";
+import { colorForName } from "../lib/charts";
+import { fmtPctBiz } from "../lib/format";
+import {
+  asList, strOf, numOf, humanize, titleCase, fmtMetric, getNoSchemaInfo,
+} from "../lib/intelHelpers";
+import {
+  Card, CardHead, NoDatasetPanel, ErrorPanel, LoadingPanel, Field, StatPill,
+  CountUp, Sparkline, selectCls, inputCls, btnPrimary, btnGhost,
+} from "./intelligence/cards";
+import { useExplore, RANGE_OPTIONS, type RangeKey } from "./intelligence/useExplore";
+import { intelligenceApi, analyzeQuestion, normalizeApiError, apiFetch } from "../../services/api";
+import EvidenceDrawer, { type EvidenceContext } from "./intelligence/EvidenceDrawer";
+
+/* ------------------------------------------------------------------ */
+/*  Types                                                              */
+/* ------------------------------------------------------------------ */
 
 interface AIAnalyticsProps {
   initialQuery?: string;
@@ -21,1132 +44,1479 @@ interface AIAnalyticsProps {
   loading?: boolean;
   onNavigate?: (page: string) => void;
   onAskCopilot?: (question: string) => void;
+  connectionStatus?: string;
+  dbName?: string;
 }
 
-const CHART_COLORS = CATEGORY_COLORS;
+type HomeTab = "recent" | "saved" | "collections" | "shared";
 
-// Dynamic suggestions from the actual analysis result — fully database-independent.
-function getDynamicSuggestions(goalResult: any): string[] {
-  const fromResult = goalResult?.followUpQuestions || goalResult?.follow_up_questions
-    || goalResult?.suggestedQuestions || goalResult?.suggested_questions || [];
-  if (fromResult.length > 0) {
-    return fromResult.slice(0, 6);
+/* ------------------------------------------------------------------ */
+/*  Popular actions                                                    */
+/* ------------------------------------------------------------------ */
+
+const POPULAR_ACTIONS: { label: string; icon: any; query?: string; navigate?: string }[] = [
+  { label: "Compare segments", icon: GitCompareArrows, query: "Compare segments breakdown" },
+  { label: "Analyze a trend", icon: TrendingUp, query: "Analyze trend over time" },
+];
+
+/* ------------------------------------------------------------------ */
+/*  Sidebar actions                                                    */
+/* ------------------------------------------------------------------ */
+
+const SIDEBAR_ACTIONS = [
+  { label: "Explain this analysis", sub: "Get a plain language summary", icon: Brain, query: "Explain this analysis in plain language" },
+  { label: "Investigate possible factors", sub: "Find what might be behind this", icon: Compass, query: "What factors might be driving these results?" },
+  { label: "Compare with previous period", sub: "See how it changed over time", icon: GitCompareArrows, query: "Compare this with the previous period" },
+  { label: "Test a scenario", sub: "Try different values or conditions", icon: Zap, query: "What-if scenario analysis" },
+];
+
+const CONTINUE_EXPLORING = [
+  { label: "Drill down", sub: "View detailed breakdowns", icon: BarChart3, tab: "explore" },
+  { label: "Apply a filter", sub: "Narrow down your data", icon: SlidersHorizontal, tab: "explore" },
+  { label: "Create a goal", sub: "Set a target and track progress", icon: Target, tab: "goals" },
+  { label: "Save this analysis", sub: "Keep it for later", icon: Bookmark, tab: "explore" },
+];
+
+/* ------------------------------------------------------------------ */
+/*  Chart palette                                                      */
+/* ------------------------------------------------------------------ */
+
+const CHART_PALETTE = [
+  "#2F6FAD", "#5B9BD5", "#70AD47", "#FFC000", "#ED7D31",
+  "#A855F7", "#06B6D4", "#F43F5E", "#10B981", "#8B5CF6",
+  "#EC4899", "#14B8A6", "#F97316", "#6366F1", "#84CC16",
+];
+
+function palette(n: number): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < n; i++) out.push(CHART_PALETTE[i % CHART_PALETTE.length]);
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Dynamic chart — renders based on chart_spec from backend           */
+/* ------------------------------------------------------------------ */
+
+function DynamicChart({ data, chartSpec, metric }: { data: any[]; chartSpec: any; metric: string }) {
+  const spec: any = chartSpec || {};
+  const chartType: string = spec.chart_type || "bar";
+  const xField: string = spec.x || "";
+  const yField: string = spec.y || "";
+
+  const specYCols: string[] = useMemo(() => {
+    if (spec.y_columns && spec.y_columns.length) return spec.y_columns;
+    if (Array.isArray(spec.y)) return spec.y;
+    return [yField];
+  }, [spec, yField]);
+
+  const points = useMemo(() => {
+    if (!data || !data.length) return [];
+    return data.slice(0, 60).map((r: any) => ({
+      label: strOf(r?.label ?? r?.[xField] ?? ""),
+      value: numOf(r?.value ?? r?.[yField]) ?? 0,
+    }));
+  }, [data, xField, yField]);
+
+  if (!data || !data.length) return null;
+
+  const colors = palette(Math.max(data.length, 10));
+  /* Stable per-series color so single-metric charts differ by metric instead
+     of all rendering the same blue. */
+  const lineColor = colorForName(strOf(metric || yField || "value") || "value");
+  const fmtVal = (v: number) => fmtMetric(v, metric);
+  const tickStyle = { fontSize: 11, fill: "#9CA3AF" };
+  const gridStyle = { strokeDasharray: "3 3", stroke: "#E5E7EB" };
+  const tooltipStyle = { fontSize: 12, borderRadius: 8 };
+
+  /* ---- Bar family (per-category colors) ---- */
+  if (chartType === "bar" || chartType === "column") {
+    const barData = data.slice(0, 60).map((r: any) => ({ label: strOf(r?.[xField] ?? r?.label ?? ""), value: numOf(r?.[yField] ?? r?.value) ?? 0 }));
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={barData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <Bar dataKey="value" name="Current" radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500}>
+            {barData.map((d: any, i: number) => <Cell key={i} fill={colorForName(d.label || String(i))} />)}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    );
   }
-  return [
-    "How many total records are in the connected data?",
-    "What is the total of the main numeric measure?",
-    "Which categories or segments appear most frequently?",
-    "How has the key metric changed over time?",
-    "What are the top items by value or quantity?",
-    "What is the average of the primary measure?",
-  ];
+
+  if (chartType === "bar_horizontal" || chartType === "horizontal_bar") {
+    const hbarData = data.slice(0, 60).map((r: any) => ({ label: strOf(r?.[xField] ?? r?.label ?? ""), value: numOf(r?.[yField] ?? r?.value) ?? 0 }));
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart layout="vertical" data={hbarData} margin={{ top: 8, right: 8, bottom: 0, left: 80 }}>
+          <CartesianGrid {...gridStyle} horizontal={false} />
+          <XAxis type="number" tick={tickStyle} axisLine={false} tickLine={false} tickFormatter={fmtVal} />
+          <YAxis type="category" dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} width={76} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <Bar dataKey="value" name="Current" radius={[0, 4, 4, 0]} isAnimationActive animationDuration={500}>
+            {hbarData.map((d: any, i: number) => <Cell key={i} fill={colorForName(d.label || String(i))} />)}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "bar_stacked" || chartType === "stacked_bar") {
+    const stackedData = data.slice(0, 60).map((r: any) => {
+      const row: any = { label: strOf(r?.[xField] ?? r?.label ?? "") };
+      specYCols.forEach((yc: string) => { row[yc] = numOf(r?.[yc]) ?? 0; });
+      return row;
+    });
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={stackedData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v)]} contentStyle={tooltipStyle} />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
+          {specYCols.map((yc: string, i: number) => (
+            <Bar key={yc} dataKey={yc} stackId="a" name={humanize(yc)} fill={colors[i]} isAnimationActive animationDuration={500} />
+          ))}
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "bar_grouped" || chartType === "grouped_bar") {
+    const groupedData = data.slice(0, 60).map((r: any) => {
+      const row: any = { label: strOf(r?.[xField] ?? r?.label ?? "") };
+      specYCols.forEach((yc: string) => { row[yc] = numOf(r?.[yc]) ?? 0; });
+      return row;
+    });
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={groupedData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v)]} contentStyle={tooltipStyle} />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
+          {specYCols.map((yc: string, i: number) => (
+            <Bar key={yc} dataKey={yc} name={humanize(yc)} fill={colors[i]} radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500} />
+          ))}
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "bar_normalized" || chartType === "normalized_bar") {
+    const normData = data.slice(0, 60).map((r: any) => {
+      const row: any = { label: strOf(r?.[xField] ?? r?.label ?? "") };
+      let total = 0;
+      specYCols.forEach((yc: string) => { total += numOf(r?.[yc]) ?? 0; });
+      specYCols.forEach((yc: string) => { row[yc] = total > 0 ? ((numOf(r?.[yc]) ?? 0) / total) * 100 : 0; });
+      return row;
+    });
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={normData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => `${Math.round(v)}%`} />
+          <Tooltip formatter={(v: number) => [`${v.toFixed(1)}%`]} contentStyle={tooltipStyle} />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
+          {specYCols.map((yc: string, i: number) => (
+            <Bar key={yc} dataKey={yc} stackId="a" name={humanize(yc)} fill={colors[i]} isAnimationActive animationDuration={500} />
+          ))}
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "bar_diverging" || chartType === "diverging_bar") {
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data.slice(0, 60).map((r: any) => ({ label: strOf(r?.[xField] ?? r?.label ?? ""), value: numOf(r?.[yField] ?? r?.value) ?? 0 }))} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <ReferenceLine y={0} stroke="#CBD5E1" />
+          <Bar dataKey="value" name="Current" radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500}>
+            {data.slice(0, 60).map((r: any, i: number) => {
+              const val = numOf(r?.[yField] ?? r?.value) ?? 0;
+              return <Cell key={i} fill={val >= 0 ? "#10B981" : "#F43F5E"} />;
+            })}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "lollipop") {
+    const lolliData = data.slice(0, 60).map((r: any) => ({ label: strOf(r?.[xField] ?? r?.label ?? ""), value: numOf(r?.[yField] ?? r?.value) ?? 0 }));
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={lolliData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <Bar dataKey="value" name="Current" barSize={8} radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500}>
+            {lolliData.map((d: any, i: number) => <Cell key={i} fill={colorForName(d.label || String(i))} />)}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "pareto") {
+    const sorted = data.slice(0, 60).map((r: any) => ({ label: strOf(r?.[xField] ?? r?.label ?? ""), value: numOf(r?.[yField] ?? r?.value) ?? 0 })).sort((a: any, b: any) => b.value - a.value);
+    const total = sorted.reduce((s: number, p: any) => s + p.value, 0);
+    let cum = 0;
+    const paretoData = sorted.map((p: any) => { cum += p.value; return { ...p, cumulative: total > 0 ? (cum / total) * 100 : 0 }; });
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={paretoData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip contentStyle={tooltipStyle} />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
+          <Bar dataKey="value" name="Value" radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500}>
+            {paretoData.map((p: any, i: number) => <Cell key={i} fill={colorForName(p.label || String(i))} />)}
+          </Bar>
+          <Line type="monotone" dataKey="cumulative" name="Cumulative %" stroke="#ED7D31" strokeWidth={2} dot={false} yAxisId={0} />
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "waterfall") {
+    const wfData = data.slice(0, 60).map((r: any, i: number) => {
+      const val = numOf(r?.[yField] ?? r?.value) ?? 0;
+      return { label: strOf(r?.[xField] ?? r?.label ?? ""), value: Math.abs(val), fill: val >= 0 ? "#10B981" : "#F43F5E", base: i === 0 ? 0 : undefined };
+    });
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={wfData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <Bar dataKey="value" name="Value" radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500}>
+            {wfData.map((entry: any, i: number) => <Cell key={i} fill={entry.fill} />)}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "histogram") {
+    const histData = data.slice(0, 60).map((r: any) => ({ label: strOf(r?.[xField] ?? r?.label ?? ""), value: numOf(r?.[yField] ?? r?.value) ?? 0 }));
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={histData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <Bar dataKey="value" name="Frequency" radius={[2, 2, 0, 0]} isAnimationActive animationDuration={500}>
+            {histData.map((d: any, i: number) => <Cell key={i} fill={colorForName(d.label || String(i))} />)}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "box_plot") {
+    const boxData = data.slice(0, 60).map((r: any) => ({ label: strOf(r?.[xField] ?? r?.label ?? ""), value: numOf(r?.[yField] ?? r?.value ?? r?.median ?? 0) }));
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={boxData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <Bar dataKey="value" name="Median" radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500}>
+            {boxData.map((d: any, i: number) => <Cell key={i} fill={colorForName(d.label || String(i))} />)}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "bullet") {
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data.slice(0, 60).map((r: any) => ({ label: strOf(r?.[xField] ?? r?.label ?? ""), value: numOf(r?.[yField] ?? r?.value) ?? 0, target: numOf(r?.target) ?? 0 }))} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip contentStyle={tooltipStyle} />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
+          <Bar dataKey="value" name="Actual" fill={CHART_PALETTE[0]} radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500} />
+          <Bar dataKey="target" name="Target" fill="#CBD5E1" radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500} />
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "combo") {
+    const comboData = data.slice(0, 60).map((r: any) => {
+      const row: any = { label: strOf(r?.[xField] ?? r?.label ?? "") };
+      specYCols.forEach((yc: string) => { row[yc] = numOf(r?.[yc]) ?? 0; });
+      return row;
+    });
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={comboData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip contentStyle={tooltipStyle} />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
+          {specYCols.map((yc: string, i: number) => {
+            if (i === 0) return <Bar key={yc} dataKey={yc} name={humanize(yc)} fill={colors[i]} radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500} />;
+            return <Line key={yc} type="monotone" dataKey={yc} name={humanize(yc)} stroke={colors[i]} strokeWidth={2} dot={false} />;
+          })}
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "funnel") {
+    const funnelData = data.slice(0, 20).map((r: any) => ({ label: strOf(r?.[xField] ?? r?.label ?? ""), value: numOf(r?.[yField] ?? r?.value) ?? 0 }));
+    return (
+      <div className="flex flex-col gap-1.5 py-2">
+        {funnelData.map((p: any, i: number) => {
+          const maxVal = Math.max(...funnelData.map((f: any) => f.value), 1);
+          const pct = (p.value / maxVal) * 100;
+          return (
+            <div key={i} className="flex items-center gap-2">
+              <span className="w-[120px] text-right text-[11px] text-slate-600 truncate flex-shrink-0">{p.label}</span>
+              <div className="flex-1 bg-slate-100 rounded-md h-6 relative overflow-hidden">
+                <div className="absolute inset-y-0 left-0 rounded-md transition-all duration-500" style={{ width: `${pct}%`, backgroundColor: colors[i % colors.length] }} />
+                <span className="absolute inset-0 flex items-center justify-center text-[10.5px] font-medium text-[#0F2440] z-10">{fmtVal(p.value)}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  if (chartType === "treemap") {
+    const tmData = data.slice(0, 40).map((r: any, i: number) => ({
+      name: strOf(r?.[xField] ?? r?.label ?? `Item ${i + 1}`),
+      value: numOf(r?.[yField] ?? r?.value) ?? 0,
+      fill: colors[i % colors.length],
+    }));
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={tmData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="name" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v)]} contentStyle={tooltipStyle} />
+          <Bar dataKey="value" name="Value" isAnimationActive animationDuration={500}>
+            {tmData.map((entry: any, i: number) => <Cell key={i} fill={entry.fill} />)}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  /* ---- Line family ---- */
+  if (chartType === "line" || chartType === "multi_line") {
+    if (chartType === "multi_line" && specYCols.length > 1) {
+      const mlData = data.slice(0, 60).map((r: any) => {
+        const row: any = { label: strOf(r?.[xField] ?? r?.label ?? "") };
+        specYCols.forEach((yc: string) => { row[yc] = numOf(r?.[yc]) ?? 0; });
+        return row;
+      });
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={mlData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+            <CartesianGrid {...gridStyle} vertical={false} />
+            <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+            <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+            <Tooltip formatter={(v: number) => [fmtVal(v)]} contentStyle={tooltipStyle} />
+            <Legend wrapperStyle={{ fontSize: 11 }} />
+            {specYCols.map((yc: string, i: number) => (
+              <Line key={yc} type="monotone" dataKey={yc} name={humanize(yc)} stroke={colors[i]} strokeWidth={2.5} dot={false} isAnimationActive animationDuration={500} />
+            ))}
+          </LineChart>
+        </ResponsiveContainer>
+      );
+    }
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <Line type="monotone" dataKey="value" name="Current" stroke={lineColor} strokeWidth={2.5} dot={false} isAnimationActive animationDuration={500} />
+        </LineChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "step_line" || chartType === "step") {
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <Line type="stepAfter" dataKey="value" name="Current" stroke={lineColor} strokeWidth={2.5} dot={false} isAnimationActive animationDuration={500} />
+        </LineChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "slope") {
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <Line type="linear" dataKey="value" name="Current" stroke={lineColor} strokeWidth={2.5} dot={{ r: 4, fill: lineColor }} isAnimationActive animationDuration={500} />
+        </LineChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "control_chart") {
+    const mean = points.length > 0 ? points.reduce((s: number, p: any) => s + p.value, 0) / points.length : 0;
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <ReferenceLine y={mean} stroke="#ED7D31" strokeDasharray="5 4" label={{ value: "Mean", position: "right", fontSize: 10, fill: "#ED7D31" }} />
+          <Line type="monotone" dataKey="value" name="Current" stroke={lineColor} strokeWidth={2.5} dot={{ r: 3, fill: lineColor }} isAnimationActive animationDuration={500} />
+        </LineChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (chartType === "sparkline") {
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={points} margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
+          <Line type="monotone" dataKey="value" stroke={lineColor} strokeWidth={1.5} dot={false} isAnimationActive animationDuration={500} />
+        </LineChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  /* ---- Area family ---- */
+  if (chartType === "area" || chartType === "stacked_area") {
+    if (chartType === "stacked_area" && specYCols.length > 1) {
+      const saData = data.slice(0, 60).map((r: any) => {
+        const row: any = { label: strOf(r?.[xField] ?? r?.label ?? "") };
+        specYCols.forEach((yc: string) => { row[yc] = numOf(r?.[yc]) ?? 0; });
+        return row;
+      });
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={saData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+            <defs>
+              {specYCols.map((_: string, i: number) => (
+                <linearGradient key={i} id={`areaGrad${i}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={colors[i]} stopOpacity={0.3} />
+                  <stop offset="100%" stopColor={colors[i]} stopOpacity={0.05} />
+                </linearGradient>
+              ))}
+            </defs>
+            <CartesianGrid {...gridStyle} vertical={false} />
+            <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+            <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+            <Tooltip formatter={(v: number) => [fmtVal(v)]} contentStyle={tooltipStyle} />
+            <Legend wrapperStyle={{ fontSize: 11 }} />
+            {specYCols.map((yc: string, i: number) => (
+              <Area key={yc} type="monotone" dataKey={yc} stackId="a" name={humanize(yc)} stroke={colors[i]} fill={`url(#areaGrad${i})`} strokeWidth={2} isAnimationActive animationDuration={500} />
+            ))}
+          </AreaChart>
+        </ResponsiveContainer>
+      );
+    }
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <defs>
+            <linearGradient id="areaGradSingle" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={CHART_PALETTE[0]} stopOpacity={0.3} />
+              <stop offset="100%" stopColor={CHART_PALETTE[0]} stopOpacity={0.05} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <Area type="monotone" dataKey="value" name="Current" stroke={CHART_PALETTE[0]} fill="url(#areaGradSingle)" strokeWidth={2.5} isAnimationActive animationDuration={500} />
+        </AreaChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  /* ---- Scatter family ---- */
+  if (chartType === "scatter" || chartType === "bubble") {
+    const scatterData = data.slice(0, 200).map((r: any) => ({
+      x: numOf(r?.[xField] ?? r?.x ?? r?.value) ?? 0,
+      y: numOf(r?.[yField] ?? r?.y) ?? 0,
+      z: numOf(r?.z ?? r?.size ?? r?.value) ?? 10,
+      name: strOf(r?.label ?? r?.name ?? ""),
+    }));
+    const isBubble = chartType === "bubble";
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <ScatterChart margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} />
+          <XAxis type="number" dataKey="x" name={humanize(xField)} tick={tickStyle} axisLine={false} tickLine={false} tickFormatter={fmtVal} />
+          <YAxis type="number" dataKey="y" name={humanize(yField)} tick={tickStyle} axisLine={false} tickLine={false} tickFormatter={fmtVal} />
+          {isBubble && <ZAxis type="number" dataKey="z" range={[40, 400]} name="Size" />}
+          <Tooltip cursor={{ strokeDasharray: "3 3" }} formatter={(v: any) => [typeof v === "number" ? fmtVal(v) : v]} contentStyle={tooltipStyle} />
+          <Scatter name="Data" fill={CHART_PALETTE[0]} isAnimationActive animationDuration={500}>
+            {scatterData.map((_: any, i: number) => <Cell key={i} fill={colors[i % colors.length]} />)}
+          </Scatter>
+        </ScatterChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  /* ---- Pie family ---- */
+  if (chartType === "pie" || chartType === "doughnut" || chartType === "polar_area") {
+    const pieData = data.slice(0, 20).map((r: any, i: number) => ({
+      name: strOf(r?.[xField] ?? r?.label ?? r?.name ?? `Item ${i + 1}`),
+      value: numOf(r?.[yField] ?? r?.value) ?? 0,
+    }));
+    const inner = chartType === "doughnut" ? 60 : 0;
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <PieChart>
+          <Pie data={pieData} cx="50%" cy="50%" outerRadius={100} innerRadius={inner} dataKey="value" nameKey="name" label={({ name, percent }: any) => `${name} ${(percent * 100).toFixed(0)}%`} labelLine={{ strokeWidth: 1 }} isAnimationActive animationDuration={500}>
+            {pieData.map((_: any, i: number) => <Cell key={i} fill={colors[i % colors.length]} />)}
+          </Pie>
+          <Tooltip formatter={(v: number) => [fmtVal(v)]} contentStyle={tooltipStyle} />
+        </PieChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  /* ---- Radar ---- */
+  if (chartType === "radar") {
+    const radarData = data.slice(0, 20).map((r: any) => {
+      const row: any = { subject: strOf(r?.[xField] ?? r?.label ?? "") };
+      specYCols.forEach((yc: string) => { row[yc] = numOf(r?.[yc]) ?? 0; });
+      if (!specYCols.length) row.value = numOf(r?.[yField] ?? r?.value) ?? 0;
+      return row;
+    });
+    const radarKeys = specYCols.length ? specYCols : ["value"];
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <RadarChart data={radarData} cx="50%" cy="50%" outerRadius="70%">
+          <PolarGrid stroke="#E5E7EB" />
+          <PolarAngleAxis dataKey="subject" tick={{ fontSize: 11, fill: "#9CA3AF" }} />
+          <PolarRadiusAxis tick={{ fontSize: 10, fill: "#9CA3AF" }} />
+          <Tooltip contentStyle={tooltipStyle} />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
+          {radarKeys.map((rk: string, i: number) => (
+            <Radar key={rk} name={humanize(rk)} dataKey={rk} stroke={colors[i]} fill={colors[i]} fillOpacity={0.2} strokeWidth={2} isAnimationActive animationDuration={500} />
+          ))}
+        </RadarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  /* ---- Heatmap / Calendar Heatmap (CSS grid) ---- */
+  if (chartType === "heatmap" || chartType === "calendar_heatmap") {
+    const hmData = data.slice(0, 100).map((r: any) => ({
+      x: strOf(r?.[xField] ?? r?.x ?? r?.label ?? ""),
+      y: strOf(r?.[yField] ?? r?.y ?? r?.category ?? ""),
+      value: numOf(r?.value ?? r?.count) ?? 0,
+    }));
+    const allVals = hmData.map((d: any) => d.value);
+    const minV = Math.min(...allVals, 0);
+    const maxV = Math.max(...allVals, 1);
+    const range = maxV - minV || 1;
+    const getColor = (v: number) => {
+      const t = (v - minV) / range;
+      const r = Math.round(47 + (16 - 47) * t);
+      const g = Math.round(111 + (185 - 111) * t);
+      const b = Math.round(173 + (164 - 173) * t);
+      return `rgb(${r},${g},${b})`;
+    };
+    const xLabels = [...new Set(hmData.map((d: any) => d.x))];
+    const yLabels = [...new Set(hmData.map((d: any) => d.y))];
+    return (
+      <div className="overflow-auto">
+        <div className="inline-grid gap-px" style={{ gridTemplateColumns: `60px repeat(${xLabels.length}, minmax(28px, 1fr))` }}>
+          <div />
+          {xLabels.map((xl: string) => <div key={xl} className="text-[9px] text-slate-500 text-center truncate px-0.5">{xl}</div>)}
+          {yLabels.map((yl: string) => {
+            const rowKey = `row-${yl}`;
+            return [
+              <div key={`y-${rowKey}`} className="text-[9px] text-slate-500 text-right pr-1.5 truncate flex items-center justify-end">{yl}</div>,
+              ...xLabels.map((xl: string) => {
+                const cell = hmData.find((d: any) => d.x === xl && d.y === yl);
+                const v = cell?.value ?? 0;
+                return <div key={`${rowKey}-${xl}`} className="w-full aspect-square rounded-sm flex items-center justify-center text-[8px] text-white font-medium" style={{ backgroundColor: getColor(v) }} title={`${yl}: ${xl} = ${fmtVal(v)}`} />;
+              }),
+            ];
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  /* ---- KPI Card ---- */
+  if (chartType === "kpi_card" || chartType === "kpi") {
+    const kpiVal = numOf(data[0]?.[yField] ?? data[0]?.value) ?? 0;
+    return (
+      <div className="flex flex-col items-center justify-center py-6">
+        <span className="text-[36px] font-bold text-[#0F2440] tabular-nums">{fmtVal(kpiVal)}</span>
+        <span className="text-[12px] text-slate-500 mt-1">{spec.label || humanize(metric)}</span>
+      </div>
+    );
+  }
+
+  /* ---- Gauge ---- */
+  if (chartType === "gauge") {
+    const gaugeVal = numOf(data[0]?.[yField] ?? data[0]?.value) ?? 0;
+    const gaugeMax = numOf(data[0]?.max) ?? 100;
+    const pct = gaugeMax > 0 ? (gaugeVal / gaugeMax) * 100 : 0;
+    return (
+      <div className="flex flex-col items-center justify-center py-6">
+        <div className="relative w-32 h-32">
+          <svg viewBox="0 0 120 120" className="w-full h-full -rotate-90">
+            <circle cx="60" cy="60" r="50" fill="none" stroke="#E5E7EB" strokeWidth="10" />
+            <circle cx="60" cy="60" r="50" fill="none" stroke={CHART_PALETTE[0]} strokeWidth="10" strokeDasharray={`${Math.PI * 100}`} strokeDashoffset={`${Math.PI * 100 * (1 - pct / 100)}`} strokeLinecap="round" className="transition-all duration-1000" />
+          </svg>
+          <div className="absolute inset-0 flex flex-col items-center justify-center">
+            <span className="text-[20px] font-bold text-[#0F2440] tabular-nums">{fmtVal(gaugeVal)}</span>
+            <span className="text-[10px] text-slate-500">/ {fmtVal(gaugeMax)}</span>
+          </div>
+        </div>
+        <span className="text-[12px] text-slate-500 mt-2">{spec.label || humanize(metric)}</span>
+      </div>
+    );
+  }
+
+  /* ---- Ecdf ---- */
+  if (chartType === "ecdf") {
+    const sorted = [...data].sort((a: any, b: any) => (numOf(a?.[yField] ?? a?.value) ?? 0) - (numOf(b?.[yField] ?? b?.value) ?? 0));
+    let cumN = 0;
+    const ecdfData = sorted.map((r: any) => {
+      cumN++;
+      return { value: numOf(r?.[yField] ?? r?.value) ?? 0, ecdf: (cumN / sorted.length) * 100 };
+    });
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={ecdfData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="value" tick={tickStyle} axisLine={false} tickLine={false} tickFormatter={fmtVal} name={humanize(metric)} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => `${Math.round(v)}%`} name="ECDF" />
+          <Tooltip formatter={(v: any, name: string) => [name === "ECDF" ? `${(v as number).toFixed(1)}%` : fmtVal(v as number), name]} contentStyle={tooltipStyle} />
+          <Line type="stepAfter" dataKey="ecdf" name="ECDF" stroke={CHART_PALETTE[0]} strokeWidth={2.5} dot={false} isAnimationActive animationDuration={500} />
+        </LineChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  /* ---- Density ---- */
+  if (chartType === "density") {
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <defs>
+            <linearGradient id="densityGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={CHART_PALETTE[0]} stopOpacity={0.4} />
+              <stop offset="100%" stopColor={CHART_PALETTE[0]} stopOpacity={0.05} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), "Density"]} contentStyle={tooltipStyle} />
+          <Area type="monotone" dataKey="value" name="Density" stroke={CHART_PALETTE[0]} fill="url(#densityGrad)" strokeWidth={2.5} isAnimationActive animationDuration={500} />
+        </AreaChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  /* ---- Violin (approximate with mirrored area) ---- */
+  if (chartType === "violin") {
+    const viData = points.map((p: any) => ({ ...p, neg: -p.value }));
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={viData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <defs>
+            <linearGradient id="violinGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={CHART_PALETTE[0]} stopOpacity={0.4} />
+              <stop offset="100%" stopColor={CHART_PALETTE[0]} stopOpacity={0.05} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid {...gridStyle} vertical={false} />
+          <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+          <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+          <Area type="monotone" dataKey="value" stroke={CHART_PALETTE[0]} fill="url(#violinGrad)" strokeWidth={2} isAnimationActive animationDuration={500} />
+        </AreaChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  /* ---- Fallback: simple bar (per-category colors) ---- */
+  const fallbackData = data.slice(0, 60).map((r: any) => ({ label: strOf(r?.[xField] ?? r?.label ?? ""), value: numOf(r?.[yField] ?? r?.value) ?? 0 }));
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <BarChart data={fallbackData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+        <CartesianGrid {...gridStyle} vertical={false} />
+        <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
+        <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
+        <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
+        <Bar dataKey="value" name="Current" radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500}>
+          {fallbackData.map((d: any, i: number) => <Cell key={i} fill={colorForName(d.label || String(i))} />)}
+        </Bar>
+      </BarChart>
+    </ResponsiveContainer>
+  );
 }
 
-export default function AIAnalytics({
-  initialQuery = "",
-  onAsk,
-  analysisResult = null,
-  goalStatus = "idle",
-  goalResult = null,
-  goalError = "",
-  loading = false,
-  onNavigate,
-  onAskCopilot,
-}: AIAnalyticsProps) {
-  const { isDark } = useTheme();
-  const [query, setQuery] = useState(initialQuery);
-  const [showTable, setShowTable] = useState(false);
-  const [showWhy, setShowWhy] = useState(false);
-  const [showEvidence, setShowEvidence] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-  // Data-aware autocomplete (GET /api/autocomplete, same pattern as Dashboard).
-  const [suggestions, setSuggestions] = useState<string[]>([]);
-  const [showSuggestions, setShowSuggestions] = useState(false);
-  const [activeIndex, setActiveIndex] = useState(-1);
-  const debounceRef = useRef<any>(null);
+/* ------------------------------------------------------------------ */
+/*  Time-ago                                                           */
+/* ------------------------------------------------------------------ */
 
-  const fetchAutocomplete = async (partial: string) => {
-    try {
-      const res = await fetch(`${API_BASE}/autocomplete?partial=${encodeURIComponent(partial)}&limit=6`, {
-        credentials: "include",
-      });
-      if (!res.ok) { setSuggestions([]); return; }
-      const data = await res.json();
-      const list = Array.isArray(data?.suggestions)
-        ? data.suggestions.map((s: any) => typeof s === "string" ? s : s.text).filter(Boolean)
-        : [];
-      setSuggestions(list);
-      setActiveIndex(-1);
-    } catch {
-      setSuggestions([]);
-    }
-  };
+function formatTimeAgo(ts: string): string {
+  try {
+    const d = new Date(ts);
+    const diff = Date.now() - d.getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return "Just now";
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    if (days < 7) return `${days}d ago`;
+    return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  } catch { return ""; }
+}
 
-  useEffect(() => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    const partial = query || "";
-    // Only hit the backend once the user typed something; empty query
-    // keeps the static "Try asking" chips below.
-    if (!partial.trim()) { setSuggestions([]); return; }
-    debounceRef.current = setTimeout(() => fetchAutocomplete(partial), 250);
-    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
-  }, [query]);
+/* ------------------------------------------------------------------ */
+/*  Analysis card (Recent / Saved)                                      */
+/* ------------------------------------------------------------------ */
 
-  const grid = isDark ? "#2A2A35" : "#E5E7EB";
-  const axis = isDark ? "#8889A0" : "#9CA3AF";
-
-  // Derive state from props
-  const state: AnalysisState =
-    loading || goalStatus === "loading" ? "processing" :
-    goalError ? "error" :
-    goalResult?.clarificationRequired ? "clarification" :
-    (analysisResult && (goalStatus === "success" || goalResult?.generatedSql)) ||
-    ((goalResult?.answer || goalResult?.message) && goalStatus === "success") ||
-    (goalResult?.data && goalStatus === "success") ? "done" :
-    "idle";
-
-  const runAnalysis = (q?: string) => {
-    const text = q || query;
-    if (!text.trim()) return;
-    setQuery(text);
-    setChartOverride("");
-    onAsk?.(text);
-  };
-
-
-  // Extract real data from results (no raw SQL/provenance rendered — backend only).
-  // Stable analytics contract fields are rendered as-is; missing keys render
-  // as empty states, never fabricated client-side.
-  const visualization = goalResult?.visualization || null;
-  const tableData = (visualization?.data?.length ? visualization.data : null)
-    || goalResult?.data || analysisResult?.data || [];
-  const chartData = tableData;
-  const followUps = (goalResult?.followUpQuestions?.length ? goalResult.followUpQuestions : null)
-    || goalResult?.follow_up_questions || goalResult?.suggestedQuestions || goalResult?.suggested_questions || [];
-  const backendSpec = goalResult?.chartSpec || null;
-  const analysisMeta = goalResult?.analysis || null;
-  const answer = goalResult?.answer || goalResult?.message || "";
-  const findings: any[] = Array.isArray(goalResult?.findings) ? goalResult.findings : [];
-  const evidenceList: any[] = Array.isArray(goalResult?.evidence) ? goalResult.evidence : [];
-  const limitations: any[] = Array.isArray(goalResult?.limitations) ? goalResult.limitations : [];
-  const possibleDrivers: any[] = Array.isArray(goalResult?.possibleDrivers)
-    ? goalResult.possibleDrivers
-    : (Array.isArray(goalResult?.possible_drivers) ? goalResult.possible_drivers : []);
-  const hypothesisObj = goalResult?.hypothesis || null;
-  const recommendationsList: any[] = Array.isArray(goalResult?.recommendations) ? goalResult.recommendations : [];
-  const comparisonPeriod = goalResult?.comparisonPeriod || goalResult?.comparison_period || null;
-  const resultStatus: string = goalResult?.resultStatus || goalResult?.result_status || "";
-  const resultMessage: string = goalResult?.resultMessage || goalResult?.result_message || "";
-  const interpreted = goalResult?.interpretedIntent || goalResult?.interpreted_intent || null;
-
-  // Feedback tracking (personalization layer — Section 62)
-  const [insightRating, setInsightRating] = useState<"useful" | "not_useful" | null>(null);
-  // User chart override: changing visualization records a preference so the
-  // backend learns contextual chart taste (RL loop). Never overrides validity.
-  const [chartOverride, setChartOverride] = useState("");
-  const trackChartSwitch = async (toType: string) => {
-    setChartOverride(toType);
-    try {
-      const cols = Object.keys(chartData[0] || {}).sort().join("_");
-      await fetch(`${API_BASE}/feedback/chart`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ chart_type: toType, context: cols || "general" }),
-      });
-    } catch (err) { console.debug("[ARIA] background request failed:", err); }
-  };
-  const trackSuggestionClick = async (text: string) => {
-    try {
-      await fetch(`${API_BASE}/feedback/suggestion`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ suggestion_text: text, source: "analytics" }),
-      });
-    } catch (err) { console.debug("[ARIA] background request failed:", err); }
-  };
-  const rateInsight = async (rating: "useful" | "not_useful") => {
-    setInsightRating(rating);
-    try {
-      await fetch(`${API_BASE}/feedback/insight`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({
-          question: goalResult?.question || query,
-          rating,
-          category: "analytics",
-        }),
-      });
-    } catch (err) { console.debug("[ARIA] background request failed:", err); }
-  };
-
-  // Determine chart plan from data shape, preferring the backend registry
-  // spec (chartSpec) when the shape genuinely supports it — never forcing.
-  const getChartPlan = () => {
-    if (!chartData.length) return null;
-    const keys = Object.keys(chartData[0]);
-    const dateKeys = keys.filter(k => /date|time|month|year|period|day/i.test(k));
-    const numKeys = keys.filter(k => {
-      const v = chartData[0]?.[k];
-      return typeof v === "number" || (typeof v === "string" && v !== "" && !isNaN(Number(v)));
-    });
-    const catKeys = keys.filter(k => !dateKeys.includes(k) && !numKeys.includes(k));
-    const pickNum = (exclude: string[] = []) =>
-      numKeys.find(k => !exclude.includes(k)) || "";
-    const specType = goalResult?.display?.chart?.type || goalResult?.chartSpec?.chart_type || "";
-    const vizType = String(visualization?.type || "").toLowerCase();
-    const vizX = visualization?.x && keys.includes(visualization.x) ? visualization.x : null;
-    const vizY = visualization?.y && keys.includes(visualization.y) ? visualization.y : null;
-    // Contract-first overrides: the backend intent determines the family.
-    if (vizType === "scatter" && numKeys.length >= 2) {
-      return { type: "scatter", data: chartData, xKey: vizX || numKeys[0], yKey: vizY || numKeys[1], series: [] as string[] };
-    }
-    if (vizType === "histogram" && numKeys.length >= 1) {
-      const col = (vizY && numKeys.includes(vizY) ? vizY : numKeys[0]);
-      const hvals = chartData.map(r => Number(r[col])).filter(v => !isNaN(v));
-      if (hvals.length >= 5) {
-        const hlo = Math.min(...hvals), hhi = Math.max(...hvals);
-        const hb = Math.max(4, Math.min(12, Math.round(Math.sqrt(hvals.length))));
-        const hw = (hhi - hlo) / hb || 1;
-        const hc = new Array(hb).fill(0);
-        hvals.forEach(v => {
-          const i = Math.min(hb - 1, Math.max(0, Math.floor((v - hlo) / hw)));
-          hc[i]++;
-        });
-        return { type: "histogram", data: hc.map((c, i) => ({
-          bin: `${(hlo + i * hw).toFixed(1)}–${(hlo + (i + 1) * hw).toFixed(1)}`, count: c,
-        })), xKey: "bin", yKey: "count", series: [] as string[] };
-      }
-    }
-    if ((vizType === "line" || vizType === "area") && (dateKeys.length || numKeys.length || catKeys.length)) {
-      const xk = vizX || dateKeys[0] || catKeys[0] || keys[0];
-      return { type: vizType === "area" ? "area" : "line", data: chartData, xKey: xk, yKey: vizY || pickNum([xk]), series: [] as string[] };
-    }
-    if ((vizType === "comparison" || vizType === "stacked") && catKeys.length && numKeys.length) {
-      const xk = vizX || catKeys[0];
-      if (vizType === "stacked" && numKeys.length >= 2) {
-        return { type: "stacked", data: chartData.slice(0, 10), xKey: xk, yKey: numKeys[0], series: numKeys.slice(0, 3) };
-      }
-      return { type: "bar", data: chartData.slice(0, 12), xKey: xk, yKey: vizY || pickNum(), series: [] as string[] };
-    }
-    if ((vizType === "h-bar" || vizType === "bar") && catKeys.length && numKeys.length) {
-      const xk = vizX || catKeys[0];
-      const horizontal = vizType === "h-bar" || chartData.length > 8;
-      return { type: horizontal ? "hbar" : "bar", data: horizontal ? chartData.slice(0, 12) : chartData, xKey: xk, yKey: vizY || pickNum(), series: [] as string[] };
-    }
-
-    // Two numerics → scatter (backend "relationship" shape).
-    if (numKeys.length >= 2 && !dateKeys.length && !catKeys.length) {
-      if (["scatter", "hexbin", "contour", "bubble"].includes(specType)
-          || !["bar", "pie", "line", "area"].includes(specType)) {
-        return { type: "scatter", data: chartData, xKey: numKeys[0], yKey: numKeys[1], series: [] as string[] };
-      }
-    }
-    // Single numeric, no categories → histogram (client-side binning of real values).
-    if (numKeys.length >= 1 && !catKeys.length && !dateKeys.length) {
-      const col = numKeys[0];
-      const vals = chartData.map(r => Number(r[col])).filter(v => !isNaN(v));
-      if (vals.length >= 5) {
-        const lo = Math.min(...vals), hi = Math.max(...vals);
-        const bins = Math.max(4, Math.min(12, Math.round(Math.sqrt(vals.length))));
-        const width = (hi - lo) / bins || 1;
-        const counts = new Array(bins).fill(0);
-        vals.forEach(v => {
-          const i = Math.min(bins - 1, Math.max(0, Math.floor((v - lo) / width)));
-          counts[i]++;
-        });
-        const data = counts.map((c, i) => ({
-          bin: `${(lo + i * width).toFixed(1)}–${(lo + (i + 1) * width).toFixed(1)}`,
-          count: c,
-        }));
-        return { type: "histogram", data, xKey: "bin", yKey: "count", series: [] as string[] };
-      }
-    }
-    // Time + numeric → area/line.
-    if (dateKeys.length && numKeys.length) {
-      const t = (specType === "line" || specType === "step_line" || specType === "sparkline") ? "line" : "area";
-      return { type: t, data: chartData, xKey: dateKeys[0], yKey: pickNum(), series: [] as string[] };
-    }
-    // Category + 2 numerics → stacked bar.
-    if (catKeys.length && numKeys.length >= 2) {
-      return { type: "stacked", data: chartData.slice(0, 10), xKey: catKeys[0], yKey: numKeys[0], series: numKeys.slice(0, 3) };
-    }
-    // Category + numeric → bar (horizontal for long labels / many cats).
-    if (catKeys.length && numKeys.length) {
-      const labels = chartData.map(r => String(r[catKeys[0]] ?? ""));
-      const avgLen = labels.reduce((a, s) => a + s.length, 0) / Math.max(1, labels.length);
-      const horizontal = chartData.length > 8 || avgLen > 14;
-      const preferPie = ["pie", "doughnut", "donut", "polar_area"].includes(specType)
-        && chartData.length <= 6;
-      if (preferPie) return { type: "pie", data: chartData, xKey: catKeys[0], yKey: pickNum(), series: [] as string[] };
-      return { type: horizontal ? "hbar" : "bar", data: horizontal ? chartData.slice(0, 12) : chartData, xKey: catKeys[0], yKey: pickNum(), series: [] as string[] };
-    }
-    // Single category (counts) → bar of frequencies.
-    if (catKeys.length) {
-      const freq: Record<string, number> = {};
-      chartData.forEach(r => { const k = String(r[catKeys[0]] ?? "—"); freq[k] = (freq[k] || 0) + 1; });
-      const data = Object.entries(freq).map(([name, value]) => ({ name, value }))
-        .sort((a, b) => b.value - a.value).slice(0, 10);
-      return { type: "bar", data, xKey: "name", yKey: "value", series: [] as string[] };
-    }
-    return { type: "bar", data: chartData, xKey: keys[0], yKey: pickNum([keys[0]]), series: [] as string[] };
-  };
-
-  const chartPlan = getChartPlan();
-  // Backend registry names → locally renderable families.
-  const mapBackendType = (t: string): string | null => {
-    const v = (t || "").toLowerCase();
-    if (["line", "step_line", "sparkline", "slope", "multi_line", "control_chart"].includes(v)) return "line";
-    if (["area", "stacked_area", "density", "ecdf", "calendar_heatmap"].includes(v)) return "area";
-    if (["bar_horizontal"].includes(v)) return "hbar";
-    if (["bar_stacked", "bar_grouped", "bar_normalized", "combo", "heatmap"].includes(v)) return "stacked";
-    if (["bar", "bar_diverging", "lollipop", "pareto", "waterfall", "funnel", "bullet"].includes(v)) return "bar";
-    if (["pie", "doughnut", "donut", "polar_area", "gauge"].includes(v)) return "pie";
-    if (["scatter", "hexbin", "contour", "bubble"].includes(v)) return "scatter";
-    if (["histogram"].includes(v)) return "histogram";
-    if (["kpi_card"].includes(v)) return "bar";
-    return null;
-  };
-  const _autoType = chartPlan?.type || "bar";
-  const _compatTypes: string[] = [
-    ...(goalResult?.chartSpec?.compatible || []),
-    goalResult?.chartSpec?.chart_type || "",
-  ];
-  const chartOptions: string[] = [];
-  [_autoType, ..._compatTypes].forEach((t) => {
-    const m = mapBackendType(t);
-    if (m && !chartOptions.includes(m)) chartOptions.push(m);
-  });
-  if (!chartOptions.includes(_autoType)) chartOptions.unshift(_autoType);
-  const chartType = chartOverride && chartOptions.includes(chartOverride) ? chartOverride : _autoType;
-  const xKey = chartPlan?.xKey || "";
-  const yKey = chartPlan?.yKey || "";
-  const chartSeries: string[] = chartPlan?.series || [];
-  const chartRenderData = chartPlan?.data || chartData;
-
-  const contextQuestion = query || (goalResult as any)?.interpretedGoal || "";
-  const goRelatedInsights = () => {
-    saveAnalysisContext({
-      origin: "analytics",
-      question: contextQuestion,
-      metric: analysisMeta?.entity || yKey || null,
-      dimension: xKey || null,
-      table: (goalResult?.relevantTables || [])[0] || null,
-    });
-    try {
-      sessionStorage.setItem("aria_insight_handoff", JSON.stringify({
-        origin: "analytics", question: contextQuestion,
-        metric: analysisMeta?.entity || yKey || null,
-      }));
-    } catch { /* best-effort */ }
-    gotoWithContext("insights", {});
-  };
-  const goCopilotAnalysis = () => {
-    saveAnalysisContext({
-      origin: "analytics",
-      question: contextQuestion,
-      metric: analysisMeta?.entity || yKey || null,
-      dimension: xKey || null,
-      table: (goalResult?.relevantTables || [])[0] || null,
-    });
-    if (onAskCopilot) onAskCopilot(contextQuestion || "Continue this analysis");
-    else gotoWithContext("copilot", {});
-  };
-  const goHistory = () => {
-    // History rows persist server-side on every /api/ask; this opens them.
-    gotoWithContext("history", {});
-  };
-  const goPage = (p: string) => {
-    if (onNavigate) {
-      try { onNavigate(p); return; } catch { /* fall through to hash */ }
-    }
-    gotoWithContext(p, {});
-  };
-
-  // Lifecycle-driven AI stage (real milestones only, never timers):
-  // 0 = request in flight, no payload yet · 1 = goal payload arrived,
-  // evidence building · 2 = evidence ready, finalizing visualization.
-  // Stage 3 ("Generating visualization") is the chart-reveal itself on done.
-  const aiStage = !goalResult ? 0 : !analysisResult ? 1 : 2;
-  // Chart-click drill selection: Investigate / Explain / Forecast
-  // hooks travel with the shared analysis context.
-  const [drill, setDrill] = useState<{ label: string; value: any } | null>(null);
-
-  // Persist cross-module context on every successful analysis so Forecast
-  // opens preselected via the shared context
-  // (never re-analyzing); the hypothesis capability is embedded here
-  // as Possible drivers instead of a standalone page.
-  const submittedQ = (goalResult as any)?.interpretedGoal || "";
-  useEffect(() => {
-    if (state === "done" && (goalResult || analysisResult)) {
-      const cols = Object.keys(chartData[0] || {});
-      saveAnalysisContext({
-        origin: "analytics",
-        question: submittedQ || query,
-        metric: yKey || null,
-        dimension: xKey || null,
-        table: (goalResult?.relevantTables || [])[0] || null,
-        filters: null,
-        source: goalResult?.relevantTables?.length
-          ? { tables: goalResult.relevantTables, columns: cols }
-          : null,
-      });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state]);
-
-  const drillHooks = (label: string) => {
-    saveAnalysisContext({
-      origin: "analytics-chart",
-      question: query || submittedQ,
-      metric: yKey || null,
-      dimension: xKey || null,
-      table: (goalResult?.relevantTables || [])[0] || null,
-      segment: label || null,
-    });
-  };
-
-  const onChartClick = (st: any) => {
-    const p = st?.activePayload?.[0]?.payload;
-    if (!p || !xKey) return;
-    const label = String(p?.[xKey] ?? "");
-    if (!label) return;
-    const value = yKey ? p?.[yKey] : null;
-    setDrill({ label, value });
-    drillHooks(label);
-  };
+function AnalysisCard({ item, onOpen }: { item: any; onOpen: () => void }) {
+  const title = strOf(item?.title || item?.name, "Untitled Analysis");
+  const metric = strOf(item?.metric);
+  const summary = strOf(item?.result_summary || item?.summary);
+  const ts = item?.updated_at || item?.created_at;
+  const timeAgo = ts ? formatTimeAgo(ts) : "";
+  const changePct = numOf(item?.change_pct ?? item?.result?.change_pct);
+  const total = numOf(item?.result?.total);
 
   return (
-    <div className="p-6 max-w-4xl mx-auto space-y-6">
-      {/* Header */}
-      <div className="animate-fade-in">
-        <h2 className="text-xl font-bold text-foreground tracking-tight">AI Analytics</h2>
-        <p className="text-sm text-muted-foreground mt-0.5">Ask questions. Explore your data. Get answers.</p>
-      </div>
-
-      {/* Query Composer */}
-      <div className="space-y-3">
-        <div className="relative">
-          <div className="flex items-center gap-3 bg-card border border-border rounded-xl px-4 py-3.5 focus-within:border-primary/50 focus-within:shadow-[0_0_0_3px_var(--primary-light)] transition-all duration-200" style={{ boxShadow: 'var(--shadow-sm)' }}>
-            <Sparkles size={16} className="text-primary flex-shrink-0" />
-              <input
-                ref={inputRef}
-                value={query}
-                aria-label="Ask ARIA a business question"
-                onChange={(e) => setQuery(e.target.value)}
-              onFocus={() => setShowSuggestions(true)}
-              onBlur={() => setTimeout(() => setShowSuggestions(false), 200)}
-              onKeyDown={(e) => {
-                if (e.key === "ArrowDown" && suggestions.length > 0) {
-                  e.preventDefault();
-                  setShowSuggestions(true);
-                  setActiveIndex((i) => (i + 1) % suggestions.length);
-                } else if (e.key === "ArrowUp" && suggestions.length > 0) {
-                  e.preventDefault();
-                  setActiveIndex((i) => (i - 1 + suggestions.length) % suggestions.length);
-                } else if (e.key === "Escape") {
-                  setShowSuggestions(false);
-                } else if (e.key === "Enter") {
-                  if (showSuggestions && activeIndex >= 0 && suggestions[activeIndex] && !loading) {
-                    e.preventDefault();
-                    runAnalysis(suggestions[activeIndex]);
-                    setShowSuggestions(false);
-                  } else if (!loading) {
-                    runAnalysis();
-                  }
-                }
-              }}
-              placeholder="How many records? What is the total? Which categories rank highest? How has the metric changed over time?"
-              className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none"
-              disabled={loading}
-            />
-            {query && (
-              <button onClick={() => { setQuery(""); }} className="text-muted-foreground hover:text-foreground transition-colors">
-                <X size={15} />
-              </button>
-            )}
-            <button
-              onClick={() => runAnalysis()}
-              disabled={loading || !query.trim()}
-              className="premium-btn btn-glow flex-shrink-0 px-4 py-1.5 rounded-lg text-xs font-semibold text-white transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{ background: 'var(--gradient-primary)' }}
-            >
-              {loading ? "Analyzing..." : "Analyze"}
-            </button>
+    <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] hover:shadow-md hover:border-blue-200 transition-all group">
+      <div className="p-4">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <span className="inline-flex items-center justify-center w-9 h-9 rounded-xl bg-blue-50 text-blue-700 flex-shrink-0">
+              <BarChart3 size={16} />
+            </span>
+            <div className="min-w-0">
+              <h4 className="text-[13px] font-semibold text-[#0F2440] truncate">{title}</h4>
+              <p className="text-[11px] text-slate-400 flex items-center gap-1">
+                {timeAgo && <><Clock size={10} />{timeAgo}</>}
+                {!timeAgo && metric && <>{humanize(metric)}</>}
+              </p>
+            </div>
           </div>
-
-          {showSuggestions && query.trim().length > 0 && suggestions.length > 0 && (
-            <div className="absolute top-full left-0 right-0 mt-2 bg-card border border-border rounded-xl shadow-lg py-1.5 z-20 max-h-[260px] overflow-y-auto">
-              {suggestions.map((s: string, i: number) => (
-                <button
-                  key={s + i}
-                  onMouseDown={() => { runAnalysis(s); setShowSuggestions(false); }}
-                  onMouseEnter={() => setActiveIndex(i)}
-                  className={`w-full flex items-center gap-3 px-4 py-2.5 text-sm text-foreground hover:bg-secondary transition-colors text-left ${i === activeIndex ? "bg-secondary" : ""}`}
-                >
-                  <Search size={13} className="text-primary flex-shrink-0" />
-                  <span className="truncate">{s}</span>
-                </button>
-              ))}
-            </div>
-          )}
+          <button onClick={onOpen} className="text-[11px] font-medium text-blue-700 hover:text-blue-800 px-2 py-1 rounded-md hover:bg-blue-50 opacity-0 group-hover:opacity-100 transition-opacity" aria-label="Open analysis">Open</button>
         </div>
-
-        {/* Suggested queries */}
-        {state === "idle" && (
-          <div className="space-y-1.5">
-            <p className="text-xs font-medium text-muted-foreground flex items-center gap-1.5"><Clock size={11} /> Try asking</p>
-            <div className="flex flex-wrap gap-2">
-              {getDynamicSuggestions(goalResult).map((q) => (
-                <button
-                  key={q}
-                  onClick={() => runAnalysis(q)}
-                  className="text-xs px-3 py-1.5 bg-secondary hover:bg-secondary/70 border border-border rounded-full text-muted-foreground hover:text-foreground transition-colors truncate max-w-xs"
-                >
-                  {q}
-                </button>
-              ))}
-            </div>
+        {total !== null && (
+          <div className="mt-3 flex items-baseline gap-2">
+            <span className="text-[20px] font-bold text-[#0F2440] tabular-nums">{fmtMetric(total, metric)}</span>
+            {changePct !== null && (
+              <span className={`inline-flex items-center gap-0.5 text-[11px] font-semibold ${changePct >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                {changePct >= 0 ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
+                {fmtPctBiz(changePct)}
+              </span>
+            )}
           </div>
         )}
+        {summary && <p className="mt-2 text-[11.5px] text-slate-500 line-clamp-2 leading-relaxed">{summary}</p>}
       </div>
+      <div className="px-4 pb-3">
+        <button onClick={onOpen} className="w-full text-left text-[12px] font-semibold text-blue-700 hover:text-blue-800 flex items-center justify-between py-1.5 border-t border-slate-100 mt-1">
+          Explore this analysis <ChevronRight size={13} />
+        </button>
+      </div>
+    </div>
+  );
+}
 
-      {/* Processing — 4 stages driven by the real request lifecycle
-          (App: ask sent → goal payload → analytics payload → reveal).
-          Chart skeleton reserves layout; reveal swaps it in, then static. */}
-      {state === "processing" && (
-        <div className="space-y-4">
-          <AIProcessingIndicator stage={aiStage} />
-          <div className="bg-card border border-border rounded-xl p-5 space-y-3" aria-hidden="true">
-            <div className="chart-skeleton h-5 w-48" />
-            <div className="chart-skeleton h-[220px] w-full" />
-            <div className="flex gap-2">
-              <div className="chart-skeleton h-8 w-24" />
-              <div className="chart-skeleton h-8 w-24" />
-            </div>
+/* ================================================================== */
+/*  Main component                                                     */
+/* ================================================================== */
+
+export default function AIAnalytics({
+  onNavigate,
+  onAskCopilot,
+  connectionStatus,
+  dbName,
+}: AIAnalyticsProps) {
+  /* ---- Meta / schema ---- */
+  const [meta, setMeta] = useState<any>(null);
+  const [metaLoading, setMetaLoading] = useState(true);
+  const [metaError, setMetaError] = useState("");
+
+  const loadMeta = useCallback(async () => {
+    setMetaLoading(true); setMetaError("");
+    try { const r = await intelligenceApi.getMeta(); setMeta(r.data || null); }
+    catch (e: any) { setMetaError(normalizeApiError({ message: e?.message }, e?.status || 0, null).message); setMeta(null); }
+    finally { setMetaLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    if (connectionStatus === "connected" || connectionStatus === undefined) loadMeta();
+    else { setMeta(null); setMetaLoading(false); }
+  }, [connectionStatus, dbName, loadMeta]);
+
+  const ex = useExplore(meta);
+  const { recent, savedCols, recentError, loadRecent } = ex;
+
+  /* ---- UI state ---- */
+  const [homeTab, setHomeTab] = useState<HomeTab>("recent");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [sidebarCtx, setSidebarCtx] = useState<{ metric?: string; breakdown?: string }>({});
+  /* The question the user asked, kept visible until they dismiss it. */
+  const [askedQuestion, setAskedQuestion] = useState("");
+
+  /* ---- Analysis results (on-page) ---- */
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState<any>(null);
+  const [error, setError] = useState("");
+  const [followUpQuery, setFollowUpQuery] = useState("");
+  const [history, setHistory] = useState<{ q: string; r: any }[]>([]);
+  const abortRef = useRef<AbortController | null>(null);
+
+  /* ---- Autocomplete ---- */
+  const [acOptions, setAcOptions] = useState<string[]>([]);
+  const [acOpen, setAcOpen] = useState(false);
+  const acTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchAc = useCallback((partial: string) => {
+    if (acTimer.current) clearTimeout(acTimer.current);
+    if (!partial || partial.length < 1) { setAcOptions([]); return; }
+    acTimer.current = setTimeout(async () => {
+      try {
+        const data: any = await apiFetch(`/autocomplete?partial=${encodeURIComponent(partial)}&limit=6`);
+        const list = Array.isArray(data?.suggestions) ? data.suggestions.map((s: any) => typeof s === "string" ? s : s?.text || "").filter(Boolean) : [];
+        setAcOptions(list);
+      } catch { setAcOptions([]); }
+    }, 200);
+  }, []);
+
+  /* ---- Suggestions (starter chips) — refreshed for the connected
+     database, and stale analysis is cleared on dataset switch so old
+     results (old columns) can never linger into a new database. ---- */
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const datasetKey = dbName || "";
+  const prevDatasetRef = useRef<string | null>(null);
+  const loadSuggestions = useCallback(async () => {
+    try {
+      const data: any = await apiFetch("/copilot/suggestions");
+      if (Array.isArray(data?.suggestions) && data.suggestions.length) setSuggestions(data.suggestions.slice(0, 4));
+      else setSuggestions([]);
+    } catch { /* keep previous chips on transient errors */ }
+  }, []);
+  useEffect(() => {
+    loadSuggestions();
+    if (prevDatasetRef.current !== null && prevDatasetRef.current !== datasetKey) {
+      abortRef.current?.abort();
+      setResult(null); setError(""); setHistory([]); setAskedQuestion("");
+      setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(false);
+      setSidebarCtx({});
+    }
+    prevDatasetRef.current = datasetKey;
+  }, [connectionStatus, datasetKey, loadSuggestions]);
+
+  /* ---- Navigation ---- */
+  const gotoTab = useCallback((tab: string) => {
+    try { window.location.hash = `#/intelligence?tab=${tab}`; } catch { /* ignore */ }
+    if (onNavigate) { try { onNavigate("intelligence"); } catch { /* ignore */ } }
+  }, [onNavigate]);
+
+  /* ---- Run analysis on-page ---- */
+  const runOnPage = useCallback(async (question: string) => {
+    const q = question.trim();
+    if (!q || running) return;
+    setAskedQuestion(q);
+    setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(false);
+    setRunning(true); setError(""); setResult(null);
+    abortRef.current?.abort();
+    const ctrl = new AbortController(); abortRef.current = ctrl;
+    try {
+      const data = await analyzeQuestion(q, null, { dataset: datasetKey || undefined }, null, { signal: ctrl.signal, timeoutMs: 120000 });
+      if (ctrl.signal.aborted) return;
+      setResult(data);
+      setSidebarCtx({ metric: data?.analytics_envelope?.metric || data?.display?.metric, breakdown: (data?.analytics_envelope?.dimensions || [])[0] });
+      setHistory((h) => [...h.slice(-9), { q, r: data }]);
+    } catch (e: any) {
+      if (e?.name === "AbortError") return;
+      setError(e?.message || "Could not analyze this question.");
+    } finally { setRunning(false); }
+  }, [running, datasetKey]);
+
+  /* ---- Follow-up submit ---- */
+  const submitFollowUp = () => {
+    const q = followUpQuery.trim();
+    if (!q) return;
+    runOnPage(q);
+  };
+
+  /* ---- Popular action click ---- */
+  const handlePopularAction = (a: typeof POPULAR_ACTIONS[number]) => {
+    if (a.navigate) { gotoTab(a.navigate); return; }
+    if (a.query) runOnPage(a.query);
+  };
+
+  /* ---- Sidebar action click ---- */
+  const handleSidebarAction = (a: typeof SIDEBAR_ACTIONS[number]) => {
+    const ctx = sidebarCtx.metric ? ` about ${humanize(sidebarCtx.metric)}` : "";
+    runOnPage(`${a.query}${ctx}`);
+  };
+
+  /* ---- Tab items ---- */
+  const tabItems = useMemo(() => {
+    if (homeTab === "recent") return asList(recent);
+    if (homeTab === "saved") return asList(savedCols);
+    return [];
+  }, [homeTab, recent, savedCols]);
+
+  /* ---- Open saved analysis from card ---- */
+  const openAnalysis = (item: any) => {
+    const q = `Analyze ${item?.metric || "data"}${item?.breakdown ? ` by ${item.breakdown}` : ""}`;
+    runOnPage(q);
+  };
+
+  /* ---- Back to home ---- */
+  const goHome = () => { setResult(null); setError(""); setHistory([]); setAskedQuestion(""); };
+
+  /* ---- Result normalization (analyzeQuestion returns {success, data: goalData}) ---- */
+  const gd = result?.data || result;  // goalData or raw
+  const answerMessage = strOf(gd?.answer || gd?.message || "");
+  const findings: string[] = asList(gd?.findings || []).map((f: any) => strOf(typeof f === "string" ? f : f?.text)).filter(Boolean);
+  const vizData = gd?.visualization?.data || gd?.data || [];
+  const vizType = gd?.visualization?.type || "bar";
+  const chartMetric = strOf(gd?.metric || gd?.display?.metric || gd?.processedDataSummary?.columns?.[0] || "");
+  const columns: string[] = gd?.processedDataSummary?.columns || gd?.columns || [];
+  const followUps: string[] = gd?.followUpQuestions || gd?.suggestedQuestions || [];
+  const story = strOf(gd?.story || "");
+  const limitations: string[] = asList(gd?.limitations || gd?.why?.limitations || []);
+  const b360: any = (gd as any)?.business360 || (result as any)?.business360 || null;
+
+  const hasDataset = meta && (meta?.metrics?.length > 0 || meta?.measures?.length > 0);
+  const showResults = result || running || error;
+
+  /* ---- Chart spec: chart_spec first, visualization envelope as fallback.
+     Both carry REAL column names (x/y) pointing into the data keys — never
+     positional guesses, so charts show names (artists, regions…) not blanks. */
+  const _cs: any = (gd as any)?.chart_spec || {};
+  const _vz: any = (gd as any)?.visualization || {};
+  const chartSpec = {
+    chart_type: _cs.chart_type || _vz.type || "bar",
+    x: _cs.x || _vz.x || "",
+    y: _cs.y || _vz.y || "",
+    label: _cs.label || "",
+  };
+  const showChart = vizData.length > 0 && chartSpec.chart_type !== "table" && !!chartSpec.x && !!chartSpec.y;
+
+  /* ------------------------------------------------------------------ */
+  /*  Not connected / Loading / Error / No dataset                       */
+  /* ------------------------------------------------------------------ */
+
+  if (connectionStatus !== undefined && connectionStatus !== "connected") {
+    return (
+      <div className="min-h-full bg-[#F7F8FB]">
+        <div className="p-6 max-w-screen-xl mx-auto">
+          <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">ARIA</p>
+          <h1 className="text-[28px] font-bold text-[#0F2440] tracking-tight mt-1">Analytics</h1>
+          <p className="text-[14px] text-slate-500 mt-0.5">Turn your data into answers.</p>
+          <div className="mt-8 text-center py-16 bg-white border border-slate-200 rounded-2xl">
+            <Database size={28} className="mx-auto text-slate-400 mb-3" />
+            <p className="text-sm font-medium">No data source connected</p>
+            {onNavigate && <button onClick={() => onNavigate("data")} className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-xl text-[13px] font-semibold text-white bg-blue-700 hover:bg-blue-800">Go to Data</button>}
           </div>
         </div>
-      )}
+      </div>
+    );
+  }
+  if (metaLoading) return <div className="min-h-full bg-[#F7F8FB]"><div className="p-6 max-w-screen-xl mx-auto"><LoadingPanel label="Loading analytics…" /></div></div>;
+  if (metaError && !meta) return <div className="min-h-full bg-[#F7F8FB]"><div className="p-6 max-w-screen-xl mx-auto"><ErrorPanel message={metaError} onRetry={loadMeta} retryLabel="Reload" /></div></div>;
+  if (meta && !hasDataset) return <div className="min-h-full bg-[#F7F8FB]"><div className="p-6 max-w-screen-xl mx-auto"><NoDatasetPanel onRetry={loadMeta} hint={(() => { try { return (getNoSchemaInfo(meta).hint as string) || undefined; } catch { return undefined; } })()} /></div></div>;
 
-      {/* Error */}
-      {goalError && state === "error" && (
-        <div className="bg-negative/10 border border-negative/20 rounded-xl p-5">
-          <div className="flex items-start gap-3">
-            <AlertCircle size={16} className="text-negative mt-0.5 flex-shrink-0" />
-            <div className="space-y-2">
-              <p className="text-sm text-negative font-medium">{goalError}</p>
-              <button
-                onClick={() => runAnalysis()}
-                className="text-xs text-negative/80 hover:text-negative underline transition-colors"
-              >
-                Try again
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+  /* ------------------------------------------------------------------ */
+  /*  Render                                                             */
+  /* ------------------------------------------------------------------ */
 
-      {/* Clarification */}
-      {state === "clarification" && goalResult?.clarificationMessage && (
-        <div className="bg-card border border-border rounded-xl p-5 space-y-3">
-          <div className="flex items-center gap-2">
-            <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center">
-              <Sparkles size={12} className="text-primary" />
-            </div>
-            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Clarification needed</p>
-          </div>
-          <p className="text-sm text-foreground leading-relaxed">{goalResult.clarificationMessage}</p>
-          <div className="flex flex-wrap gap-2 pt-1">
-            {(followUps.length > 0 ? followUps : getDynamicSuggestions(goalResult)).slice(0, 4).map((q) => (
-              <button
-                key={q}
-                onClick={() => runAnalysis(q)}
-                className="text-xs px-3 py-1.5 bg-secondary hover:bg-secondary/70 border border-border rounded-full text-muted-foreground hover:text-foreground transition-colors"
-              >
-                {q}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Results */}
-      {state === "done" && (
-        <div className="space-y-4">
-          {/* Graceful states: actionable copy, never stack traces/SQL/raw errors */}
-          {resultStatus && resultStatus !== "success" && (
-            <div className="bg-warning/10 border border-warning/30 rounded-xl p-4 flex items-start gap-3">
-              <AlertCircle size={15} className="text-warning mt-0.5 flex-shrink-0" />
+  return (
+    <div className="min-h-full bg-[#F7F8FB]">
+      <div className="flex gap-6 p-4 md:p-6 max-w-[1440px] mx-auto">
+        {/* ---- Main column ---- */}
+        <div className="flex-1 min-w-0 space-y-5">
+          {/* Header */}
+          <div>
+            <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">ARIA <span className="text-slate-400 font-normal tracking-normal">/ Analytics</span></p>
+            <div className="flex items-start justify-between gap-3 mt-1">
               <div>
-                <p className="text-sm font-medium text-foreground capitalize">{resultStatus.replace(/-/g, " ")}</p>
-                <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed">
-                  {resultMessage || "Try narrowing to one metric or period and ask again."}
-                </p>
+                <h1 className="text-[28px] font-bold text-[#0F2440] tracking-tight">Analytics</h1>
+                <p className="text-[14px] text-slate-500 mt-0.5">Turn your data into answers. Explore, compare, and uncover what matters.</p>
               </div>
-            </div>
-          )}
-
-          {/* Answer */}
-          {answer && (
-            <div className="premium-card bg-card border border-border rounded-xl p-5 space-y-3">
-              <div className="flex items-center gap-2">
-                <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center">
-                  <Sparkles size={12} className="text-primary" />
-                </div>
-                <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Answer</p>
-                {interpreted?.primary && (
-                  <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded capitalize">
-                    {String(interpreted.primary).replace(/_/g, " ")}
-                  </span>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {!showResults && (
+                  <button onClick={() => gotoTab("explore")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium text-slate-600 border border-slate-200 hover:text-[#0F2440] hover:border-slate-300 bg-white transition-colors">
+                    <Bookmark size={13} /> Saved analyses
+                  </button>
+                )}
+                {showResults ? (
+                  <button onClick={goHome} className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[12.5px] font-semibold text-white bg-blue-700 hover:bg-blue-800 transition-colors">
+                    <Plus size={14} /> New analysis
+                  </button>
+                ) : (
+                  <button onClick={() => gotoTab("explore")} className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[12.5px] font-semibold text-white bg-blue-700 hover:bg-blue-800 transition-colors">
+                    <Plus size={14} /> New analysis
+                  </button>
                 )}
               </div>
-              <p className="text-[14px] font-medium text-foreground leading-relaxed">
-                {answer}
-              </p>
-              {comparisonPeriod?.description && (
-                <p className="text-[11px] text-muted-foreground leading-relaxed">
-                  {comparisonPeriod.description}
-                </p>
-              )}
-              {findings.length > 1 && (
-                <ul className="space-y-1.5 pt-1">
-                  {findings.slice(0, 5).map((f: any, i: number) => (
-                    <li key={i} className="text-[13px] text-foreground leading-relaxed flex gap-2">
-                      <span className="text-primary mt-0.5">·</span>
-                      <span>{typeof f === "string" ? f : JSON.stringify(f)}</span>
-                    </li>
+            </div>
+          </div>
+
+          {/* Compact search bar — always visible when results are shown */}
+          {showResults && (
+            <div className="relative">
+              <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2.5 focus-within:border-blue-400 transition-colors shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+                <Search size={15} className="text-slate-400 flex-shrink-0" />
+                <input
+                  value={searchQuery}
+                  onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
+                  onFocus={() => setAcOpen(true)}
+                  onBlur={() => setTimeout(() => setAcOpen(false), 200)}
+                  onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); runOnPage(searchQuery); } }}
+                  placeholder="Ask another question..."
+                  className="flex-1 bg-transparent outline-none text-[13px] text-[#0F2440] placeholder:text-slate-400"
+                  aria-label="Ask a question"
+                />
+                <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
+                  <Send size={14} />
+                </button>
+              </div>
+              {acOpen && acOptions.length > 0 && (
+                <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
+                  {acOptions.map((s, i) => (
+                    <button key={s + i} onMouseDown={() => { setAcOpen(false); setSearchQuery(s); runOnPage(s); }}
+                      className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-[#0F2440] hover:bg-slate-50 transition-colors text-left">
+                      <Zap size={13} className="text-blue-600 flex-shrink-0" />
+                      <span className="truncate">{s}</span>
+                    </button>
                   ))}
-                </ul>
-              )}
-              <div className="flex flex-wrap gap-4 pt-1 text-[11px] text-muted-foreground">
-                {analysisMeta?.based_on > 0 && (
-                  <span>
-                    Based on{" "}
-                    <span className="text-foreground font-medium">
-                      {analysisMeta.based_on.toLocaleString()}
-                    </span>{" "}
-                    records
-                  </span>
-                )}
-                {analysisMeta?.entity_count > 0 && (
-                  <span>
-                    <span className="text-foreground font-medium">
-                      {analysisMeta.entity_count}
-                    </span>{" "}
-                    {analysisMeta.entity
-                      ? (analysisMeta.entity_count === 1 ? analysisMeta.entity : `${analysisMeta.entity}s`)
-                      : "groups"}{" "}
-                    analyzed
-                  </span>
-                )}
-                {(goalResult.confidence || analysisMeta?.confidence) && (
-                  <span>
-                    Confidence:{" "}
-                    <span className="text-positive font-medium">
-                      {goalResult.confidence || analysisMeta.confidence}
-                    </span>
-                  </span>
-                )}
-              </div>
-              {/* Server-defined KPIs (t.txt-5): rendered as-is, never recomputed */}
-              {goalResult?.display?.kpis && Object.keys(goalResult.display.kpis).length > 0 && (
-                <div className="flex flex-wrap gap-2 pt-1">
-                  {Object.entries(goalResult.display.kpis).slice(0, 3).map(([k, v]: any) => {
-                    const sum = Number(v?.sum);
-                    const avg = Number(v?.avg);
-                    return (
-                      <span key={k} className="text-[11px] px-2 py-1 rounded-md bg-secondary border border-border text-muted-foreground">
-                        {k}: <span className="text-foreground font-semibold">{isNaN(sum) ? "—" : sum.toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>
-                        <span className="ml-1">avg {isNaN(avg) ? "—" : avg.toLocaleString(undefined, { maximumFractionDigits: 1 })}</span>
-                      </span>
-                    );
-                  })}
                 </div>
               )}
-              {/* Feedback buttons — personalization signal (Section 62) */}
-              <div className="flex items-center gap-2 pt-2 border-t border-border">
-                <span className="text-[11px] text-muted-foreground">Was this helpful?</span>
-                <button
-                  onClick={() => rateInsight("useful")}
-                  className={`px-2 py-0.5 text-[11px] rounded-md border transition-colors ${insightRating === "useful" ? "bg-positive/10 border-positive/30 text-positive" : "border-border text-muted-foreground hover:text-foreground hover:border-primary/30"}`}
-                >
-                  Yes
-                </button>
-                <button
-                  onClick={() => rateInsight("not_useful")}
-                  className={`px-2 py-0.5 text-[11px] rounded-md border transition-colors ${insightRating === "not_useful" ? "bg-destructive/10 border-destructive/30 text-destructive" : "border-border text-muted-foreground hover:text-foreground hover:border-primary/30"}`}
-                >
-                  No
-                </button>
-              </div>
             </div>
           )}
 
-          {/* Possible drivers — embedded hypothesis capability (evidence-backed) */}
-          {(possibleDrivers.length > 0 || hypothesisObj) && (
-            <div className="bg-card border border-border rounded-xl p-5 space-y-3">
-              <div className="flex items-center gap-2">
-                <TrendingUp size={14} className="text-primary" />
-                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Possible drivers</p>
-                {hypothesisObj?.confidence && (
-                  <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-                    {hypothesisObj.confidence} confidence
-                  </span>
+          {/* Start a new analysis — only show when no results */}
+          {!showResults && (
+            <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-5">
+              <div className="flex items-center gap-2.5 mb-1">
+                <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 text-white"><Sparkles size={15} /></span>
+                <div>
+                  <h3 className="text-[14px] font-semibold text-[#0F2440]">Start a new analysis</h3>
+                  <p className="text-[11.5px] text-slate-500">Ask a question or choose from common analysis types.</p>
+                </div>
+              </div>
+              <div className="mt-3 relative">
+                <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/60 px-3 py-2.5 focus-within:border-blue-400 focus-within:bg-white transition-colors">
+                  <Search size={15} className="text-slate-400 flex-shrink-0" />
+                  <input
+                    value={searchQuery}
+                    onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
+                    onFocus={() => setAcOpen(true)}
+                    onBlur={() => setTimeout(() => setAcOpen(false), 200)}
+                    onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); runOnPage(searchQuery); } }}
+                    placeholder="E.g. Why did revenue drop last month?"
+                    className="flex-1 bg-transparent outline-none text-[13px] text-[#0F2440] placeholder:text-slate-400"
+                    aria-label="Ask a question"
+                  />
+                  <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
+                    <ChevronRight size={15} />
+                  </button>
+                </div>
+                {acOpen && acOptions.length > 0 && (
+                  <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
+                    {acOptions.map((s, i) => (
+                      <button key={s + i} onMouseDown={() => { setAcOpen(false); setSearchQuery(s); runOnPage(s); }}
+                        className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-[#0F2440] hover:bg-slate-50 transition-colors text-left">
+                        <Zap size={13} className="text-blue-600 flex-shrink-0" />
+                        <span className="truncate">{s}</span>
+                      </button>
+                    ))}
+                  </div>
                 )}
               </div>
-              {hypothesisObj?.text && (
-                <p className="text-sm text-foreground leading-relaxed">{hypothesisObj.text}</p>
+              <div className="mt-3">
+                <p className="text-[11px] font-medium text-slate-400 mb-2">Popular actions</p>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {POPULAR_ACTIONS.map((a) => (
+                    <button key={a.label} onClick={() => handlePopularAction(a)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-slate-600 border border-slate-200 hover:border-blue-300 hover:text-blue-700 hover:bg-blue-50/50 transition-colors">
+                      <a.icon size={13} /> {a.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {suggestions.length > 0 && (
+                <div className="mt-3">
+                  <p className="text-[11px] font-medium text-slate-400 mb-2">Suggested questions</p>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {suggestions.map((s, i) => (
+                      <button key={s + i} onClick={() => runOnPage(s)} className="px-3 py-1.5 rounded-lg text-[12px] font-medium text-blue-700 border border-blue-200 hover:bg-blue-50 transition-colors">
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               )}
-              {possibleDrivers.length > 0 && (
-                <div className="space-y-2">
-                  {possibleDrivers.slice(0, 5).map((d: any, i: number) => (
-                    <div key={i} className="flex items-center gap-3 bg-secondary/40 rounded-lg px-3 py-2">
+            </div>
+          )}
+
+          {/* Results — inline on-page */}
+          {showResults && (
+            <div className="space-y-4">
+              {/* Running */}
+              {running && <LoadingPanel label="Analyzing your question…" />}
+
+              {/* Error */}
+              {!running && error && (
+                <Card className="p-5">
+                  <p className="text-[13px] text-rose-600 font-medium">{error}</p>
+                  <button onClick={() => runOnPage(searchQuery || history[history.length - 1]?.q || "")} className="mt-2 text-[12px] font-semibold text-blue-700 hover:underline">Try again</button>
+                </Card>
+              )}
+
+              {/* Answer + Chart + Insights */}
+              {!running && !error && result && (
+                <div className="space-y-4 chart-reveal">
+                  {/* Asked question — stays until the user dismisses it */}
+                  {askedQuestion && (
+                    <div className="flex items-start gap-2.5 rounded-xl border border-slate-200 bg-slate-50/70 px-4 py-3">
+                      <Search size={14} className="text-slate-400 flex-shrink-0 mt-0.5" />
                       <div className="flex-1 min-w-0">
-                        <p className="text-[13px] font-medium text-foreground truncate">{d.driver || d.value}</p>
-                        <p className="text-[11px] text-muted-foreground">
-                          {d.metric}{d.period ? ` · ${d.period}` : ""}{d.confidence ? ` · ${d.confidence} confidence` : ""}
-                          {d.evidence?.table ? ` · ${d.evidence.table}` : ""}
-                        </p>
+                        <p className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-slate-400">Your question</p>
+                        <p className="text-[13px] font-medium text-[#0F2440] leading-snug break-words">{askedQuestion}</p>
                       </div>
-                      {d.contribution_pct !== undefined && (
-                        <span className="text-[13px] font-semibold text-primary flex-shrink-0">
-                          {d.contribution_pct}%
-                        </span>
-                      )}
+                      <button onClick={() => setAskedQuestion("")} className="inline-flex items-center justify-center w-6 h-6 rounded-md text-slate-400 hover:text-slate-600 hover:bg-slate-200/70 transition-colors flex-shrink-0" aria-label="Dismiss question" title="Dismiss">
+                        <X size={13} />
+                      </button>
                     </div>
-                  ))}
+                  )}
+                  {/* Answer message */}
+                  {answerMessage && (
+                    <Card className="p-5">
+                      <div className="flex items-start gap-3">
+                        <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 text-white flex-shrink-0"><Sparkles size={15} /></span>
+                        <div>
+                          <p className="text-[13px] text-[#0F2440] leading-relaxed">{answerMessage}</p>
+                        </div>
+                      </div>
+                    </Card>
+                  )}
+
+                  {/* Follow-up suggestion chips */}
+                  {(() => {
+                    const fus = asList(result?.followUpQuestions || result?.suggested_questions);
+                    if (!fus.length) return null;
+                    return (
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {fus.slice(0, 4).map((fq: string, i: number) => (
+                          <button key={fq + i} onClick={() => runOnPage(fq)} className="px-3 py-1.5 rounded-lg text-[12px] font-medium text-blue-700 border border-blue-200 hover:bg-blue-50 transition-colors">
+                            {fq}
+                          </button>
+                        ))}
+                      </div>
+                    );
+                  })()}
+
+                  {/* Chart — only for real chart types with named x/y axes.
+                      Table-type or axis-less results skip the chart so we never
+                      render a nameless/zeroed graph. */}
+                  {showChart && (
+                    <Card className="p-5">
+                      <CardHead title={chartSpec.label || (chartMetric ? `${humanize(chartMetric)} Analysis` : "Analysis Results")} sub={`${vizData.length} data points`} />
+                      <div className="h-[260px] mt-3">
+                        <DynamicChart data={vizData} chartSpec={chartSpec} metric={chartMetric} />
+                      </div>
+                    </Card>
+                  )}
+
+                  {/* Key Insights / Findings */}
+                  {findings.length > 0 && (
+                    <Card className="p-5">
+                      <h3 className="text-[14px] font-semibold text-[#0F2440] tracking-tight flex items-center gap-1.5">
+                        <Sparkles size={14} className="text-blue-700" /> Key Insights
+                      </h3>
+                      <ul className="mt-2 space-y-2">
+                        {findings.map((f, i) => (
+                          <li key={i} className="flex items-start gap-2 text-[12.5px] text-slate-700 leading-relaxed">
+                            <span className="w-1.5 h-1.5 rounded-full bg-blue-600 flex-shrink-0 mt-1.5" />{f}
+                          </li>
+                        ))}
+                      </ul>
+                    </Card>
+                  )}
+
+                  {/* Follow-up suggestions */}
+                  {followUps.length > 0 && (
+                    <Card className="p-5">
+                      <h3 className="text-[13px] font-semibold text-[#0F2440] mb-2">Suggested follow-ups</h3>
+                      <div className="flex flex-wrap gap-2">
+                        {followUps.slice(0, 6).map((fq, i) => (
+                          <button key={i} onClick={() => runOnPage(fq)} className="text-[11.5px] text-slate-600 border border-slate-200 rounded-full px-3 py-1.5 hover:border-blue-300 hover:text-blue-700 transition-colors">
+                            {fq}
+                          </button>
+                        ))}
+                      </div>
+                    </Card>
+                  )}
+
+                  {/* Limitations */}
+                  {limitations.length > 0 && (
+                    <div className="flex items-start gap-1.5 text-[11px] text-slate-500 bg-blue-50/60 border border-blue-100 rounded-xl px-3 py-2">
+                      <Info size={13} className="text-blue-600 flex-shrink-0 mt-px" />
+                      <span>{limitations[0]}</span>
+                    </div>
+                  )}
                 </div>
+              )}
+
+              {/* Follow-up input — always visible when results shown */}
+              {showResults && !running && (
+                <Card className="p-4">
+                  <div className="relative">
+                    <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/60 px-3 py-2.5 focus-within:border-blue-400 focus-within:bg-white transition-colors">
+                      <Search size={15} className="text-slate-400 flex-shrink-0" />
+                      <input
+                        value={followUpQuery}
+                        onChange={(e) => { setFollowUpQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
+                        onFocus={() => setAcOpen(true)}
+                        onBlur={() => setTimeout(() => setAcOpen(false), 200)}
+                        onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); submitFollowUp(); } }}
+                        placeholder="Ask a follow-up..."
+                        className="flex-1 bg-transparent outline-none text-[13px] text-[#0F2440] placeholder:text-slate-400"
+                        aria-label="Ask a follow-up question"
+                      />
+                      <button onClick={() => { setAcOpen(false); submitFollowUp(); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Send">
+                        <Send size={14} />
+                      </button>
+                    </div>
+                    {acOpen && acOptions.length > 0 && (
+                      <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
+                        {acOptions.map((s, i) => (
+                          <button key={s + i} onMouseDown={() => { setAcOpen(false); setFollowUpQuery(s); runOnPage(s); }}
+                            className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-[#0F2440] hover:bg-slate-50 transition-colors text-left">
+                            <Zap size={13} className="text-blue-600 flex-shrink-0" />
+                            <span className="truncate">{s}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </Card>
               )}
             </div>
           )}
 
-          {/* Recommendations (from the result, never invented) */}
-          {recommendationsList.length > 0 && (
-            <div className="bg-card border border-border rounded-xl p-5 space-y-2">
-              <div className="flex items-center gap-2">
-                <Lightbulb size={14} className="text-primary" />
-                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Recommendations</p>
+          {/* Tab bar — only when no results */}
+          {!showResults && (
+            <>
+              <div className="flex items-center gap-1 border-b border-slate-200" role="tablist" aria-label="Analysis sections">
+                {([ { id: "recent" as const, label: "Recent" }, { id: "saved" as const, label: "Saved" }, { id: "collections" as const, label: "Collections" }, { id: "shared" as const, label: "Shared" } ]).map((t) => {
+                  const on = homeTab === t.id;
+                  return (
+                    <button key={t.id} role="tab" aria-selected={on} onClick={() => setHomeTab(t.id)}
+                      className={`px-3.5 py-2.5 text-[12.5px] font-medium border-b-2 -mb-px transition-colors whitespace-nowrap ${on ? "border-blue-700 text-blue-800" : "border-transparent text-slate-400 hover:text-slate-600"}`}>
+                      {t.label}
+                    </button>
+                  );
+                })}
               </div>
-              <ul className="space-y-1.5">
-                {recommendationsList.slice(0, 4).map((r: any, i: number) => (
-                  <li key={i} className="text-[13px] text-foreground leading-relaxed flex gap-2">
-                    <span className="text-primary mt-0.5">·</span>
-                    <span>
-                      {typeof r === "string" ? r : (r.text || JSON.stringify(r))}
-                      {r?.confidence && <span className="text-muted-foreground"> ({r.confidence} confidence)</span>}
-                    </span>
-                  </li>
-                ))}
-              </ul>
+
+              {/* Tab content */}
+              {(homeTab === "recent" || homeTab === "saved") ? (
+                <div>
+                  {recentError && homeTab === "recent" && <p className="text-[12px] text-rose-600 mb-3">{recentError}</p>}
+                  {tabItems.length > 0 ? (
+                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                      {tabItems.map((item: any, i: number) => (
+                        <AnalysisCard key={item?.id || i} item={item} onOpen={() => openAnalysis(item)} />
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-center py-12 bg-white border border-slate-200 rounded-2xl">
+                      <BarChart3 size={24} className="mx-auto text-slate-300 mb-2" />
+                      <p className="text-[13px] font-medium text-slate-500">{homeTab === "recent" ? "No recent analyses yet." : "No saved analyses yet."}</p>
+                      <button onClick={() => gotoTab("explore")} className="mt-3 inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[12.5px] font-semibold text-white bg-blue-700 hover:bg-blue-800"><Plus size={13} /> New analysis</button>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="text-center py-12 bg-white border border-slate-200 rounded-2xl">
+                  <Compass size={24} className="mx-auto text-slate-300 mb-2" />
+                  <p className="text-[13px] font-medium text-slate-500">{homeTab === "collections" ? "No collections yet." : "No shared analyses yet."}</p>
+                </div>
+              )}
+
+              {/* Saved Analyses section */}
+              {homeTab === "recent" && asList(savedCols).length > 0 && (
+                <div>
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-[14px] font-semibold text-[#0F2440]">Saved Analyses</h3>
+                    <button onClick={() => setHomeTab("saved")} className="text-[12px] font-medium text-blue-700 hover:text-blue-800 flex items-center gap-0.5">View all <ChevronRight size={12} /></button>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                    {asList(savedCols).slice(0, 4).map((item: any, i: number) => (
+                      <AnalysisCard key={item?.id || i} item={item} onOpen={() => openAnalysis(item)} />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* ---- Right sidebar ---- */}
+        <aside className="w-[300px] flex-shrink-0 hidden lg:block space-y-4">
+          {/* 360 degree business view — side panel keeps the main column short */}
+          {b360 && (
+            <div className="bg-white border border-blue-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4 bg-gradient-to-b from-blue-50/60 to-white">
+              <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">360 DEGREE BUSINESS VIEW</p>
+              <h3 className="text-[14px] font-bold text-[#0F2440] tracking-tight mt-1 leading-snug">{strOf(b360?.headline || "Here's the full picture")}</h3>
+              <p className="mt-1.5 text-[12px] text-slate-700 leading-relaxed">{strOf(b360?.what_happened?.summary || "")}</p>
+              {asList(b360?.likely_causes).length > 0 && (
+                <div className="mt-2.5">
+                  <p className="text-[11px] font-semibold text-[#0F2440]">Most likely causes</p>
+                  <ul className="mt-1 space-y-1">
+                    {asList(b360.likely_causes).slice(0, 3).map((c: any, i: number) => (
+                      <li key={i} className="text-[12px] text-slate-600 leading-relaxed">· <span className="font-semibold text-[#0F2440]">{strOf(c?.cause)}</span> — {strOf(c?.why_plain)}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {asList(b360?.what_to_do).length > 0 && (
+                <div className="mt-2.5">
+                  <p className="text-[11px] font-semibold text-[#0F2440]">What to do next</p>
+                  <div className="mt-1 space-y-1.5">
+                    {asList(b360.what_to_do).slice(0, 3).map((a: any, i: number) => (
+                      <details key={i} className="rounded-xl bg-emerald-50/60 border border-emerald-200 px-2.5 py-1.5">
+                        <summary className="text-[12px] font-bold text-emerald-900 cursor-pointer leading-snug">{strOf(a?.title)}</summary>
+                        <ul className="mt-1 space-y-0.5">
+                          {asList(a?.steps).slice(0, 3).map((s: string, j: number) => (
+                            <li key={j} className="text-[11.5px] text-slate-700 leading-relaxed">✓ {strOf(s)}</li>
+                          ))}
+                        </ul>
+                        {strOf(a?.expected) && <p className="mt-1 text-[11.5px] text-slate-600">{strOf(a.expected)}</p>}
+                      </details>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {strOf(b360?.if_do_nothing) && (
+                <div className="mt-2.5 rounded-xl bg-amber-50 border border-amber-200 px-2.5 py-2">
+                  <p className="text-[11px] font-semibold text-amber-900">If you do nothing</p>
+                  <p className="text-[11.5px] text-amber-800 leading-relaxed">{strOf(b360.if_do_nothing)}</p>
+                </div>
+              )}
             </div>
           )}
-
-          {/* Limitations (honest, from the backend) */}
-          {limitations.length > 0 && (
-            <div className="bg-secondary/40 border border-border rounded-xl p-4 space-y-1">
-              <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Limitations</p>
-              {limitations.slice(0, 4).map((lim: any, i: number) => (
-                <p key={i} className="text-xs text-muted-foreground leading-relaxed">· {typeof lim === "string" ? lim : JSON.stringify(lim)}</p>
+          {/* ARIA Assistant */}
+          <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
+            <div className="flex items-center gap-2.5 mb-4">
+              <span className="inline-flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 text-white"><Sparkles size={16} /></span>
+              <div>
+                <h3 className="text-[13px] font-semibold text-[#0F2440]">ARIA</h3>
+                <p className="text-[11px] text-slate-400">Your analysis assistant</p>
+              </div>
+            </div>
+            <div className="space-y-0.5">
+              {SIDEBAR_ACTIONS.map((a) => (
+                <button key={a.label} onClick={() => handleSidebarAction(a)}
+                  className="w-full text-left py-2.5 px-2 -mx-2 flex items-center gap-2.5 hover:bg-blue-50/50 rounded-lg transition-colors group">
+                  <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-50 text-blue-700 flex-shrink-0"><a.icon size={14} /></span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-[12px] font-medium text-[#0F2440] group-hover:text-blue-700">{a.label}</span>
+                    <span className="block text-[11px] text-slate-400">{a.sub}</span>
+                  </span>
+                  <ChevronRight size={13} className="text-slate-300 group-hover:text-blue-500 flex-shrink-0" />
+                </button>
               ))}
             </div>
-          )}
+          </div>
 
-          {/* Visualization: skeleton swapped for a one-shot reveal (keyed by
-              question so each new analysis replays it once, then static).
-              Click a mark to drill down — Investigate / Explain / Forecast
-              hooks travel with the shared context. */}
-          {chartRenderData.length > 0 && xKey && yKey && (
-            <div className="bg-card border border-border rounded-xl p-5 chart-reveal" key={submittedQ || query}>
-              <div className="flex items-center justify-between mb-4">
-                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Visualization</p>
-                <div className="flex items-center gap-2">
-                  {goalResult?.chartSpec?.reason && (
-                    <p className="text-[10px] text-muted-foreground hidden md:block" title={goalResult.chartSpec.reason}>
-                      {goalResult.chartSpec.label || chartType}
-                    </p>
-                  )}
-                  {chartOptions.length > 1 && (
-                    <select
-                      value={chartType}
-                      aria-label="Change chart type"
-                      onChange={(e) => trackChartSwitch(e.target.value)}
-                      className="text-[11px] bg-secondary border border-border rounded-lg px-2 py-1 text-foreground outline-none focus:border-primary cursor-pointer"
-                    >
-                      {chartOptions.map((t) => (
-                        <option key={t} value={t}>
-                          {t === "hbar" ? "Horizontal bar" : t === "stacked" ? "Stacked bar" : t[0].toUpperCase() + t.slice(1)}
-                        </option>
-                      ))}
-                    </select>
-                  )}
+          {/* Context */}
+          {sidebarCtx.metric && (
+            <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
+              <h4 className="text-[11px] font-medium text-slate-400 mb-2">Context</h4>
+              <div className="flex items-center gap-2.5 p-2.5 bg-slate-50 rounded-xl">
+                <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-50 text-blue-700 flex-shrink-0"><BarChart3 size={14} /></span>
+                <div className="min-w-0">
+                  <p className="text-[12px] font-medium text-[#0F2440] truncate">{humanize(sidebarCtx.metric)}</p>
+                  <p className="text-[11px] text-slate-400">{sidebarCtx.breakdown ? `By ${humanize(sidebarCtx.breakdown)}` : "Overall"}</p>
                 </div>
               </div>
-              <ResponsiveContainer width="100%" height={260}>
-                {chartType === "area" || chartType === "line" ? (
-                  <AreaChart data={chartRenderData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
-                    <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
-                    <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
-                    <Tooltip content={<BizTooltip />} />
-                    <Area type="monotone" dataKey={yKey} stroke={CHART_COLORS[0]} fill={CHART_COLORS[0]} fillOpacity={0.15} strokeWidth={2} />
-                  </AreaChart>
-                ) : chartType === "scatter" ? (
-                  <ScatterChart>
-                    <CartesianGrid strokeDasharray="3 3" stroke={grid} />
-                    <XAxis dataKey={xKey} name={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
-                    <YAxis dataKey={yKey} name={yKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
-                    <Tooltip
-                      content={<BizTooltip />}
-                      cursor={{ strokeDasharray: "3 3" }}
-                    />
-                    <Scatter data={chartRenderData} fill={CHART_COLORS[0]} fillOpacity={0.6} />
-                  </ScatterChart>
-                ) : chartType === "hbar" ? (
-                  <BarChart data={chartRenderData} layout="vertical" barSize={22}>
-                    <CartesianGrid strokeDasharray="3 3" stroke={grid} horizontal={false} />
-                    <XAxis type="number" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
-                    <YAxis type="category" dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={110} />
-                    <Tooltip content={<BizTooltip />} />
-                    <Bar dataKey={yKey} radius={[0, 5, 5, 0]}>
-                      {chartRenderData.map((row: any, i: number) => (
-                        <Cell key={i} fill={colorForName(String(row?.[xKey] ?? i))} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                ) : chartType === "stacked" ? (
-                  <BarChart data={chartRenderData} barSize={28}>
-                    <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
-                    <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
-                    <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
-                    <Tooltip content={<BizTooltip />} />
-                    {chartSeries.map((s, i) => (
-                      <Bar key={s} dataKey={s} stackId="a" fill={CHART_COLORS[i % CHART_COLORS.length]} radius={i === chartSeries.length - 1 ? [5, 5, 0, 0] : [0, 0, 0, 0]} />
-                    ))}
-                  </BarChart>
-                ) : chartType === "pie" ? (
-                  <PieChart>
-                    <Pie
-                      data={chartRenderData}
-                      cx="50%"
-                      cy="50%"
-                      outerRadius={90}
-                      dataKey={yKey}
-                      nameKey={xKey}
-                      label={({ name, percent }) => `${name} ${((percent ?? 0) * 100).toFixed(0)}%`}
-                      labelLine={false}
-                    >
-                      {chartRenderData.map((_, i) => (
-                        <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />
-                      ))}
-                    </Pie>
-                    <Tooltip content={<BizTooltip />} />
-                  </PieChart>
-                ) : (
-                  <BarChart data={chartRenderData} barSize={36} onClick={onChartClick}>
-                    <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
-                    <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
-                    <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={60} />
-                    <Tooltip content={<BizTooltip />} />
-                    <Bar dataKey={yKey} radius={[5, 5, 0, 0]}>
-                      {chartRenderData.map((row: any, i: number) => (
-                        <Cell
-                          key={i}
-                          fill={chartType === "histogram" ? CHART_COLORS[0] : colorForName(String(row?.[xKey] ?? i))}
-                          fillOpacity={chartType === "histogram" ? 0.55 + (0.45 * i) / Math.max(1, chartRenderData.length) : 1}
-                        />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                )}
-              </ResponsiveContainer>
-              {drill && (
-                <div className="mt-3 rounded-lg border border-primary/25 bg-primary/5 px-3 py-2.5">
-                  <p className="text-xs text-foreground">
-                    <span className="font-semibold">{drill.label}</span>
-                    {drill.value !== null && drill.value !== undefined && (
-                      <span className="text-muted-foreground"> · {typeof drill.value === "number" ? drill.value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : String(drill.value)}</span>
-                    )}
-                    <span className="text-muted-foreground"> — what next?</span>
-                  </p>
-                  <div className="mt-2 flex flex-wrap gap-1.5">
-                    <button
-                      onClick={() => {
-                        drillHooks(drill.label);
-                        const wq = `Why did ${yKey || "the metric"} change for ${drill.label}?`;
-                        setQuery(wq);
-                        onAsk?.(wq);
-                        setDrill(null);
-                      }}
-                      className="text-[11px] font-medium px-2.5 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
-                    >
-                      Investigate why
-                    </button>
-                    <button
-                      onClick={() => {
-                        drillHooks(drill.label);
-                        onAsk?.(`Explain this finding: ${drill.label} in ${query || submittedQ}`);
-                      }}
-                      className="text-[11px] font-medium px-2.5 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
-                    >
-                      Explain
-                    </button>
-                    <button
-                      onClick={() => {
-                        drillHooks(drill.label);
-                        gotoWithContext("predictive", { metric: yKey });
-                      }}
-                      className="text-[11px] font-medium px-2.5 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
-                    >
-                      Forecast
-                    </button>
-                    <button
-                      onClick={() => setDrill(null)}
-                      className="text-[11px] text-muted-foreground hover:text-foreground px-2 py-1.5"
-                    >
-                      Clear
-                    </button>
-                  </div>
-                </div>
-              )}
             </div>
           )}
 
-          {/* Why? — stored structured explanation (§21), shown on demand */}
-          {goalResult?.why && (
-            <div className="bg-card border border-border rounded-xl overflow-hidden">
-              <button
-                onClick={() => setShowWhy((w) => !w)}
-                className="w-full flex items-center justify-between px-5 py-3.5 hover:bg-secondary/40 transition-colors"
-              >
-                <div className="flex items-center gap-2">
-                  <HelpCircle size={14} className="text-primary" />
-                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Why this result?</p>
-                  <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-                    {goalResult.why.confidence} confidence
+          {/* Continue exploring */}
+          <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
+            <h4 className="text-[11px] font-medium text-slate-400 mb-2">Continue exploring</h4>
+            <div className="space-y-0.5">
+              {CONTINUE_EXPLORING.map((a) => (
+                <button key={a.label} onClick={() => gotoTab(a.tab)}
+                  className="w-full text-left py-2.5 px-2 -mx-2 flex items-center gap-2.5 hover:bg-blue-50/50 rounded-lg transition-colors group">
+                  <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-slate-50 text-slate-600 flex-shrink-0"><a.icon size={14} /></span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-[12px] font-medium text-[#0F2440] group-hover:text-blue-700">{a.label}</span>
+                    <span className="block text-[11px] text-slate-400">{a.sub}</span>
                   </span>
-                </div>
-                {showWhy ? <ChevronUp size={14} className="text-muted-foreground" /> : <ChevronDown size={14} className="text-muted-foreground" />}
-              </button>
-              {showWhy && (
-                <div className="border-t border-border px-5 py-4 space-y-3">
-                  <div>
-                    <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">What happened</p>
-                    <p className="text-sm text-foreground leading-relaxed">{goalResult.why.what_happened}</p>
-                  </div>
-                  <div>
-                    <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Why it matters</p>
-                    <p className="text-sm text-foreground leading-relaxed">{goalResult.why.why_it_matters}</p>
-                  </div>
-                  {goalResult.why.contributing_factors?.length > 0 && (
-                    <div>
-                      <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Contributing factors</p>
-                      <p className="text-sm text-foreground">{goalResult.why.contributing_factors.join(", ")}</p>
-                    </div>
-                  )}
-                  {goalResult.why.limitations?.length > 0 && (
-                    <div className="bg-secondary/40 rounded-lg p-3">
-                      <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1">Limitations</p>
-                      {goalResult.why.limitations.map((lim: string, i: number) => (
-                        <p key={i} className="text-xs text-muted-foreground leading-relaxed">· {lim}</p>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Story — coherent evidence-based narrative (§23) */}
-          {goalResult?.story && (
-            <div className="bg-primary/5 border border-primary/20 rounded-xl p-5 space-y-2">
-              <div className="flex items-center gap-2">
-                <BookOpen size={14} className="text-primary" />
-                <p className="text-xs font-semibold text-primary uppercase tracking-wider">Data Story</p>
-              </div>
-              <p className="text-sm text-foreground leading-relaxed">{goalResult.story}</p>
-            </div>
-          )}
-
-
-          {/* Table */}
-          <div className="bg-card border border-border rounded-xl overflow-hidden">
-            <button
-              onClick={() => setShowTable((t) => !t)}
-              className="w-full flex items-center justify-between px-5 py-3.5 hover:bg-secondary/40 transition-colors"
-            >
-              <div className="flex items-center gap-2">
-                <Table2 size={14} className="text-muted-foreground" />
-                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Supporting Data</p>
-                {tableData.length > 0 && (
-                  <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">{tableData.length} rows</span>
-                )}
-              </div>
-              {showTable ? <ChevronUp size={14} className="text-muted-foreground" /> : <ChevronDown size={14} className="text-muted-foreground" />}
-            </button>
-            {showTable && tableData.length > 0 && (
-              <div className="border-t border-border overflow-x-auto max-h-80 overflow-y-auto">
-                <table className="w-full text-sm">
-                  <thead className="sticky top-0 bg-card">
-                    <tr className="border-b border-border">
-                      {Object.keys(tableData[0]).map((h) => (
-                        <th key={h} className="text-left text-xs font-medium text-muted-foreground px-5 py-3 whitespace-nowrap">{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {tableData.slice(0, 50).map((row, i) => (
-                      <tr key={i} className={`${i < Math.min(tableData.length, 50) - 1 ? "border-b border-border" : ""} hover:bg-secondary/30 transition-colors`}>
-                        {Object.values(row).map((val: any, j) => (
-                          <td key={j} className="px-5 py-3 text-foreground whitespace-nowrap">
-                            {typeof val === "number" ? new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(val) : String(val ?? "—")}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
-
-          {/* Evidence — tables/columns/values only. Raw SQL stays backend-only
-              and is never rendered on this user-facing page. */}
-          {evidenceList.length > 0 && (
-            <div className="bg-card border border-border rounded-xl overflow-hidden">
-              <button
-                onClick={() => setShowEvidence((e) => !e)}
-                className="w-full flex items-center justify-between px-5 py-3.5 hover:bg-secondary/40 transition-colors"
-              >
-                <div className="flex items-center gap-2">
-                  <Database size={14} className="text-muted-foreground" />
-                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Evidence</p>
-                  {evidenceList[0]?.tables?.length > 0 && (
-                    <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-                      {evidenceList[0].tables.slice(0, 3).join(", ")}
-                    </span>
-                  )}
-                </div>
-                {showEvidence ? <ChevronUp size={14} className="text-muted-foreground" /> : <ChevronDown size={14} className="text-muted-foreground" />}
-              </button>
-              {showEvidence && (
-                <div className="border-t border-border px-5 py-4 space-y-2 text-xs text-muted-foreground leading-relaxed">
-                  <p>Tables: {(evidenceList[0]?.tables || []).join(", ") || "—"}</p>
-                  <p>Columns: {(evidenceList[0]?.columns || []).join(", ") || "—"}</p>
-                  <p>Rows analyzed: {evidenceList[0]?.row_count ?? tableData.length}</p>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* P2 §20: raw SQL / raw JSON / chain-of-thought / prompts are never
-              exposed on this user-facing page. Provenance (source/tables/
-              columns/SQL trace) stays in the backend goalResult payload for
-              admin/debug use only. */}
-
-          {/* Follow-ups */}
-          {followUps.length > 0 && (
-            <div className="space-y-2">
-              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Continue your analysis</p>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 stagger-children">
-                {followUps.map((q, i) => (
-                  <button
-                    key={i}
-                    onClick={() => { trackSuggestionClick(q); setQuery(q); runAnalysis(q); }}
-                    className="premium-card flex items-center justify-between bg-card border border-border rounded-xl px-4 py-3 hover:border-primary/40 text-left group"
-                  >
-                    <p className="text-sm text-foreground group-hover:text-primary transition-colors">{q}</p>
-                    <ArrowRight size={13} className="text-muted-foreground group-hover:text-primary transition-colors ml-2 flex-shrink-0" />
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Next actions: handoffs carry the shared analysis context
-              (localStorage aria_analysis_context + hash params) so the user
-              never retypes and the target page never re-analyzes. */}
-          <div className="space-y-2">
-            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Next actions</p>
-            <div className="flex flex-wrap gap-2">
-              <button
-                onClick={() => {
-                  const m = analysisMeta?.entity || yKey || "the metric";
-                  const wq = `Why did ${m} change?`;
-                  setQuery(wq);
-                  runAnalysis(wq);
-                }}
-                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
-              >
-                Investigate why
-              </button>
-              <button
-                onClick={() => {
-                  const q = `Compare this period with the previous period for: ${query || submittedQ || "the current analysis"}`;
-                  setQuery(q);
-                  runAnalysis(q);
-                }}
-                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
-              >
-                Compare periods
-              </button>
-              <button
-                onClick={() => {
-                  const m = analysisMeta?.entity || yKey || "";
-                  const period = comparisonPeriod?.granularity || (goalResult?.comparison_period as any)?.granularity || "";
-                  const table = (goalResult?.relevantTables || [])[0] || null;
-                  const q = query || submittedQ || "";
-                  saveAnalysisContext({
-                    origin: "analytics",
-                    question: q || null,
-                    metric: m || null,
-                    dimension: xKey || null,
-                    table,
-                    period: period || null,
-                    dateRange: period || null,
-                  });
-                  try {
-                    localStorage.setItem("aria_forecast_context", JSON.stringify({
-                      metric: m || undefined,
-                      dataset: table || undefined,
-                      date: period || undefined,
-                      granularity: period || undefined,
-                      question: q || undefined,
-                    }));
-                  } catch { /* best-effort */ }
-                  gotoWithContext("predictive", { metric: m, period: period || undefined, question: q || undefined });
-                }}
-                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
-              >
-                Forecast
-              </button>
-              <button
-                onClick={goRelatedInsights}
-                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
-              >
-                Related insights
-              </button>
-              <button
-                onClick={goCopilotAnalysis}
-                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
-              >
-                Continue in Copilot
-              </button>
-              <button
-                onClick={goHistory}
-                className="text-xs font-medium px-3 py-1.5 rounded-lg border border-border bg-card text-foreground hover:border-primary/50 transition-colors"
-              >
-                Save analysis
-              </button>
+                  <ChevronRight size={13} className="text-slate-300 group-hover:text-blue-500 flex-shrink-0" />
+                </button>
+              ))}
             </div>
           </div>
 
-          {/* n.txt-10: Source & Provenance removed from this user-facing page.
-              Provenance (source/tables/columns/SQL trace) stays in the backend
-              goalResult payload for admin/debug use only. */}
-        </div>
-      )}
+          {/* Follow-up input */}
+          <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
+            <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/60 px-3 py-2 focus-within:border-blue-400 transition-colors">
+              <input
+                value={followUpQuery}
+                onChange={(e) => setFollowUpQuery(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") submitFollowUp(); }}
+                placeholder="Ask a follow-up..."
+                className="flex-1 bg-transparent outline-none text-[12px] text-[#0F2440] placeholder:text-slate-400"
+                aria-label="Ask a follow-up question"
+              />
+              <button onClick={submitFollowUp} className="inline-flex items-center justify-center w-7 h-7 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Send">
+                <Send size={12} />
+              </button>
+            </div>
+            <p className="text-[10.5px] text-slate-400 mt-2 leading-relaxed">ARIA can help you analyze, compare, and go deeper.</p>
+          </div>
+        </aside>
+      </div>
     </div>
   );
 }

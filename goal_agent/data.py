@@ -29,12 +29,77 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _plain_words(identifier):
+    """Identifier -> plain words for user-facing text ('order_date' -> 'order date')."""
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", str(identifier or "")) if p]
+    return " ".join(w.lower() for w in parts) or str(identifier or "")
+
+
+def _natural_unmatched(kind, names, available):
+    """Natural-English failure text naming what was asked for in plain words
+    plus the available datasets/fields — never raw SQL or identifiers."""
+    named = ", ".join(f"'{_plain_words(n)}'" for n in list(names)[:3]) or "that"
+    avail = ", ".join(f"'{_plain_words(a)}'" for a in list(available)[:10]) or "your connected data"
+    if kind == "table":
+        return (f"I couldn't match {named} to your data. "
+                f"Available datasets: {avail}. Try asking with one of these.")
+    return (f"I couldn't match {named} to your data. "
+            f"Available fields: {avail}. Try rephrasing with one of these fields.")
+
+
+_UNDEFINED_COLUMN_RES = (
+    re.compile(r'no such column:?\s*["`\'\[]?([\w.]+)', re.IGNORECASE),
+    re.compile(r'column\s+["`\'\[]?([\w.]+)["`\'\]]?\s+does not exist', re.IGNORECASE),
+    re.compile(r"unknown column\s+['\"`]?([\w.]+)", re.IGNORECASE),
+    re.compile(r"invalid column name\s+['\"`]?([\w.]+)", re.IGNORECASE),
+)
+
+
+def _extract_undefined_column(exc):
+    """Pull the offending column name out of a DB undefined-column error."""
+    try:
+        text = str(exc or "")
+    except Exception:
+        return None
+    for rx in _UNDEFINED_COLUMN_RES:
+        m = rx.search(text)
+        if m:
+            return m.group(1).strip().strip("\"'`[]")
+    if re.search(r"undefinedcolumn|undefined_column", text, re.IGNORECASE):
+        m = re.search(r'["`\'\[]?([\w.]+)["`\'\]]?', text)
+        if m:
+            return m.group(1)
+    return None
+
+
 class DataMixin:
     # Bounded budget for each LLM repair call. Without this a slow/unavailable
     # local model (Ollama) call (capped at 120s in llm_provider) inside a
     # repair loop can block a request for many minutes. Repairs that exceed
     # this are abandoned and the caller degrades gracefully instead of hanging.
     _REPAIR_TIMEOUT = int(os.getenv("ARIA_REPAIR_TIMEOUT", "60"))
+
+    # ---- _no_llm_rebuild (_no_llm_rebuild) ----
+
+    def _no_llm_rebuild(self, user_goal, join_path, kpi_map, ir, join_plan,
+                        current_sql):
+        """Deterministic rebuild when an LLM repair call fails (LLM disabled).
+
+        Returns cleaned IR-driven SQL to continue the loop with, or None when
+        no distinct rebuild exists (caller raises the original error).
+        """
+        try:
+            det = self._deterministic_sql(  # type: ignore[attr-defined]
+                user_goal, join_path, kpi_map, ir, join_plan)
+        except Exception:
+            return None
+        if det and det.strip() != (current_sql or "").strip():
+            try:
+                return self._clean_sql(det)  # type: ignore[attr-defined]
+            except Exception:
+                return None
+        return None
 
     # ---- _execute_with_retry (_execute_with_retry) ----
 
@@ -96,10 +161,8 @@ class DataMixin:
             bad_tables = unknown_sql_tables(current_sql, self.tables)
             if bad_tables:
                 if attempt >= retries:
-                    raise RuntimeError(
-                        f"Generated SQL referenced tables that do not exist "
-                        f"({', '.join(bad_tables)}) and could not be repaired."
-                    )
+                    raise RuntimeError(_natural_unmatched(
+                        "table", bad_tables, list(self.tables.keys())))
                 logger.warning(
                     f"SQL references unknown table(s) {bad_tables} on attempt {attempt + 1}. "
                     f"Asking LLM to repair."
@@ -126,10 +189,17 @@ No explanations, no markdown.
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
-                    raise RuntimeError(
-                        f"Generated SQL referenced tables that do not exist "
-                        f"({', '.join(bad_tables)}) and could not be repaired."
-                    )
+                    _rb = self._no_llm_rebuild(
+                        user_goal, join_path, kpi_map, ir, join_plan,
+                        current_sql)
+                    if _rb:
+                        logger.warning(
+                            "LLM table repair unavailable; continuing with "
+                            "deterministic rebuild (no LLM).")
+                        current_sql = _rb
+                        continue
+                    raise RuntimeError(_natural_unmatched(
+                        "table", bad_tables, list(self.tables.keys())))
 
             # Validation layer: reject hallucinated COLUMN references before a
             # database round-trip (e.g. `orders.quantity` when quantity lives
@@ -146,11 +216,24 @@ No explanations, no markdown.
                     )
                     current_sql = repaired
                     continue
-                if attempt >= retries:
-                    raise RuntimeError(
-                        f"Generated SQL referenced columns that do not exist "
-                        f"({', '.join(bad_columns)}) and could not be repaired."
+                # Near-miss names (typos/plurals/case) fixed without an LLM.
+                try:
+                    repaired, changed = self._repair_fuzzy_columns(
+                        current_sql, columns_by_table, bad_columns
                     )
+                except Exception:
+                    repaired, changed = current_sql, False
+                if changed:
+                    logger.warning(
+                        f"SQL referenced unknown column(s) {bad_columns}; "
+                        f"repaired by fuzzy match (no LLM)."
+                    )
+                    current_sql = repaired
+                    continue
+                if attempt >= retries:
+                    raise RuntimeError(_natural_unmatched(
+                        "column", bad_columns,
+                        sorted({c for cols in columns_by_table.values() for c in cols})))
                 logger.warning(
                     f"SQL references unknown column(s) {bad_columns} on attempt {attempt + 1}. "
                     f"Asking LLM to repair."
@@ -177,10 +260,18 @@ No explanations, no markdown.
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
-                    raise RuntimeError(
-                        f"Generated SQL referenced columns that do not exist "
-                        f"({', '.join(bad_columns)}) and could not be repaired."
-                    )
+                    _rb = self._no_llm_rebuild(
+                        user_goal, join_path, kpi_map, ir, join_plan,
+                        current_sql)
+                    if _rb:
+                        logger.warning(
+                            "LLM column repair unavailable; continuing with "
+                            "deterministic rebuild (no LLM).")
+                        current_sql = _rb
+                        continue
+                    raise RuntimeError(_natural_unmatched(
+                        "column", bad_columns,
+                        sorted({c for cols in columns_by_table.values() for c in cols})))
 
             # Validation layer: reject SQL that references a table (as `tbl.col`
             # or in a JOIN ON) without that table in FROM/JOIN. This is a plain,
@@ -199,8 +290,8 @@ No explanations, no markdown.
                     continue
                 if attempt >= retries:
                     raise RuntimeError(
-                        f"Generated SQL referenced table(s) {missing} without including "
-                        f"them in FROM/JOIN and could not be repaired."
+                        "I couldn't build that breakdown with the current data. "
+                        "Try a simpler question about totals, averages or top items."
                     )
                 logger.warning(
                     f"SQL references {missing} without a FROM clause on attempt {attempt + 1}. "
@@ -229,9 +320,18 @@ Return only the corrected SQL query. No explanations, no markdown.
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
+                    _rb = self._no_llm_rebuild(
+                        user_goal, join_path, kpi_map, ir, join_plan,
+                        current_sql)
+                    if _rb:
+                        logger.warning(
+                            "LLM missing-table repair unavailable; continuing "
+                            "with deterministic rebuild (no LLM).")
+                        current_sql = _rb
+                        continue
                     raise RuntimeError(
-                        f"Generated SQL referenced table(s) {missing} without including "
-                        f"them in FROM/JOIN and could not be repaired."
+                        "I couldn't build that breakdown with the current data. "
+                        "Try a simpler question about totals, averages or top items."
                     )
 
             # Validation layer: reject nested aggregate functions before a
@@ -272,6 +372,15 @@ Return only the corrected SQL query. No explanations, no markdown.
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
+                    _rb = self._no_llm_rebuild(
+                        user_goal, join_path, kpi_map, ir, join_plan,
+                        current_sql)
+                    if _rb:
+                        logger.warning(
+                            "LLM nested-aggregate repair unavailable; continuing "
+                            "with deterministic rebuild (no LLM).")
+                        current_sql = _rb
+                        continue
                     raise RuntimeError(
                         f"Generated SQL nested aggregate function(s) "
                         f"({', '.join(nested)}) and could not be repaired."
@@ -281,6 +390,19 @@ Return only the corrected SQL query. No explanations, no markdown.
             # (e.g. SUM(name) on a TEXT column). Deterministic; repair via LLM.
             bad_types = self._find_incompatible_aggregations(current_sql)
             if bad_types:
+                # Deterministic (no-LLM) repair first: swap the offending
+                # column for the table's verified-safe numeric measure.
+                try:
+                    _fixed, _ok = self._repair_incompatible_aggregation(
+                        current_sql)
+                except Exception:
+                    _fixed, _ok = current_sql, False
+                if _ok:
+                    logger.warning(
+                        "SQL aggregates incompatible datatype(s) %s; repaired "
+                        "deterministically (no LLM).", bad_types)
+                    current_sql = _fixed
+                    continue
                 if attempt >= retries:
                     raise RuntimeError(
                         f"Generated SQL aggregates incompatible datatype(s) "
@@ -312,6 +434,15 @@ Return only the corrected SQL query. No explanations, no markdown.
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
+                    _rb = self._no_llm_rebuild(
+                        user_goal, join_path, kpi_map, ir, join_plan,
+                        current_sql)
+                    if _rb:
+                        logger.warning(
+                            "LLM datatype repair unavailable; continuing with "
+                            "deterministic rebuild (no LLM).")
+                        current_sql = _rb
+                        continue
                     raise RuntimeError(
                         f"Generated SQL aggregates incompatible datatype(s) "
                         f"({', '.join(bad_types)}) and could not be repaired."
@@ -358,6 +489,15 @@ Return only the corrected SQL query using real FK relationships. No explanations
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
+                    _rb = self._no_llm_rebuild(
+                        user_goal, join_path, kpi_map, ir, join_plan,
+                        current_sql)
+                    if _rb:
+                        logger.warning(
+                            "LLM join repair unavailable; continuing with "
+                            "deterministic rebuild (no LLM).")
+                        current_sql = _rb
+                        continue
                     raise RuntimeError(
                         f"Generated SQL joins unrelated tables "
                         f"({', '.join(bad_joins)}) and could not be repaired."
@@ -400,6 +540,15 @@ Return only the corrected SQL query. No explanations, no markdown.
                     current_sql = self._clean_sql(raw)
                     continue
                 except Exception:
+                    _rb = self._no_llm_rebuild(
+                        user_goal, join_path, kpi_map, ir, join_plan,
+                        current_sql)
+                    if _rb:
+                        logger.warning(
+                            "LLM aggregation repair unavailable; continuing with "
+                            "deterministic rebuild (no LLM).")
+                        current_sql = _rb
+                        continue
                     raise RuntimeError(
                         "Generated SQL is a plain `SELECT *` that does not aggregate the "
                         "data the goal asks for, and could not be repaired."
@@ -462,6 +611,15 @@ No explanations, no markdown.
                         current_sql = self._clean_sql(raw)
                         continue
                     except Exception:
+                        _rb = self._no_llm_rebuild(
+                            user_goal, join_path, kpi_map, ir, join_plan,
+                            current_sql)
+                        if _rb:
+                            logger.warning(
+                                "LLM semantic-plan repair unavailable; continuing "
+                                "with deterministic rebuild (no LLM).")
+                            current_sql = _rb
+                            continue
                         raise RuntimeError(
                             "Generated SQL violates the semantic goal plan: "
                             + "; ".join(sem_issues)
@@ -500,6 +658,34 @@ No explanations, no markdown.
                                 f"Try a goal based on the tables that contain data."
                             )
                         }
+                    # LLM produced 0-row SQL: try deterministic template as
+                    # fallback (handles TEXT-date columns the LLM misses).
+                    _det = None
+                    try:
+                        _det = self._deterministic_sql(
+                            user_goal, join_path, kpi_map, ir, join_plan)
+                    except Exception:
+                        pass
+                    if _det and _det.strip() != current_sql.strip():
+                        try:
+                            _det = self._clean_sql(_det)
+                            with self.engine.connect() as _c:
+                                _r = _c.execute(text(_det))
+                                _rows = _r.fetchmany(10_001)
+                                _cols = list(_r.keys())
+                            if _rows:
+                                _df = pd.DataFrame(_rows, columns=_cols)
+                                _df = _df.where(pd.notnull(_df), None)
+                                for _c in _df.select_dtypes(include=['float64', 'int64']).columns:
+                                    _df[_c] = _df[_c].astype(float)
+                                records = _df.to_dict(orient="records")
+                                logger.info(
+                                    "Deterministic fallback recovered %d rows "
+                                    "for trend goal",
+                                    len(records))
+                                return records, _det, None
+                        except Exception:
+                            pass
                     # Spec §14: zero rows are NOT an error. Do NOT auto-broaden
                     # joins / loosen filters just because the result is empty.
                     # Return success + row_count 0 with an honest message.
@@ -536,13 +722,32 @@ No explanations, no markdown.
                 return records, current_sql, note
             except Exception as exc:
                 _validation_failures.append(f"exec:{str(exc)[:120]}")
+                # The database itself rejects an unknown column (bare reference
+                # the pre-checks skip): fuzzy-repair against the real schema
+                # and retry within budget instead of failing the question.
+                _bad_name = _extract_undefined_column(exc)
+                if _bad_name and attempt < retries:
+                    try:
+                        _fixed, _ok = self._repair_fuzzy_columns(
+                            current_sql, columns_by_table, [_bad_name])
+                    except Exception:
+                        _fixed, _ok = current_sql, False
+                    if _ok:
+                        logger.warning(
+                            "Execution hit undefined column %s; repaired by "
+                            "fuzzy match (no LLM).", _bad_name)
+                        current_sql = _fixed
+                        continue
                 if attempt >= retries:
-                    # Give up on the LLM SQL, but never fail the request: try a
-                    # safe generic query on the join-path tables first.
+                    # Give up on the LLM SQL, but never fail the request: try
+                    # the IR-driven deterministic fallback (verified measure,
+                    # real FK joins, preserved aggregation) first.
                     # Bounded like the main path: never fetchall() an
                     # unbounded result into the JSON payload.
                     try:
-                        safe_sql = self._fallback_sql(join_path)
+                        safe_sql = self._fallback_sql(
+                            join_path, ir=ir, join_plan=join_plan,
+                            user_goal=user_goal)
                         safe_sql = _enforce(safe_sql)
                         with self.engine.connect() as conn:
                             result = conn.execute(text(safe_sql))
@@ -557,10 +762,13 @@ No explanations, no markdown.
                             df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
                         for col in df.select_dtypes(include=['float64', 'int64']).columns:
                             df[col] = df[col].astype(float)
-                        if self._goal_asks_for_aggregation(user_goal):
+                        if self._goal_asks_for_aggregation(user_goal) \
+                                and self._find_bare_select_star(safe_sql):
                             # A raw `SELECT *` fallback would be misleading for an
                             # aggregating goal (it charts IDs, not the breakdown the
-                            # user asked for). Explain instead of guessing.
+                            # user asked for). Explain instead of guessing. An
+                            # IR-driven fallback that aggregates answers the goal
+                            # and is returned as success below.
                             logger.warning(
                                 "SQL retry: generation_time_ms=%d repair_count=%d "
                                 "outcome=safe_fail detail=aggregate_fallback_refused goal=%.120s",
@@ -604,6 +812,14 @@ Fix it and return only the corrected SQL query. No explanations, no markdown.
                                             timeout=self._REPAIR_TIMEOUT)
                     current_sql = self._clean_sql(raw)
                 except Exception:
+                    _rb = self._no_llm_rebuild(
+                        user_goal, join_path, kpi_map, ir, join_plan,
+                        current_sql)
+                    if _rb:
+                        logger.warning(
+                            "LLM execution-error repair unavailable; continuing "
+                            "with deterministic rebuild (no LLM).")
+                        current_sql = _rb
                     continue
 
         logger.warning(

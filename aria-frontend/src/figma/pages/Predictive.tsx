@@ -7,7 +7,7 @@ import { ChartFrame, useSeriesToggle, ToggleLegend } from "../components/charts"
 import { CATEGORY_COLORS } from "../lib/charts";
 import AIProcessingIndicator from "../components/AIProcessingIndicator";
 import { loadAnalysisContext, readHashParams, saveAnalysisContext } from "../lib/analysisContext";
-import { apiFetch, normalizeApiError } from "../../services/api";
+import { apiFetch, normalizeApiError, prescriptionApi } from "../../services/api";
 
 interface PredictiveProps {
   insightResult?: any;
@@ -286,12 +286,41 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   const [pendingDateHint, setPendingDateHint] = useState<string | null>(null);
   const [win, setWin] = useState<{ s: number; e: number } | null>(null);
   const [pointSel, setPointSel] = useState<any | null>(null);
+  const [showWhy, setShowWhy] = useState(false);
   const [confidenceOpen, setConfidenceOpen] = useState(false);
   const [revealKey, setRevealKey] = useState(0);
   const [scenarioPct, setScenarioPct] = useState(10);
   const [scenario, setScenario] = useState<any>(null);
   const [scenarioLoading, setScenarioLoading] = useState(false);
   const [scenarioError, setScenarioError] = useState("");
+  /* So-consider actions: top prescriptions for the forecast target, fetched
+     once per forecast from the existing engine. Honest omission on refusal. */
+  const [rxItems, setRxItems] = useState<any[]>([]);
+  const rxFor = useRef<string>("");
+  useEffect(() => {
+    const m = String((forecast as any)?.column || (forecast as any)?.target || selectedTarget || "").trim();
+    if (!forecast || !m) {
+      rxFor.current = "";
+      setRxItems([]);
+      return;
+    }
+    if (rxFor.current === m) return;
+    rxFor.current = m;
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await (prescriptionApi as any).analyze({ metric: m });
+        const d: any = (r as any)?.data ?? null;
+        const list = Array.isArray(d?.prescriptions) ? d.prescriptions : [];
+        if (!cancelled) setRxItems(list.slice(0, 2));
+      } catch {
+        if (!cancelled) setRxItems([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [forecast, selectedTarget]);
   const fcToggle = useSeriesToggle(["Actual", "Forecast", "Baseline", "Likely range"]);
   // Forecast race guard: abort the obsolete in-flight request before a new
   // one starts (double-click Refresh / fast target switches).
@@ -599,7 +628,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     : (Array.isArray(predictions?.history) ? predictions.history : []);
   const rawFuture: any[] = Array.isArray((predictions as any)?.forecast)
     ? (predictions as any).forecast
-    : (Array.isArray(predictions?.points) ? predictions.points : []);
+    : (Array.isArray((predictions as any)?.forecast_series) ? (predictions as any).forecast_series
+      : (Array.isArray(predictions?.points) ? predictions.points : []));
   const hasPredictions = predictions && (
     predictions.valid || rawFuture.length > 0 || rawHistorical.length > 0);
   const targetName = plainName(
@@ -626,6 +656,13 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   const futHigh = (p: any) => p?.upper ?? p?.upper95 ?? null;
 
   const chartRows = useMemo(() => {
+    const scenRx = rxItems.find(
+      (p: any) =>
+        String(p?.action_type || "").toLowerCase() === "scenario" &&
+        p?.impact?.rel_pct !== null &&
+        p?.impact?.rel_pct !== undefined,
+    );
+    const relPct = scenRx ? Number(scenRx.impact.rel_pct) : null;
     const rows: any[] = [
       ...rawHistorical
         .filter((h: any) => histDate(h) !== null && histDate(h) !== "" && histVal(h) !== null)
@@ -645,6 +682,13 @@ export default function Predictive({ insightResult = null, goalResult = null, co
           short: shortLabel(String(futDate(p))),
           actual: null,
           forecast: Number(futVal(p)),
+          // If-we-act estimate: forecast shifted by the modeled scenario
+          // percent from a real scenario prescription for this metric.
+          // Omitted entirely when no scenario action exists.
+          act:
+            relPct !== null && Number.isFinite(Number(futVal(p)))
+              ? Math.round(Number(futVal(p)) * (1 + relPct / 100) * 100) / 100
+              : null,
           lower95: futLow(p) !== null ? Number(futLow(p)) : null,
           upper95: futHigh(p) !== null ? Number(futHigh(p)) : null,
         })),
@@ -676,7 +720,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       return r;
     });
     return withBand.map((r: any) => ({ ...r, short: r.short || shortLabel(r.label) }));
-  }, [rawHistorical, rawFuture, tab]);
+  }, [rawHistorical, rawFuture, tab, rxItems]);
 
   // Any new series resets the zoom/range window — stale indices must never
   // window the wrong data.
@@ -1281,6 +1325,9 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                     {!fcToggle.isHidden("Forecast") && (
                       <Line type="monotone" dataKey="forecast" stroke={FORECAST_C} strokeWidth={2} strokeDasharray="6 4" dot={{ r: 3 }} connectNulls name="Forecast" isAnimationActive={true} animationBegin={0} animationDuration={900} />
                     )}
+                    {!fcToggle.isHidden("Forecast") && chartRows.some((r: any) => r.act !== null && r.act !== undefined) && (
+                      <Line type="monotone" dataKey="act" stroke="#8B5CF6" strokeWidth={2} strokeDasharray="2 3" dot={false} connectNulls name="If we act (estimate)" isAnimationActive={true} animationBegin={200} animationDuration={900} />
+                    )}
                     {chartRows.length > 5 && (
                       <Brush
                         dataKey="short" height={24} stroke="var(--primary)" travellerWidth={10}
@@ -1315,31 +1362,45 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               )}
             </div>
 
-            {/* Why ARIA expects this — backend explanation only. */}
-            <div className="bg-card border border-border rounded-xl p-4 space-y-2.5">
-              <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Why ARIA expects this</p>
-              {whyItems.length > 0 ? (
-                <ul className="space-y-2">
-                  {whyItems.map((w, i) => (
-                    <li key={i} className="flex items-start gap-2.5">
-                      <span className="w-6 h-6 rounded-full bg-primary/10 text-primary flex items-center justify-center flex-shrink-0 mt-0.5">
-                        <Check size={12} />
-                      </span>
-                      <div className="min-w-0">
-                        <p className="text-[13px] font-semibold text-foreground">{w.title}</p>
-                        <p className="text-xs text-muted-foreground leading-relaxed">{w.body}</p>
-                        <p className="text-[10px] text-muted-foreground/70">source: backend · {w.source}</p>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="text-xs text-muted-foreground leading-relaxed">The backend did not return an explanation for this forecast.</p>
+            {/* Why: small button — technical details only on click. */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowWhy((v) => !v)}
+                aria-expanded={showWhy}
+                className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold text-blue-700 border border-blue-200 rounded-full px-3 py-1.5 hover:bg-blue-50 transition-colors"
+                aria-label="Show why ARIA expects this"
+              >
+                Why?
+              </button>
+              {whyItems.length > 0 && (
+                <span className="text-[11px] text-slate-500">{whyItems.length} reason{whyItems.length === 1 ? "" : "s"} from your data</span>
               )}
-              <p className="text-[10px] text-muted-foreground/70 leading-relaxed pt-1">
-                The forecast service does not return per-driver attribution (no drivers[] in the backend contract), so no driver breakdown is shown rather than an invented one.
-              </p>
             </div>
+            {showWhy && (
+              <div className="bg-card border border-border rounded-xl p-4 space-y-2.5">
+                {whyItems.length > 0 ? (
+                  <ul className="space-y-2">
+                    {whyItems.map((w, i) => (
+                      <li key={i} className="flex items-start gap-2.5">
+                        <span className="w-6 h-6 rounded-full bg-primary/10 text-primary flex items-center justify-center flex-shrink-0 mt-0.5">
+                          <Check size={12} />
+                        </span>
+                        <div className="min-w-0">
+                          <p className="text-[13px] font-semibold text-foreground">{w.title}</p>
+                          <p className="text-xs text-muted-foreground leading-relaxed">{w.body}</p>
+                          <p className="text-[10px] text-muted-foreground/70">source: backend · {w.source}</p>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-xs text-muted-foreground leading-relaxed">The backend did not return an explanation for this forecast.</p>
+                )}
+                <p className="text-[10px] text-muted-foreground/70 leading-relaxed pt-1">
+                  The forecast service does not return per-driver attribution (no drivers[] in the backend contract), so no driver breakdown is shown rather than an invented one.
+                </p>
+              </div>
+            )}
 
             {scenarios && (
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -1392,6 +1453,48 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                     <span className="font-semibold text-foreground">Key signal:</span> {forecastStory.signal}
                   </p>
                 )}
+                {(() => {
+                  const fwd = (fwdVals || []).map((v: any) => Number(v)).filter((v: number) => Number.isFinite(v));
+                  if (fwd.length >= 2 && fwd.every((v: number) => v === fwd[0])) {
+                    return (
+                      <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-2 leading-relaxed">
+                        Flat projection — recent history shows no stable trend, so ARIA holds the last level
+                        {modelName && modelName !== "none" ? ` (${modelName})` : ""} rather than inventing movement.
+                      </p>
+                    );
+                  }
+                  return null;
+                })()}
+              </div>
+            )}
+                {(() => {
+                  const acc = accuracy;
+                  const ok = (predictions as any)?.valid !== false;
+                  const verdict = !ok || (acc !== null && acc < 70)
+                    ? { t: "Direction only — don't plan on precise numbers.", c: "text-amber-700 border-amber-200 bg-amber-50" }
+                    : acc !== null && acc >= 80
+                      ? { t: "Plan on this — backtesting supports the outlook.", c: "text-emerald-700 border-emerald-200 bg-emerald-50" }
+                      : { t: "Working estimate — plan with margin.", c: "text-blue-700 border-blue-200 bg-blue-50" };
+                  return (
+                    <p className={`text-xs font-semibold rounded-lg border px-2.5 py-2 ${verdict.c}`}>
+                      {verdict.t}{acc !== null ? ` Backtested accuracy ${acc.toFixed(0)}%.` : ""}
+                    </p>
+                  );
+                })()}
+
+            {hasPredictions && rxItems.length > 0 && (
+              <div className="bg-card border border-border rounded-xl p-4 space-y-2">
+                <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">So consider — from your data</p>
+                {rxItems.map((p: any, i: number) => (
+                  <div key={String(p?.id || i)} className="rounded-lg bg-muted/50 px-3 py-2">
+                    <p className="text-sm font-semibold text-foreground leading-snug">{String(p?.display?.action_text || p?.title || "Recommended action")}</p>
+                    {p?.display?.outcome_text && <p className="text-sm font-bold text-primary tabular-nums">{String(p.display.outcome_text)}</p>}
+                    {p?.display?.why_summary && <p className="text-xs text-muted-foreground leading-relaxed mt-0.5">{String(p.display.why_summary)}</p>}
+                  </div>
+                ))}
+                <button onClick={() => { window.location.hash = "#/intelligence?tab=prescriptions"; }} className="text-xs font-semibold text-primary hover:underline" aria-label="Open prescriptions">
+                  Open full prescriptions →
+                </button>
               </div>
             )}
           </div>
@@ -1525,53 +1628,6 @@ export default function Predictive({ insightResult = null, goalResult = null, co
         </div>
       )}
 
-      {hasPredictions && (
-        <div className="bg-card border border-border rounded-xl p-4 space-y-3">
-          <div>
-            <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">What-if estimate</p>
-            <p className="text-xs text-muted-foreground mt-0.5">Slide to see what happens if {targetName || "your number"} changes. An estimate, not a forecast.</p>
-          </div>
-          <div className="flex flex-wrap items-center gap-4">
-            <input
-              type="range" min={-95} max={95} step={5} value={scenarioPct}
-              onChange={(e) => setScenarioPct(Number(e.target.value))}
-              className="flex-1 min-w-[160px] accent-[var(--primary)]"
-              aria-label="Percentage change"
-            />
-            <span className={`text-lg font-bold w-20 text-right ${scenarioPct >= 0 ? "text-positive" : "text-negative"}`}>
-              {scenarioPct >= 0 ? "+" : ""}{scenarioPct}%
-            </span>
-            <button
-              onClick={() => runScenario()}
-              disabled={scenarioLoading}
-              className="bg-primary text-primary-foreground px-5 py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition-opacity disabled:opacity-50"
-            >
-              {scenarioLoading ? "Calculating..." : "See result"}
-            </button>
-          </div>
-          {scenarioError && <p className="text-sm text-negative font-medium">{scenarioError}</p>}
-          {scenario && (
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="border border-border rounded-xl p-4 space-y-1">
-                <p className="text-xs text-muted-foreground">Recent average</p>
-                <p className="text-xl font-bold text-foreground">{isNaN(Number(scenario.baseline)) ? "—" : Number(scenario.baseline).toLocaleString()}</p>
-                <p className="text-xs text-muted-foreground">{scenario.periods_used} recent {scenario.periods_used === 1 ? "period" : "periods"}</p>
-              </div>
-              <div className="border border-primary/40 bg-primary/5 rounded-xl p-4 space-y-1">
-                <p className="text-xs text-muted-foreground">With {scenario.pct_change > 0 ? "+" : ""}{scenario.pct_change}%</p>
-                <p className="text-xl font-bold text-foreground">{isNaN(Number(scenario.scenario_value)) ? "—" : Number(scenario.scenario_value).toLocaleString()}</p>
-                <p className={`text-xs font-semibold ${scenario.delta >= 0 ? "text-positive" : "text-negative"}`}>
-                  {scenario.delta >= 0 ? "+" : ""}{isNaN(Number(scenario.delta)) ? "—" : Number(scenario.delta).toLocaleString()} vs recent average
-                </p>
-              </div>
-              <div className="border border-border rounded-xl p-4 space-y-1">
-                <p className="text-xs text-muted-foreground">Keep in mind</p>
-                <p className="text-xs text-foreground leading-relaxed">Uniform change on recent months — sensitivity analysis, not a forecast.</p>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
 
       {/* Click-point detail popup: backend row + derived prior-period change. */}
       {pointSel && (

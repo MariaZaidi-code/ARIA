@@ -201,6 +201,112 @@ def _forecast_labels(last_label, steps, period_code):
     return [(last_ts + k * step).strftime("%Y-%m-%d") for k in range(1, steps + 1)]
 
 
+def _series_varies(vals) -> bool:
+    """True when consecutive points actually move (not a flat level line).
+
+    Relative bar: range must exceed 1e-6 of the series scale, so genuine
+    micro-variation counts but float dust does not.
+    """
+    try:
+        v = np.asarray(vals, dtype=float)
+        v = v[np.isfinite(v)]
+        if len(v) < 2:
+            return False
+        scale = max(1.0, abs(float(np.mean(np.abs(v)))))
+        return bool(float(np.max(v) - np.min(v)) > 1e-6 * scale)
+    except Exception:
+        return False
+
+
+def _forecast_varies(vals) -> bool:
+    """Alias kept at the forecast call-site: same varying-series rule."""
+    return _series_varies(vals)
+
+
+def _history_varies(vals) -> bool:
+    return _series_varies(vals)
+
+
+def _substitute_flat_winner(values, season_period, model_spec, sel_meta,
+                            sel_metrics, steps):
+    """Swap a flat-projecting winner for a varying scored alternate.
+
+    When the winner's own refit projects a constant level on genuinely
+    varying history, prefer the best-ranked validated candidate whose refit
+    actually varies (still a backtested model; the swap is disclosed in the
+    returned selection statement) — never invented wiggle. No varying
+    scored alternate -> inputs returned unchanged with note None.
+
+    Returns (model_spec, sel_meta, sel_metrics, sub_note).
+    """
+    from .evaluate import _make as _mk
+    try:
+        _probe = max(1, min(int(steps or 1), len(values)))
+        if season_period:
+            _probe = max(_probe, min(int(season_period), len(values)))
+        _winner = getattr(model_spec, "name", "?") \
+            if isinstance(model_spec, type) else "ensemble"
+        try:
+            _wpts = np.asarray(
+                _mk(model_spec, season_period).fit(values).predict(
+                    _probe), dtype=float) \
+                if isinstance(model_spec, type) else \
+                np.asarray(model_spec.predict(_probe), dtype=float)
+        except Exception:
+            log.debug("flat-line guard: winner probe refit failed",
+                      exc_info=True)
+            return model_spec, sel_meta, sel_metrics, None
+        if _wpts is None or _forecast_varies(_wpts) \
+                or not _history_varies(values):
+            return model_spec, sel_meta, sel_metrics, None
+        for _row in (sel_meta.get("ranking") or [])[1:]:
+            _alt_name = _row.get("model")
+            if not _alt_name or _alt_name == _winner:
+                continue
+            if (_row.get("mae") is None and _row.get("mape") is None):
+                continue  # unscored candidates cannot substitute
+            _alt = next(
+                (c for c in M.CANDIDATES if c.name == _alt_name),
+                None)
+            if _alt is None or _alt is model_spec:
+                continue
+            if len(values) < getattr(_alt, "min_points", 0):
+                continue
+            if (getattr(_alt, "needs_real_period", False)
+                    and not season_period):
+                continue
+            try:
+                _alt_pts = np.asarray(
+                    _mk(_alt, season_period).fit(values).predict(
+                        _probe), dtype=float)
+            except Exception:
+                continue
+            if _forecast_varies(_alt_pts):
+                _new_metrics = {
+                    "mae": _row.get("mae"),
+                    "rmse": _row.get("rmse"),
+                    "mape": _row.get("mape"),
+                }
+                _new_meta = dict(sel_meta)
+                _new_meta["winner"] = _alt_name
+                _note = (
+                    f"{_winner} validated best but projected a "
+                    f"flat level line on varying history; using "
+                    f"{_alt_name} (holdout MAPE {_row.get('mape')}%) "
+                    f"so the projection carries the observed dynamics."
+                )
+                _new_meta["statement"] = (
+                    str(_new_meta.get("statement") or "")
+                    + " " + _note).strip()
+                return _alt, _new_meta, _new_metrics, _note
+        log.debug("flat-line guard: winner %s flat on varying history but "
+                  "no varying scored alternate found", _winner)
+        return model_spec, sel_meta, sel_metrics, None
+    except Exception:
+        log.debug("flat-line guard failed", exc_info=True)
+        return model_spec, sel_meta, sel_metrics, None
+
+
 class PredictionAgent:
     def __init__(self, horizon=6, min_points=5, valid_threshold=70.0,
                  confidence_threshold=50, auto_horizon=True):
@@ -256,8 +362,12 @@ class PredictionAgent:
             # Identifier-like columns (ids/keys/codes) are never forecast targets:
             # they are synthetic keys, not measures.
             def _is_id_like(name):
-                low = name.lower().strip()
-                return low.endswith("_id") or low.endswith("_key") or low in ("id", "key", "code", "codeid")
+                try:
+                    from core.identifiers import is_id_like as _canon
+                    return bool(_canon(name))
+                except Exception:
+                    low = str(name or "").lower().strip()
+                    return low.endswith("_id") or low.endswith("_key") or low in ("id", "key", "code", "codeid")
 
             measure_cols = [c for c in numeric_cols if not _is_id_like(c)]
             if not measure_cols:
@@ -763,22 +873,49 @@ class PredictionAgent:
                 diagnostics=diagnostics,
                 missing_field="history",
             )
-        else:
-            from .evaluate import one_step_ahead_mae as _oos_mae
-            from .evaluate import one_step_ahead_mape as _oos_mape
-            oos_mape = _oos_mape(model_spec, values, season_period) \
-                if isinstance(model_spec, type) else sel_meta.get("walk_forward_mape")
-            oos_mae = _oos_mae(model_spec, values, season_period) \
-                if isinstance(model_spec, type) else sel_meta.get("walk_forward_mae")
+        # Flat-line guard (pre-refit probe): a validated winner that
+        # projects a constant level on genuinely varying history draws a
+        # flat line users read as "no forecast". A post-refit safety net
+        # below re-checks the FINAL points (probe and final fit can differ).
+        _probe_steps = max(1, min(int(horizon_eff or 1), len(values)))
+        if season_period:
+            _probe_steps = max(_probe_steps,
+                               min(int(season_period), len(values)))
+        model_spec, sel_meta, sel_metrics, _sub_note = \
+            _substitute_flat_winner(values, season_period, model_spec,
+                                    sel_meta, sel_metrics, _probe_steps)
+        from .evaluate import one_step_ahead_mae as _oos_mae
+        from .evaluate import one_step_ahead_mape as _oos_mape
+        oos_mape = _oos_mape(model_spec, values, season_period) \
+            if isinstance(model_spec, type) else sel_meta.get("walk_forward_mape")
+        oos_mae = _oos_mae(model_spec, values, season_period) \
+            if isinstance(model_spec, type) else sel_meta.get("walk_forward_mae")
 
         # An EnsembleModel arrives already fitted, but its .fit(values) is also a
         # no-op that records the series for fitted()/residuals(); classes are
-        # fitted here on the full series.
+        # fitted here on the full series — via the same constructor the
+        # backtests used, so a seasonal winner keeps its real period
+        # (seasonal_naive refit with a default period 7 on monthly data, or
+        # auto_ets refit without its period, silently mis-forecast).
         if isinstance(model_spec, type):
-            model = model_spec().fit(values)
+            from .evaluate import _make as _mk_final
+            model = _mk_final(model_spec, season_period).fit(values)
         else:
             model = model_spec.fit(values)
-        steps = max(1, min(horizon_eff, len(values)))
+        # Horizon is capped at history length (extrapolating further is not
+        # supported). The cap is now disclosed via horizon_capped/details
+        # instead of silent min() — numeric behavior unchanged.
+        try:
+            _req_steps = max(1, int(horizon_eff))
+        except (TypeError, ValueError):
+            _req_steps = 1
+        steps = max(1, min(_req_steps, len(values)))
+        horizon_capped = _req_steps > len(values)
+        horizon_note = (
+            f"Requested horizon {_req_steps} exceeds history length {len(values)}; "
+            f"capped to {steps}."
+            if horizon_capped else None
+        )
         points = np.asarray(model.predict(steps), dtype=float)
 
         try:
@@ -796,6 +933,45 @@ class PredictionAgent:
             sigma = oos_mae / 0.8
         else:
             sigma = std
+        # Post-refit safety net: the pre-refit probe can disagree with the
+        # final fit (refit nondeterminism, ensemble path). If the FINAL
+        # points are flat on varying history, substitute and rebuild
+        # points/bands from the alternate — a flat line is never shipped
+        # silently.
+        if (not _forecast_varies(points) and _history_varies(values)):
+            _post_spec, _post_meta, _post_met, _post_note = \
+                _substitute_flat_winner(values, season_period, model_spec,
+                                        sel_meta, sel_metrics, steps)
+            if _post_note is not None and _post_spec is not model_spec:
+                try:
+                    from .evaluate import _make as _mk_post
+                    model_spec, sel_meta, sel_metrics = \
+                        _post_spec, _post_meta, _post_met
+                    model = _mk_post(model_spec, season_period).fit(values) \
+                        if isinstance(model_spec, type) \
+                        else model_spec.fit(values)
+                    points = np.asarray(model.predict(steps), dtype=float)
+                    try:
+                        resid = model.residuals(values)
+                    except Exception:
+                        try:
+                            resid = np.asarray(values, dtype=float) - np.asarray(
+                                model.fitted(), dtype=float)
+                        except Exception:
+                            resid = np.zeros_like(values, dtype=float)
+                    std = float(np.std(resid)) if len(resid) > 1 else 0.0
+                    if isinstance(model_spec, type):
+                        oos_mape = _oos_mape(model_spec, values, season_period)
+                        oos_mae = _oos_mae(model_spec, values, season_period)
+                    else:
+                        oos_mape = sel_meta.get("walk_forward_mape")
+                        oos_mae = sel_meta.get("walk_forward_mae")
+                    sigma = oos_mae / 0.8 if oos_mae else std
+                    _sub_note = ((_sub_note + " ") if _sub_note else "") + _post_note
+                    log.info("flat-line guard (post-refit): %s", _post_note)
+                except Exception:
+                    log.debug("flat-line guard post-refit rebuild failed",
+                              exc_info=True)
         last_actual = float(values[-1])
         accuracy = accuracy_from_mape(oos_mape)
         projected_pct = (
@@ -920,6 +1096,19 @@ class PredictionAgent:
             "Very low observed error — treat as uncertain, not guaranteed"
             if perfect_fit else None
         )
+        # Documented flat line: no validated candidate varies on this
+        # history, so the level projection stands — the note (surfaced in
+        # the UI) says why instead of leaving a flat line unexplained.
+        try:
+            if (uncertainty_note is None and _sub_note is None
+                    and not _forecast_varies(points)
+                    and _history_varies(values)):
+                uncertainty_note = (
+                    "Validated models project a steady level on this history — "
+                    "the flat line is the backtested signal, not missing data."
+                )
+        except Exception:
+            pass
 
         # Candidates with scores (best first) + the winner — all derived
         # from the same trailing-holdout backtest, never invented.
@@ -982,7 +1171,8 @@ class PredictionAgent:
             "selection": {k: v for k, v in sel_meta.items()},
             "diagnostics": dict(diagnostics or {}),
             "horizon": {"requested": horizon, "suggested": horizon_suggested,
-                        "used": steps, "frequency": frequency_label},
+                        "used": steps, "frequency": frequency_label,
+                        "capped": horizon_capped, "note": horizon_note},
             "confidence_threshold": conf_thresh,
             "sigma": round(float(sigma), 2),
             "legacy_reliability_label": _legacy_reliability_label(accuracy),
@@ -994,6 +1184,8 @@ class PredictionAgent:
             "period": period_name,
             "horizon": steps,
             "horizon_suggested": horizon_suggested,
+            "horizon_capped": horizon_capped,
+            "horizon_note": horizon_note,
             "forecast_stage": forecast_stage,
             "method": model_name,
             "model_selected": model_selected,

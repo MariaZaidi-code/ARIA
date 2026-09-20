@@ -45,27 +45,45 @@ def _is_id_like(name: str) -> bool:
 
 
 def _human(name: str) -> str:
-    return str(name).replace("_", " ").strip()
+    """Schema-agnostic human label: never leaks raw snake_case.
+
+    Uses the shared semantic humanizer (title text, expanded shorthands,
+    dropped id/key tails) with a plain fallback. 'invoice_line' reads as
+    'Invoice line' — never raw.
+    """
+    try:
+        from core.semantic import humanize as _hz
+        return _hz(str(name or ""))
+    except Exception:
+        return str(name or "").replace("_", " ").replace("-", " ").strip()
 
 
 def _fmt(value: Any) -> str:
+    """Human-scale numbers: 42K / 1.8M, never 42000.0 in prose."""
     try:
         number = float(value)
-        if abs(number) >= 1_000_000:
-            return f"{number / 1_000_000:.2f}M"
-        if abs(number) >= 1_000:
-            return f"{number:,.0f}"
-        if abs(number) >= 100:
-            return f"{number:,.1f}"
-        return f"{number:,.2f}"
     except Exception:
         return str(value)
+    import math as _math
+    if number != number or number in (float("inf"), float("-inf")):
+        return str(value)
+    a = abs(number)
+    if a >= 1_000_000:
+        return f"{number / 1_000_000:.1f}M"
+    if a >= 1_000:
+        return f"{number / 1_000:.1f}K"
+    if a >= 100:
+        return f"{number:,.0f}"
+    if a >= 1:
+        return f"{number:,.1f}"
+    return f"{number:,.2f}"
 
 
 class AdvancedInsightAgent(BaseInsightAgent):
     """Production-oriented Insight Agent that preserves the current public contract."""
 
     VERSION = "2.1"
+    ANOMALY_METHOD = "iqr"
 
     def __init__(self, provider=None):
         super().__init__(provider=provider)
@@ -594,7 +612,8 @@ class AdvancedInsightAgent(BaseInsightAgent):
             processed_data, kpis, trends, anomalies, hypotheses, predictions
         )
         prompt = f"""
-You are ARIA's retail and sales Insight Agent. Rewrite the draft for a busy,
+You are ARIA's business Insight Agent (any domain: retail, HR, finance,
+operations — adapt vocabulary to the evidence, never assume retail). Rewrite the draft for a busy,
 non-technical manager.
 
 DRAFT:
@@ -802,6 +821,7 @@ Rules:
 
         insights = {
             "analysis_version": self.VERSION,
+            "anomaly_method": self.ANOMALY_METHOD,
             "generated_at": datetime.now().isoformat(),
             "source_processed_data": processed_data_path,
             "user_goal": processed_data.get("user_goal", "Unknown goal"),

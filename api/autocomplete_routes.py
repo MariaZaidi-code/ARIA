@@ -24,6 +24,11 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 
 from core.config import get_session, save_session
+from core.data_intelligence import (
+    hint_hit as _hint_hit,
+    is_id_like_name as _is_id_like_name,
+    name_tokens as _name_tokens,
+)
 from core.deps import get_current_user
 
 router = APIRouter()
@@ -84,7 +89,7 @@ _INTENT_WORDS = {
 
 _NUMERIC_HINT = {"amount", "price", "cost", "revenue", "sales", "total", "sum",
                  "count", "quantity", "qty", "value", "profit", "income",
-                 "balance", "order", "pay", "discount", "tax", "fee", "rate",
+                 "balance", "pay", "discount", "tax", "fee", "rate",
                  "percent", "number", "num", "stock", "weight", "score"}
 
 
@@ -153,8 +158,8 @@ def _column_iter(table_info):
 
 def _looks_like_date(col_name, col_info):
     low = col_name.lower()
-    if any(k in low for k in ("date", "time", "created", "updated", "day",
-                              "month", "year", "period", "quarter", "week")):
+    if _hint_hit(col_name, ("date", "time", "created", "updated", "day",
+                            "month", "year", "period", "quarter", "week")):
         return True
     dtype = str(col_info.get("dtype", col_info.get("data_type", ""))).lower()
     return any(t in dtype for t in ("date", "time", "timestamp"))
@@ -165,8 +170,7 @@ def _looks_like_numeric(col_name, col_info):
         return False
     if _is_id_like(col_name):
         return False
-    low = col_name.lower()
-    if any(k in low for k in _NUMERIC_HINT):
+    if _hint_hit(col_name, _NUMERIC_HINT):
         return True
     dtype = str(col_info.get("dtype", col_info.get("data_type", ""))).lower()
     return any(t in dtype for t in ("int", "float", "decimal", "numeric",
@@ -177,9 +181,8 @@ def _looks_like_categorical(col_name, col_info):
     """Heuristic: text/string column with short, label-like values."""
     if _looks_like_numeric(col_name, col_info) or _looks_like_date(col_name, col_info):
         return False
-    low = col_name.lower()
-    if any(k in low for k in ("name", "type", "category", "region", "status",
-                              "group", "kind", "label", "tag", "class")):
+    if _hint_hit(col_name, ("name", "type", "category", "region", "status",
+                            "group", "kind", "label", "tag", "class")):
         return True
     dtype = str(col_info.get("dtype", col_info.get("data_type", ""))).lower()
     return any(t in dtype for t in ("char", "text", "varchar", "string"))
@@ -279,7 +282,7 @@ def _build_data_index(session, schema_path: Path):
     }
 
 
-def _get_data_index(session):
+def _get_data_index(session, user_id=None):
     """Return cached data_index for the session's schema, rebuilding if
     the schema file mtime changed."""
     schema_path: Path = session.get("schema_path")
@@ -288,23 +291,30 @@ def _get_data_index(session):
             schema_path = Path(str(schema_path)) if schema_path else None
         except Exception:
             schema_path = None
-    if not schema_path:
-        return {"tables": [], "metrics": [], "categories": [],
+    if not schema_path:        return {"tables": [], "metrics": [], "categories": [],
                 "dates": [], "values": [], "ready": False}
 
     try:
         mtime = schema_path.stat().st_mtime if schema_path.exists() else 0.0
     except Exception:
         mtime = 0.0
-    key = str(schema_path)
+    # Key includes the user: two users must never share an index even if
+    # paths ever collide (linked/shared DBs, tmp paths in tests).
+    try:
+        _uid = int(str(user_id)) if user_id is not None else 0
+    except (TypeError, ValueError):
+        _uid = 0
+    key = (_uid, str(schema_path))
     with _INDEX_LOCK:
         cached = _INDEX_CACHE.get(key)
         if cached and cached[0] == mtime:
+            # LRU touch: reinsert so eviction drops least-recently-used.
+            _INDEX_CACHE.pop(key, None)
+            _INDEX_CACHE[key] = cached
             return cached[1]
-        # Evict oldest if at capacity
+        # Evict least-recently-used if at capacity
         if len(_INDEX_CACHE) >= _MAX_INDEX_ENTRIES and key not in _INDEX_CACHE:
-            oldest = min(_INDEX_CACHE, key=lambda k: _INDEX_CACHE[k][0])
-            _INDEX_CACHE.pop(oldest, None)
+            _INDEX_CACHE.pop(next(iter(_INDEX_CACHE)))
         idx = _build_data_index(session, schema_path)
         _INDEX_CACHE[key] = (mtime, idx)
         return idx
@@ -324,34 +334,44 @@ def _fuzzy_ratio(a, b):
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def _match_quality(query, candidate):
+    """Match quality tier: 3 = prefix, 2 = substring, 1 = fuzzy, 0 = none.
+
+    Prefix matches carry the strongest signal (typing "sal" almost surely
+    means the Sales column, not a fuzzy value hit), so ranking scores
+    follow the tier instead of rating every hit equally.
+    """
+    if not query:
+        return 0
+    q = query.lower()
+    c = candidate.lower()
+    if c.startswith(q) or any(w.startswith(q) for w in c.split()):
+        return 3
+    if q in c:
+        return 2
+    # Fuzzy: allow genuine typos (section 59).  The bar sits well above
+    # coincidental 3-letter overlaps ("what" must not match "Art") while
+    # real typos ("salse" -> "sales") still clear it.  Comparison is
+    # two-sided so it stays fair regardless of string length.
+    if len(q) >= 3:
+        # Cap the comparison window to the longer of |query| and |candidate|
+        window = c[:max(len(q), len(c))]
+        if _fuzzy_ratio(q, window) >= 0.65:
+            return 1
+    return 0
+
+
 def _partial_match(query, candidate):
     """True if ``query`` is a prefix or fuzzy substring of ``candidate``."""
     if not query:
         return True
-    q = query.lower()
-    c = candidate.lower()
-    if c.startswith(q):
-        return True
-    if q in c.split():
-        return True
-    if q in c:
-        return True
-    # Substring fallback: query appears anywhere in candidate
-    if q in c:
-        return True
-    # Fuzzy: allow typos (section 59).  Use two-sided ratio so the
-    # comparison is fair regardless of which string is shorter.
-    if len(q) >= 3:
-        # Cap the comparison window to the longer of |query| and |candidate|
-        window = c[:max(len(q), len(c))]
-        if _fuzzy_ratio(q, window) > 0.55:
-            return True
-    return False
+    return _match_quality(query, candidate) > 0
 
 
 def _is_id_like(name: str) -> bool:
-    low = (name or "").lower()
-    return low == "id" or low.endswith("_id") or low.endswith("_key")
+    # Separator-agnostic (shared helper): "order_id", "Order ID" and
+    # "postal_code" are identifiers; "country" is not.
+    return bool(_is_id_like_name(name))
 
 
 def _rank_suggestions(index, partial, limit):
@@ -380,27 +400,53 @@ def _rank_suggestions(index, partial, limit):
     # 1) Value-level matches: actual distinct values from the database.
     #    This is the highest signal — typing "ali" should surface
     #    "Ali Traders" if it exists in the data (section 58).
+    #    Scores follow match quality so a prefix hit outranks a typo-level
+    #    fuzzy hit, and pairs are capped so intent/metric templates below
+    #    always have room in the limit window.
+    _value_pairs = 0
+    _best_value_q = 0
     if partial_n:
         for v in index.get("values", []):
+            if _value_pairs >= 3:
+                break
             val = v["value"]
-            if not _partial_match(partial_n, val):
+            q = _match_quality(partial_n, val)
+            if q == 0:
                 # Also try matching against the *first* word of multi-word
                 # values (e.g. typing "ali" -> "Ali Traders").
-                first_word = val.split(" ")[0].lower()
-                if not _partial_match(partial_n, first_word):
+                q = _match_quality(partial_n, val.split(" ")[0])
+                if q == 0:
                     continue
+            _best_value_q = max(_best_value_q, q)
             col = v.get("column", "value")
-            t = v.get("table", "data")
             # Dimension columns (text values) get contextual suggestions.
             # Wording is neutral (no hardcoded business nouns like "Sales").
-            _add(f"Filter {col} to {val}", "value", 0.95)
-            _add(f"Show details for {val}", "value", 0.85)
+            if q >= 3:
+                _add(f"Filter {col} to {val}", "value", 0.95)
+                _add(f"Show details for {val}", "value", 0.85)
+            elif q == 2:
+                _add(f"Filter {col} to {val}", "value", 0.82)
+                _add(f"Show details for {val}", "value", 0.76)
+            else:
+                _add(f"Filter {col} to {val}", "value", 0.68)
+                _add(f"Show details for {val}", "value", 0.62)
+            _value_pairs += 1
 
     # 2) Template matches: build "Top {category} by {metric}" only if
     #    we actually have a category + a metric.  Triggered by typing
     #    intent words like "top", "best", "highest" (section 57).
     tokens = partial_n.split()
     intent_tokens = [t for t in tokens if t in _INTENT_WORDS]
+    # Prefix expansion: incomplete words still signal intent ("tot"→total,
+    # "ave"→average, "tre"→trend) so mid-typing always offers something.
+    for _tok in tokens:
+        if _tok in _INTENT_WORDS or len(_tok) < 3:
+            continue
+        for _word, _canon in _INTENT_WORDS.items():
+            if _word.startswith(_tok):
+                if _canon not in intent_tokens:
+                    intent_tokens.append(_canon)
+                break
     # Prefer non-ID dimensions for breakdowns (grouping by an ID column
     # is analytically weak). Fall back to all categories if needed.
     _cats = [c for c in index.get("categories", []) if not _is_id_like(c.get("name", ""))]
@@ -421,28 +467,67 @@ def _rank_suggestions(index, partial, limit):
                     _add(f"Count of {cat['name'].replace('_', ' ')}", "template", 0.72)
 
     # 3) Column-level matches: typing the start of a column name.
+    #    A prefix of a real column name is a strong signal (typing "sal"
+    #    means the Sales column), so it outranks fuzzy value hits.
     if partial_n:
         for met in index.get("metrics", []):
             name = met["name"].replace("_", " ")
-            if _partial_match(partial_n, name):
-                _first_cat = _cats[0]["name"].replace("_", " ") if _cats else "category"
-                _add(f"Show {name} by {_first_cat}",
-                     "metric", 0.68)
+            qm = _match_quality(partial_n, name)
+            if qm == 0:
+                continue
+            _first_cat = _cats[0]["name"].replace("_", " ") if _cats else "category"
+            _add(f"Show {name} by {_first_cat}",
+                 "metric", 0.90 if qm >= 3 else 0.68)
         for cat in _cats:
             name = cat["name"].replace("_", " ")
-            if _partial_match(partial_n, name):
-                if index["metrics"]:
-                    m = index["metrics"][0]["name"].replace("_", " ")
-                    _add(f"Top {name} by {m}", "metric", 0.66)
+            qc = _match_quality(partial_n, name)
+            if qc == 0:
+                continue
+            if index["metrics"]:
+                m = index["metrics"][0]["name"].replace("_", " ")
+                _add(f"Top {name} by {m}", "metric", 0.88 if qc >= 3 else 0.66)
+        # Date columns: typing "order"/"month" should surface the trend the
+        # schema can actually plot (only offered when a metric exists).
+        for dt in index.get("dates", [])[:3]:
+            name = dt["name"].replace("_", " ")
+            qd = _match_quality(partial_n, name)
+            if qd == 0:
+                continue
+            if index["metrics"]:
+                m = index["metrics"][0]["name"].replace("_", " ")
+                _add(f"{m.title()} by {name}", "metric", 0.88 if qd >= 3 else 0.66)
 
     # 4) Time-aware fallback (section 74).  If a date column exists and
     #    the user types a time word not already covered, offer a trend
     #    template.  This is data-driven (we only suggest it when we
     #    actually have a date column to plot).
-    if any(w in partial_n for w in ("trend", "over", "by month", "by day", "over time")):
+    if any(w in partial_n for w in ("trend", "over", "by month", "by day", "over time")) \
+            or "trend" in intent_tokens:
         if index["dates"] and index["metrics"]:
             m = index["metrics"][0]["name"].replace("_", " ")
             _add(f"{m.title()} trend over time", "template", 0.70)
+
+    # 5) Question-starter fallback: "what", "which", "show…" carry no intent
+    #    word, yet the dropdown must still respond with grounded starters
+    #    from THIS schema rather than going blank. Also fires when the only
+    #    hits so far are typo-level fuzzy matches — the user is clearly
+    #    starting a fresh question, not filtering to that value.
+    if not suggestions or _best_value_q < 2:
+        _starts = ("what", "which", "show", "tell", "give", "list", "is",
+                   "are", "how", "compare", "find", "get")
+        _pn = partial_n.strip()
+        _is_starter = any(_pn == w or _pn.startswith(w + " ") or (len(_pn) >= 2 and w.startswith(_pn))
+                          for w in _starts)
+        if _is_starter:
+            _m0 = index["metrics"][0]["name"].replace("_", " ") if index.get("metrics") else None
+            _c0 = _cats[0]["name"].replace("_", " ") if _cats else None
+            if _m0 and _c0:
+                _add(f"Top {_c0} by {_m0}", "template", 0.60)
+                _add(f"Total {_m0} by {_c0}", "template", 0.59)
+            elif _m0:
+                _add(f"What is the total {_m0}?", "template", 0.60)
+            if _c0:
+                _add(f"Which {_c0} has the most records?", "template", 0.58)
 
     suggestions.sort(key=lambda s: s["score"], reverse=True)
     return suggestions[:limit]
@@ -528,7 +613,7 @@ def _autocomplete(partial: str, limit: int, user: dict):
         return {"ok": True, "suggestions": [], "ready": False,
                 "index_summary": {"tables": 0, "values": 0}}
 
-    index = _get_data_index(session)
+    index = _get_data_index(session, user["user_id"])
     suggestions = _rank_suggestions(index, partial, limit)
 
     return {

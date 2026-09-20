@@ -149,8 +149,16 @@ def _decode_token(token: str):
 
 def _get_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    # Busy-timeout + WAL: concurrent logins/history writes must not 500
+    # with "database is locked". Retries handled by callers' short loops;
+    # the timeout below covers the common contention window.
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
     _ensure_schema(conn)
     return conn
 

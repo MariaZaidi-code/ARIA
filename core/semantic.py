@@ -18,7 +18,23 @@ IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _NUMERIC_HINTS = ("int", "float", "double", "decimal", "numeric", "number", "real")
 _DATE_HINTS = ("date", "time", "timestamp", "datetime")
 _BOOL_HINTS = ("bool",)
-_ID_HINTS = ("_id", "id", "uuid", "guid", "key", "code", "number", "no")
+_ID_TOKENS = frozenset({"id", "uuid", "guid", "key", "code", "number", "no"})
+_ID_SUFFIXES = ("_id", "_key", "_code", "_guid", "_uuid", "_no")
+
+
+def _has_id_token(name: str) -> bool:
+    """Whole-token / suffix identifier match (never bare substrings).
+
+    "order_id" -> True; "valid"/"innovation"/"north"/"snow"/"grid" -> False
+    ("id" inside "valid", "no" inside "innovation" must not trigger).
+    """
+    low = str(name or "").lower()
+    # Split camelCase so MediaTypeId behaves like media_type_id.
+    low = __import__("re").sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name or "")).lower()
+    for tok in __import__("re").split(r"[^a-z0-9]+", low):
+        if tok in _ID_TOKENS:
+            return True
+    return low.endswith(_ID_SUFFIXES)
 _MONEY_HINTS = ("price", "cost", "amount", "revenue", "profit", "salary", "total", "payment")
 _PCT_HINTS = ("pct", "percent", "rate", "ratio")
 _GEO_HINTS = ("city", "country", "region", "state", "zip", "postal", "lat", "lon", "lng", "address")
@@ -103,25 +119,39 @@ def classify_semantic_type(column_name: str, db_type: str = "") -> str:
     """
     name = (column_name or "").lower()
     dtype = (db_type or "").lower()
+    # Whole-word tokens (camelCase split first): every hint below matches
+    # full tokens only — never bare substrings ("separate" is not a rate,
+    # "salon" is not a lon, "candidate" is not a date).
+    import re as _re
+    toks = set(
+        t for t in _re.split(
+            r"[^a-z0-9]+",
+            _re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(column_name or "")).lower(),
+        )
+        if t
+    )
     if any(h in dtype for h in _BOOL_HINTS) or dtype in ("boolean", "bit"):
         return "boolean"
     if any(h in dtype for h in _DATE_HINTS):
         return "date"
     if any(h in dtype for h in _NUMERIC_HINTS):
-        if any(h in name for h in _ID_HINTS):
+        if _has_id_token(column_name):
             return "identifier"
-        if any(h in name for h in _MONEY_HINTS):
-            return "money"
-        if any(h in name for h in _PCT_HINTS):
-            return "percentage"
+        if not _has_dimension_veto(column_name):
+            if toks & set(_MONEY_HINTS):
+                return "money"
+            if toks & set(_PCT_HINTS):
+                return "percentage"
         return "measure"
-    if any(h in name for h in _ID_HINTS):
+    # Pass the original-case name so camelCase (MediaTypeId) splits correctly.
+    if _has_id_token(column_name):
         return "identifier"
-    if any(h in dtype for h in _DATE_HINTS) or "date" in name or "time" in name:
-        return "date"
-    if any(h in name for h in _MONEY_HINTS + _PCT_HINTS):
+    if any(h in dtype for h in _DATE_HINTS) or toks & {"date", "time", "day", "month", "year", "created", "updated", "timestamp", "datetime", "at"}:
+        if not _has_technical_signal(column_name):
+            return "date"
+    if toks & (set(_MONEY_HINTS) | set(_PCT_HINTS)) and not _has_dimension_veto(column_name):
         return "measure"
-    if any(h in name for h in _GEO_HINTS):
+    if toks & set(_GEO_HINTS):
         return "geography"
     # Low-cardinality textual names behave as categories; default to text.
     return "text"
@@ -219,9 +249,17 @@ def _has_technical_signal(name: str) -> bool:
 
 
 def _has_derived_signal(name: str) -> bool:
+    # Whole-token match only: bare substrings misfire ("separate" has
+    # "rate", "strategy" has "rate", "generate" has "rate", "ratio" in
+    # "separation"). Multiword hints ("per night") still substring-match.
+    toks = set(_field_tokens(name))
     low = str(name or "").lower()
     for h in _DERIVED_HINTS:
-        if h in low:
+        h = h.lower()
+        if "_" in h or " " in h or "-" in h:
+            if h.replace("-", " ") in low.replace("_", " ").replace("-", " "):
+                return True
+        elif h in toks:
             return True
     return False
 
@@ -239,15 +277,38 @@ def _has_business_measure_signal(name: str) -> bool:
     return False
 
 
+# Tokens that mark a column as a LABEL, not a number — even when a sibling
+# token looks monetary ("payment_method" is a category, "payment_amount" is
+# money). Token equality only, so "classified" does not trip on "class".
+_DIMENSION_VETO_TOKENS = frozenset({
+    "method", "mode", "type", "status", "name", "label", "category",
+    "segment", "region", "group", "kind", "tag", "class", "code",
+    "key", "id", "description", "title",
+})
+
+
+def _has_dimension_veto(name: str) -> bool:
+    """True when a name token is intrinsically dimensional.
+
+    A vetoed column is never a measure by NAME alone ("payment_method",
+    "rate_type", "Ship Mode"). Real numeric dtypes still classify as
+    measures through the dtype branches — the veto only demotes
+    name-inferred TEXT/ambiguous columns to dimensions, never real numbers.
+    """
+    return bool(set(_field_tokens(name)) & _DIMENSION_VETO_TOKENS)
+
+
 def _is_identifier_flavored(name: str) -> bool:
     low = str(name or "").lower().strip()
     if not low:
         return False
     if low in ("id", "key", "code", "uuid", "guid", "pk", "fk"):
         return True
-    if low.endswith("_id") or low.endswith("id") and len(low) > 3:
-        # trailing-id without separator also counts (storeid, personid)
+    if low.endswith("_id"):
         return True
+    # NOTE: bare endswith("id") was removed — it misclassified ordinary
+    # words ("valid", "grid"). Separator-less forms ("storeid") are only
+    # accepted for the unambiguous uuid/guid tails below.
     tail = low.split("_")[-1] if "_" in low else low
     if tail in _REF_TAILS:
         return True
@@ -282,7 +343,21 @@ def classify_field_role(column_name: str, db_type: str = "",
         return "IDENTIFIER"
     if any(h in dtype for h in _DATE_HINTS):
         return "DATE"
-    if "date" in low or "time" in low and _is_identifier_flavored(name) is False:
+    # Whole-token date words only ("order_date", "created_at") — bare
+    # substrings misfire on ordinary words ("candidate", "update",
+    # "mandate"). CamelCase is split first (CreatedAt -> created_at).
+    _dtoks = set(
+        t for t in __import__("re").split(
+            r"[^a-z0-9]+",
+            __import__("re").sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name or "")).lower(),
+        )
+        if t
+    )
+    if (_dtoks & {"date", "time", "day", "month", "year", "created", "updated",
+                  "timestamp", "datetime", "at"}
+            or low.endswith(("_date", "_time", "_at", "_on", "_ts"))
+            or low in ("date", "time", "datetime", "timestamp")) \
+            and _is_identifier_flavored(name) is False:
         # 'time' alone is a date signal unless it is part of a technical
         # compound (response_time, execution_time -> technical wins below).
         if not _has_technical_signal(name):
@@ -291,11 +366,14 @@ def classify_field_role(column_name: str, db_type: str = "",
         return "TECHNICAL_MEASURE"
     if _has_derived_signal(name):
         return "DERIVED_METRIC"
-    if _has_business_measure_signal(name):
+    if _has_business_measure_signal(name) and not _has_dimension_veto(name):
         return "BUSINESS_MEASURE"
     if any(h in dtype for h in _NUMERIC_HINTS):
         return "MEASURE"
-    if any(h in name.lower() for h in _GEO_HINTS):
+    # Whole-token geography only ("city", "lon", "lat", "state" as full
+    # tokens): substrings misfire ("velocity" has "city", "salon" has
+    # "lon", "plate" has "lat", "estate" has "state").
+    if set(_field_tokens(name)) & set(_GEO_HINTS):
         return "DIMENSION"
     if distinct_count is not None:
         try:

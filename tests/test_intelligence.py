@@ -142,6 +142,80 @@ class TestEligibility:
         assert order_roles["revenue"] in ("MEASURE", "BUSINESS_MEASURE")
 
 
+class TestUndefinedColumnHonesty:
+    """FAILURE C regression: type errors must not masquerade as join errors."""
+
+    def test_sum_text_is_not_undefined_column(self):
+        from services.intelligence_service import _is_undefined_column
+        type_err = type("ProgrammingError", (Exception,), {})(
+            "(psycopg2.errors.UndefinedFunction) function sum(text) does not exist")
+        assert _is_undefined_column(type_err) is False
+        missing = Exception(
+            '(psycopg2.errors.UndefinedColumn) column "foo" does not exist')
+        assert _is_undefined_column(missing) is True
+        assert _is_undefined_column(Exception("no such column: foo")) is True
+        assert _is_undefined_column(Exception("Unknown column 'foo'")) is True
+        assert _is_undefined_column(
+            Exception('ORA-00904: "FOO": invalid identifier')) is True
+
+    def test_text_metric_casts_instead_of_crashing(self, tmp_path):
+        """TEXT-stored prices (e.g. 'Rs.1,099') SUM via numeric cast."""
+        import json as _json
+        import sqlite3 as _sqlite3
+        db_path = tmp_path / "textmoney.db"
+        conn = _sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE amazon (id INTEGER PRIMARY KEY, price TEXT, cat TEXT)")
+        for i, (p, c) in enumerate([("Rs.1,099", "A"), ("Rs.349", "B"),
+                                    ("Rs.2,000", "A"), ("Rs.100", "B")]):
+            conn.execute("INSERT INTO amazon VALUES (?,?,?)", (i, p, c))
+        conn.commit()
+        conn.close()
+        mapping = {"tables": {"amazon": {
+            "columns": [
+                {"column": "id", "data_type": "integer", "nullable": False},
+                {"column": "price", "data_type": "text", "nullable": True},
+                {"column": "cat", "data_type": "text", "nullable": True},
+            ],
+            "primary_key": ["id"], "row_count": 4}}}
+        schema_path = tmp_path / "schema_mapping_latest.json"
+        schema_path.write_text(_json.dumps(mapping), encoding="utf-8")
+        session = {"provider": "local", "source_type": "csv",
+                   "db_uri": f"sqlite:///{db_path}",
+                   "db_name": "tm", "schema_path": str(schema_path)}
+        from services.intelligence_service import run_explore
+        res = run_explore(session, {"metric": "price", "breakdown": "cat"})
+        assert res["ok"] is True, res.get("detail")
+        assert abs(float(res["total"]) - 3548.0) < 0.05
+        assert res.get("validation", {}).get("passed") is True
+
+
+class TestJoinPathDepth:
+    """FAILURE F regression: 3-hop paths join instead of refusing."""
+
+    def test_three_hop_path_found(self):
+        from services.intelligence_service import _find_join_path
+        mapping = {"tables": {"a": {}, "b": {}, "c": {}, "d": {}},
+                   "declared_relationships": [
+                       {"table_name": "b", "column_name": "a_id",
+                        "references_table": "a", "references_column": "id"},
+                       {"table_name": "c", "column_name": "b_id",
+                        "references_table": "b", "references_column": "id"},
+                       {"table_name": "d", "column_name": "c_id",
+                        "references_table": "c", "references_column": "id"},
+                   ]}
+        roles = {"a": {"id": "IDENTIFIER"}, "b": {"a_id": "FOREIGN_KEY"},
+                 "c": {"b_id": "FOREIGN_KEY"}, "d": {"c_id": "FOREIGN_KEY",
+                                                     "x": "DIMENSION"}}
+        hops = _find_join_path(mapping, roles, "a", "d")
+        assert hops is not None and len(hops) == 3
+        # Unknown names resolve to no targets ([]); a real but isolated
+        # table is honestly unreachable (None).
+        assert _find_join_path(mapping, roles, "a", "zz") == []
+        mapping["tables"]["iso"] = {}
+        roles["iso"] = {"z": "DIMENSION"}
+        assert _find_join_path(mapping, roles, "a", "iso") is None
+
+
 # ---------------------------------------------------------------------------
 # Meta tests
 # ---------------------------------------------------------------------------

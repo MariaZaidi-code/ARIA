@@ -17,9 +17,16 @@ type Message = {
   timestamp: string;
   sql?: string | null;
   provider?: string | null;
+  providerFailed?: boolean;
   rows?: Record<string, any>[];
   chart?: { type: string; x: string; y: string; reason?: string } | null;
 };
+
+/** Provider/LLM failure signals in a copilot payload or error text. */
+function isProviderFailure(data: any, errText = ""): boolean {
+  const hay = `${data?.error || ""} ${data?.detail || ""} ${data?.answer || ""} ${errText}`;
+  return /provider|llm|model|groq|ollama|deepseek|omniroute|\b403\b|\b404\b|access denied|could not reach|timed out/i.test(hay);
+}
 
 interface Conversation {
   id: string;
@@ -45,7 +52,13 @@ function renderChart(msg: Message, isDark?: boolean) {
   if (!spec || !rows.length) return null;
   const x = spec.x;
   const y = spec.y;
-  const data = rows.slice(0, 24).map((r) => ({ [x]: String(r[x] ?? ""), [y]: Number(r[y]) || 0 }));
+  // Guard shape drift: if the spec keys don't exist in the rows, render
+  // nothing instead of a flat zero chart. Never invent zeros.
+  if (!x || !y || !rows.some((r) => r[x] !== undefined && r[y] !== undefined && r[y] !== null)) return null;
+  const data = rows
+    .map((r) => ({ [x]: String(r[x] ?? ""), [y]: Number(r[y]) }))
+    .filter((d) => d[x] !== "" && Number.isFinite(d[y]))
+    .slice(0, 24);
   if (!data.length) return null;
   const grid = isDark ? "#2A2A35" : "#E5E7EB";
   const axis = isDark ? "#8889A0" : "#9CA3AF";
@@ -73,7 +86,7 @@ function renderChart(msg: Message, isDark?: boolean) {
             <XAxis dataKey={x} tick={tick} axisLine={false} tickLine={false} minTickGap={24} />
             <YAxis tick={tick} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => fmtBiz(v)} />
             <Tooltip content={<BizTooltip metricNames={{ [y]: y }} />} />
-            <Line type="monotone" dataKey={y} stroke="var(--primary)" strokeWidth={2} dot={{ r: 3 }} activeDot={{ r: 5 }} name={y} />
+            <Line type="monotone" dataKey={y} stroke={colorForName(String(y))} strokeWidth={2} dot={{ r: 3 }} activeDot={{ r: 5 }} name={y} />
           </LineChart>
         </ResponsiveContainer>
       ) : horizontal ? (
@@ -224,6 +237,8 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
       const data: any = await apiFetch("/copilot", {
         method: "POST",
         body: JSON.stringify(chartCtx ? { question: content, context: chartCtx } : { question: content }),
+        // Cold local models can take minutes on first load — don't cut them off.
+        timeoutMs: 300000,
       });
       // Response headers arrived — analysis running server-side.
       setCopilotStage(1);
@@ -236,6 +251,7 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
         timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         sql: data.sql || null,
         provider: data.provider || null,
+        providerFailed: !data.ok && isProviderFailure(data),
         rows: Array.isArray(data.data) ? data.data : [],
         chart: data.chart || null,
       };
@@ -360,6 +376,21 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
                     <div className="flex-1 space-y-1.5">
                       <div className="bg-card/90 border border-border/80 rounded-2xl rounded-tl-md px-4 py-3 shadow-sm backdrop-blur-sm">
                         <p className="text-[13px] text-foreground leading-relaxed">{msg.content}</p>
+                        {(msg as any).providerFailed && (
+                          <button
+                            onClick={async () => {
+                              try {
+                                await apiFetch("/provider/switch", {
+                                  method: "POST",
+                                  body: JSON.stringify({ provider: "local" }),
+                                });
+                              } catch { /* best-effort; user can retry regardless */ }
+                            }}
+                            className="mt-2 inline-flex items-center gap-1.5 text-[12px] font-semibold text-blue-700 border border-blue-200 rounded-lg px-3 py-1.5 hover:bg-blue-50"
+                          >
+                            Switch to on-device AI and retry your question
+                          </button>
+                        )}
                         {renderChart(msg, isDark)}
                         {msg.sql && (
                           <div className="mt-2">

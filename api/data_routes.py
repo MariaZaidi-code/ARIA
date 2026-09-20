@@ -231,6 +231,9 @@ class PreviewRequest(BaseModel):
     search: str = ""
     sort_column: str = ""
     sort_direction: str = "ASC"
+    # Optional explicit search scope; when omitted the first 50 text
+    # columns are searched (was a silent first-20 cut).
+    search_columns: list[str] | None = None
 
     @field_validator("limit")
     @classmethod
@@ -293,6 +296,15 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
     table_info = mapping["tables"][req.table]
     columns = [c["column"] for c in table_info.get("columns", [])]
     dialect = session.get("dialect", "postgresql")
+    # Explicit search scope wins (validated against the mapping so unknown
+    # names cannot inject SQL); otherwise the first 50 columns. The old
+    # silent first-20 cut could never match wide-table columns.
+    if req.search_columns:
+        _known = set(columns)
+        _sel = [c for c in req.search_columns if c in _known][:50]
+        search_cols = _sel or columns[:50]
+    else:
+        search_cols = columns[:50]
 
     config, db_type, engine_url = _get_db_config(session)
     if not engine_url:
@@ -317,13 +329,15 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
         like_op = "ILIKE" if dialect == "postgresql" else "LIKE"
 
         def _search_cond(columns):
+            # CAST target is dialect-specific: TEXT (pg/sqlite), CHAR (mysql).
+            _cast = "CHAR" if dialect == "mysql" else "TEXT"
             if like_op == "ILIKE":
                 return " OR ".join(
-                    f"CAST({_quote(c, dialect)} AS TEXT) ILIKE :search" for c in columns[:20]
+                    f"CAST({_quote(c, dialect)} AS {_cast}) ILIKE :search" for c in search_cols
                 )
             return " OR ".join(
-                f"LOWER(CAST({_quote(c, dialect)} AS TEXT)) LIKE LOWER(:search)"
-                for c in columns[:20]
+                f"LOWER(CAST({_quote(c, dialect)} AS {_cast})) LIKE LOWER(:search)"
+                for c in search_cols
             )
 
         # Count total

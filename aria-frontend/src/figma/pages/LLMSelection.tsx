@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { Zap, Shield, CheckCircle2 } from "lucide-react";
-import { API_BASE } from "../../services/api";
+import { apiFetch } from "../../services/api";
 
 interface LLMSelectionProps {
   onSelectLLM: (mode: string, apiKey?: string) => Promise<void> | void;
@@ -40,11 +40,10 @@ export default function LLMSelection({ onSelectLLM }: LLMSelectionProps) {
   const loadStatus = async () => {
     setStatusLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/providers/status`, {
-        credentials: "include",
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && Array.isArray(data.providers)) {
+      // Single client: apiFetch handles API_BASE + credentials:include +
+      // X-Request-ID + 401. Throws on error; status stays advisory.
+      const data = await apiFetch(`/providers/status`);
+      if (Array.isArray(data.providers)) {
         const map: Record<string, { available: boolean; reason: string }> = {};
         for (const p of data.providers) {
           map[p.provider] = { available: !!p.available, reason: p.reason || "" };

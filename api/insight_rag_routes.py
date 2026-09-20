@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from core.deps import require_writable
-from insight_agent_industry import InsightAgent
+from insight_agent.industry import IndustryInsightAgent as InsightAgent
 from insight_rag import InsightPDFRAG
 from insight_rag.config import (
     MAX_PDF_MB,
@@ -36,16 +36,57 @@ class PDFChatRequest(BaseModel):
 
 
 def _capability(user_id: str | int) -> InsightPDFRAG:
-    """Attach PDF-RAG to the same highest-capability Insight Agent used by /api/insight."""
-    provider = create_provider(
-        "deepseek",
-        models={
-            "rag": RAG_LLM_MODEL,
-            "rag_rewrite": RAG_LLM_MODEL,
-            "rag_verify": RAG_LLM_MODEL,
-            "rag_plan": RAG_LLM_MODEL,
-        },
-    )
+    """Attach PDF-RAG to the session's selected provider (Cloud = user's Groq key, Local = Ollama fine-tunes).
+
+    Falls back to DeepSeek only when the session has no usable provider.
+    RAG chat roles (rag/rag_rewrite/...) are mapped onto the active
+    provider's own models so Cloud/Local never receive another
+    provider's model names.
+    """
+    from core.config import get_session, resolve_provider_key
+    try:
+        _session = get_session(int(user_id))
+    except Exception:
+        _session = {}
+    _pname = (_session.get("provider_name") or "local")
+    if _pname not in ("local", "cloud", "deepseek", "omniroute", "grok"):
+        _pname = "deepseek"
+    if _pname == "deepseek":
+        provider = create_provider(
+            "deepseek",
+            models={
+                "rag": RAG_LLM_MODEL,
+                "rag_rewrite": RAG_LLM_MODEL,
+                "rag_verify": RAG_LLM_MODEL,
+                "rag_plan": RAG_LLM_MODEL,
+            },
+        )
+    elif _pname == "local":
+        from llm_provider import PROVIDERS as _PROVIDERS
+        _chat_model = (_PROVIDERS["local"]["models"].get("semi")
+                       or _PROVIDERS["local"]["models"].get("suggest")
+                       or "aria-goal")
+        provider = create_provider("local")
+        provider.models.update({
+            "rag": _chat_model,
+            "rag_scope": _chat_model,
+            "rag_rewrite": _chat_model,
+            "rag_verify": _chat_model,
+            "rag_plan": _chat_model,
+        })
+    else:
+        from llm_provider import PROVIDERS as _PROVIDERS
+        _key = resolve_provider_key(_pname, (_session.get("api_keys") or {}))
+        provider = create_provider(_pname, api_key=_key)
+        _fallback = provider.model_for("sql") or provider.model_for("story")
+        if _fallback:
+            provider.models.update({
+                "rag": _fallback,
+                "rag_scope": _fallback,
+                "rag_rewrite": _fallback,
+                "rag_verify": _fallback,
+                "rag_plan": _fallback,
+            })
     insight_agent = InsightAgent(provider=provider)
     return InsightPDFRAG(insight_agent=insight_agent, user_id=user_id)
 

@@ -124,6 +124,21 @@ natural-English questions. Never mention raw table or column identifiers
 
             ts = []
             if self._is_entity_table(table_name):
+                # Dimension nouns ("products") read naturally; bare table nouns
+                # ("diag sales" for a file upload) leak filenames into prose.
+                # Referenced (real domain) tables keep table nouns; standalone
+                # tables use their text dimension.
+                dim_col = next(
+                    (c for c in info["columns"]
+                     if c.lower() != "id" and not c.lower().endswith("_id")
+                     and self._classify_column(table_name, c) == "text"),
+                    None,
+                )
+                if fact_refs or not dim_col:
+                    dim_plural, dim_single = plural, singular
+                else:
+                    dim_plural = self._plural_label(dim_col)
+                    dim_single = self._natural_label(dim_col)
                 fact = fact_refs[0] if fact_refs else None
                 fact_measure = self._pick_measure_column(fact) if fact else None
                 fact_date = None
@@ -135,16 +150,27 @@ natural-English questions. Never mention raw table or column identifiers
                     )
                 if fact_measure:
                     noun = self._measure_noun(fact, fact_measure)
-                    ts.append(f"What are the top {plural} by {noun}?")
-                    ts.append(f"Which {plural} contribute the most to {noun}?")
+                    ts.append(f"What are the top {dim_plural} by {noun}?")
+                    ts.append(f"Which {dim_plural} contribute the most to {noun}?")
                     if fact_date:
                         ts.append(f"How has {noun} changed over time?")
-                    ts.append(f"What is the average {noun} per {singular}?")
+                    ts.append(f"What is the average {noun} per {dim_single}?")
                 elif own_measure:
+                    # Standalone (file-like) tables use the bare column label
+                    # so filenames never leak ("top products by amount",
+                    # never "top diag sales by diag sale value").
+                    _own_noun = (self._measure_noun(table_name, own_measure)
+                                 if fact_refs else self._natural_label(own_measure))
                     ts.append(
-                        f"What are the top {plural} by {self._measure_noun(table_name, own_measure)}?"
+                        f"What are the top {dim_plural} by {_own_noun}?"
                     )
-                ts.append(f"What are the most important metrics for {plural}?")
+                # Referenced (domain) tables keep the dataset noun the tests
+                # and relational UX expect ("metrics for customers");
+                # standalone tables stay neutral ("metrics in this data").
+                if fact_refs:
+                    ts.append(f"What are the most important metrics for {plural}?")
+                else:
+                    ts.append("What are the most important metrics in this data?")
             else:
                 if own_measure:
                     noun = self._measure_noun(table_name, own_measure)

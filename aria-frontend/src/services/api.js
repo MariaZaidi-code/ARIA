@@ -106,7 +106,13 @@ const getLLMMode = () => {
 // the cookie travels automatically. On 401 the session is cleared and the
 // app is asked to return to login.
 const request = async (path, options = {}) => {
-  const { signal: externalSignal, ...rest } = options || {};
+  const { signal: externalSignal, timeoutMs, ...rest } = options || {};
+  // Per-request timeout override (clamped 1s–10min): cold local LLM calls
+  // can take minutes on first load; the 90s default would abort them.
+  const limitMs = Math.max(
+    1000,
+    Math.min(600000, Number(timeoutMs) || REQUEST_TIMEOUT_MS),
+  );
   const headers = {
     ...(rest.headers || {}),
   };
@@ -145,7 +151,7 @@ const request = async (path, options = {}) => {
       externalSignal.addEventListener("abort", onExternalAbort, { once: true });
     } catch { /* ignore */ }
   }
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), limitMs);
   let response;
   try {
     response = await fetch(resolvePath(path), {
@@ -164,7 +170,7 @@ const request = async (path, options = {}) => {
     // AbortError so UI race guards can ignore it — never a timeout.
     if (err?.name === "AbortError" && externalSignal?.aborted) throw err;
     if (err?.name === "AbortError") {
-      const error = new Error(`Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`);
+      const error = new Error(`Request timed out after ${limitMs / 1000}s.`);
       error.status = 0;
       error.code = "TIMEOUT";
       error.requestId = requestId;
@@ -182,12 +188,10 @@ const request = async (path, options = {}) => {
   } catch { /* ignore */ }
 
   let data;
-  let jsonOk = true;
 
   try {
     data = await response.json();
   } catch {
-    jsonOk = false;
     data = {};
   }
 
@@ -226,7 +230,7 @@ export const apiFetch = (path, options = {}) => request(path, options);
 // own copy while rendering a concise message + Request ID (never stacks).
 export const normalizeApiError = (data, status = 0, headers = null) => {
   const body = data && typeof data === "object" ? data : {};
-  let raw = "";
+  let raw;
   const detail = body?.detail;
   if (typeof detail === "string" && detail) raw = detail;
   else if (Array.isArray(detail))
@@ -246,7 +250,7 @@ export const normalizeApiError = (data, status = 0, headers = null) => {
   let headerId = "";
   try {
     headerId = (typeof headers?.get === "function" ? headers.get("X-Request-ID") : headers?.["X-Request-ID"]) || "";
-  } catch { headerId = ""; }
+  } catch { /* keep headerId as "" */ }
   const requestId = body?.request_id || body?.requestId || body?.error?.request_id || headerId || "";
   const code = body?.code || body?.error?.code
     || (status === 401 ? "UNAUTHORIZED" : status === 403 ? "FORBIDDEN"
@@ -319,11 +323,18 @@ const humanize = (key) => {
 };
 
 const isIdLike = (key) => {
-  const low = String(key || "").toLowerCase();
-
+  // Whole-token / suffix match mirroring the backend (semantic +
+  // lexical): bare endswith("id") misfires on valid/grid/MediaTypeId.
+  const raw = String(key || "");
+  const low = raw.toLowerCase();
+  const split = raw.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase();
+  const toks = split.split(/[^a-z0-9]+/).filter(Boolean);
+  if (toks.some((t) => ["id", "uuid", "guid", "key", "code", "no", "number"].includes(t))) return true;
   return (
     low.endsWith("_id") ||
     low.endsWith("_key") ||
+    low.endsWith("_code") ||
+    low.endsWith("_no") ||
     low === "id" ||
     low === "key" ||
     low === "code"
@@ -708,7 +719,18 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
     if (!shared || typeof shared !== "object" || Object.keys(shared).length === 0) {
       try { shared = JSON.parse(localStorage.getItem("aria_analysis_context") || "{}") || {}; } catch { shared = {}; }
     }
-    if (shared && typeof shared === "object") {
+    // Dataset guard: cross-module context describes a specific dataset. When
+    // the caller names its dataset explicitly and the stored context names
+    // a DIFFERENT one (user switched databases), the stale context is
+    // dropped instead of poisoning the question with old metric/filters.
+    // Comparison is normalized (case/punctuation-insensitive) and missing
+    // dataset info on either side keeps the previous behavior.
+    const normDs = (v) => String(v || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+    const explicitDs = normDs(ctx.dataset || ctx.table);
+    const sharedDs = shared && typeof shared === "object"
+      ? normDs(shared.dataset || shared.table || (shared.source && shared.source.tables && shared.source.tables[0]))
+      : "";
+    if (shared && typeof shared === "object" && (!explicitDs || !sharedDs || sharedDs === explicitDs)) {
       if (!body.metric && shared.metric) body.metric = shared.metric;
       if (!body.grouping && (shared.dimensions || shared.dimension)) {
         body.grouping = shared.dimensions || shared.dimension;
@@ -733,8 +755,11 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
 
   const status = data?.status || "success";
 
+  // Conversational turns (greetings/thanks/bye/help/empty) are NOT errors:
+  // they carry a warm message + starter suggestions with empty data and
+  // must flow to the UI like clarification (never throw).
   const failed =
-    status !== "success" && status !== "clarification";
+    status !== "success" && status !== "clarification" && status !== "conversation";
 
   if (failed) {
     throw new Error(
@@ -757,9 +782,11 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
 
     goalType: deriveGoalType(data),
 
-    clarificationRequired: status === "clarification",
+    clarificationRequired: status === "clarification" || status === "conversation",
 
-    clarificationMessage: status === "clarification" ? data?.message || "" : "",
+    clarificationMessage: (status === "clarification" || status === "conversation") ? data?.message || "" : "",
+    conversation: status === "conversation",
+    conversationMessage: status === "conversation" ? data?.message || "" : "",
 
     relevantTables: data?.data_selection?.tables || data?.kpi_alignment?.tables || [],
 
@@ -824,6 +851,8 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
     dimensions: Array.isArray(data?.dimensions) ? data.dimensions : [],
     filters: data?.filters ?? null,
     timeRange: data?.time_range ?? null,
+    // Business 360: non-technical 360° view (headline/what/causes/actions).
+    business360: data?.business360 || data?.business_360 || null,
   };
 
   return {
@@ -907,13 +936,14 @@ export const generateAnalyticsResult = async (goalResult = {}) => {
   const charts = [];
 
   if (dimension && measure && rows.length >= 2) {
+    // Null measures stay null (filtered below) — never plotted as 0.
     const chartData = rows.slice(0, 12).map((row) => ({
       [dimension]: row[dimension] ?? String(row[dimension] ?? ""),
 
-      [measure]: toNumber(row[measure]) ?? 0,
-    }));
-
-    charts.push({
+      [measure]: toNumber(row[measure]) ?? null,
+    })).filter((r) => r[measure] !== null);
+    if (chartData.length >= 2) {
+      charts.push({
       title: `${humanize(measure)} by ${humanize(dimension)}`,
 
       type: "bar",
@@ -927,15 +957,16 @@ export const generateAnalyticsResult = async (goalResult = {}) => {
       yLabel: humanize(measure),
 
       data: chartData,
-    });
+      });
+    }
   } else if (measure) {
     const chartData = rows.slice(0, 10).map((row, index) => ({
       _rank: `${humanize(measure)} #${index + 1}`,
 
-      [measure]: toNumber(row[measure]) ?? 0,
-    }));
-
-    charts.push({
+      [measure]: toNumber(row[measure]) ?? null,
+    })).filter((r) => r[measure] !== null);
+    if (chartData.length >= 1) {
+      charts.push({
       title: `${humanize(measure)} (top values)`,
 
       type: "horizontal-bar",
@@ -949,7 +980,8 @@ export const generateAnalyticsResult = async (goalResult = {}) => {
       yLabel: "Value",
 
       data: chartData,
-    });
+      });
+    }
   }
 
   if (dimension && measure && rows.length) {
@@ -957,8 +989,10 @@ export const generateAnalyticsResult = async (goalResult = {}) => {
 
     for (const row of rows) {
       const groupKey = String(row[dimension] ?? "—");
-
-      grouped[groupKey] = (grouped[groupKey] || 0) + (toNumber(row[measure]) || 0);
+      // Null measures contribute nothing (never fabricated as 0,
+      // but a missing value must not zero out real grouped sums either).
+      const v = toNumber(row[measure]);
+      grouped[groupKey] = (grouped[groupKey] || 0) + (v === null ? 0 : v);
     }
 
     const entries = Object.entries(grouped)
@@ -993,10 +1027,11 @@ export const generateAnalyticsResult = async (goalResult = {}) => {
       .map((row) => ({
         [timeColumn]: String(row[timeColumn]),
 
-        [measure]: toNumber(row[measure]) ?? 0,
-      }));
-
-    charts.push({
+        [measure]: toNumber(row[measure]) ?? null,
+      }))
+      .filter((r) => r[measure] !== null);
+    if (chartData.length >= 2) {
+      charts.push({
       title: `${humanize(measure)} over time`,
 
       type: "line",
@@ -1010,19 +1045,20 @@ export const generateAnalyticsResult = async (goalResult = {}) => {
       yLabel: humanize(measure),
 
       data: chartData,
-    });
+      });
+    }
   } else if (allNumeric.length >= 2 && !dimension) {
     const xColumn = allNumeric[0];
 
     const yColumn = allNumeric[1];
 
     const chartData = rows.slice(0, 30).map((row) => ({
-      [xColumn]: toNumber(row[xColumn]) ?? 0,
+      [xColumn]: toNumber(row[xColumn]) ?? null,
 
-      [yColumn]: toNumber(row[yColumn]) ?? 0,
-    }));
-
-    charts.push({
+      [yColumn]: toNumber(row[yColumn]) ?? null,
+    })).filter((r) => r[xColumn] !== null && r[yColumn] !== null);
+    if (chartData.length >= 2) {
+      charts.push({
       title: `${humanize(xColumn)} vs ${humanize(yColumn)}`,
 
       type: "scatter",
@@ -1036,7 +1072,8 @@ export const generateAnalyticsResult = async (goalResult = {}) => {
       yLabel: humanize(yColumn),
 
       data: chartData,
-    });
+      });
+    }
   }
 
   // ---------- Table ----------
@@ -1068,145 +1105,10 @@ export const generateAnalyticsResult = async (goalResult = {}) => {
 // INSIGHT AGENT
 // =========================================================
 
-const confidenceToNumber = (value) => {
-  if (typeof value === "number") {
-    return value;
-  }
-
-  const normalized = String(value || "").toLowerCase();
-
-  if (normalized === "high") {
-    return 0.9;
-  }
-
-  if (normalized === "medium") {
-    return 0.6;
-  }
-
-  if (normalized === "low") {
-    return 0.35;
-  }
-
-  return 0.5;
-};
-
-const adaptHypotheses = (hypotheses) => {
-  return (hypotheses || []).slice(0, 4).map((item, index) => ({
-    title: item?.hypothesis || `Possible explanation ${index + 1}`,
-
-    description: item?.basis || "",
-
-    rank: index + 1,
-
-    confidence: confidenceToNumber(item?.confidence),
-
-    evidence: item?.basis ? [item.basis] : [],
-  }));
-};
-
-const adaptTrends = (trends) => {
-  return (trends || []).slice(0, 3).map((item) => {
-    const increasing = item?.direction === "increasing";
-
-    const decreasing = item?.direction === "decreasing";
-
-    const change =
-      item?.pct_change !== null && item?.pct_change !== undefined
-        ? ` (${item.pct_change > 0 ? "+" : ""}${item.pct_change}% change)`
-        : "";
-
-    return {
-      title: `${humanize(item?.dimension)} movement`,
-
-      description: `${humanize(item?.columns?.[0] || item?.dimension)} is ${
-        increasing ? "trending upward" : decreasing ? "trending downward" : "moving in a mixed pattern"
-      }${change}.`,
-
-      direction: increasing ? "up" : decreasing ? "down" : "mixed",
-    };
-  });
-};
-
-const adaptAnomalies = (anomalies) => {
-  return (anomalies || []).slice(0, 5).map((item) => {
-    const zScore = Number(item?.z_score || 0);
-
-    return {
-      title: `${humanize(item?.column)} outlier`,
-
-      description: `${humanize(item?.column)} = ${formatValue(item?.value)} at row ${
-        Number(item?.row || 0) + 1
-      } is ${item?.note || "outside the normal band"} (z-score ${zScore}).`,
-
-      severity: zScore >= 3 ? "high" : zScore >= 2.5 ? "medium" : "low",
-    };
-  });
-};
-
-const adaptPredictions = (predictions) => {
-  if (!predictions) {
-    return [];
-  }
-
-  if (Array.isArray(predictions)) {
-    return predictions.slice(0, 4).map((item, index) => ({
-      title: item?.title || `Forecast ${index + 1}`,
-
-      description: item?.description || item?.reason || "",
-
-      confidence: confidenceToNumber(item?.confidence),
-    }));
-  }
-
-  if (predictions.valid && Array.isArray(predictions.points) && predictions.points.length) {
-    const field = predictions.column || "metric";
-
-    return predictions.points.slice(0, 4).map((point) => {
-      const label = point?.date ?? point?.period ?? "Next period";
-
-      const forecast = point?.forecast ?? point?.value ?? point?.fitted;
-
-      const confidence =
-        predictions.accuracy_pct !== null && predictions.accuracy_pct !== undefined
-          ? Number(predictions.accuracy_pct) / 100
-          : predictions.reliability === "high" || predictions.reliability === "medium"
-            ? confidenceToNumber(predictions.reliability)
-            : "medium";
-
-      return {
-        title: `${humanize(field)} · ${label}`,
-
-        description:
-          forecast !== null && forecast !== undefined
-            ? `Projected value ${formatValue(forecast)}${
-                point?.actual !== null && point?.actual !== undefined
-                  ? ` (last actual ${formatValue(point.actual)})`
-                  : ""
-              }.`
-            : point?.reason || "Forecast point.",
-
-        confidence,
-      };
-    });
-  }
-
-  if (predictions.reason) {
-    return [
-      {
-        title: "Forecast not generated",
-
-        description: predictions.reason,
-
-        confidence: "medium",
-      },
-    ];
-  }
-
-  return [];
-};
-
 // NOTE: the legacy POST /api/insight client (generateInsights) was removed.
 // Insights re-analyze via GET /api/insights from the Insights page.
+// (Its adaptHypotheses/adaptTrends/adaptAnomalies/adaptPredictions helpers
+// were removed with it as dead code.)
 
 // =========================================================
 // DAY 8 - FEEDBACK AGENT
@@ -1244,6 +1146,16 @@ const intelQuery = (params = {}) => {
   return parts.length ? `?${parts.join("&")}` : "";
 };
 
+const intelList = (data, extraKeys = []) => {
+  const candidates = [data?.data, data?.items, ...extraKeys.map((k) => data?.[k])];
+  for (const c of candidates) {
+    if (Array.isArray(c)) return c;
+  }
+  return [];
+};
+
+const intelTotal = (data, list) => data?.total ?? data?.count ?? (Array.isArray(list) ? list.length : null) ?? null;
+
 export const intelligenceApi = {
   // ---- Explore ----
   // GET /api/intelligence/meta -> { metrics, breakdowns, time_grains,
@@ -1270,10 +1182,11 @@ export const intelligenceApi = {
   // the backend must not send them; the UI additionally drops them.
   listHypotheses: async (params = {}) => {
     const data = await request(`/intelligence/hypotheses${intelQuery(params)}`);
+    const list = intelList(data, ["hypotheses", "goals", "results", "reports"]);
     return {
       success: true,
-      data: data?.data || data?.items || [],
-      total: data?.total ?? data?.count ?? null,
+      data: list,
+      total: intelTotal(data, list),
       page: data?.page ?? params.page ?? null,
       pageSize: data?.page_size ?? params.page_size ?? null,
     };
@@ -1287,10 +1200,11 @@ export const intelligenceApi = {
   // ---- Goals (CRUD, status persists server-side) ----
   listGoals: async (params = {}) => {
     const data = await request(`/intelligence/goals${intelQuery(params)}`);
+    const list = intelList(data, ["goals", "hypotheses", "results", "reports"]);
     return {
       success: true,
-      data: data?.data || data?.items || [],
-      total: data?.total ?? data?.count ?? null,
+      data: list,
+      total: intelTotal(data, list),
     };
   },
 
@@ -1317,6 +1231,21 @@ export const intelligenceApi = {
     return { success: true, data: data?.data || data || {} };
   },
 
+  // POST /api/intelligence/goals/:id/refresh -> recomputes current from
+  // live data server-side; returns { ok, item } or { ok: false, detail }.
+  refreshGoal: async (id) => {
+    const data = await request(`/intelligence/goals/${encodeURIComponent(id)}/refresh`, {
+      method: "POST",
+    });
+    if (data && data.ok === false) {
+      const err = new Error(data.detail || "ARIA couldn't refresh this goal.");
+      err.code = data.code;
+      err.payload = data;
+      throw err;
+    }
+    return { success: true, data: data?.data || data?.item || data || {} };
+  },
+
   // ---- What-If (slider range + results both from backend) ----
   // GET /api/intelligence/what-if/meta -> { variables, change_types,
   //   ranges: { [variable]: { min, max, step, ... } }, apply_targets }
@@ -1338,7 +1267,7 @@ export const intelligenceApi = {
 
   listScenarios: async (params = {}) => {
     const data = await request(`/intelligence/what-if/scenarios${intelQuery(params)}`);
-    return { success: true, data: data?.data || data?.items || [] };
+    return { success: true, data: intelList(data, ["scenarios", "goals", "hypotheses", "results", "reports"]) };
   },
 
   saveScenario: async (payload = {}) => {
@@ -1352,10 +1281,11 @@ export const intelligenceApi = {
   // ---- Saved analyses ----
   listAnalyses: async (params = {}) => {
     const data = await request(`/intelligence/analyses${intelQuery(params)}`);
+    const list = intelList(data, ["analyses", "goals", "hypotheses", "results", "reports"]);
     return {
       success: true,
-      data: data?.data || data?.items || [],
-      total: data?.total ?? data?.count ?? null,
+      data: list,
+      total: intelTotal(data, list),
     };
   },
 
@@ -1370,12 +1300,12 @@ export const intelligenceApi = {
   // ---- Reports ----
   listReports: async (params = {}) => {
     const data = await request(`/intelligence/reports${intelQuery(params)}`);
-    return { success: true, data: data?.data || data?.items || [] };
+    return { success: true, data: intelList(data, ["reports", "goals", "hypotheses", "results"]) };
   },
 
   listReportTemplates: async () => {
     const data = await request("/intelligence/reports/templates");
-    return { success: true, data: data?.data || data?.items || [] };
+    return { success: true, data: intelList(data, ["templates", "reports", "goals", "hypotheses", "results"]) };
   },
 
   // POST /api/intelligence/reports/generate { name, description, date_range,
@@ -1427,6 +1357,148 @@ export const intelligenceApi = {
     const data = await request("/intelligence/coverage");
     return { success: true, data: data?.data || data || {} };
   },
+};
+
+// =========================================================
+// PRESCRIPTION API (Explore "Recommended Actions" card)
+// =========================================================
+//
+// Thin wrappers over the EXISTING prescription engine only:
+//   POST /api/prescriptions/analyze { metric?, driver?, dimensions?[],
+//     segment?, table?, question? } -> ranked prescriptions or honest
+//     refusal ({ ok: False } / { status: "no_prescription" }).
+//   POST /api/prescriptions/save { prescription, question? } -> persisted.
+// Uses the shared request() helper (API_BASE, credentials:include,
+// clamped timeout, normalized errors). No recommendation logic lives here.
+export const prescriptionApi = {
+  // Analyze via the existing engine — never fabricates actions client-side.
+  // Returns the raw backend payload ({ ok, status, prescriptions, ... })
+  // so the caller can adapt defensively and omit on honest refusal.
+  analyze: async (payload = {}, opts = {}) => {
+    const data = await request("/prescriptions/analyze", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+    });
+    return { success: true, data: data || {} };
+  },
+
+  // Persist one engine-produced prescription (structured, never prose alone).
+  /** @param {any} prescription @param {any} [question] */
+  save: async (prescription = {}, question = null) => {
+    const data = await request("/prescriptions/save", {
+      method: "POST",
+      body: JSON.stringify({
+        prescription: prescription || {},
+        ...(question ? { question } : {}),
+      }),
+    });
+    return { success: true, data: data || {} };
+  },
+
+  // Dynamic prescription context (metrics/drivers/dimensions/dates/tables/
+  // opportunities) — populates the Prescriptions tab pickers. Never hardcoded.
+  context: async () => {
+    const data = await request("/prescriptions/context");
+    return { success: true, data: data || {} };
+  },
+
+  // Read-only scenario recomputation for a modeled driver:
+  // { table, metric, driver, changes: [{ field, operation, value }],
+  //   filters?, join? } -> { scenarios: [{ baseline, scenario, delta,
+  //   rel_pct, range, observed, ... }], assumptions, warning }.
+  runScenario: async (payload = {}) => {
+    const data = await request("/prescriptions/scenario", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data || {} };
+  },
+
+  // Saved prescriptions (per-user, server-side).
+  listSaved: async () => {
+    const data = await request("/prescriptions/saved");
+    return { success: true, data: data || {} };
+  },
+
+  // Remove one saved prescription by id.
+  unsave: async (id) => {
+    const data = await request(`/prescriptions/saved/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    return { success: true, data: data || {} };
+  },
+
+  // Update business fields of a saved prescription (owner, priority, due,
+  // review_outcome, review_note, review_at). Backend validates values.
+  updateSaved: async (id, patch = {}) => {
+    const data = await request(`/prescriptions/saved/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch || {}),
+    });
+    return { success: true, data: data || {} };
+  },
+
+  // Cost of doing nothing: monthly run-rate projection for one metric.
+  // { metric?, table? } -> { monthly_burn, direction, headline, display, note }.
+  inaction: async (payload = {}, opts = {}) => {
+    const data = await request("/prescriptions/inaction", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+    });
+    return { success: true, data: data || {} };
+  },
+
+  // Alerts that matter: unusual latest-month moves. -> { alerts: [...] }.
+  alerts: async (opts = {}) => {
+    const data = await request("/prescriptions/alerts", {
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+    });
+    return { success: true, data: data || {} };
+  },
+
+  // Lever badges: per-column testability for a metric. Never hardcoded.
+  levers: async (params = {}, opts = {}) => {
+    const qs = new URLSearchParams(
+      Object.entries(params || {}).filter(([, v]) => v !== undefined && v !== null && v !== ""),
+    ).toString();
+    const data = await request(`/prescriptions/levers${qs ? `?${qs}` : ""}`, {
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+    });
+    return { success: true, data: data || {} };
+  },
+
+  // Starter questions derived from the live schema. Never static.
+  presets: async (opts = {}) => {
+    const data = await request("/prescriptions/presets", {
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+    });
+    return { success: true, data: data || {} };
+  },
+
+  // ---- Display-safe contract accessors (additive, pure) ----
+  // The backend attaches display{title,action_text,outcome_text,
+  // confidence_label,why_summary} + details{evidence_pass,checks,numbers,
+  // limitations} to every prescription; refusal{headline,reason_code,
+  // alternatives[]} to refusals. These helpers read the new keys with
+  // legacy fallbacks so cards never invent numbers client-side.
+  /** @param {any} p */
+  displayOf: (p) => (p && typeof p.display === "object" && p.display) || {},
+  /** @param {any} p */
+  detailsOf: (p) => (p && typeof p.details === "object" && p.details) || {},
+  /** @param {any} p */
+  numbersOf: (p) => {
+    const d = (p && p.details && p.details.numbers) || {};
+    return d && typeof d === "object" ? d : {};
+  },
+  /** @param {any} p */
+  confidenceLabelOf: (p) =>
+    (p && (p.display?.confidence_label || p.confidence_label || p.confidence)) || "—",
+  /** @param {any} p */
+  whyOf: (p) => (p && (p.display?.why_summary || p.why_summary)) || "",
+  /** @param {any} out */
+  refusalOf: (out) => (out && typeof out.refusal === "object" && out.refusal) || null,
 };
 
 // =========================================================

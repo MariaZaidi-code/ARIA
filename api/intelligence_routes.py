@@ -133,7 +133,7 @@ class TemplateRequest(BaseModel):
 def _get_session_and_user(request: Request, user: dict = Depends(get_current_user)):
     """Resolve session + ownership for Intelligence endpoints."""
     session = get_session(user["user_id"])
-    provider = session.get("provider")
+    provider = session.get("provider") or session.get("provider_name") or session.get("llm_provider")
     if not provider:
         raise HTTPException(status_code=400, detail="Choose an LLM provider and connect a source first.")
     if session.get("source_type") == "relational" and not session.get("db"):
@@ -157,13 +157,54 @@ def get_meta(request: Request, user: dict = Depends(get_current_user)):
     try:
         session, user = _get_session_and_user(request, user)
     except HTTPException:
-        return {"ok": True, "metrics": [], "measures": [], "dimensions": [], "breakdowns": [], "date_columns": [], "tables": [], "time_grains": ["Monthly"], "comparisons": ["Previous Period"], "date_ranges": ["Last 12 months"], "filterable_columns": [], "variables": [], "change_types": ["Increase", "Decrease"], "apply_targets": ["All data"], "ranges": {}}
+        return {"ok": True, "metrics": [], "measures": [], "dimensions": [], "breakdowns": [], "date_columns": [], "tables": [], "time_grains": ["Monthly"], "comparisons": ["Previous Period"], "date_ranges": ["Last 12 months"], "filterable_columns": [], "variables": [], "change_types": ["Increase", "Decrease"], "apply_targets": ["All data"], "ranges": {}, "reason": "NO_SCHEMA", "hint": "Connect a data source or run Extract Schema (POST /api/extract_schema)"}
     return intel.get_intelligence_meta(session)
 
 
 # ---------------------------------------------------------------------------
 # POST /explore
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Short-TTL result cache for explore/meta (single-process; Redis covers
+# multi-worker via the session store). Key = (user, schema mtime, params):
+# same dataset + same question -> identical result. TTL 120s, cap 200
+# entries oldest-first. Never caches errors/refusals.
+# ---------------------------------------------------------------------------
+_EXPLORE_CACHE: dict = {}
+_EXPLORE_CACHE_TTL = 120
+_EXPLORE_CACHE_MAX = 200
+
+
+def _explore_cache_get(key):
+    try:
+        ts, val = _EXPLORE_CACHE.get(key, (0, None))
+        if val is not None and __import__("time").time() - ts < _EXPLORE_CACHE_TTL:
+            return val
+        _EXPLORE_CACHE.pop(key, None)
+    except Exception:
+        pass
+    return None
+
+
+def _explore_cache_put(key, val):
+    try:
+        if len(_EXPLORE_CACHE) >= _EXPLORE_CACHE_MAX:
+            _EXPLORE_CACHE.pop(next(iter(_EXPLORE_CACHE)))
+        _EXPLORE_CACHE[key] = (__import__("time").time(), val)
+    except Exception:
+        pass
+
+
+def _schema_cache_tag(session: dict) -> str:
+    try:
+        import os as _os
+        p = session.get("schema_path")
+        s = str(p) if p is not None else ""
+        return f"{s}:{_os.path.getmtime(s)}" if s and _os.path.exists(s) else s
+    except Exception:
+        return ""
+
 
 @router.post("/explore")
 def run_explore(req: ExploreRequest, request: Request, user: dict = Depends(get_current_user)):
@@ -180,6 +221,14 @@ def run_explore(req: ExploreRequest, request: Request, user: dict = Depends(get_
         payload["compare"] = payload["comparison"]
     if payload.get("dateRange") and not payload.get("date_range"):
         payload["date_range"] = payload["dateRange"]
+    try:
+        _ckey = (user["user_id"], _schema_cache_tag(session),
+                 __import__("json").dumps(payload, sort_keys=True, default=str))
+        _hit = _explore_cache_get(_ckey)
+        if _hit is not None:
+            return _hit
+    except Exception:
+        _ckey = None
     result = intel.run_explore(session, payload)
     rid = get_request_id(request)
     if result.get("ok"):
@@ -188,6 +237,8 @@ def run_explore(req: ExploreRequest, request: Request, user: dict = Depends(get_
         log.warning("Explore rejected [rid=%s] reason=%s", rid, result.get("detail"))
     # wrap so api.js `data?.data || data` works
     result["data"] = {k: v for k, v in result.items() if k != "data"}
+    if result.get("ok") and _ckey is not None:
+        _explore_cache_put(_ckey, result)
     return result
 
 
@@ -202,7 +253,7 @@ def list_hypotheses(request: Request, user: dict = Depends(get_current_user)):
     try:
         session, user = _get_session_and_user(request, user)
     except HTTPException:
-        return {"ok": True, "candidates": [], "items": [], "data": [], "total_candidates": 0, "total": 0, "count": 0}
+        return {"ok": True, "candidates": [], "items": [], "data": [], "total_candidates": 0, "total": 0, "count": 0, "reason": "NO_SCHEMA", "hint": "Connect a data source or run Extract Schema (POST /api/extract_schema)"}
     params = dict(request.query_params) if request else {}
     result = intel.generate_hypotheses(session, params)
     result["data"] = result.get("data", [])
@@ -271,6 +322,28 @@ def delete_goal(goal_id: str, request: Request, user: dict = Depends(get_current
     return {"ok": True}
 
 
+@router.post("/goals/{goal_id}/refresh")
+def refresh_goal(goal_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Recompute one goal's current value from live data (auto-progress).
+
+    Loads the stored goal, re-runs the run_explore-equivalent aggregation
+    for goal.metric (overall, no breakdown) on the user's current dataset,
+    stores the live total as current, recomputes progress + status pill,
+    and returns the updated goal. Honest ok:False (goal unchanged) when the
+    metric is missing or the aggregation cannot run.
+    """
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    result = intel.refresh_goal(user["user_id"], did, goal_id, session)
+    if result.get("ok"):
+        return {"ok": True, "item": result.get("item"), "data": result.get("data")}
+    if result.get("code") == "NOT_FOUND":
+        raise HTTPException(status_code=404, detail=result.get("detail") or "Goal not found.")
+    return {"ok": False, "detail": result.get("detail"),
+            "code": result.get("code"), "item": result.get("item"),
+            "data": result.get("data")}
+
+
 # ---------------------------------------------------------------------------
 # What-If
 # ---------------------------------------------------------------------------
@@ -281,7 +354,7 @@ def whatif_meta(request: Request, user: dict = Depends(get_current_user)):
     try:
         session, user = _get_session_and_user(request, user)
     except HTTPException:
-        return {"ok": True, "variables": [], "change_types": ["Increase", "Decrease"], "apply_targets": ["All data"], "ranges": {}, "range": None}
+        return {"ok": True, "variables": [], "change_types": ["Increase by", "Decrease by"], "changeTypes": ["Increase by", "Decrease by"], "apply_targets": ["All data"], "applyTargets": ["All data"], "scopes": ["All data"], "ranges": {}, "range": None, "reason": "NO_SCHEMA", "hint": "Connect a data source or run Extract Schema (POST /api/extract_schema)"}
     return intel.get_whatif_meta(session)
 
 
@@ -461,7 +534,7 @@ def get_coverage(request: Request, user: dict = Depends(get_current_user)):
     try:
         session, user = _get_session_and_user(request, user)
     except HTTPException:
-        return {"ok": True, "tables": [], "columns": [], "total_cells": 0}
+        return {"ok": True, "tables": [], "columns": [], "total_cells": 0, "reason": "NO_SCHEMA", "hint": "Connect a data source or run Extract Schema (POST /api/extract_schema)"}
     return intel.get_coverage(session)
 
 
@@ -475,7 +548,7 @@ def refresh(request: Request, user: dict = Depends(get_current_user)):
     try:
         session, user = _get_session_and_user(request, user)
     except HTTPException:
-        return {"ok": True, "meta": {"ok": True, "metrics": [], "dimensions": [], "date_columns": [], "tables": []}, "coverage": {"ok": True, "tables": [], "columns": [], "total_cells": 0}, "active_goals": 0, "timestamp": time.time()}
+        return {"ok": True, "meta": {"ok": True, "metrics": [], "dimensions": [], "date_columns": [], "tables": [], "reason": "NO_SCHEMA", "hint": "Connect a data source or run Extract Schema (POST /api/extract_schema)"}, "coverage": {"ok": True, "tables": [], "columns": [], "total_cells": 0, "reason": "NO_SCHEMA", "hint": "Connect a data source or run Extract Schema (POST /api/extract_schema)"}, "active_goals": 0, "timestamp": time.time(), "reason": "NO_SCHEMA", "hint": "Connect a data source or run Extract Schema (POST /api/extract_schema)"}
     meta = intel.get_intelligence_meta(session)
     coverage = intel.get_coverage(session)
     did = _dataset_id(session)

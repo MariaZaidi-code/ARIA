@@ -25,7 +25,14 @@ from core.semantic import humanize, kpi_label
 from api.schema_intel import SchemaIntelligence, _safe_name, _run_sql
 
 router = APIRouter()
-from services.kpi_service import (_fmt, _is_currency_col, _safe, _validate_schema_ident, _bound_limit, _recommend_chart, _profile_numeric, _rollback, _variation, _score_kpi, _time_grain_expr, _parse_full_date, _parse_date_to_month, _pretty_month, _pretty_date, _discover_special_columns, _fetch_time_series, _holiday_lift, _retail_candidates_for_table, _SERIES_FALLBACK_MAX, _CHART_BY_INTENT, DASHBOARD_MIN_SCORE, _AMOUNT_HINTS, _ENTITY_HINTS, _DATE_HINTS, _STORE_HINTS, _HOLIDAY_HINTS, _SALES_HINTS, _DATE_PARSE_FORMATS, _MONTH_NAMES)  # noqa: F401,E402  # thin-wrapper re-export
+
+# Short-TTL KPI cache per dataset (schema-mtime key, 300s, cap 100).
+# KPI detection runs full-table aggregates; repeat dashboard views must
+# not recompute. Errors/empties are never cached.
+_KPI_CACHE: dict = {}
+_KPI_CACHE_TTL = 300
+_KPI_CACHE_MAX = 100
+from services.kpi_service import (_fmt, _is_currency_col, _safe, _validate_schema_ident, _bound_limit, _recommend_chart, _profile_numeric, _rollback, _variation, _score_kpi, _time_grain_expr, _parse_full_date, _parse_date_to_month, _pretty_month, _pretty_date, _discover_special_columns, _fetch_time_series, _holiday_lift, _retail_candidates_for_table, _measure_expr, _coerce_num, _SERIES_FALLBACK_MAX, _CHART_BY_INTENT, DASHBOARD_MIN_SCORE, _AMOUNT_HINTS, _ENTITY_HINTS, _DATE_HINTS, _STORE_HINTS, _HOLIDAY_HINTS, _SALES_HINTS, _DATE_PARSE_FORMATS, _MONTH_NAMES)  # noqa: F401,E402  # thin-wrapper re-export
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -54,14 +61,22 @@ def _build_engine(session):
             logging.getLogger("aria.kpi").debug("kpi secret decrypt skipped: %s", exc)
 
     schema = db_config.get("db_schema", "public")
+    # Required connection fields via .get(): incomplete mappings return
+    # (None, ...) so callers show "not connected" instead of 500 KeyError.
+    _user = db_config.get("user")
+    _pw = db_config.get("password")
+    _host = db_config.get("host")
+    _db = db_config.get("db")
+    if not all([_user, _pw, _host, _db]):
+        return None, db_type, db_type
     if db_type == "mysql":
-        uri = (f"mysql+pymysql://{quote_plus(str(db_config['user']))}:{quote_plus(str(db_config['password']))}"
-               f"@{db_config['host']}:{db_config.get('port', 3306)}/{db_config['db']}")
+        uri = (f"mysql+pymysql://{quote_plus(str(_user))}:{quote_plus(str(_pw))}"
+               f"@{_host}:{db_config.get('port', 3306)}/{_db}")
         return create_engine(uri, pool_pre_ping=True,
                              connect_args={"connect_timeout": 10}), db_type, db_type
     else:
-        uri = (f"postgresql://{quote_plus(str(db_config['user']))}:{quote_plus(str(db_config['password']))}"
-               f"@{db_config['host']}:{db_config.get('port', 5432)}/{db_config['db']}"
+        uri = (f"postgresql://{quote_plus(str(_user))}:{quote_plus(str(_pw))}"
+               f"@{_host}:{db_config.get('port', 5432)}/{_db}"
                f"?options=-c%20search_path%3D{schema}")
 
     return create_engine(uri, pool_pre_ping=True,
@@ -75,12 +90,10 @@ def _load_schema(session, user_id=None):
     if schema_path and Path(str(schema_path)).exists():
         mapping = json.loads(Path(str(schema_path)).read_text(encoding="utf-8"))
         return SchemaIntelligence(mapping)
-    # Fall back to the default/latest schema file (global / previous extraction)
+    # NOTE: no global SCHEMA_DIR/schema_mapping_latest.json fallback here.
+    # A shared default would leak one user's tables into another user's
+    # session — per-user paths only (session schema_path, then user dir).
     from core.config import SCHEMA_DIR
-    default_path = SCHEMA_DIR / "schema_mapping_latest.json"
-    if default_path.exists():
-        mapping = json.loads(default_path.read_text(encoding="utf-8"))
-        return SchemaIntelligence(mapping)
     # Try user-specific file name using DB name (connect_routes naming convention)
     db_name = session.get("db_name", "")
     if db_name:
@@ -92,7 +105,7 @@ def _load_schema(session, user_id=None):
             return SchemaIntelligence(mapping)
         # Also try the user's directory without DB name suffix
         user_default = SCHEMA_DIR / user_dir / "schema_mapping_latest.json"
-        if user_default.exists() and user_default != default_path:
+        if user_default.exists():
             mapping = json.loads(user_default.read_text(encoding="utf-8"))
             return SchemaIntelligence(mapping)
     # Last resort: try to trigger auto-extraction from the session DB info.
@@ -203,6 +216,21 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
     if not intel or not intel.tables:
         return {"ok": True, "kpis": [], "charts": [], "summary": {}}
 
+    # Short-TTL cache per dataset (schema mtime key): KPI detection runs
+    # full-table aggregates, so repeat views must not recompute. Errors and
+    # empty results are never cached.
+    try:
+        import os as _os, time as _time
+        _sp = session.get("schema_path")
+        _ss = str(_sp) if _sp is not None else ""
+        _stag = f"{_ss}:{_os.path.getmtime(_ss)}" if _ss and _os.path.exists(_ss) else _ss
+        _ckey = (user["user_id"], _stag)
+        _hit = _KPI_CACHE.get(_ckey)
+        if _hit is not None and _time.time() - _hit[0] < _KPI_CACHE_TTL:
+            return _hit[1]
+    except Exception:
+        _ckey = None
+
     engine, dialect, db_type = _build_engine(session)
     if engine is None:
         return {"ok": True, "kpis": [], "charts": [], "summary": {
@@ -250,7 +278,7 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
                 is_curr = _is_currency_col(measure)
                 try:
                     result = conn.execute(text(
-                        f"SELECT SUM({_safe_name(measure, dialect)}) FROM {_safe_name(tname, dialect)}"
+                        f"SELECT SUM({_measure_expr(intel, tname, measure, dialect)}) FROM {_safe_name(tname, dialect)}"
                     ))
                     row = result.fetchone()
                     if row and row[0] is not None:  # noqa: SIM108 (typed guard below)
@@ -272,7 +300,7 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
                 is_curr = _is_currency_col(measure)
                 try:
                     result = conn.execute(text(
-                        f"SELECT AVG({_safe_name(measure, dialect)}) FROM {_safe_name(tname, dialect)}"
+                        f"SELECT AVG({_measure_expr(intel, tname, measure, dialect)}) FROM {_safe_name(tname, dialect)}"
                     ))
                     row = result.fetchone()
                     if row and row[0] is not None:
@@ -406,7 +434,7 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
                     try:
                         result = conn.execute(text(
                             f"SELECT {_safe_name(dim, dialect)} AS dim_val, "
-                            f"SUM({_safe_name(measure, dialect)}) AS val "
+                            f"SUM({_measure_expr(intel, tname, measure, dialect)}) AS val "
                             f"FROM {_safe_name(tname, dialect)} "
                             f"WHERE {_safe_name(dim, dialect)} IS NOT NULL "
                             f"GROUP BY dim_val ORDER BY val DESC LIMIT 8"
@@ -492,7 +520,16 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
         if measure and dim and len(recommendations) < 6:
             recommendations.append({"q": f"Show {measure} breakdown by {dim}"})
 
-    return {"ok": True, "kpis": kpis[:8], "charts": charts[:3], "summary": summary, "recommendations": recommendations[:6]}
+    out = {"ok": True, "kpis": kpis[:8], "charts": charts[:3], "summary": summary, "recommendations": recommendations[:6]}
+    try:
+        if _ckey is not None and out.get("kpis"):
+            import time as _t2
+            if len(_KPI_CACHE) >= _KPI_CACHE_MAX:
+                _KPI_CACHE.pop(next(iter(_KPI_CACHE)))
+            _KPI_CACHE[_ckey] = (_t2.time(), out)
+    except Exception:
+        pass
+    return out
 
 
 # ── Real KPI endpoint (same route, enhanced logic) ───────────────────────
@@ -577,7 +614,7 @@ def get_dashboard_summaries(request: Request, user: dict = Depends(get_current_u
                 # Get total
                 try:
                     result = conn.execute(text(
-                        f"SELECT SUM({_safe_name(measure, dialect)}) FROM {_safe_name(tname, dialect)}"
+                        f"SELECT SUM({_measure_expr(intel, tname, measure, dialect)}) FROM {_safe_name(tname, dialect)}"
                     ))
                     row = result.fetchone()
                     total = float(row[0]) if row and row[0] is not None else None
@@ -609,12 +646,23 @@ def get_dashboard_summaries(request: Request, user: dict = Depends(get_current_u
                     else:
                         time_expr = f"TO_CHAR({_safe_name(dt, dialect)}, 'YYYY-MM')"
                     result = conn.execute(text(
-                        f"SELECT {time_expr} AS period, SUM({_safe_name(measure, dialect)}) AS val "
+                        f"SELECT {time_expr} AS period, SUM({_measure_expr(intel, tname, measure, dialect)}) AS val "
                         f"FROM {_safe_name(tname, dialect)} "
                         f"WHERE {_safe_name(dt, dialect)} IS NOT NULL "
                         f"GROUP BY period ORDER BY period DESC LIMIT 6"
                     ))
                     rows = result.fetchall()
+                    if not rows:
+                        # TEXT-stored dates the bucket function cannot parse
+                        # (NULL periods): fall back to raw-value grouping so
+                        # month-shaped TEXT ('2024-01') still trends.
+                        result = conn.execute(text(
+                            f"SELECT {_safe_name(dt, dialect)} AS period, SUM({_measure_expr(intel, tname, measure, dialect)}) AS val "
+                            f"FROM {_safe_name(tname, dialect)} "
+                            f"WHERE {_safe_name(dt, dialect)} IS NOT NULL "
+                            f"GROUP BY period ORDER BY period DESC LIMIT 6"
+                        ))
+                        rows = result.fetchall()
                     if len(rows) >= 2:
                         vals = [(str(r[0]), float(r[1])) for r in rows if r[1] is not None]
                         if len(vals) >= 2:
@@ -641,8 +689,14 @@ def get_dashboard_summaries(request: Request, user: dict = Depends(get_current_u
                     continue
                 tdesc = intel.tables[tname].get("description", tname)
                 try:
+                    if dialect == "sqlite":
+                        months_expr = f"strftime('%Y-%m', {_safe_name(dt, dialect)})"
+                    elif dialect == "mysql":
+                        months_expr = f"DATE_FORMAT({_safe_name(dt, dialect)}, '%Y-%m')"
+                    else:
+                        months_expr = f"TO_CHAR({_safe_name(dt, dialect)}, 'YYYY-MM')"
                     result = conn.execute(text(
-                        f"SELECT COUNT(DISTINCT strftime('%Y-%m', {_safe_name(dt, dialect)})) "
+                        f"SELECT COUNT(DISTINCT {months_expr}) "
                         f"FROM {_safe_name(tname, dialect)} "
                         f"WHERE {_safe_name(dt, dialect)} IS NOT NULL"
                     ))
@@ -669,7 +723,7 @@ def get_dashboard_summaries(request: Request, user: dict = Depends(get_current_u
                 tdesc = intel.tables[tname].get("description", tname)
                 try:
                     result = conn.execute(text(
-                        f"SELECT {_safe_name(dim, dialect)} AS d, SUM({_safe_name(measure, dialect)}) AS v "
+                        f"SELECT {_safe_name(dim, dialect)} AS d, SUM({_measure_expr(intel, tname, measure, dialect)}) AS v "
                         f"FROM {_safe_name(tname, dialect)} "
                         f"WHERE {_safe_name(dim, dialect)} IS NOT NULL "
                         f"GROUP BY d ORDER BY v DESC LIMIT 5"
@@ -926,7 +980,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                             else:
                                 gexpr = f"TO_CHAR({_safe_name(c['date_col'], dialect)}, 'YYYY-MM')"
                             prow = conn.execute(text(
-                                f"SELECT {gexpr} AS p, SUM({_safe_name(c['column'], dialect)}) AS v "
+                                f"SELECT {gexpr} AS p, SUM({_measure_expr(intel, c['table'], c['column'], dialect)}) AS v "
                                 f"FROM {_safe_name(c['table'], dialect)} "
                                 f"WHERE {_safe_name(c['date_col'], dialect)} IS NOT NULL "
                                 f"GROUP BY p ORDER BY p DESC LIMIT 2"
@@ -1054,13 +1108,14 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         continue
                     try:
                         # Real-SQL profile for variation scoring.
+                        _mref = _measure_expr(intel, tname, measure, dialect)
                         srow = conn.execute(text(
                             f"SELECT MIN({_safe_name(dt_col, dialect)}), "
                             f"MAX({_safe_name(dt_col, dialect)}), "
-                            f"SUM({_safe_name(measure, dialect)}), "
-                            f"AVG({_safe_name(measure, dialect)}), "
-                            f"MIN({_safe_name(measure, dialect)}), "
-                            f"MAX({_safe_name(measure, dialect)}) "
+                            f"SUM({_mref}), "
+                            f"AVG({_mref}), "
+                            f"MIN({_mref}), "
+                            f"MAX({_mref}) "
                             f"FROM {_safe_name(tname, dialect)} "
                             f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL"
                         )).fetchone()
@@ -1125,7 +1180,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                             try:
                                 result = conn.execute(text(
                                     f"SELECT {_safe_name(dim, dialect)} AS dim_val, "
-                                    f"SUM({_safe_name(measure, dialect)}) AS val "
+                                    f"SUM({_measure_expr(intel, tname, measure, dialect)}) AS val "
                                     f"FROM {_safe_name(tname, dialect)} "
                                     f"WHERE {_safe_name(dim, dialect)} IS NOT NULL "
                                     f"GROUP BY dim_val ORDER BY val DESC LIMIT 8"
@@ -1164,8 +1219,8 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         m2 = num_cols[1]
                         try:
                             result = conn.execute(text(
-                                f"SELECT {_safe_name(m1, dialect)} AS x, "
-                                f"{_safe_name(m2, dialect)} AS y "
+                                f"SELECT {_measure_expr(intel, tname, m1, dialect)} AS x, "
+                                f"{_measure_expr(intel, tname, m2, dialect)} AS y "
                                 f"FROM {_safe_name(tname, dialect)} "
                                 f"WHERE {_safe_name(m1, dialect)} IS NOT NULL "
                                 f"AND {_safe_name(m2, dialect)} IS NOT NULL "
@@ -1252,7 +1307,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     is_curr = _is_currency_col(measure)
                     try:
                         result = conn.execute(text(
-                            f"SELECT SUM({_safe_name(measure, dialect)}) FROM {_safe_name(tname, dialect)}"
+                            f"SELECT SUM({_measure_expr(intel, tname, measure, dialect)}) FROM {_safe_name(tname, dialect)}"
                         ))
                         row = result.fetchone()
                         total = float(row[0]) if row and row[0] is not None else None
@@ -1286,7 +1341,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         else:
                             time_expr = f"TO_CHAR({_safe_name(dt, dialect)}, 'YYYY-MM')"
                         result = conn.execute(text(
-                            f"SELECT {time_expr} AS period, SUM({_safe_name(measure, dialect)}) AS val "
+                            f"SELECT {time_expr} AS period, SUM({_measure_expr(intel, tname, measure, dialect)}) AS val "
                             f"FROM {_safe_name(tname, dialect)} "
                             f"WHERE {_safe_name(dt, dialect)} IS NOT NULL "
                             f"GROUP BY period ORDER BY period DESC LIMIT 6"
@@ -1358,7 +1413,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     tdesc = intel.tables[tname].get("description", tname)
                     try:
                         result = conn.execute(text(
-                            f"SELECT {_safe_name(dim, dialect)} AS d, SUM({_safe_name(measure, dialect)}) AS v "
+                            f"SELECT {_safe_name(dim, dialect)} AS d, SUM({_measure_expr(intel, tname, measure, dialect)}) AS v "
                             f"FROM {_safe_name(tname, dialect)} "
                             f"WHERE {_safe_name(dim, dialect)} IS NOT NULL "
                             f"GROUP BY d ORDER BY v DESC LIMIT 5"

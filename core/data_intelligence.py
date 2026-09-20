@@ -51,10 +51,11 @@ _DATE_NAME_HINTS = ("date", "time", "day", "month", "year", "created",
                     "updated", "timestamp", "period", "shipped", "ordered")
 
 # Numeric columns whose NAME signals a category/flag rather than a math
-# measure (store id, holiday flag, ...). Shared by profile_table() so a
-# single-table dataset like Walmart (Store/Holiday_Flag as bigint) classifies
-# them as dimensions, not measures. Generic name fragments only — never a
-# table/column literal — so multi-table schemas are unaffected.
+# measure (store id, holiday flag, ...). Token-based (never bare
+# substrings): a column is dimension-like when its LAST token is
+# dimension-ish ("holiday_flag", "store"), while a trailing measure token
+# ("store_sales", "brand_revenue") keeps measure status. Generic name
+# fragments only — never a table/column literal.
 _DIMENSION_LIKE_NUMERIC_TOKENS = (
     "year", "month", "day", "status", "state", "code", "rank", "rating",
     "level", "version", "quarter", "age",
@@ -62,12 +63,64 @@ _DIMENSION_LIKE_NUMERIC_TOKENS = (
     "channel", "department", "division", "group", "type", "class", "gender",
     "outlet", "branch", "location", "site", "shop",
 )
+_MEASURE_TAIL_TOKENS = (
+    "sales", "revenue", "profit", "amount", "total", "price", "cost",
+    "margin", "income", "expense", "balance", "quantity", "qty", "count",
+    "value", "rate", "score", "hours", "salary", "wage",
+)
+
+
+def name_tokens(column_name: str) -> list:
+    """Split a column/table name into lowercase tokens, separator-agnostic.
+
+    Handles snake_case, spaces, dots AND camelCase ("OrderDate" ->
+    ["order", "date"]) so name-hint matching works on every naming
+    convention instead of only underscore-joined names.
+    """
+    s = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", str(column_name or ""))
+    return [t for t in re.split(r"[^a-z0-9]+", s.lower()) if t]
+
+
+def is_id_like_name(column_name: str) -> bool:
+    """True when a column name is identifier-like (id/key/code/uuid/guid).
+
+    Separator-agnostic: "order_id", "Order ID" and "postal_code" all match,
+    while "country", "monkey" or "barcode" do not (token equality, never
+    bare substrings).
+    """
+    toks = name_tokens(column_name)
+    if not toks:
+        return False
+    if toks == ["id"]:
+        return True
+    return toks[-1] in ("id", "uuid", "guid", "key", "code")
+
+
+def hint_hit(column_name: str, hints) -> bool:
+    """True when any token of the name equals a hint (singular/plural).
+
+    Token equality — never substring — so "count" does not fire on
+    "country", "order" does not fire on "order_status", and "class"
+    does not fire on "classification".
+    """
+    for t in name_tokens(column_name):
+        for h in (hints or ()):
+            hl = str(h or "").lower()
+            if not hl:
+                continue
+            if t == hl or t == hl + "s" or (t.endswith("s") and len(t) > 3 and t[:-1] == hl):
+                return True
+    return False
 
 
 def is_dimension_like_numeric(column_name: str) -> bool:
     """True when a NUMERIC column's name signals a dimension, not a measure."""
-    low = str(column_name or "").lower()
-    return any(k in low for k in _DIMENSION_LIKE_NUMERIC_TOKENS)
+    toks = [t for t in re.split(r"[^a-z0-9]+", str(column_name or "").lower()) if t]
+    if not toks:
+        return False
+    if toks[-1] in _MEASURE_TAIL_TOKENS:
+        return False
+    return any(t in _DIMENSION_LIKE_NUMERIC_TOKENS for t in toks)
 
 
 def quote_identifier(name: Any, dialect: str = "postgresql") -> str:
@@ -109,7 +162,9 @@ def date_parse_expression(quoted_col: str, dialect: str = "postgresql") -> str:
             f"CASE WHEN {col} REGEXP '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$' "
             f"THEN STR_TO_DATE({col}, '%d-%m-%Y') "
             f"WHEN {col} REGEXP '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}' "
-            f"THEN CAST({col} AS DATE) ELSE NULL END"
+            f"THEN CAST({col} AS DATE) "
+            f"WHEN {col} REGEXP '^[0-9]{{4}}-[0-9]{{2}}$' "
+            f"THEN CAST(CONCAT({col}, '-01') AS DATE) ELSE NULL END"
         )
     if (dialect or "") == "sqlite":
         iso = (
@@ -118,13 +173,17 @@ def date_parse_expression(quoted_col: str, dialect: str = "postgresql") -> str:
         )
         return (
             f"CASE WHEN substr({col}, 3, 1) = '-' AND length({col}) >= 10 "
-            f"THEN date({iso}) ELSE date({col}) END"
+            f"THEN date({iso}) "
+            f"WHEN length({col}) = 7 AND {col} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]' "
+            f"THEN date({col} || '-01') ELSE date({col}) END"
         )
     return (
         f"CASE WHEN {col} ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$' "
         f"THEN TO_DATE({col}, 'DD-MM-YYYY') "
         f"WHEN {col} ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}' "
-        f"THEN {col}::date ELSE NULL END"
+        f"THEN {col}::date "
+        f"WHEN {col} ~ '^[0-9]{{4}}-[0-9]{{2}}$' "
+        f"THEN ({col} || '-01')::date ELSE NULL END"
     )
 
 
@@ -165,19 +224,19 @@ def classify_column(column_name: str, data_type: Any = "") -> str:
     if any(tok in dtype for tok in _DATETIME_TOKENS):
         return "datetime"
     if any(tok in dtype for tok in _NUMERIC_TOKENS):
-        if _ID_NAME_RE.search(name) or name == "id":
+        if is_id_like_name(name):
             return "identifier"
         return "numerical"
     if any(tok in dtype for tok in _TEXT_TOKENS) or not dtype:
-        if _ID_NAME_RE.search(name) or name == "id":
+        if is_id_like_name(name):
             return "identifier"
-        if any(h in name for h in _DATE_NAME_HINTS):
+        if hint_hit(name, _DATE_NAME_HINTS):
             return "datetime"
         return "categorical"
     # Unknown vendor type: fall back to the name.
-    if _ID_NAME_RE.search(name) or name == "id":
+    if is_id_like_name(name):
         return "identifier"
-    if any(h in name for h in _DATE_NAME_HINTS):
+    if hint_hit(name, _DATE_NAME_HINTS):
         return "datetime"
     return "categorical"
 

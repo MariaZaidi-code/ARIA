@@ -25,9 +25,13 @@ _GIBSMASH = {
     "jjjj", "kkkk", "llll", "mmmm", "nnnn", "oooo", "pppp", "qqqq", "rrrr",
     "ssss", "tttt", "uuuu", "vvvv", "wwww", "xxxx", "yyyy", "zzzz",
     "asdfjkl", "qwe", "rty", "uio", "p", "sdf", "fgh", "jkl", "lkj",
-    "test", "testing", "test123", "abc", "abcd", "abcde", "xyz", "xy",
+    "xyz", "xy",
     "lorem", "ipsum", "loremipsum", "fuck", "shit", "poop", "butt",
 }
+# NOTE: real English words ("test", "testing", "abc", ...) were removed
+# from the smash list — "Show test results by category" and "ABC analysis"
+# are legitimate questions. Smash detection relies on the structural
+# checks below (repetition, low diversity, no vowels) instead.
 
 _GOAL_VOWELS = set("aeiouy")
 
@@ -102,14 +106,13 @@ _SQL_TABLE_RE = re.compile(
 
 
 _READONLY_DESTRUCTIVE_RE = re.compile(
-    r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM"
-    r"|DROP\s+(?:TABLE|DATABASE|VIEW|INDEX|SCHEMA|TRIGGER|FUNCTION|PROCEDURE)"
-    r"|ALTER\s+(?:TABLE|DATABASE|VIEW|SCHEMA|SYSTEM)"
-    r"|CREATE\s+(?:TABLE|DATABASE|INDEX|VIEW|SCHEMA|TRIGGER|FUNCTION|PROCEDURE)"
-    r"|TRUNCATE\s+(?:TABLE\s+)?|GRANT|REVOKE|CALL|EXEC(?:UTE)?\b|MERGE\s+INTO"
-    r"|COMMENT\s+ON|COPY\s+(?:\(?[A-Z_][\w$]*\)?\s+)?(?:TO|FROM)\b"
+    r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|DELETE\s+\w+\s+FROM"
+    r"|DROP|ALTER|CREATE|TRUNCATE\s+(?:TABLE\s+)?|GRANT|REVOKE|CALL|EXEC(?:UTE)?\b|MERGE\s+INTO"
+    r"|COMMENT\s+ON|COPY\b"
     r"|\bVACUUM\b|\bANALYZE\b|\bEXPLAIN\b|\bSET\b|\bSHOW\b"
     r"|\bLISTEN\b|\bNOTIFY\b|\bLOAD\b|\bIMPORT\b|\bINTO\b"
+    r"|\bPRAGMA\b|\bATTACH\b|\bDETACH\b|\bREINDEX\b|\bREPLACE\s+INTO\b|\bHANDLER\b"
+    r"|\bDO\b|FOR\s+UPDATE\b|LOCK\s+IN\s+SHARE\s+MODE"
     r"|pg_sleep\s*\(|pg_read_file\s*\(|dblink\s*\()",
     re.IGNORECASE,
 )
@@ -129,6 +132,12 @@ def is_read_only_sql(sql) -> bool:
         return False
     stripped = _READONLY_STRIP_STRINGS_RE.sub(" ", sql)
     stripped = _READONLY_STRIP_COMMENTS_RE.sub(" ", stripped)
+    # Fail closed on stacked statements: any semicolon outside a string or
+    # comment can smuggle a second statement past keyword checks.
+    # A single trailing semicolon terminator is tolerated.
+    _core = stripped.strip()
+    if ";" in _core.rstrip(";").strip():
+        return False
     if _READONLY_DESTRUCTIVE_RE.search(stripped):
         return False
     return bool(re.match(r"\s*(select|with)\b", stripped, re.IGNORECASE))
@@ -389,6 +398,17 @@ def find_incompatible_aggregations(sql, columns_by_type=None) -> list:
     for m in _AGG_CALL_RE.finditer(sql):
         fn, qual, col = m.group(1).upper(), m.group(2), m.group(3)
         if col == "*" or fn in ("COUNT", "MIN", "MAX"):
+            continue
+        # Coerced text-numeric aggregates wrap a SAFE cast expression
+        # (SUM(CAST(NULLIF(...)))) rather than a bare column: the value is
+        # numeric at aggregation time, so this is valid and never flagged.
+        # Bare SUM/AVG over text/datetime/binary is still flagged below.
+        try:
+            _call = m.group(0)
+        except Exception:
+            _call = ""
+        if re.search(r"\b(CAST|REGEXP_REPLACE|NULLIF)\s*\(", _call,
+                     re.IGNORECASE):
             continue
         # SUM/AVG over a text/datetime/binary column is a datatype error.
         table = aliases.get((qual or "").lower()) if qual else None

@@ -4,6 +4,39 @@ Used by both KPI routes and Insights engine. Zero hardcoded table/column names.
 Classifies columns by their actual database data_type from the schema metadata.
 """
 
+import re
+
+
+def _name_tokens(name: str) -> list:
+    """Lowercase tokens, separator-agnostic (snake_case, spaces, camelCase)."""
+    s = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", str(name or ""))
+    return [t for t in re.split(r"[^a-z0-9]+", s.lower()) if t]
+
+
+def _is_id_like(name: str) -> bool:
+    """Identifier-like columns ("order_id", "Order ID", "postal_code").
+
+    Token equality — never substrings — so "country" is not an ID.
+    """
+    toks = _name_tokens(name)
+    if not toks:
+        return False
+    if toks == ["id"]:
+        return True
+    return toks[-1] in ("id", "uuid", "guid", "key", "code")
+
+
+def _hint_hit(name: str, hints) -> bool:
+    """Any name token equals a hint (singular/plural tolerant)."""
+    for t in _name_tokens(name):
+        for h in (hints or ()):
+            hl = str(h or "").lower()
+            if not hl:
+                continue
+            if t == hl or t == hl + "s" or (t.endswith("s") and len(t) > 3 and t[:-1] == hl):
+                return True
+    return False
+
 # ── Type classification (fully dynamic from data_type) ────────────────────
 
 NUMERIC_TYPES = {
@@ -19,7 +52,33 @@ TEXT_TYPES = {
     "character varying", "varchar", "character", "char",
     "text", "citext", "ltree", "uuid",
 }
-BINARY_TYPES = {"bytea", "blob", "binary", "varbinary"}
+BINARY_TYPES = {"bytea", "blob", "binary", "varbinary", "image"}
+
+# Binary/blob-like column-name tokens. A column whose name carries one of
+# these tokens (e.g. product_photo, picture, thumbnail, counter internals)
+# is never an analytical measure, even when its declared type looks
+# numeric. Token equality (never bare substrings) so "encounter" does not
+# trip on "counter".
+_BINARY_NAME_TOKENS = frozenset({
+    "binary", "blob", "bytea", "bytes", "image", "photo", "picture",
+    "thumb", "thumbnail", "thumbs", "icon", "counter", "rowversion",
+})
+
+# Binary/blob-like type fragments (substring match on the data_type).
+_BINARY_TYPE_TOKENS = (
+    "bytea", "blob", "binary", "varbinary", "bytes", "image",
+)
+
+
+def _is_binary_like_name(name: str) -> bool:
+    """True when a column name carries a binary/blob/image token."""
+    return any(t in _BINARY_NAME_TOKENS for t in _name_tokens(name))
+
+
+def _is_binary_like_type(data_type: str) -> bool:
+    """True when a declared data_type is binary/blob-like."""
+    dt = str(data_type or "").lower().strip()
+    return any(k in dt for k in _BINARY_TYPE_TOKENS)
 
 # Amount-like column name hints (used to prefer revenue columns over IDs)
 AMOUNT_HINTS = (
@@ -38,6 +97,15 @@ STORE_HINTS = (
     "warehouse", "depot",
 )
 
+# Date-like name hints: a date column drives trends, it is not the headline
+# breakdown for "which X has the highest ...". Token-based (never bare
+# substrings) so "holiday" does not trip on "day".
+_DATE_NAME_HINTS = (
+    "date", "time", "day", "month", "year", "created",
+    "updated", "timestamp", "period", "quarter", "week",
+    "shipped", "ordered",
+)
+
 # Holiday/flag column hints (retail: Holiday_Flag lift analysis).
 HOLIDAY_HINTS = (
     "holiday", "is_holiday", "holiday_flag", "festival",
@@ -48,6 +116,8 @@ HOLIDAY_HINTS = (
 def classify_type(data_type: str) -> str:
     """Classify a database column type into a semantic category."""
     dt = data_type.lower().strip()
+    if _is_binary_like_type(dt) or dt in BINARY_TYPES:
+        return "binary"
     if dt in NUMERIC_TYPES or any(k in dt for k in (
         "int", "decimal", "numeric", "float", "real", "double", "money"
     )):
@@ -70,7 +140,14 @@ def _safe_name(name: str, dialect: str = "postgresql") -> str:
 
 
 def _run_sql(conn, sql: str, limit: int = 500):
-    """Execute read-only SQL and return (columns, rows_as_dicts)."""
+    """Execute read-only SQL and return (columns, rows_as_dicts).
+
+    Distinguishes empty from broken: DB errors are logged with the
+    statement prefix and rolled back, then ([], []) is returned ONLY for
+    missing-relation/undefined cases. Programming/connection errors still
+    return ([], []) but are logged at warning level with the SQL so silent
+    detector blindness is diagnosable server-side.
+    """
     try:
         cur = conn.cursor()
         cur.execute(sql)
@@ -78,7 +155,10 @@ def _run_sql(conn, sql: str, limit: int = 500):
         rows = cur.fetchmany(limit)
         cur.close()
         return cols, [dict(zip(cols, row)) for row in rows]
-    except Exception:
+    except Exception as exc:
+        import logging as _logging
+        _logging.getLogger("aria.schema_intel").warning(
+            "sql failed (returning empty): sql=%.200s error=%s", sql, exc)
         try:
             conn.rollback()
         except Exception:
@@ -146,15 +226,27 @@ class SchemaIntelligence:
             if not cat_map.get("numeric") and col_names:
                 cat_map = {"numeric": [], "text": [], "datetime": [], "binary": [], "other": []}
                 for cname in col_names:
-                    low = cname.lower()
-                    if any(h in low for h in ("amount", "price", "cost", "total", "value", "revenue", "sales", "qty", "quantity", "count")):
+                    if _hint_hit(cname, ("amount", "price", "cost", "total", "value", "revenue", "sales", "qty", "quantity", "count")):
                         cat_map["numeric"].append(cname)
-                    elif any(h in low for h in ("date", "time", "created", "updated", "timestamp")):
+                    elif _hint_hit(cname, ("date", "time", "created", "updated", "timestamp")):
                         cat_map["datetime"].append(cname)
-                    elif low.endswith("_id") or low in ("id", "key", "code"):
+                    elif _is_id_like(cname) or cname.lower() in ("key", "code"):
                         cat_map["other"].append(cname)
                     else:
                         cat_map["text"].append(cname)
+                # Preserve the mapping's real dtypes (e.g. "text" for a
+                # relational TEXT column) instead of blanking them: dtype
+                # drives TEXT-numeric coercion downstream, and "inferred"
+                # would hide a genuine text type. Only truly unknown dtypes
+                # keep the "inferred" marker.
+                _orig_dtype: dict[str, str] = {}
+                try:
+                    for _c in (cols_raw if isinstance(cols_raw, list) else []):
+                        if isinstance(_c, dict) and str(_c.get("column", "")).strip():
+                            _orig_dtype[str(_c.get("column")).strip()] = str(
+                                _c.get("data_type", "") or "")
+                except Exception:
+                    _orig_dtype = {}
                 for cname in col_names:
                     low = cname.lower()
                     if cname in cat_map.get("numeric", []):
@@ -167,7 +259,8 @@ class SchemaIntelligence:
                         cat = "other"
                     else:
                         cat = "text"
-                    self._col_types.setdefault(tname, {})[cname] = "inferred"
+                    self._col_types.setdefault(tname, {})[cname] = (
+                        _orig_dtype.get(cname) or "inferred")
                     self._col_category.setdefault(tname, {})[cname] = cat
             self._table_categories[tname] = cat_map
 
@@ -178,6 +271,18 @@ class SchemaIntelligence:
             ref_c = fk.get("references_column", "")
             if t and col and ref_t and ref_c:
                 self._fk_map.setdefault(t, []).append((col, ref_t, ref_c))
+
+    def dtype_of(self, table: str, col: str) -> str:
+        """Declared data_type for one column ("" when unknown).
+
+        Schema-agnostic accessor for TEXT-numeric coercion decisions:
+        callers coerce SUM/AVG over text-dtype measures instead of failing
+        with ``function sum(text) does not exist``. Never raises.
+        """
+        try:
+            return str((self._col_types.get(table, {}) or {}).get(col, "") or "")
+        except Exception:
+            return ""
 
     def get_numeric_cols(self, table: str) -> list:
         return self._table_categories.get(table, {}).get("numeric", [])
@@ -213,43 +318,55 @@ class SchemaIntelligence:
         outgoing_fks = self.get_fks(table)
         return len(texts) >= 1 and len(pks) >= 1 and len(outgoing_fks) <= 1
 
+    def _usable_measure_cols(self, table: str) -> list:
+        """Numeric columns verified safe for SUM/AVG.
+
+        Excludes binary/blob/bytea/image/photo/picture columns by type AND
+        by name (a photo/thumbnail/counter column is never a measure, even
+        when its declared type looks numeric), plus PK/FK/identifier keys.
+        """
+        col_types = self._col_types.get(table, {})
+        return [c for c in self.get_numeric_cols(table)
+                if c not in set(self.get_pk(table))
+                and c not in set(fk[0] for fk in self.get_fks(table))
+                and not _is_id_like(c)
+                and not _is_binary_like_name(c)
+                and not _is_binary_like_type(col_types.get(c, ""))]
+
     def find_best_measure(self, table: str):
-        """Pick the most analytically useful numeric column (prefer amounts over IDs)."""
-        numerics = self.get_numeric_cols(table)
+        """Pick the most analytically useful numeric column (prefer amounts over IDs).
+
+        Binary/blob/bytea/image/photo/picture columns are excluded by type
+        AND by name — SUM over a photo column is always wrong.
+        """
+        numerics = self._usable_measure_cols(table)
         if not numerics:
             return None
-        pks = set(self.get_pk(table))
-        fk_cols = set(fk[0] for fk in self.get_fks(table))
 
         # Tier 1: amount-like names, not PK/FK
         tier1 = [c for c in numerics
-                 if c not in pks and c not in fk_cols
-                 and any(h in c.lower() for h in AMOUNT_HINTS)]
+                 if any(h in c.lower() for h in AMOUNT_HINTS)]
         if tier1:
             return tier1[0]
 
         # Tier 2: non-PK/FK, non-ID columns
-        tier2 = [c for c in numerics
-                 if c not in pks and c not in fk_cols
-                 and not c.lower().endswith("_id")
-                 and not c.lower() == "id"]
-        if tier2:
-            return tier2[0]
+        if numerics:
+            return numerics[0]
 
         return None
 
     def find_all_measures(self, table: str):
         """Return all usable numeric measure columns for a table."""
-        numerics = self.get_numeric_cols(table)
-        pks = set(self.get_pk(table))
-        fk_cols = set(fk[0] for fk in self.get_fks(table))
-        return [c for c in numerics
-                if c not in pks and c not in fk_cols
-                and not c.lower().endswith("_id")
-                and not c.lower() == "id"]
+        return list(self._usable_measure_cols(table))
 
     def find_best_dimension(self, table: str):
-        """Pick the most descriptive text column for grouping (skip IDs)."""
+        """Pick the most descriptive text column for grouping (skip IDs).
+
+        Date-named text columns are skipped while a non-date alternative
+        exists — a date drives trends, it is not the headline answer to
+        "which X has the highest ...". Falls back to the date column when
+        it is the only text available.
+        """
         texts = self.get_text_cols(table)
         if not texts:
             # Single-table retail sources (e.g. Walmart CSV): the entity
@@ -264,13 +381,14 @@ class SchemaIntelligence:
         fk_cols = set(fk[0] for fk in self.get_fks(table))
         usable = [c for c in texts
                   if c not in pks and c not in fk_cols
-                  and not c.lower().endswith("_id")
-                  and not c.lower() == "id"]
+                  and not _is_id_like(c)]
         if usable:
-            return usable[0]
+            non_date = [c for c in usable if not _hint_hit(c, _DATE_NAME_HINTS)]
+            return (non_date or usable)[0]
         non_pk = [c for c in texts if c not in pks]
         if non_pk:
-            return non_pk[0]
+            non_date = [c for c in non_pk if not _hint_hit(c, _DATE_NAME_HINTS)]
+            return (non_date or non_pk)[0]
         return texts[0] if texts else None
 
     def find_store_column(self, table: str):
@@ -324,9 +442,8 @@ class SchemaIntelligence:
         fk_cols = set(fk[0] for fk in self.get_fks(table))
         return [c for c in texts
                 if c not in pks and c not in fk_cols
-                and not c.lower().endswith("_id")
-                and not c.lower() == "id"
-                and not any(h in c.lower() for h in AMOUNT_HINTS)]
+                and not _is_id_like(c)
+                and not _hint_hit(c, AMOUNT_HINTS)]
 
     def find_best_datetime(self, table: str):
         """Pick the most analytically useful datetime column."""

@@ -7,7 +7,12 @@ import { defineConfig, globalIgnores } from 'eslint/config'
 export default defineConfig([
   globalIgnores(['dist']),
   {
-    files: ['**/*.{js,jsx,ts,tsx}'],
+    // NOTE: scoped to JS/JSX — the default espree parser cannot parse
+    // TypeScript syntax. TS correctness is enforced by `tsc --noEmit`
+    // (`npm run typecheck`, also run as part of `npm run build`).
+    // To lint .ts/.tsx as well, add devDependency `typescript-eslint`
+    // and set its parser/languageOptions here.
+    files: ['**/*.{js,jsx}'],
     extends: [
       js.configs.recommended,
       reactHooks.configs.flat.recommended,

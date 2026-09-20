@@ -69,11 +69,67 @@ def _singular(word) -> str:
 
 
 def natural_label(identifier) -> str:
-    """Identifier -> plain-English phrase: 'order_details' -> 'order detail'."""
-    parts = [p for p in re.split(r"[^A-Za-z0-9]+", str(identifier or "")) if p]
+    """Identifier -> plain-English phrase: 'order_details' -> 'order detail'.
+
+    Schema-agnostic: only the column part of 'table.column' is used, so a
+    qualified reference like 'order_details.unit_price' reads as
+    'unit price' — the table name never leaks into prose. No underscores,
+    dots or SQL ever survive: output is plain words only.
+    """
+    text = str(identifier or "")
+    # Drop any table qualifier: 'order_details.unit_price' -> 'unit_price'.
+    if "." in text:
+        text = text.split(".")[-1]
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", text) if p]
     if not parts:
-        return str(identifier or "")
-    return " ".join(_singular(p.lower()) for p in parts)
+        return re.sub(r"[_.\"]+", " ", str(identifier or "")).strip() or "value"
+    _ALIASES = {"avg": "average", "qty": "quantity", "cnt": "count",
+                "std": "standard deviation", "sum": "total",
+                "min": "minimum", "max": "maximum"}
+    out = []
+    for p in parts:
+        low = p.lower()
+        if low in _ALIASES:
+            out.append(_ALIASES[low])
+        else:
+            out.append(_singular(low))
+    return " ".join(out)
+
+
+def human_entity(identifier) -> str:
+    """Plural human noun for a grouped entity: 'invoice_line' -> 'invoice lines'.
+
+    Schema-agnostic pluralization of the last word only ('orders' stays
+    'orders'). Used for entity nouns so prose never shows a raw table name.
+    """
+    base = natural_label(identifier)
+    if not base:
+        return "groups"
+    words = base.split()
+    words[-1] = _plural(words[-1])
+    return " ".join(words)
+
+
+def _scrub_prose(text: str) -> str:
+    """Safety net: raw identifiers must never reach the user.
+
+    Replaces any surviving snake_case / table.column / dotted reference with
+    plain words and strips SQL keywords, so even an unexpected label cannot
+    leak raw schema text into conversational prose.
+    """
+    s = str(text or "")
+    # table.column -> column words
+    s = re.sub(r"[A-Za-z_][A-Za-z0-9_]*\.([A-Za-z_][A-Za-z0-9_]*)",
+               lambda m: natural_label(m.group(1)), s)
+    # surviving snake_case -> spaces
+    s = re.sub(r"[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+",
+               lambda m: natural_label(m.group(0)), s)
+    # Raw SQL leaks are conventionally UPPERCASE; everyday words like
+    # "from"/"on" must survive in conversational prose, so this match is
+    # deliberately case-sensitive.
+    s = re.sub(r"\b(SELECT|FROM|WHERE|GROUP BY|ORDER BY|JOIN|LIMIT|OFFSET|SQL)\b",
+               "the data", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def _plural(label: str) -> str:
@@ -90,10 +146,17 @@ def _is_id_like(name) -> bool:
     low = _norm(name)
     if not low:
         return False
+    # Whole-token / suffix match only — bare endswith("id") misfires on
+    # ordinary words ("valid", "grid"). CamelCase is split first so
+    # MediaTypeId still matches.
+    import re as _re
+    _split = _re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name or "")).lower()
+    _toks = set(t for t in _re.split(r"[^a-z0-9]+", _split) if t)
+    if _toks & {"id", "uuid", "guid", "key", "code"}:
+        return True
     return (
         low in ("id", "key", "code", "codeid")
         or low.endswith("_id") or low.endswith("_key") or low.endswith("_code")
-        or low.endswith("id")
     )
 
 
@@ -251,6 +314,10 @@ def extract_intent(ir, goal="") -> dict:
 
     goal_l = _norm(goal) or _norm(ir.get("original_goal"))
     goal_words = set(re.findall(r"[a-z0-9]+", goal_l))
+    try:
+        goal_tokens = {_singular(w) for w in goal_words}
+    except Exception:
+        goal_tokens = set(goal_words)
     if metric and metric.get("aggregation") == "COUNT" and metric.get("inferred"):
         if goal_words & _MEASURE_WORDS:
             metric["aggregation"] = "SUM"
@@ -266,6 +333,7 @@ def extract_intent(ir, goal="") -> dict:
         "entity": entity,
         "metric": metric,
         "wants_share": wants_share,
+        "goal_words": goal_tokens,
     }
 
 
@@ -378,6 +446,20 @@ def _frame(agg_rows, label_name, measure_name):
     return [{label_name: a["label"], measure_name: a["value"]} for a in agg_rows]
 
 
+def _labels_unique(rows, label_col, columns) -> bool:
+    """True when each result row is its own group (grouped shape, not raw
+    transaction rows): the label column has no repeats. Lets clean small
+    breakdowns on key-less sources (typical CSVs) validate honestly."""
+    try:
+        key = label_col or (columns or [None])[0]
+        if not key:
+            return False
+        vals = [str(r.get(key)) for r in rows if isinstance(r, dict)]
+        return bool(vals) and len(set(vals)) == len(vals)
+    except Exception:
+        return False
+
+
 def _measure_label(intent, measure_col, aggregation) -> str:
     metric = intent.get("metric") or {}
     col = measure_col or metric.get("column")
@@ -397,35 +479,75 @@ def _entity_label(intent) -> str:
     Prefers the entity concept/table name, but when that is not a meaningful
     word (e.g. a CSV upload whose table is the filename stem 's'), falls back
     to the resolved grouping column so the answer reads "Region North …"
-    rather than "S North …".
+    rather than "S North …". Likewise, when the concept is merely the
+    humanized table name (file-derived tables such as "diag sales"), the
+    grouping column is the meaningful entity ("Product …", never
+    "Diag sale Banana …"), so table names never leak into prose.
     """
     ent = intent.get("entity") or {}
     concept = ent.get("concept") or ent.get("table") or "group"
     col = ent.get("column")
-    if col and not _is_id_like(col) and len(str(concept).strip()) < 3:
-        return natural_label(col)
+    table = ent.get("table")
+    if col and not _is_id_like(col):
+        try:
+            col_tokens = {_singular(w) for w in re.findall(r"[a-z0-9]+", _norm(col))}
+            concept_tokens = {_singular(w) for w in re.findall(r"[a-z0-9]+", _norm(concept))}
+            gw = set(intent.get("goal_words") or set())
+            col_hit = bool(col_tokens & gw)
+            concept_hit = bool(concept_tokens & gw)
+            # The question names the grouping ("Which product…?", "top
+            # customers…"): that wording wins, so table names never leak
+            # into prose ("Product banana…", never "Diag sale banana…").
+            if col_hit and not concept_hit:
+                return natural_label(col)
+            if concept_hit and not col_hit:
+                return natural_label(concept)
+        except Exception:
+            pass
+        if len(str(concept).strip()) < 3:
+            return natural_label(col)
+        try:
+            if _norm(natural_label(concept)) == _norm(natural_label(table or "")):
+                return natural_label(col)
+        except Exception:
+            pass
+    if not col and table:
+        try:
+            if _norm(concept) == _norm(natural_label(table or "")):
+                return "group"
+        except Exception:
+            pass
     return natural_label(concept)
 
 
 def synthesize_answer(frame, measure_label, entity_label) -> str:
+    """Conversational answer from executed rows only.
+
+    Short sentences, human-scale numbers (42K, 18%), no raw identifiers.
+    Every number comes from `frame` — never invented.
+    """
     if not frame:
         return "No matching rows were found for this question."
+    measure_label = natural_label(measure_label)
+    entity_label = natural_label(entity_label)
     names = list(frame[0].keys())
     if len(names) >= 2:
         label_name, measure_name = names[0], names[1]
         top = frame[:3]
         lead = top[0]
-        head = (f"{entity_label.capitalize()} {lead[label_name]} has the highest "
-                f"{measure_label} at {_fmt(lead[measure_name])}")
+        head = (f"{entity_label.capitalize()} {lead[label_name]} leads your "
+                f"{_plural(entity_label)} — {_fmt(lead[measure_name])} in "
+                f"{measure_label}.")
         if len(top) > 1:
-            others = "; ".join(
-                f"{r[label_name]} ({_fmt(r[measure_name])})" for r in top[1:]
+            others = ", ".join(
+                f"{r[label_name]} at {_fmt(r[measure_name])}" for r in top[1:]
             )
-            return f"{head}, followed by {others}."
-        return head + "."
+            return _scrub_prose(f"{head} Next come {others}. "
+                                f"So {lead[label_name]} is the clear standout.")
+        return _scrub_prose(head)
     if len(names) == 1:
-        return f"The result is {_fmt(frame[0][names[0]])}."
-    return f"{names[0]} = {_fmt(frame[0][names[0]])}, {names[1]} = {_fmt(frame[0][names[1]])}."
+        return _scrub_prose(f"{measure_label.capitalize()} is {_fmt(frame[0][names[0]])}.")
+    return _scrub_prose(f"{names[0]} = {_fmt(frame[0][names[0]])}, {names[1]} = {_fmt(frame[0][names[1]])}.")
 
 
 def _numeric_key(frame, names):
@@ -439,7 +561,122 @@ def _numeric_key(frame, names):
     return names[1] if len(names) > 1 else names[0]
 
 
+_DECLINE_WORD_RE = re.compile(
+    r"\b(decline|declined|declining|declines|decrease|decreased|"
+    r"decreasing|decreases|drop|dropped|dropping|drops|fall|fell|"
+    r"falling|falls)\b", re.IGNORECASE)
+
+_MONTH_NAMES = ("January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November",
+                "December")
+
+
+def _pretty_period(label) -> str:
+    """Human month/period label: '2024-03' -> 'March 2024', else as-is."""
+    try:
+        s = str(label or "").strip()
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m", "%Y/%m"):
+            try:
+                dt = datetime.strptime(s[:10] if len(s) >= 10 and fmt.endswith("%d")
+                                       else s[:7], fmt)
+                if fmt in ("%Y-%m", "%Y/%m"):
+                    return f"{_MONTH_NAMES[dt.month - 1]} {dt.year}"
+                return f"{_MONTH_NAMES[dt.month - 1]} {dt.year}"
+            except ValueError:
+                continue
+        # Bare month name fragments stay readable.
+        low = s.lower()
+        for m in _MONTH_NAMES:
+            if low.startswith(m.lower()[:3]) and len(s) <= 12:
+                return m
+    except Exception:
+        pass
+    return str(label)
+
+
+def _short_month(label) -> str:
+    """Short month name for decline prose ('2024-03' -> 'March')."""
+    try:
+        s = str(label or "").strip()
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m", "%Y/%m"):
+            try:
+                dt = datetime.strptime(s[:10] if len(s) >= 10 and fmt.endswith("%d")
+                                       else s[:7], fmt)
+                return _MONTH_NAMES[dt.month - 1]
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    return str(label)
+
+
+def synthesize_decline_answer(frame, measure_label, goal="") -> str:
+    """Month-over-month decline answer (deterministic, schema-agnostic).
+
+    Conversational: short sentences, human-scale numbers, up/down direction
+    words. Every number comes from the ordered monthly frame — never invented.
+    """
+    measure_label = natural_label(measure_label)
+    if not frame:
+        return "No matching rows were found for this question."
+    names = list(frame[0].keys())
+    if len(names) < 2:
+        return synthesize_answer(frame, measure_label, "period")
+    label_name = names[0]
+    measure_name = _numeric_key(frame, names)
+    values = [(_to_float(r.get(measure_name)) or 0.0) for r in frame]
+    labels = [r.get(label_name) for r in frame]
+    if len(frame) < 2:
+        return _scrub_prose(
+            f"{_pretty_period(labels[0])} came in at {_fmt(values[0])} in "
+            f"{measure_label}. There is only one period, so no month-over-month "
+            f"change can be measured.")
+    changes = []
+    for i in range(1, len(values)):
+        prev, curr = values[i - 1], values[i]
+        if prev:
+            pct = (curr - prev) / abs(prev) * 100.0
+        else:
+            pct = None
+        changes.append((i, pct, prev, curr))
+    declines = [(i, p, pr, cu) for (i, p, pr, cu) in changes
+                if p is not None and p < 0]
+    if not declines:
+        # Honest: the data shows no decline.
+        first, last = values[0], values[-1]
+        if first:
+            pct = (last - first) / abs(first) * 100.0
+            move = (f"up about {abs(pct):.0f}%"
+                    if pct > 0 else "flat")
+        else:
+            move = f"from {_fmt(first)} to {_fmt(last)}"
+        return _scrub_prose(
+            f"Good news — no month fell. {measure_label.capitalize()} is {move} "
+            f"across {len(frame)} periods, from {_pretty_period(labels[0])} to "
+            f"{_pretty_period(labels[-1])}."
+        )
+    declines.sort(key=lambda t: t[1])
+    wi, wpct, wprev, wcurr = declines[0]
+    wlab, plab = labels[wi], labels[wi - 1]
+    head = (f"{_short_month(wlab)} was your toughest month — {measure_label} "
+            f"fell {abs(wpct):.0f}% to {_fmt(wcurr)}, down from {_fmt(wprev)} "
+            f"in {_short_month(plab)}")
+    if len(declines) > 1:
+        others = ", ".join(
+            f"{_short_month(labels[i])} down {abs(p):.0f}% to {_fmt(cu)}"
+            for (i, p, _pr, cu) in declines[1:3])
+        return _scrub_prose(
+            f"{head}. Other down months: {others}. "
+            f"That covers {len(frame)} months, {_pretty_period(labels[0])} to "
+            f"{_pretty_period(labels[-1])}.")
+    return _scrub_prose(
+        f"{head}. That covers {len(frame)} months, "
+        f"{_pretty_period(labels[0])} to {_pretty_period(labels[-1])}.")
+
+
 def synthesize_trend_answer(frame, measure_label, period_label) -> str:
+    """Conversational trend summary from executed rows only."""
+    measure_label = natural_label(measure_label)
     if not frame:
         return "No matching rows were found for this question."
     names = list(frame[0].keys())
@@ -452,20 +689,29 @@ def synthesize_trend_answer(frame, measure_label, period_label) -> str:
     first, last = values[0], values[-1]
     if first:
         pct = (last - first) / abs(first) * 100.0
-        direction = "increased" if pct > 0 else ("decreased" if pct < 0 else "stayed flat")
-        movement = f"{measure_label} {direction} by about {abs(pct):.0f}%"
+        if pct > 0:
+            movement = (f"{measure_label} increased by about {abs(pct):.0f}% — "
+                        f"up from {_fmt(first)} to {_fmt(last)}")
+        elif pct < 0:
+            movement = (f"{measure_label} decreased by about {abs(pct):.0f}% — "
+                        f"down from {_fmt(first)} to {_fmt(last)}")
+        else:
+            movement = f"{measure_label} stayed flat near {_fmt(first)}"
     else:
         movement = f"{measure_label} moved from {_fmt(first)} to {_fmt(last)}"
     peak_i = max(range(len(values)), key=lambda i: values[i])
     low_i = min(range(len(values)), key=lambda i: values[i])
-    return (
-        f"Over {len(frame)} periods from {labels[0]} to {labels[-1]}, {movement}. "
-        f"The peak is {labels[peak_i]} at {_fmt(values[peak_i])} and the low is "
-        f"{labels[low_i]} at {_fmt(values[low_i])}."
+    return _scrub_prose(
+        f"Across {len(frame)} periods, {movement}. "
+        f"The peak was {_pretty_period(labels[peak_i])} at {_fmt(values[peak_i])}. "
+        f"The low was {_pretty_period(labels[low_i])} at {_fmt(values[low_i])}."
     )
 
 
 def build_story(frame, measure_label, entity_label, based_on, op="") -> str:
+    """Conversational story: headline, concentration, provenance — all traceable."""
+    measure_label = natural_label(measure_label)
+    entity_label = natural_label(entity_label)
     if not frame:
         return "No data matched this question, so no conclusion can be drawn."
     names = list(frame[0].keys())
@@ -479,21 +725,20 @@ def build_story(frame, measure_label, entity_label, based_on, op="") -> str:
     lead_share = values[0] / total * 100 if total else 0
     parts = [
         synthesize_answer(frame, measure_label, entity_label),
-        (f"{entity_label.capitalize()} {lead[label_name]} alone accounts for about "
-         f"{lead_share:.0f}% of the measured {measure_label} across {len(frame)} "
-         f"{_plural(entity_label)}."),
+        (f"{lead[label_name]} alone is about {lead_share:.0f}% of all "
+         f"{measure_label} across {len(frame)} {_plural(entity_label)}."),
     ]
     if len(frame) > 3:
         top3 = sum(values[:3])
         top3_share = top3 / total * 100 if total else 0
         parts.append(
             f"The top three {_plural(entity_label)} together hold about "
-            f"{top3_share:.0f}% of the total, so {measure_label} is concentrated."
+            f"{top3_share:.0f}% — so {measure_label} is concentrated in a few names."
         )
     if based_on:
-        parts.append(f"Computed over {based_on} underlying records from the connected source.")
-    parts.append("These associations describe this dataset only and do not establish causation.")
-    return " ".join(parts)
+        parts.append(f"This comes from {based_on} underlying records.")
+    parts.append("These patterns describe this data only.")
+    return _scrub_prose(" ".join(parts))
 
 
 def _compatible(op, wants_share, n_groups):
@@ -542,8 +787,29 @@ def select_visualization(intent, columns, frame, measure_label) -> dict:
             "measure_label": measure_label,
         }
 
-    x, y = columns[0], columns[1]
+    # Validation: x/y must match real column TYPES, not positions.
+    # First row drives typing (numbers vs text vs date-ish names).
+    first = frame[0] if frame and isinstance(frame[0], dict) else {}
+    def _is_num(c):
+        v = first.get(c)
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    num_cols = [c for c in columns if _is_num(c)]
+    dt_cols = [c for c in columns if any(k in c.lower() for k in
+               ("date", "time", "month", "year", "day", "period"))]
+    cat_cols = [c for c in columns if c not in num_cols and first.get(c) is not None]
+    # Prefer semantic slots over positions: time->x for trends, category->x + numeric->y otherwise.
+    if dt_cols and num_cols:
+        x, y = dt_cols[0], num_cols[0]
+    elif cat_cols and num_cols:
+        x, y = cat_cols[0], num_cols[0]
+    else:
+        x, y = columns[0], columns[1]
     n_groups = len(frame)
+    # Shape guard: trend without time axis, or pie with 1 / 9+ slices, misleads — downgrade.
+    if op in _TREND_OPS and not dt_cols:
+        op = "comparison"  # render honest bars instead of a fake time line
+    if intent.get("wants_share") and (n_groups < 2 or n_groups > 8):
+        intent = dict(intent, wants_share=False)
     compatible = _compatible(op, intent.get("wants_share"), n_groups)
     reasons = {
         "bar_horizontal": "ranked comparison — names read best on a horizontal bar",
@@ -557,7 +823,7 @@ def select_visualization(intent, columns, frame, measure_label) -> dict:
     elif op in _TREND_OPS:
         chart_type = "line"
     elif op == "correlation":
-        chart_type = "scatter"
+        chart_type = "scatter" if len(num_cols) >= 2 else "bar"
     elif op == "distribution":
         chart_type = "histogram"
     elif op == "segmentation":
@@ -587,39 +853,54 @@ def select_visualization(intent, columns, frame, measure_label) -> dict:
 
 def build_why(intent, frame, columns, entity_label, measure_label, based_on,
               confidence, issues) -> dict:
+    """Conversational 'why' — plain English, human-scale numbers, no raw schema.
+
+    `what_happened` reads like a person explaining, never 'Ranked N X by Y'.
+    Table/column identifiers and SQL never surface in prose (scrubbed); the
+    structured evidence keeps humanized names only.
+    """
+    entity_label = natural_label(entity_label)
+    measure_label = natural_label(measure_label)
     limitations = list(issues)
     if not frame:
         limitations.append("The query returned no rows, so no conclusion can be drawn.")
-    limitations.append("Associations describe this dataset only and do not establish causation.")
+    limitations.append("These patterns describe this data only.")
     if frame and len(columns) >= 2:
         names = list(frame[0].keys())
+        lead_val = _to_float(frame[0][names[1]])
+        total = sum((_to_float(r.get(names[1])) or 0.0) for r in frame)
+        share = (lead_val / total * 100) if lead_val is not None and total else 0
         what = (
-            f"Ranked {len(frame)} {_plural(entity_label)} by {measure_label}; "
-            f"{names[0]} '{frame[0][names[0]]}' leads with {_fmt(frame[0][names[1]])}."
+            f"You have {len(frame)} {_plural(entity_label)}. "
+            f"{frame[0][names[0]]} leads with {_fmt(frame[0][names[1]])} in "
+            f"{measure_label}"
+            + (f" — about {share:.0f}% of everything measured." if total else ".")
+            + " The rest trail behind."
         )
     elif frame:
-        what = "Computed a single summary value over the connected data."
+        what = "The numbers boil down to a single total from your data."
     else:
         what = "The analysis produced no result to explain."
     factors = []
     if len(frame) > 1:
-        factors = [f"differences across {_plural(entity_label)}"]
+        factors = [f"some {_plural(entity_label)} simply bring in far more {measure_label} than others"]
     return {
-        "what_happened": what,
-        "why_it_matters": (
-            f"Answers the question directly from {based_on or 'the returned'} "
-            f"records in the connected source."
+        "what_happened": _scrub_prose(what),
+        "why_it_matters": _scrub_prose(
+            f"This answers your question straight from "
+            f"{based_on or 'the returned'} records. "
+            f"It shows where your {measure_label} is coming from."
         ),
         "evidence": {
             "tables": [entity_label],
-            "columns": columns[:10],
+            "columns": [natural_label(c) for c in (columns or [])[:10]],
             "row_count": len(frame),
             "sql": None,
         },
-        "contributing_factors": factors,
+        "contributing_factors": [_scrub_prose(f) for f in factors],
         "comparisons": [],
         "confidence": confidence,
-        "limitations": limitations,
+        "limitations": [_scrub_prose(str(l)) for l in limitations],
     }
 
 
@@ -646,6 +927,24 @@ def analyze_result(ir, columns, rows, goal="", sql="", row_count=0) -> dict:
     aggregation = (intent.get("metric") or {}).get("aggregation") or (
         "SUM" if measure_col else "COUNT"
     )
+    # The result's own first label column ("region") beats a stale entity
+    # noun ("product") when the question names it ("Show amount by region"):
+    # values belong to the displayed groups, never to another column.
+    try:
+        _cand = next(
+            (c for c in (columns or [])
+             if "(" not in str(c) and "*" not in str(c)
+             and not _is_id_like(c) and c != measure_col),
+            None,
+        )
+        if _cand:
+            _cand_tokens = {_singular(w) for w in re.findall(r"[a-z0-9]+", _norm(_cand))}
+            _gw = set(intent.get("goal_words") or set())
+            _ent_tokens = {_singular(w) for w in re.findall(r"[a-z0-9]+", _norm(entity_label))}
+            if _cand_tokens & _gw and not (_ent_tokens & _gw):
+                entity_label = natural_label(_cand)
+    except Exception:
+        pass
 
     if op in _GROUPING_OPS and intent.get("entity") is not None and key_col:
         expected_granularity = f"one row per {entity_label}"
@@ -682,7 +981,15 @@ def analyze_result(ir, columns, rows, goal="", sql="", row_count=0) -> dict:
         tcol = profile["datetime"][0]
         final_rows = sorted(final_rows, key=lambda r: str(r.get(tcol) or ""))
 
-    valid = bool(final_rows) and not (op in _GROUPING_OPS and intent.get("entity") and not key_col)
+    valid = bool(final_rows) and not (
+        op in _GROUPING_OPS
+        and intent.get("entity")
+        and not key_col
+        # Key-less sources (typical CSVs) have no entity key by construction;
+        # unique labels still prove a grouped shape, so honest small
+        # breakdowns validate instead of alarming "insufficient".
+        and not _labels_unique(final_rows, label_col, final_columns)
+    )
     if not final_rows:
         issues.append("the query returned no rows")
 
@@ -691,8 +998,68 @@ def analyze_result(ir, columns, rows, goal="", sql="", row_count=0) -> dict:
         "medium" if valid else "low"
     )
 
+    # Trend questions need a time axis: without any datetime column the SQL
+    # result (e.g. SUM vs COUNT) is meaningless, so refuse with a clear
+    # natural-English explanation instead of a fabricated "trend".
+    if op in _TREND_OPS and not profile["datetime"]:
+        _no_time_msg = (
+            "This data has no time or date column, so change over time "
+            "can't be shown. Try a breakdown or ranking instead."
+        )
+        issues.append("the connected data has no time or date column for a trend")
+        return {
+            "data": [],
+            "columns": [],
+            "valid": False,
+            "repaired": repaired,
+            "issues": issues,
+            "granularity": {
+                "expected": "one row per period",
+                "actual": "row_level",
+                "ok": False,
+            },
+            "intent": intent,
+            "chart_spec": {"chart_type": "table", "label": "No chart",
+                           "reason": "no time column", "compatible": []},
+            "answer": _no_time_msg,
+            "story": _no_time_msg,
+            "why": {
+                "what_happened": _no_time_msg,
+                "why_it_matters": "Trend analysis needs dated records.",
+                "evidence": {"tables": [], "columns": [],
+                             "row_count": 0, "sql": sql or None},
+                "contributing_factors": [],
+                "comparisons": [],
+                "confidence": "low",
+                "limitations": [_no_time_msg],
+            },
+            "consistency": {"consistent": False, "issues": issues,
+                            "chart_spec": {"chart_type": "table"}},
+            "analysis": {
+                "based_on": based_on,
+                "result_count": 0,
+                "entity": entity_label,
+                "entity_count": None,
+                "measure_label": measure_label,
+                "measure_column": measure_col,
+                "dimension_columns": [],
+                "aggregation": aggregation,
+                "operation": op,
+                "granularity": "one row per period",
+                "repaired": repaired,
+                "confidence": "low",
+            },
+        }
+
     if op in _TREND_OPS:
-        answer = synthesize_trend_answer(final_rows, measure_label, entity_label)
+        try:
+            _decline_q = bool(_DECLINE_WORD_RE.search(str(goal or "")))
+        except Exception:
+            _decline_q = False
+        if _decline_q:
+            answer = synthesize_decline_answer(final_rows, measure_label, goal)
+        else:
+            answer = synthesize_trend_answer(final_rows, measure_label, entity_label)
     else:
         answer = synthesize_answer(final_rows, measure_label, entity_label)
     story = build_story(final_rows, measure_label, entity_label, based_on, op)
@@ -701,7 +1068,9 @@ def analyze_result(ir, columns, rows, goal="", sql="", row_count=0) -> dict:
         intent, final_rows, final_columns, entity_label, measure_label,
         based_on, confidence, issues,
     )
-    why["evidence"]["sql"] = sql or None
+    # SQL stays server-side for debugging — it must never surface in prose
+    # or user-facing evidence. Provenance keeps humanized names only.
+    why["evidence"]["sql"] = None
 
     analysis = {
         "based_on": based_on,

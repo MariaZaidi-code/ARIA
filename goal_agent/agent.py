@@ -147,6 +147,7 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
         self._last_semantic_warnings = []
         self._schema_word_tokens = self._build_schema_word_tokens()
         self._active_original_goal = None
+        self._active_current_question = None
         self._typo_warnings = []
 
     # ---- _build_engine (_build_engine) ----
@@ -158,8 +159,15 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
 
         connect_timeout + pool_pre_ping bound the initial connect so a
         slow/unreachable database fails fast instead of hanging the request.
+
+        Defense in depth: a missing/empty db_uri raises instead of silently
+        falling back to DEFAULT_DB_URI (which would query the wrong
+        database). Callers needing the local-dev default must pass
+        DEFAULT_DB_URI explicitly.
         """
-        uri = db_uri or DEFAULT_DB_URI
+        if not db_uri or (isinstance(db_uri, str) and not db_uri.strip()):
+            raise ValueError("No database connection in session — reconnect first")
+        uri = db_uri
         if self.dialect == "postgresql":
             args: dict = {"connect_timeout": 10}
             if self.schema and self.schema != "public":
@@ -180,8 +188,26 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
         except OSError:
             pass
         try:
-            corrected_goal, corrections = self._correct_goal(user_goal)
             self._active_original_goal = user_goal
+            # DEFECT 1: pure conversational inputs (greetings, thanks, bye,
+            # help, 'who are you', empty) answer WITHOUT typo correction,
+            # overview detection, clarification, or any SQL. Checked on the
+            # CURRENT question only so multi-turn history never turns 'hi'
+            # into a data answer. Schema-agnostic, no table/column names.
+            try:
+                if self._is_conversational(user_goal):
+                    return self._converse(user_goal, output_path)
+            except Exception:
+                pass
+            corrected_goal, corrections = self._correct_goal(user_goal)
+            # A conversational turn that only became visible after typo
+            # correction (e.g. 'helo' -> greeting) is still conversational:
+            # never let it fall through to data.
+            try:
+                if self._is_conversational(corrected_goal):
+                    return self._converse(user_goal, output_path)
+            except Exception:
+                pass
             self._typo_warnings = [
                 f"Did you mean '{suggestion}' for '{typo}' in your question?"
                 for typo, suggestion in corrections
@@ -338,6 +364,58 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
                 state["user_goal"], state["join_path"], state["kpi_map"],
                 ir=state.get("goal_ir"), join_plan=state.get("join_plan"),
             )
+            state["repair_attempts"] = int(state.get("repair_attempts") or 0)
+            return state
+
+        def validate_sql(state):
+            """Validation gate 1: SQL must be read-only + schema-grounded.
+
+            On failure (and attempts left) the error text is fed back into
+            state so generate_sql repairs instead of executing a bad query.
+            """
+            import logging as _lg
+            _log = _lg.getLogger(__name__)
+            sql = state.get("raw_sql") or ""
+            issues = []
+            try:
+                issues = self._validate_generated_sql(sql) or []
+            except Exception as exc:
+                issues = [str(exc)[:200]]
+            # Semantic plan check (IR + join plan) — same gate as linear path.
+            try:
+                ir = state.get("goal_ir")
+                if ir and not issues:
+                    sem_issues, _w = self._semantic_validate_sql(
+                        ir, sql, state.get("join_path") or [],
+                        state.get("join_plan"))
+                    issues = list(sem_issues or [])
+            except Exception:
+                pass
+            state["sql_issues"] = issues
+            if issues:
+                _log.warning("LangGraph validate_sql failed (attempt %s): %s",
+                             state.get("repair_attempts"), issues[:3])
+            return state
+
+        def repair_sql(state):
+            """LLM repair pass: re-generate with the validation errors as context."""
+            attempts = int(state.get("repair_attempts") or 0) + 1
+            state["repair_attempts"] = attempts
+            issues = state.get("sql_issues") or []
+            try:
+                fix_prompt = (
+                    "The SQL below failed validation:\n"
+                    + "\n".join("- " + str(i) for i in issues[:5])
+                    + "\n\nUser goal:\n" + str(state.get("user_goal"))
+                    + "\n\nBroken SQL:\n" + str(state.get("raw_sql"))
+                    + "\n\nReturn only the corrected read-only SELECT query. "
+                      "No explanations, no markdown."
+                )
+                raw = self.llm.complete("sql", fix_prompt, temperature=0.1,
+                                        num_predict=500, timeout=self._REPAIR_TIMEOUT)
+                state["raw_sql"] = self._clean_sql(raw)
+            except Exception:
+                pass
             return state
 
         def execute_sql(state):
@@ -351,6 +429,33 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
             state["_failed"] = bool(note and note.get("failed"))
             state["message"] = (note or {}).get("message") if note else None
             state["preprocessing"] = self.preprocessing_report
+            return state
+
+        def validate_result(state):
+            """Validation gate 2: result frame must be chartable + intent-shaped.
+
+            - non-empty columns, no all-NULL frame (raises in _validate_result_shape)
+            - trend intent needs >=2 rows; ranking needs ordering; never empty+non-table
+            On failure with attempts left, route back to repair_sql.
+            """
+            import logging as _lg
+            _log = _lg.getLogger(__name__)
+            try:
+                rows = state.get("rows") or []
+                cols = list(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
+                self._validate_result_shape(state.get("user_goal"), state.get("final_sql"),
+                                            rows, cols)
+                intent = ((state.get("goal_ir") or {}).get("intent") or "").lower()
+                if not rows:
+                    state["result_issues"] = []
+                elif "trend" in intent and len(rows) < 2:
+                    state["result_issues"] = ["trend intent returned fewer than 2 points"]
+                else:
+                    state["result_issues"] = []
+            except Exception as exc:
+                state["result_issues"] = [str(exc)[:200]]
+            if state.get("result_issues"):
+                _log.warning("LangGraph validate_result failed: %s", state["result_issues"][:2])
             return state
 
         def finalize(state):
@@ -382,27 +487,53 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
             state["result_path"] = output_path
             return state
 
+        def _sql_needs_repair(state):
+            if state.get("sql_issues") and int(state.get("repair_attempts") or 0) < 3:
+                return "repair"
+            if state.get("sql_issues"):
+                return "execute_anyway"
+            return "execute"
+
+        def _result_needs_repair(state):
+            if state.get("result_issues") and int(state.get("repair_attempts") or 0) < 3:
+                return "repair"
+            return "finalize"
+
         workflow = StateGraph(dict)
         workflow.add_node("load_schema", load_schema)
         workflow.add_node("understand_goal", understand_goal)
         workflow.add_node("resolve_semantics", resolve_semantics)
         workflow.add_node("plan_joins", plan_joins)
         workflow.add_node("generate_sql", generate_sql)
+        workflow.add_node("validate_sql", validate_sql)
+        workflow.add_node("repair_sql", repair_sql)
         workflow.add_node("execute_sql", execute_sql)
+        workflow.add_node("validate_result", validate_result)
         workflow.add_node("finalize", finalize)
         workflow.set_entry_point("load_schema")
         workflow.add_edge("load_schema", "understand_goal")
         workflow.add_edge("understand_goal", "resolve_semantics")
         workflow.add_edge("resolve_semantics", "plan_joins")
         workflow.add_edge("plan_joins", "generate_sql")
-        workflow.add_edge("generate_sql", "execute_sql")
-        workflow.add_edge("execute_sql", "finalize")
+        workflow.add_edge("generate_sql", "validate_sql")
+        workflow.add_conditional_edges("validate_sql", _sql_needs_repair, {
+            "repair": "repair_sql",
+            "execute": "execute_sql",
+            "execute_anyway": "execute_sql",
+        })
+        workflow.add_edge("repair_sql", "validate_sql")
+        workflow.add_edge("execute_sql", "validate_result")
+        workflow.add_conditional_edges("validate_result", _result_needs_repair, {
+            "repair": "repair_sql",
+            "finalize": "finalize",
+        })
         workflow.add_edge("finalize", END)
 
         app = workflow.compile()
         result = app.invoke({
             "user_goal": user_goal, "kpi_map": {}, "relevant_tables": [],
             "join_path": [], "raw_sql": "", "rows": [], "final_sql": "",
+            "repair_attempts": 0, "sql_issues": [], "result_issues": [],
         })
         logger.info("Goal Agent done! Saved to %s", result.get('result_path'))
         return result.get("result_path")

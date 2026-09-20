@@ -75,7 +75,18 @@ def _column_names(info: dict) -> list[dict]:
 
 
 def _pk_of(info: dict) -> list[str]:
-    return list(info.get("primary_key") or info.get("inferred_primary_key") or [])
+    # Composite-aware: a composite-only table still reports its key members
+    # instead of "inferred", so single-table datasets keep working.
+    pk = list(info.get("primary_key") or info.get("inferred_primary_key") or [])
+    if pk:
+        return pk
+    comp = info.get("composite_primary_key") or info.get("inferred_composite_primary_key")
+    if comp and isinstance(comp, (list, tuple)):
+        return [str(c) for c in comp]
+    cck = info.get("composite_candidate_keys") or []
+    if cck and isinstance(cck, (list, tuple)) and cck and isinstance(cck[0], (list, tuple)):
+        return [str(c) for c in cck[0]]
+    return []
 
 
 def _fk_of(info: dict) -> list[dict]:

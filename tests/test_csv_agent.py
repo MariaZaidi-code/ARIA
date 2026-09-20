@@ -139,7 +139,9 @@ class CsvGoalAgentIntegration(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["row_count"], 1)
         self.assertEqual(result["data"][0]["total"], 30.5)
-        self.assertEqual(result["sql_used"], "SELECT SUM(amount) AS total FROM sales;")
+        # Deterministic templates quote identifiers (required for
+        # space-named columns like "Order ID"); semantically identical.
+        self.assertEqual(result["sql_used"], 'SELECT SUM("amount") AS total FROM "sales";')
 
     def test_goal_agent_normalizes_csv_mapping(self):
         agent = GoalAgent(

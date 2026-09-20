@@ -46,10 +46,12 @@ _SQLITE_TYPE = {
 _TRUE_TOKENS = {"true", "yes", "y", "1"}
 _FALSE_TOKENS = {"false", "no", "n", "0"}
 
-_INSERT_BATCH = 5_000
+_INSERT_BATCH = 20_000
 # Bounded streaming for SQLite loads (spec §1): chunks of this size keep the
-# insert working set flat regardless of file size. No analytical row cap.
-_LOAD_CHUNK_ROWS = 5_000
+# insert working set flat regardless of size (50k rows x ~10 cols of short
+# strings ≈ single-digit MB). No analytical row cap. Larger chunks cut
+# pandas per-chunk parse overhead, which dominates load time on big files.
+_LOAD_CHUNK_ROWS = 50_000
 # Bounded sample used to resolve ambiguous date formats before streaming.
 _DATE_RESOLVE_SAMPLE_ROWS = 5_000
 # Value-containment sets for cross-table FK inference are capped per column
@@ -134,8 +136,9 @@ def _normalize_date_columns(df, column_logical_types: dict) -> dict[str, str]:
 def _resolve_date_formats(df_sample, column_logical_types: dict) -> dict[str, str]:
     """Decide {column: MDY/DMY} once from a bounded sample (best-effort).
 
-    Sampling is head-bounded (first 1000 non-empty values) so resolution never
-    holds the full column. Mixed-format files beyond the sample may resolve
+    Sampling is head+tail bounded (up to 1000 evenly spaced non-empty values)
+    so resolution never holds the full column and late-file format switches
+    are still observed. Mixed-format files beyond the sample may resolve
     differently than a full scan would; ambiguous columns are always left
     untouched, so the worst case is un-normalized (raw, preserved) values.
     """
@@ -148,7 +151,18 @@ def _resolve_date_formats(df_sample, column_logical_types: dict) -> dict[str, st
             continue
         try:
             series = df_sample[name].dropna().astype(str)
-            samples = [v for v in series.tolist() if str(v).strip()][:1000]
+            non_empty = [v for v in series.tolist() if str(v).strip()]
+            # Evenly spaced head+tail sample (not head-only) so a format
+            # switch late in the file is still observed. Bounded at 1000.
+            if len(non_empty) > 1000:
+                try:
+                    import numpy as _np
+                    _idx = _np.linspace(0, len(non_empty) - 1, 1000).astype(int)
+                    samples = [non_empty[int(i)] for i in _idx]
+                except Exception:
+                    samples = non_empty[:500] + non_empty[-500:]
+            else:
+                samples = non_empty
         except Exception as exc:
             _log.debug("sample extraction fallback for column %s: %s", name, exc)
             continue
@@ -470,8 +484,23 @@ def _coerce_value(raw: Any, logical_type: str) -> Any:
 
 
 def _quote_ident(name: str) -> str:
-    """Quote a SQLite identifier safely (escape embedded double quotes)."""
-    return '"' + str(name).replace('"', '""') + '"'
+    """Quote a SQLite identifier safely (validate + escape embedded quotes).
+
+    Table/column names in :func:`build_sqlite_schema_mapping` come from
+    ``sqlite_master`` / ``PRAGMA table_info`` (i.e. file content, not code),
+    so they must never be interpolated raw. Validation rejects empty names
+    and NUL bytes (SQLite rejects NUL in identifiers); everything else —
+    spaces, quotes, semicolons, unicode — is preserved by escaping ``"``
+    as ``""`` inside a double-quoted identifier. ``PRAGMA table_info(?)``
+    cannot bind identifiers, so quoting is the correct parameterisation.
+    """
+    if not isinstance(name, str):
+        raise TypeError(f"SQLite identifier must be str, got {type(name).__name__}")
+    if not name:
+        raise ValueError("SQLite identifier must be non-empty.")
+    if "\x00" in name:
+        raise ValueError("SQLite identifier must not contain NUL bytes.")
+    return '"' + name.replace('"', '""') + '"'
 
 
 def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
@@ -536,6 +565,16 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
     streamed = 0
     conn = sqlite3.connect(str(sqlite_path))
     try:
+        # Bulk-load tuning (ingest-only): skip journaling/fsync while the
+        # table is being built. The file is disposable until commit — on any
+        # failure both artifacts are deleted by the caller below.
+        try:
+            conn.execute("PRAGMA journal_mode=MEMORY")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-64000")
+        except Exception:
+            pass
         conn.execute(f'CREATE TABLE {_quote_ident(table)} ({ddl_cols})')
         insert_sql = f'INSERT INTO {_quote_ident(table)} ({col_sql}) VALUES ({placeholders})'
         try:
@@ -546,10 +585,21 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
                     except Exception:
                         logging.getLogger("aria.csv").exception(
                             "Date normalization failed for a chunk; continuing with raw values")
-                batch = [
-                    [_coerce_value(rec.get(name), column_logical_types[name]) for name in col_names]
-                    for rec in chunk.to_dict(orient="records")
-                ]
+                # itertuples fast path (measured faster than column-wise
+                # vector ops on clean data: plain int()/float() parse at
+                # C speed per cell). Column order verified per chunk.
+                try:
+                    if list(chunk.columns) != col_names:
+                        raise ValueError("column order drift")
+                    _rows = chunk.itertuples(index=False, name=None)
+                    batch = [tuple(_coerce_value(rec[i], column_logical_types[col_names[i]])
+                                   for i in range(len(col_names)))
+                             for rec in _rows]
+                except Exception:
+                    batch = [
+                        tuple(_coerce_value(rec.get(name), column_logical_types[name]) for name in col_names)
+                        for rec in chunk.to_dict(orient="records")
+                    ]
                 del chunk
                 # Sub-batch so a chunk larger than _INSERT_BATCH still commits bounded.
                 for start in range(0, len(batch), _INSERT_BATCH):
@@ -562,6 +612,20 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
             logging.getLogger("aria.csv").exception("CSV SQLite ingestion failed")
             raise
         conn.commit()
+        # Query-speed indexes (generic): DATE/DATETIME columns back every
+        # time filter/grouping the app runs; indexing them at load keeps
+        # explore/forecast fast on million-row files. Bounded: dates only,
+        # never every column (write cost + size).
+        try:
+            for _dc, _lt in column_logical_types.items():
+                if str(_lt).upper() in ("DATE", "DATETIME"):
+                    _in = f"idx_{table}_{_dc}"[:60].replace('"', '""')
+                    conn.execute(
+                        f'CREATE INDEX IF NOT EXISTS "{_in}" '
+                        f'ON {_quote_ident(table)} ({_quote_ident(_dc)})')
+            conn.commit()
+        except Exception:
+            logging.getLogger("aria.csv").debug("CSV index build skipped", exc_info=True)
     finally:
         conn.close()
 
@@ -815,18 +879,23 @@ def build_sqlite_schema_mapping(sqlite_path: str | Path,
         tables_mapping: dict[str, Any] = {}
         value_sets: dict[tuple, set] = {}
         for t in tables:
-            pragma = conn.execute(f'PRAGMA table_info("{t}")').fetchall()
+            # Table/column identifiers come from sqlite_master (file content):
+            # always quote via _quote_ident (validated, double-quote-escaped).
+            # PRAGMA / COUNT / DISTINCT cannot use "?" placeholders for
+            # identifiers, so quoting is the parameterisation. CSV write path
+            # below is unchanged (identifiers there are created by ARIA).
+            pragma = conn.execute(f'PRAGMA table_info({_quote_ident(t)})').fetchall()
             # (cid, name, type, notnull, dflt, pk)
             cols = [{"column": r[1], "data_type": (r[2] or "TEXT"),
                      "nullable": not bool(r[3])} for r in pragma]
             pragma_pk = [r[1] for r in sorted(
                 [r for r in pragma if r[5]], key=lambda r: r[5])]
-            n = conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
+            n = conn.execute(f'SELECT COUNT(*) FROM {_quote_ident(t)}').fetchone()[0]
             null_stats = {}
             for c in cols:
                 name = c["column"]
                 nulls = conn.execute(
-                    f'SELECT COUNT(*) FROM "{t}" WHERE "{name}" IS NULL'
+                    f'SELECT COUNT(*) FROM {_quote_ident(t)} WHERE {_quote_ident(name)} IS NULL'
                 ).fetchone()[0]
                 null_stats[name] = {"total_rows": n, "nulls": nulls,
                                     "null_pct": round(nulls / n * 100, 2) if n else 0.0}
@@ -840,7 +909,7 @@ def build_sqlite_schema_mapping(sqlite_path: str | Path,
                     if null_stats[name]["nulls"]:
                         continue
                     distinct = conn.execute(
-                        f'SELECT COUNT(DISTINCT "{name}") FROM "{t}"').fetchone()[0]
+                        f'SELECT COUNT(DISTINCT {_quote_ident(name)}) FROM {_quote_ident(t)}').fetchone()[0]
                     if n and distinct == n:
                         from csv_handler import CsvSchemaExtractor as _E
                         if _E._is_identifier_like(name):
@@ -902,7 +971,7 @@ def build_sqlite_schema_mapping(sqlite_path: str | Path,
                     _pairs.sort(key=lambda p: (0 if _top in p else 1, p))
                 for a, b in _pairs[:12]:
                     dup = conn.execute(
-                        f'SELECT 1 FROM "{t}" GROUP BY "{a}", "{b}" '
+                        f'SELECT 1 FROM {_quote_ident(t)} GROUP BY {_quote_ident(a)}, {_quote_ident(b)} '
                         f'HAVING COUNT(*) > 1 LIMIT 1').fetchone()
                     if dup is None:
                         composite_pk = [a, b]
@@ -921,8 +990,8 @@ def build_sqlite_schema_mapping(sqlite_path: str | Path,
             for c in cols:
                 try:
                     vals = conn.execute(
-                        f'SELECT DISTINCT "{c["column"]}" FROM "{t}" '
-                        f'WHERE "{c["column"]}" IS NOT NULL LIMIT 2000').fetchall()
+                        f'SELECT DISTINCT {_quote_ident(c["column"])} FROM {_quote_ident(t)} '
+                        f'WHERE {_quote_ident(c["column"])} IS NOT NULL LIMIT 2000').fetchall()
                     value_sets[(t, c["column"])] = {r[0] for r in vals}
                 except Exception as exc:
                     _log.debug("value set query failed for %s.%s: %s", t, c["column"], exc)

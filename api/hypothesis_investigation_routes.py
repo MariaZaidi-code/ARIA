@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from core.config import get_session
 from core.deps import get_current_user, require_writable, require_data
+from core.errors import sanitize_error as _sanitize_error
 
 router = APIRouter(tags=["hypothesis-investigation"])
 
@@ -94,8 +95,12 @@ def enriched_investigation(req: InvestigationRequest, request: Request,
                          "Insufficient evidence", "Contradictory evidence"]
         return sanitize_json({"ok": True, **out})
     except Exception as exc:
+        try:
+            _d = str(_sanitize_error(exc))[:200]
+        except Exception:
+            _d = "The investigation could not run."
         return {"ok": False, "code": "ANALYSIS_FAILED",
-                "detail": f"The investigation could not run: {str(exc)[:200]}"}
+                "detail": f"The investigation could not run: {_d}"}
     finally:
         try:
             engine.dispose()

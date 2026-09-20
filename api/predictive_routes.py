@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from core.config import get_session
+from core.data_intelligence import hint_hit as _hint_hit
 from core.deps import require_data, require_writable, get_current_user, reject_document_sql
 from core.secret_box import decrypt as _decrypt_secret
 
@@ -55,6 +56,33 @@ def _table_columns(tables, tname):
         else:
             out.append((str(c), ""))
     return [(n, d) for n, d in out if n]
+
+
+def _coerced_ref(tables, tname, col, dialect):
+    """Quoted ref for SUM/AVG over a measure, TEXT-storage safe.
+
+    Fully schema-agnostic (no table/column literals): TEXT-dtype columns
+    aggregate through :func:`core.text_numeric.coercion_sql` so currency
+    strings never raise ``function sum(text) does not exist``. Unparsable
+    values become NULL. Native numerics keep the plain column. Never raises.
+    """
+    from api.schema_intel import _safe_name
+    try:
+        q = _safe_name(col, dialect)
+    except Exception:
+        return str(col)
+    try:
+        dtype = next((d for n, d in _table_columns(tables, tname) if n == col), "")
+    except Exception:
+        dtype = ""
+    if any(k in str(dtype or "").lower()
+           for k in ("char", "text", "varchar", "string", "clob", "uuid")):
+        try:
+            from core.text_numeric import coercion_sql as _cs
+            return _cs(dialect, q)
+        except Exception:
+            return q
+    return q
 
 
 def _validate_time_dim(engine, dialect, table, column, dtype):
@@ -177,10 +205,11 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
         cols = _table_columns(tables, tname)
         measures = [m for m in (intel.find_all_measures(tname) or [])]
         # Time candidates: real date dtypes first, then date-hinted text cols.
+        # Token-based hints (never substrings): "holiday" must not match "day".
         date_cols = [n for n, d in cols
                      if any(k in d.lower() for k in ("date", "time", "timestamp"))]
         text_hints = [n for n, d in cols
-                      if n not in date_cols and any(h in n.lower() for h in _DATE_NAME_HINTS)]
+                      if n not in date_cols and _hint_hit(n, _DATE_NAME_HINTS)]
         time_dims = []
         for cand in (date_cols + text_hints)[:5]:
             dtype = next((d for n, d in cols if n == cand), "")
@@ -308,7 +337,12 @@ def run_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(re
     target_table, target_col = None, None
 
     def _holds_numbers(eng, dialect, tname, col, sample=20):
-        """Runtime check: does this column actually hold numbers?"""
+        """Runtime check: does this column actually hold numbers?
+
+        TEXT-stored numerics (currency symbols, commas, percents) count via
+        the shared text-numeric parser so TEXT columns of real numbers are
+        never mistaken for "no numeric measure".
+        """
         try:
             with eng.connect() as _c:
                 _rows = _c.execute(_text(
@@ -317,13 +351,21 @@ def run_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(re
             _vals = [r[0] for r in _rows]
             if not _vals:
                 return False
+            try:
+                from core.text_numeric import try_parse_text_number as _tpn
+            except Exception:
+                _tpn = None
             _good = 0
             for _v in _vals:
                 if isinstance(_v, bool):
                     continue
                 try:
-                    float(str(_v).replace(",", ""))
-                    _good += 1
+                    if _tpn is not None:
+                        if _tpn(_v) is not None:
+                            _good += 1
+                    else:
+                        float(str(_v).replace(",", ""))
+                        _good += 1
                 except (TypeError, ValueError):
                     continue
             return _good >= max(1, len(_vals) // 2)
@@ -406,6 +448,7 @@ def run_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(re
         except Exception:
             dt_is_real_date = False
     try:
+        _sref = _coerced_ref(mapping.get("tables", {}), target_table, target_col, dialect)
         with engine.connect() as conn:
             if dt_col and dt_is_real_date:
                 if dialect == "sqlite":
@@ -415,7 +458,7 @@ def run_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(re
                 else:
                     gexpr = f"TO_CHAR({_safe_name(dt_col, dialect)}, 'YYYY-MM')"
                 rows = conn.execute(_text(
-                    f"SELECT {gexpr} AS p, SUM({_safe_name(target_col, dialect)}) AS v "
+                    f"SELECT {gexpr} AS p, SUM({_sref}) AS v "
                     f"FROM {_safe_name(target_table, dialect)} "
                     f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
                     f"GROUP BY p ORDER BY p DESC LIMIT {n_periods}"
@@ -425,7 +468,7 @@ def run_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(re
                 series.reverse()
             elif dt_col:
                 rows = conn.execute(_text(
-                    f"SELECT {_safe_name(dt_col, dialect)} AS p, SUM({_safe_name(target_col, dialect)}) AS v "
+                    f"SELECT {_safe_name(dt_col, dialect)} AS p, SUM({_sref}) AS v "
                     f"FROM {_safe_name(target_table, dialect)} "
                     f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
                     f"GROUP BY {_safe_name(dt_col, dialect)} "
@@ -436,7 +479,7 @@ def run_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(re
                 series.reverse()
             else:
                 total_row = conn.execute(_text(
-                    f"SELECT SUM({_safe_name(target_col, dialect)}) "
+                    f"SELECT SUM({_sref}) "
                     f"FROM {_safe_name(target_table, dialect)}")).fetchone()
                 total = float(total_row[0]) if total_row and total_row[0] is not None else 0.0
                 series = [{"period": "all data", "actual": total}]
@@ -614,7 +657,7 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
     _tcols = _table_columns(_mapping0.get("tables", {}), valid_table)
     _time_cands = [n for n, d in _tcols
                    if any(k in d.lower() for k in ("date", "time", "timestamp"))
-                   or any(h in n.lower() for h in _DATE_NAME_HINTS)]
+                   or _hint_hit(n, _DATE_NAME_HINTS)]
     _want_t = ((req.time_dim or "").split(" (")[0]).strip()
     valid_time = next((n for n in _time_cands if n.lower() == _want_t.lower()),
                       None) if _want_t else None
@@ -682,9 +725,11 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
                 _dt = valid_time or _intel0.find_best_datetime(valid_table)
                 if _eng is None or not _dt:
                     return None
+                _fref = _coerced_ref(_mapping0.get("tables", {}), valid_table,
+                                     valid_measure, _dial)
                 with _eng.connect() as _conn:
                     _rows = _conn.execute(_t(
-                        f"SELECT {_sn(_dt, _dial)} AS t, SUM({_sn(valid_measure, _dial)}) AS v "
+                        f"SELECT {_sn(_dt, _dial)} AS t, SUM({_fref}) AS v "
                         f"FROM {_sn(valid_table, _dial)} "
                         f"WHERE {_sn(_dt, _dial)} IS NOT NULL "
                         f"GROUP BY {_sn(_dt, _dial)} "

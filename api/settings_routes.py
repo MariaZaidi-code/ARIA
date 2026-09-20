@@ -165,7 +165,32 @@ def _ping_ollama(timeout: int) -> None:
     """Fast Ollama liveness check (tags endpoint, no generation)."""
     import urllib.request as _url
     import json as _json
+    from urllib.parse import urlparse as _urlparse
     base = (os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434") or "").rstrip("/")
+    try:
+        _parts = _urlparse(base)
+        _host = (_parts.hostname or "").lower().rstrip(".")
+        # Operator-controlled env: allow loopback by default; block cloud
+        # metadata / private targets unless explicitly opted in via
+        # ARIA_ALLOW_OLLAMA_HOSTS=1 (dev networks with remote Ollama).
+        if _parts.scheme not in ("http", "https") or not _host:
+            raise RuntimeError("OLLAMA_BASE_URL must be http(s)://host.")
+        _blocked = {"169.254.169.254", "metadata.google.internal"}
+        if _host in _blocked or ".nip.io" in _host or ".sslip.io" in _host:
+            raise RuntimeError("OLLAMA_BASE_URL host is blocked.")
+        if os.getenv("ARIA_ALLOW_OLLAMA_HOSTS", "0").strip() not in ("1", "true", "yes", "on"):
+            import ipaddress as _ip
+            try:
+                _ip_obj = _ip.ip_address(_host)
+                if not _ip_obj.is_loopback:
+                    raise RuntimeError("OLLAMA_BASE_URL must be loopback (or set ARIA_ALLOW_OLLAMA_HOSTS=1).")
+            except ValueError:
+                if _host not in ("localhost",):
+                    raise RuntimeError("OLLAMA_BASE_URL must be loopback (or set ARIA_ALLOW_OLLAMA_HOSTS=1).")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Invalid OLLAMA_BASE_URL ({exc}).")
     req = _url.Request(f"{base}/api/tags", method="GET")
     with _url.urlopen(req, timeout=timeout) as resp:
         payload = _json.loads(resp.read().decode("utf-8") or "{}")

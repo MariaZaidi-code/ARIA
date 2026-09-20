@@ -185,7 +185,12 @@ class SqlContractMixin:
             if on_start is None:
                 continue
             cond = sql[on_start:on_end]
-            for eq in re.finditer(r"([A-Za-z_]\w*)\.(\w+)\s*=\s*([A-Za-z_]\w*)\.(\w+)", cond):
+            # Quote-tolerant: ON conditions use quoted identifiers
+            # ("orders"."customer_id" = "customers"."id") from _qcol.
+            for eq in re.finditer(
+                    r"['\"`\[]?([A-Za-z_]\w*)['\"`\]]?\s*\.\s*['\"`\[]?(\w+)['\"`\]]?"
+                    r"\s*=\s*['\"`\[]?([A-Za-z_]\w*)['\"`\]]?\s*\.\s*['\"`\[]?(\w+)['\"`\]]?",
+                    cond):
                 a, ca, b, cb = eq.groups()
                 joins.append({
                     "left_table": alias_map.get(a.lower(), a),
@@ -300,6 +305,10 @@ class SqlContractMixin:
                 "The language model is temporarily unavailable or rate-limited. "
                 "Please try again shortly or switch the model provider."
             )
+        elif exc_str.startswith("I couldn't match ") or exc_str.startswith(
+                "I couldn't build that breakdown"):
+            # Already natural-English (repair loop); don't wrap it again.
+            message = exc_str
         else:
             message = f"Could not answer this goal: {sanitized}"
         output = {
@@ -321,4 +330,29 @@ class SqlContractMixin:
         Path(output_path).write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
         logging.getLogger(__name__).error("Goal Agent graceful failure for %r: %s", user_goal, exc)
         return output_path
+
+
+def sql_references_coerced_measure(sql, table, column, agg=None) -> bool:
+    """True when `sql` aggregates a text-numeric column via its SAFE coercion
+    expression (e.g. ``SUM(CAST(NULLIF(... "col" ...)))``) rather than the
+    bare column.
+
+    Used by semantic validation to ACCEPT SUM/AVG/MIN/MAX over the coercion
+    expression for a resolved coerced measure (matched by expression-in-SQL,
+    not by bare column). No other rule is affected: bare-column aggregates
+    and every other check behave exactly as before.
+    """
+    try:
+        if not sql or not column:
+            return False
+        base = str(column).split(".")[-1].strip().strip("\"'`[]").lower()
+        if not base or base not in str(sql).lower():
+            return False
+        if "cast(" not in str(sql).lower():
+            return False
+        if agg and f"{str(agg).upper()}(" not in str(sql).upper():
+            return False
+        return True
+    except Exception:
+        return False
 

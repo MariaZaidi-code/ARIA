@@ -268,12 +268,12 @@ PROVIDERS = {
         "label": "Cloud LLM (Groq API)",
         "privacy": "Fast inference on Groq's LPU hardware, but your schema, queries and data samples are sent to the Groq API.",
         "models": {
-            "sql": "llama-3.3-70b-versatile",
-            "story": "llama-3.3-70b-versatile",
-            "suggest": "llama-3.3-70b-versatile",
-            "semi": "llama-3.3-70b-versatile",
-            "schema": "llama-3.3-70b-versatile",
-            "vision": "qwen/qwen3.6-27b",
+            "sql": "qwen/qwen3.8-27b",
+            "story": "qwen/qwen3.8-27b",
+            "suggest": "qwen/qwen3.8-27b",
+            "semi": "qwen/qwen3.8-27b",
+            "schema": "qwen/qwen3.8-27b",
+            "vision": "qwen/qwen3.8-27b",
         },
     },
     "omniroute": {

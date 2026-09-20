@@ -26,7 +26,68 @@ from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, log_and_sanitize
 
 logger = logging.getLogger("aria.kpi.service")
 
-__all__ = ["_SERIES_FALLBACK_MAX", "_CHART_BY_INTENT", "DASHBOARD_MIN_SCORE", "_AMOUNT_HINTS", "_ENTITY_HINTS", "_DATE_HINTS", "_STORE_HINTS", "_HOLIDAY_HINTS", "_SALES_HINTS", "_DATE_PARSE_FORMATS", "_MONTH_NAMES", "_fmt", "_is_currency_col", "_safe", "_validate_schema_ident", "_bound_limit", "_recommend_chart", "_profile_numeric", "_rollback", "_variation", "_score_kpi", "_time_grain_expr", "_parse_full_date", "_parse_date_to_month", "_pretty_month", "_pretty_date", "_discover_special_columns", "_fetch_time_series", "_holiday_lift", "_retail_candidates_for_table"]
+__all__ = ["_SERIES_FALLBACK_MAX", "_CHART_BY_INTENT", "DASHBOARD_MIN_SCORE", "_AMOUNT_HINTS", "_ENTITY_HINTS", "_DATE_HINTS", "_STORE_HINTS", "_HOLIDAY_HINTS", "_SALES_HINTS", "_DATE_PARSE_FORMATS", "_MONTH_NAMES", "_fmt", "_is_currency_col", "_safe", "_validate_schema_ident", "_bound_limit", "_recommend_chart", "_profile_numeric", "_rollback", "_variation", "_score_kpi", "_time_grain_expr", "_parse_full_date", "_parse_date_to_month", "_pretty_month", "_pretty_date", "_discover_special_columns", "_fetch_time_series", "_holiday_lift", "_retail_candidates_for_table", "_measure_expr", "_coerce_num"]
+
+
+def _measure_expr(intel, tname: str, col: str, dialect: str) -> str:
+    """Quoted ref for SUM/AVG over a measure, TEXT-storage safe.
+
+    Fully schema-agnostic (no table/column literals): when the declared
+    dtype is text-ish (e.g. a relational table holding ``'\\u20b91,299'`` or
+    ``'15%'`` in TEXT columns), returns the shared
+    :func:`core.text_numeric.coercion_sql` expression so aggregates yield
+    numbers instead of raising ``function sum(text) does not exist``.
+    Unparsable values become NULL (never invented). Native numerics and
+    unknown dtypes keep the plain quoted column. Never raises.
+    """
+    from api.schema_intel import _safe_name
+    try:
+        q = _safe_name(col, dialect)
+    except Exception:
+        return str(col)
+    try:
+        dtype = intel.dtype_of(tname, col) if intel is not None else ""
+    except Exception:
+        dtype = ""
+    dt = str(dtype or "").lower()
+    if any(k in dt for k in ("char", "text", "varchar", "string", "clob", "uuid")):
+        try:
+            from core.text_numeric import coercion_sql as _cs
+            return _cs(dialect, q)
+        except Exception:
+            return q
+    return q
+
+
+def _coerce_num(value):
+    """Parse one raw cell to float, TEXT-numeric aware (currency/percent/commas).
+
+    Returns None when unparsable. Schema-agnostic: reuses
+    :func:`core.text_numeric.try_parse_text_number`, falling back to a
+    comma-stripped float for plain numerics.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            import math as _math
+            f = float(value)
+            return f if _math.isfinite(f) else None
+        except (TypeError, ValueError):
+            return None
+    try:
+        from core.text_numeric import try_parse_text_number as _tpn
+        parsed = _tpn(value)
+        if parsed is not None:
+            return parsed
+    except Exception:
+        pass
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _fmt(v, is_currency=False):
@@ -205,18 +266,24 @@ _DATE_HINTS = ("date", "time", "day", "month", "year", "created", "updated",
 
 
 def _profile_numeric(conn, tname: str, col: str, dialect: str, intel=None) -> dict | None:
-    """One-query profile of a numeric column (spec §1)."""
+    """One-query profile of a numeric column (spec §1).
+
+    TEXT-stored measures aggregate through :func:`_measure_expr` so a
+    relational TEXT column holding currency strings profiles real numbers
+    instead of raising ``function sum(text) does not exist``.
+    """
     if intel is not None:
         try:
             _validate_schema_ident(intel, tname, col)
         except ValueError:
             return None
     try:
+        _mref = _measure_expr(intel, tname, col, dialect)
         row = conn.execute(text(
             f"SELECT COUNT(*) AS n, COUNT({_safe_name(col, dialect)}) AS nn, "
             f"COUNT(DISTINCT {_safe_name(col, dialect)}) AS d, "
-            f"SUM({_safe_name(col, dialect)}) AS s, AVG({_safe_name(col, dialect)}) AS a, "
-            f"MIN({_safe_name(col, dialect)}) AS mi, MAX({_safe_name(col, dialect)}) AS ma "
+            f"SUM({_mref}) AS s, AVG({_mref}) AS a, "
+            f"MIN({_mref}) AS mi, MAX({_mref}) AS ma "
             f"FROM {_safe_name(tname, dialect)}"
         )).fetchone()
         if not row or not row[0]:
@@ -483,13 +550,14 @@ def _fetch_time_series(conn, tname: str, dt_col: str, measure: str,
             return None, []
     limit = _bound_limit(limit)
     try:
+        _mref = _measure_expr(intel, tname, measure, dialect)
         srow = conn.execute(text(
             f"SELECT MIN({_safe_name(dt_col, dialect)}), "
             f"MAX({_safe_name(dt_col, dialect)}), "
-            f"SUM({_safe_name(measure, dialect)}), "
-            f"AVG({_safe_name(measure, dialect)}), "
-            f"MIN({_safe_name(measure, dialect)}), "
-            f"MAX({_safe_name(measure, dialect)}) "
+            f"SUM({_mref}), "
+            f"AVG({_mref}), "
+            f"MIN({_mref}), "
+            f"MAX({_mref}) "
             f"FROM {_safe_name(tname, dialect)} "
             f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL"
         )).fetchone()
@@ -512,7 +580,7 @@ def _fetch_time_series(conn, tname: str, dt_col: str, measure: str,
         result = conn.execute(
             text(
                 f"SELECT period, val FROM (SELECT {time_expr} AS period, "
-                f"SUM({_safe_name(measure, dialect)}) AS val "
+                f"SUM({_mref}) AS val "
                 f"FROM {_safe_name(tname, dialect)} "
                 f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
                 f"GROUP BY period ORDER BY period DESC LIMIT :limit_n) "
@@ -537,7 +605,7 @@ def _fetch_time_series(conn, tname: str, dt_col: str, measure: str,
         result = conn.execute(
             text(
                 f"SELECT {_safe_name(dt_col, dialect)} AS d, "
-                f"{_safe_name(measure, dialect)} AS v "
+                f"{_mref} AS v "
                 f"FROM {_safe_name(tname, dialect)} "
                 f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
                 f"LIMIT :fallback_limit"
@@ -577,7 +645,7 @@ def _holiday_lift(conn, tname: str, measure: str, holiday_col: str,
             _validate_schema_ident(intel, tname, holiday_col)
         except ValueError:
             return None, None, None, 0
-    mc = _safe_name(measure, dialect)
+    mc = _measure_expr(intel, tname, measure, dialect)
     hc = _safe_name(holiday_col, dialect)
     tc = _safe_name(tname, dialect)
     predicates = [
@@ -647,7 +715,7 @@ def _retail_candidates_for_table(conn, intel, tname: str,
             logger.debug("retail numerics skipped for %s: %s", tname, exc)
             numerics = {measure}
         if measure in numerics:
-            prof = _profile_numeric(conn, tname, measure, dialect)
+            prof = _profile_numeric(conn, tname, measure, dialect, intel=intel)
             if prof and prof["nn"]:
                 is_curr = _is_currency_col(measure)
                 spark: list = []

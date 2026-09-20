@@ -403,6 +403,20 @@ class SchemaMixin:
                 is_pk = column_name in info.get("primary_key", []) or col_info.get("is_primary_key")
                 suffix = " PRIMARY KEY" if is_pk else ""
                 col_defs.append(f'    "{column_name}" {data_type}{suffix}')
+                # Text-stored numerics: annotate from the probe cache (no new
+                # probes here -- the per-question budget was spent at
+                # measure-resolution time) so LLM SQL also coerces.
+                try:
+                    if self._coerced_status_cached(table_name, column_name):
+                        _cexpr = self._coercion_expression(
+                            table_name, column_name)
+                        col_defs.append(
+                            f'    -- "{column_name}" is TEXT holding numbers: '
+                            f'for SUM/AVG/MIN/MAX use {_cexpr} '
+                            f'(unparsable -> NULL; percent stays as-is, e.g. '
+                            f'15% -> 15); GROUP BY/WHERE use the raw column')
+                except Exception:
+                    pass
             fk_lines = []
             for fk in info.get("foreign_keys", []):
                 fk_lines.append(
@@ -444,6 +458,13 @@ class SchemaMixin:
         for d in ir.get("dimensions", []):
             if d.get("resolved_table"):
                 required.add(d["resolved_table"])
+        for f in ir.get("filters", []) or []:
+            try:
+                _col = str(f.get("column") or "")
+                if "." in _col and _col.split(".")[0] in self.tables:
+                    required.add(_col.split(".")[0])
+            except Exception:
+                pass
         return sorted(required) if required else list(join_path)
 
     # ---- _plan_joins (_plan_joins) ----

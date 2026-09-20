@@ -47,12 +47,15 @@ def _suggest_questions(mapping: dict, session: dict | None = None) -> list[str]:
     """Build 4 runnable questions from the connected schema (never generic).
 
     Each suggestion references a real measure/dimension/date from the
-    mapping, so every one can actually be answered. When a session is
-    provided, candidate measures are verified against real data (a text
-    column mislabeled numeric must never drive suggestions). Falls back
-    gracefully when parts are missing.
+    mapping, so every one can actually be answered. Candidate measures and
+    datetime columns are verified against real data when a session is
+    provided (a text column mislabeled numeric, or an empty date column,
+    must never drive suggestions). ID-like dimensions are never suggested.
+    Outlier / correlation / forecast / what-if questions are never emitted
+    here — those need drivers/history and live on their own tabs.
     """
-    from api.schema_intel import SchemaIntelligence
+    from api.schema_intel import SchemaIntelligence, _is_id_like
+    from core.analytical_result import natural_label as _nl
     try:
         intel = SchemaIntelligence(mapping or {})
         tables = [t for t in (mapping or {}).get("tables", {}) if t]
@@ -70,48 +73,81 @@ def _suggest_questions(mapping: dict, session: dict | None = None) -> list[str]:
                 pass
             return None
 
+        def _verified_dim(t):
+            try:
+                d = intel.find_best_dimension(t)
+            except Exception:
+                d = None
+            if d and not _is_id_like(str(d)):
+                return d
+            return None
+
+        def _verified_date(t):
+            try:
+                dt = intel.find_best_datetime(t)
+            except Exception:
+                dt = None
+            if not dt:
+                return None
+            if session is not None and not _column_holds_data(session, t, dt):
+                return None
+            return dt
+
         # Prefer the first table with a genuinely numeric measure; a text
         # column mislabeled as a measure must never drive suggestions.
-        table = tables[0]
-        measure = _numeric_measure(table)
+        # Among measured tables prefer one that ALSO has a breakdown
+        # dimension, so every suggestion is segmented ("Which X has the
+        # highest Y?") instead of a bare "Summarize <table>".
+        table, measure, dim = tables[0], None, None
         for t in tables:
             m = _numeric_measure(t)
-            if m:
+            if not m:
+                continue
+            if measure is None:
                 table, measure = t, m
+            d = _verified_dim(t)
+            if d:
+                table, measure, dim = t, m, d
                 break
-        dim = intel.find_best_dimension(table)
-        date = intel.find_best_datetime(table)
+        dim = dim or _verified_dim(table)
+        date = _verified_date(table)
         other_dim = None
         try:
             for c in (intel.get_text_cols(table) or []):
-                if c != dim:
+                if c != dim and not _is_id_like(str(c)):
                     other_dim = c
                     break
         except Exception:
             pass
         out: list[str] = []
+
+        def _total_q(raw_col: str) -> str:
+            lbl = _nl(raw_col)
+            if lbl.strip().lower() in ("total", "sum", "count", "value", "amount"):
+                return "What is the overall total value?"
+            return f"What is the total {lbl}?"
         if measure:
-            out.append(f"What is the total {measure.replace('_', ' ')}?")
+            out.append(_total_q(measure))
         else:
-            out.append(f"How many records are in {table.replace('_', ' ')}?")
+            out.append(f"How many records are in {_nl(table)}?")
         if measure and dim:
-            out.append(f"Which {dim.replace('_', ' ')} has the highest {measure.replace('_', ' ')}?")
+            out.append(f"Which {_nl(dim)} has the highest {_nl(measure)}?")
         elif dim:
-            out.append(f"Show the breakdown by {dim.replace('_', ' ')}.")
+            out.append(f"Show the breakdown by {_nl(dim)}.")
         else:
-            out.append(f"Summarize {table.replace('_', ' ')}.")
+            out.append(f"Summarize {_nl(table)}.")
         if measure and date:
-            out.append(f"How has {measure.replace('_', ' ')} changed over time?")
+            out.append(f"How has {_nl(measure)} changed over time?")
         elif measure and (other_dim or dim):
-            out.append(f"Show {measure.replace('_', ' ')} by {(other_dim or dim).replace('_', ' ')}.")
+            out.append(f"Show {_nl(measure)} by {_nl(other_dim or dim)}.")
         else:
-            out.append(f"What are the top {table.replace('_', ' ')} records?")
+            out.append(f"What are the top {_nl(table)} records?")
         if measure and dim and date:
-            out.append(f"Compare {measure.replace('_', ' ')} across {dim.replace('_', ' ')} over time.")
+            out.append(f"Compare {_nl(measure)} across {_nl(dim)} over time.")
         elif measure:
-            out.append(f"What is the average {measure.replace('_', ' ')}?")
+            out.append(f"What is the average {_nl(measure)}?")
         else:
-            out.append(f"Describe {table.replace('_', ' ')}.")
+            out.append(f"Describe {_nl(table)}.")
         seen, clean = set(), []
         for q in out:
             if q not in seen:
@@ -123,9 +159,12 @@ def _suggest_questions(mapping: dict, session: dict | None = None) -> list[str]:
         return []
 
 
-def _measure_holds_data(session: dict, table: str, column: str, sample: int = 20) -> bool:
-    """Verify a candidate measure holds numbers in the live source.
+def _column_holds_data(session: dict, table: str, column: str, sample: int = 20,
+                       numeric: bool = False) -> bool:
+    """Verify a candidate column holds usable values in the live source.
 
+    When ``numeric`` is True, at least half the sampled values must parse
+    as numbers (bools excluded); otherwise any non-null value counts.
     Never raises; verification failure means "skip this candidate".
     SQLite/CSV sources read directly; relational sources go through a
     short-lived engine built from the session (password stays server-side).
@@ -157,7 +196,13 @@ def _measure_holds_data(session: dict, table: str, column: str, sample: int = 20
                        f"@{cfg.get('host')}:{cfg.get('port', 5432)}/{cfg.get('db', '')}")
         else:
             return True
-        eng = _mk(uri, pool_pre_ping=True, connect_args={"connect_timeout": 8})
+        # No queryable URI (e.g. in-memory tests): trust the schema typing.
+        if not uri and db_type != "sqlite":
+            return True
+        eng = _mk(uri, pool_pre_ping=True, **(
+            {"connect_args": {"connect_timeout": 8}}
+            if db_type in ("postgresql", "mysql") else {}
+        ))
         try:
             with eng.connect() as conn:
                 rows = conn.execute(_t(
@@ -168,19 +213,41 @@ def _measure_holds_data(session: dict, table: str, column: str, sample: int = 20
         vals = [r[0] for r in rows]
         if not vals:
             return False
+        if not numeric:
+            return any(v is not None and str(v).strip() != "" for v in vals)
+        # TEXT-stored numerics (currency symbols, commas, percents) must
+        # count: reuse the shared text-numeric parser so a TEXT column of
+        # real numbers is never mistaken for "no data".
+        try:
+            from core.text_numeric import try_parse_text_number as _tpn
+        except Exception:
+            _tpn = None
         good = 0
         for v in vals:
             if isinstance(v, bool):
                 continue
             try:
-                float(str(v).replace(",", ""))
-                good += 1
+                if _tpn is not None:
+                    if _tpn(v) is not None:
+                        good += 1
+                else:
+                    float(str(v).replace(",", ""))
+                    good += 1
             except (TypeError, ValueError):
                 continue
         return good >= max(1, len(vals) // 2)
     except Exception as exc:
-        log.info("Copilot suggestion measure check skipped (%s).", type(exc).__name__)
+        log.info("Copilot suggestion column check skipped (%s).", type(exc).__name__)
         return True
+
+
+def _measure_holds_data(session: dict, table: str, column: str, sample: int = 20) -> bool:
+    """Verify a candidate measure holds numbers in the live source.
+
+    Thin wrapper over :func:`_column_holds_data` (numeric mode).
+    Never raises; verification failure means "skip this candidate".
+    """
+    return _column_holds_data(session, table, column, sample=sample, numeric=True)
 
 
 @router.get("/suggestions")
@@ -190,11 +257,14 @@ async def copilot_suggestions(user: dict = Depends(get_current_user)):
     mapping = _load_schema_mapping(session)
     suggestions = _suggest_questions(mapping, session=session)
     if not suggestions:
+        # Plain-ask fallback only: every item must be answerable with a
+        # plain COUNT/breakdown. Trend / outlier / correlation / forecast /
+        # what-if need verified columns, drivers or history — never here.
         suggestions = [
-            "What are the main metrics in this dataset?",
-            "Show me a summary of the data",
+            "How many records are in the data?",
             "Which categories have the most records?",
-            "What trends do you see in the data?",
+            "What are the top items by value?",
+            "Show a breakdown by the main category.",
         ]
     return {"ok": True, "suggestions": suggestions}
 

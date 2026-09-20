@@ -120,8 +120,14 @@ def _check_shared_store() -> None:
     """Fail closed for multi-worker runs without a shared store.
 
     Single-process dev always passes. With workers > 1 and the "memory"
-    backend, log a loud warning; when ARIA_REQUIRE_SHARED_STORE=1 raise
-    (503) instead of enforcing silently-divided per-process limits.
+    backend, log a loud warning; raise (503) instead of enforcing
+    silently-divided per-process limits when:
+      * ARIA_REQUIRE_SHARED_STORE is truthy (1/true/yes/on), OR
+      * ARIA_ENV=production without an explicit opt-out
+        (ARIA_REQUIRE_SHARED_STORE=0/false/no/off).
+    Choice (P0-3): explicit opt-in fails closed everywhere; production
+    fails closed by default so a missing flag can never silently split
+    limits. Single-worker default is unchanged (never raises).
     """
     global _warned_multi_worker
     if store_backend() != "memory":
@@ -138,16 +144,41 @@ def _check_shared_store() -> None:
             "per-process; use a shared store in production.",
             worker_count(),
         )
-    if os.getenv("ARIA_REQUIRE_SHARED_STORE", "0").strip().lower() in {"1", "true", "yes", "on"}:
+    _require_env = os.getenv("ARIA_REQUIRE_SHARED_STORE")
+    _require_raw = (_require_env or "").strip().lower()
+    _explicit_opt_out = _require_raw in {"0", "false", "no", "off"}
+    _require_shared = _require_raw in {"1", "true", "yes", "on"}
+    _is_prod = (os.getenv("ARIA_ENV", "") or "").strip().lower() == "production"
+    if _require_shared or (_is_prod and not _explicit_opt_out):
         raise HTTPException(
             status_code=503,
             detail="Multi-worker deployment requires a shared rate-limit store. "
-                   "Set ARIA_REDIS_URL or run a single worker.",
+                    "Set ARIA_REDIS_URL or run a single worker.",
         )
 
 
 def _enabled() -> bool:
-    return os.getenv("ARIA_RATE_LIMIT", "on").lower() not in ("off", "0", "false")
+    # Kill-switch safety: ARIA_RATE_LIMIT=off is honoured in dev only.
+    # In production the limiter stays enabled (fail-closed) so an env typo
+    # cannot silently disable brute-force / LLM-cost protection.
+    try:
+        raw = (os.getenv("ARIA_RATE_LIMIT", "on") or "on").lower()
+    except Exception:
+        return True
+    if raw not in ("off", "0", "false"):
+        return True
+    try:
+        is_prod = (os.getenv("ARIA_ENV", "") or "").strip().lower() == "production"
+    except Exception:
+        is_prod = True
+    if is_prod:
+        try:
+            logging.getLogger("uvicorn.error").warning(
+                "ARIA_RATE_LIMIT=off ignored in production (fail-closed).")
+        except Exception:
+            pass
+        return True
+    return False
 
 
 def _redis_check_limit(bucket: str, key: str, max_calls: int, window_s: int) -> bool:

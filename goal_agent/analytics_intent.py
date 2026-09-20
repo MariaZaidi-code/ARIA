@@ -58,8 +58,9 @@ _INTENT_SIGNALS: dict[str, list[str]] = {
                    r"\bdifference between\b", r"\bamong\b", r"\bbetween\b",
                    r"\bwhich (is|are) (more|less|higher|lower|better|worse)\b"],
     "trend": [r"\btrend\b", r"\bover time\b", r"\bgrowth\b", r"\bdecline\b",
-              r"\bincreas\w*\b", r"\bdecreas\w*\b", r"\bmonthly\b", r"\bweekly\b",
-              r"\bdaily\b", r"\byearly\b", r"\btime series\b"],
+               r"\bincreas\w*\b", r"\bdecreas\w*\b", r"\bmonthly\b", r"\bweekly\b",
+               r"\bdaily\b", r"\byearly\b", r"\btime series\b", r"\bhistory\b",
+               r"\bhistorical\b", r"\bchanged?\b", r"\bchange\b.*\bover\b"],
     "ranking": [r"\btop\b", r"\bbottom\b", r"\bbest\b", r"\bworst\b",
                 r"\bhighest\b", r"\blowest\b", r"\bmost\b", r"\bleast\b",
                 r"\brank\b", r"\bleader\b"],
@@ -448,13 +449,37 @@ def compute_possible_drivers(engine: Any, dialect: str, table: str,
 # Follow-ups generated from the result (never generic)
 # ---------------------------------------------------------------------------
 
+def _followup_is_id_like(name: str) -> bool:
+    """Local ID-like check (mirrors api.schema_intel._is_id_like).
+
+    Token equality — never substrings — so "country" is not an ID.
+    Kept local so the analytics layer never imports API modules.
+    """
+    toks = [t for t in re.split(r"[^a-z0-9]+", re.sub(
+        r"(?<=[a-z])(?=[A-Z])", "_", str(name or "")).lower()) if t]
+    if not toks:
+        return False
+    if toks == ["id"]:
+        return True
+    return toks[-1] in ("id", "uuid", "guid", "key", "code")
+
+
 def build_followups(question: str, primary_intent: str, metric: str | None,
                     dimensions: list[str], period_label: str = "",
                     drivers: list[dict] | None = None,
-                    limit: int = 6) -> list[str]:
-    """Follow-up questions built from actual result content."""
+                    limit: int = 6, has_datetime: bool = False) -> list[str]:
+    """Follow-up questions built from actual result content.
+
+    Only plain-ask answerable questions are emitted here: rankings,
+    breakdowns, averages and (when ``has_datetime`` is True) trends.
+    Outlier / correlation / forecast / what-if questions need drivers or
+    history and live on their own tabs — they are never suggested here.
+    """
     m = (metric or "the metric").strip() or "the metric"
-    dims = [d for d in (dimensions or []) if d]
+    # Never suggest an ID-like dimension as a breakdown segment.
+    dims = [d for d in (dimensions or [])
+            if d and "(" not in str(d) and "*" not in str(d)
+            and not _followup_is_id_like(str(d))]
     d0 = dims[0] if dims else "segment"
     d1 = dims[1] if len(dims) > 1 else None
     period = (period_label or "this period").strip()
@@ -466,8 +491,6 @@ def build_followups(question: str, primary_intent: str, metric: str | None,
         cands.append(f"Which {d0} contributes most to {m}?")
     if d1:
         cands.append(f"How does {m} break down by {d0} and {d1}?")
-    if primary_intent in ("trend", "forecasting", "scenario", "change_detection"):
-        cands.append(f"Forecast {m} for the next {period_label or 'periods'}")
     if primary_intent in ("ranking", "segmentation", "distribution",
                           "contribution"):
         cands.append(f"Which {d0} has the lowest {m}?")
@@ -475,13 +498,9 @@ def build_followups(question: str, primary_intent: str, metric: str | None,
         top = drivers[0]
         cands.append(
             f"How much of {m} comes from {top.get('value')} ({top.get('dimension')})?")
-    if primary_intent in ("anomaly",):
-        cands.append(f"Are there other anomalies in {m} across {d0}?")
-    if primary_intent in ("correlation",):
-        cands.append(f"Which {d0} shows the strongest link with {m}?")
     if primary_intent in ("recommendation",):
         cands.append(f"What should we do about {m} in {period}?")
-    # Deduplicate, keep order, cap.
+    # Deduplicate, keep order, cap (4-8 window enforced by caller limit).
     seen: set[str] = set()
     out: list[str] = []
     for c in cands:
@@ -491,10 +510,14 @@ def build_followups(question: str, primary_intent: str, metric: str | None,
         if len(out) >= limit:
             break
     # Honest fallback when nothing could be grounded (still result-derived:
-    # it references the metric that was actually analyzed).
+    # it references the metric that was actually analyzed). Trend is only
+    # offered when a real datetime column was verified upstream.
     if not out:
-        out = [f"Show {m} breakdown by {d0}",
-               f"How has {m} changed over time?"]
+        out = [f"Show {m} breakdown by {d0}"]
+        if has_datetime:
+            out.append(f"How has {m} changed over time?")
+        else:
+            out.append(f"Which {d0} has the highest {m}?")
     return out[:limit]
 
 

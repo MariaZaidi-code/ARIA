@@ -15,8 +15,6 @@ import logging
 import re
 from dataclasses import dataclass
 
-from functools import lru_cache
-
 from sqlalchemy import create_engine, text
 
 from core.validation import (
@@ -28,12 +26,90 @@ from core.validation import (
 log = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=8)
+# Bounded engine cache: avoids pinning credential-bearing URIs forever
+# (previous @lru_cache never closed/expired). TTL + explicit dispose keep
+# memory bounded; cache key is a redacted fingerprint, never the raw URI.
+_ENGINE_CACHE: dict = {}
+_ENGINE_CACHE_TTL_S = 600
+_ENGINE_CACHE_MAX = 8
+try:
+    import threading as _threading
+    _ENGINE_LOCK = _threading.Lock()
+except Exception:  # pragma: no cover
+    _ENGINE_LOCK = None
+
+
+def _cache_key(db_uri: str) -> str:
+    import hashlib as _hl
+    try:
+        return _hl.sha256(db_uri.encode("utf-8")).hexdigest()[:32]
+    except Exception:
+        return str(abs(hash(db_uri)))
+
+
 def _get_engine(db_uri: str):
-    return create_engine(db_uri, pool_pre_ping=True)
+    import time as _time
+    key = _cache_key(db_uri)
+    now = _time.monotonic()
+    lock = _ENGINE_LOCK
+    try:
+        if lock is not None:
+            lock.acquire()
+        entry = _ENGINE_CACHE.get(key)
+        if entry is not None:
+            eng, _stored_uri, ts = entry
+            if now - ts < _ENGINE_CACHE_TTL_S:
+                return eng
+            try:
+                eng.dispose()
+            except Exception:
+                pass
+            _ENGINE_CACHE.pop(key, None)
+        eng = create_engine(db_uri, pool_pre_ping=True, pool_recycle=1800)
+        if len(_ENGINE_CACHE) >= _ENGINE_CACHE_MAX:
+            try:
+                oldest = min(_ENGINE_CACHE.items(), key=lambda kv: kv[1][2])[0]
+                try:
+                    _ENGINE_CACHE[oldest][0].dispose()
+                except Exception:
+                    pass
+                _ENGINE_CACHE.pop(oldest, None)
+            except Exception:
+                pass
+        _ENGINE_CACHE[key] = (eng, db_uri, now)
+        return eng
+    finally:
+        try:
+            if lock is not None:
+                lock.release()
+        except Exception:
+            pass
+
+
+def dispose_engines() -> None:
+    """Close all cached engines (tests / shutdown). Never raises."""
+    try:
+        if _ENGINE_LOCK is not None:
+            _ENGINE_LOCK.acquire()
+        for _k, (eng, _u, _t) in list(_ENGINE_CACHE.items()):
+            try:
+                eng.dispose()
+            except Exception:
+                pass
+        _ENGINE_CACHE.clear()
+    except Exception:
+        pass
+    finally:
+        try:
+            if _ENGINE_LOCK is not None:
+                _ENGINE_LOCK.release()
+        except Exception:
+            pass
 
 # Deterministic read-only guard: reject anything that can mutate data/schema.
 _LIMIT_RE = re.compile(r"\blimit\s+\d+", re.IGNORECASE)
+_GROUP_BY_RE = re.compile(r"\bgroup\s+by\b", re.IGNORECASE)
+_AGG_RE = re.compile(r"\b(count|sum|avg|min|max)\s*\(", re.IGNORECASE)
 
 
 @dataclass
@@ -172,8 +248,12 @@ class SqlEngine:
             return SqlResult(ok=False, sql=sql, error=reason, dialect=self.dialect)
 
         safe_sql = sql
+        # Row cap without rewriting grouped/aggregate semantics: only append
+        # SQL LIMIT to plain row queries. Grouped/aggregate queries keep their
+        # grain; fetchmany() still bounds returned rows.
         if not _LIMIT_RE.search(sql) and self.dialect in ("postgresql", "mysql", "sqlite"):
-            safe_sql = f"{sql.rstrip(';')} LIMIT {self.max_rows}"
+            if not (_GROUP_BY_RE.search(sql) or _AGG_RE.search(sql)):
+                safe_sql = f"{sql.rstrip(';')} LIMIT {self.max_rows}"
 
         try:
             engine = _get_engine(self.db_uri)
@@ -184,7 +264,12 @@ class SqlEngine:
             return SqlResult(ok=True, sql=safe_sql, columns=columns, rows=rows,
                              row_count=len(rows), dialect=self.dialect)
         except Exception as exc:
-            return SqlResult(ok=False, sql=safe_sql, error=str(exc)[:400],
+            try:
+                from core.errors import sanitize_error as _san
+                err = _san(exc)
+            except Exception:
+                err = "Database query failed."
+            return SqlResult(ok=False, sql=safe_sql, error=str(err)[:400],
                              dialect=self.dialect)
 
     def generate_and_run(self, question: str, ctx, llm, tables: dict | None = None,

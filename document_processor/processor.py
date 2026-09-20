@@ -31,6 +31,15 @@ from .vector_store import VectorStore, create_vector_store, SearchResult
 
 logger = logging.getLogger(__name__)
 
+# Heavy-ops guards (P1): PDF 50 MB / 500 pages — enforced here AND at the
+# upload spool layer (api/connect_routes.py::_spool_limited -> 413).
+# Files within limits but large are processed inline with a warning log
+# (no job-queue refactor in P1).
+MAX_PDF_BYTES = 50 * 1024 * 1024
+MAX_PDF_PAGES = 500
+LARGE_INLINE_WARN_BYTES = 10 * 1024 * 1024
+LARGE_INLINE_WARN_PAGES = 100
+
 
 class DocumentProcessor:
     """
@@ -218,10 +227,18 @@ class DocumentProcessor:
         except Exception as e:
             return f"Could not read uploaded file: {e}"
         
-        # Check file size (100MB limit)
-        size_mb = file_path.stat().st_size / (1024 * 1024)
-        if size_mb > 100:
-            return f"File too large: {size_mb:.1f}MB (max 100MB)"
+        # Check file size (50MB limit — matches ARIA_MAX_UPLOAD_PDF_MB /
+        # RAG MAX_PDF_MB; connect_routes spool layer returns 413 first).
+        size_bytes = file_path.stat().st_size
+        size_mb = size_bytes / (1024 * 1024)
+        if size_bytes > MAX_PDF_BYTES:
+            return f"File too large: {size_mb:.1f}MB (max 50MB)"
+        if size_bytes > LARGE_INLINE_WARN_BYTES:
+            logger.warning(
+                "Large PDF processed inline: %s (%.1fMB). "
+                "Consider background job queue for files this size.",
+                file_path.name, size_mb,
+            )
         
         # Check PDF integrity
         try:
@@ -230,8 +247,14 @@ class DocumentProcessor:
                 page_count = len(pdf.pages)
                 if page_count == 0:
                     return "PDF has no pages"
-                if page_count > 500:
-                    return f"Too many pages: {page_count} (max 500)"
+                if page_count > MAX_PDF_PAGES:
+                    return f"Too many pages: {page_count} (max {MAX_PDF_PAGES})"
+                if page_count > LARGE_INLINE_WARN_PAGES:
+                    logger.warning(
+                        "Large PDF processed inline: %s (%d pages). "
+                        "Consider background job queue for files this size.",
+                        file_path.name, page_count,
+                    )
         except Exception as e:
             return f"Invalid or corrupted PDF: {e}"
         

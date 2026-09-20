@@ -22,20 +22,17 @@ _DOCUMENT_WORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Shape-based intent (generic): aggregation/comparison questions about
+# structured data, regardless of domain nouns (sales OR churn OR defects
+# OR readmissions). Never a noun list — "churn by plan" and "defects by
+# line" must route the same as "sales by region".
 _DB_ANALYTICS = re.compile(
-    r"\b(total\s+sales|revenue|top\s+\d+\s+products?|monthly\s+sales|"
-    r"weekly\s+sales|daily\s+sales|sales\s+trend|monthly\s+trend|weekly\s+trend|"
-    r"\btrend\b.{0,24}\b(sales|revenue|orders?)\b|"
-    r"average\s+(weekly\s+|monthly\s+|daily\s+)?(sales|order|revenue|quantity|price|value)|"
-    r"\b(total|sum)\b.{0,24}\b(sales|revenue|quantity|price|amount)\b|"
-    r"\bsales\s+by\b|\bcompare\b.{0,32}\bsales\b|\bsales\b.{0,32}\bvs\.?\b|"
-    r"\bholiday\b.{0,24}\bsales\b|\bsales\b.{0,24}\bholiday\b|"
-    r"\btop\s+\d+\b|\bbreakdown\b.{0,24}\bsales\b|"
-    r"average\s+order|orders?\s+(placed|count)|territor\w*|"
-    r"categor\w+|how\s+many\s+(customers?|orders?|products?)|"
-    r"highest[-\s]selling|best[-\s]sellers?|order\s+value|"
-    r"\b(sales|customers|orders|products|inventory)\b.{0,30}\b(by|per|across|for)\b|"
-    r"\b(sum|average|count|max|min)\b.{0,20}\b(sales|orders|revenue|quantity|price)\b)",
+    r"\btop\s+\d+\b|\bbreakdown\b|\btrend\b|\bover\s+time\b|"
+    r"\b(by|per|across|versus|vs\.?)\b.{0,24}\b|\b.{0,24}\b(by|per|across)\b|"
+    r"\b(sum|total|average|avg|count|how\s+many|max|min|median|mean)\b|"
+    r"\bcompare\b|\bhighest(?=[-\s?!.]|$)|\bbest(?=[-\s?!.]|$)|\blowest(?=[-\s?!.]|$)|\bworst(?=[-\s?!.]|$)|"
+    r"\bgrowth\b|\bdecline\b|\bgrew\b|\bfell\b|\bchange\b|\bdistribut\w+\b|"
+    r"\b(monthly|weekly|daily|quarterly|yearly)\b",
     re.IGNORECASE,
 )
 

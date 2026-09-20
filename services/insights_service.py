@@ -17,7 +17,7 @@ from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, log_and_sanitize
 
 log = logging.getLogger("aria.insights.service")
 
-__all__ = ["CHART_SPEC_VOCAB", "_MAX_SPEC_ROWS", "_MAX_RAW_VALUES", "_safe_float", "_fmt", "_fmt_currency", "_fmt_pct", "_iqr_bands", "_sanitize_spec_rows", "_normalize_chart_spec", "_confidence_level", "_evidence_quality", "_capability_flags", "_histogram_bins", "_build_takeaways", "_enrich_insight", "_normalize_legacy_insight", "_translate_sql_for_sqlite"]
+__all__ = ["CHART_SPEC_VOCAB", "_MAX_SPEC_ROWS", "_MAX_RAW_VALUES", "_safe_float", "_fmt", "_fmt_currency", "_fmt_pct", "_iqr_bands", "_sanitize_spec_rows", "_normalize_chart_spec", "_confidence_level", "_evidence_quality", "_capability_flags", "_histogram_bins", "_build_takeaways", "_enrich_insight", "_normalize_legacy_insight", "_translate_sql_for_sqlite", "build_recommendation_detail", "build_explains"]
 
 
 def _safe_float(v):
@@ -298,13 +298,87 @@ def _histogram_bins(vals, nbins: int = 12):
     return out
 
 
-def _build_takeaways(evidence, affected_period, observations, support_metrics):
-    """2-4 strings built ONLY from present numbers — skip missing, never invent.
+def _human_label(name) -> str:
+    """Schema-agnostic human label for prose (never raw snake_case)."""
+    try:
+        from core.semantic import humanize as _hz
+        return _hz(str(name or ""))
+    except Exception:
+        import re as _re
+        s = _re.sub(r"[_-]+", " ", str(name or "")).strip()
+        s = _re.sub(r"\s+", " ", s)
+        return s[:1].upper() + s[1:] if s else ""
 
-    Primary sources: changePercent / baseline / currentValue / affectedPeriod.
-    When fewer than 2 numeric takeaways exist, fill up to 2 with the
-    detector's own observation strings (already evidence-backed, no new
-    numbers invented). Capped at 4.
+
+def _human_scale(v):
+    """Human-scale numbers for prose: 42K / 1.8M, never 42000.0."""
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    a = abs(n)
+    if a >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if a >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    if a >= 100:
+        return f"{int(round(n)):,}"
+    if a >= 1:
+        return f"{round(n, 1)}"
+    return f"{round(n, 2)}"
+
+
+def _scrub_line(s) -> str:
+    """Remove raw schema traces from a prose line (identifiers/SQL/jargon)."""
+    import re as _re
+    t = str(s or "")
+    t = _re.sub(r"[A-Za-z_][A-Za-z0-9_]*\.([A-Za-z_][A-Za-z0-9_]*)",
+                lambda m: _human_label(m.group(1)), t)
+    t = _re.sub(r"[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+",
+                lambda m: _human_label(m.group(0)), t)
+    t = _re.sub(r"\b(SELECT|FROM|WHERE|GROUP BY|ORDER BY|JOIN|LIMIT|SQL)\b",
+                "the data", t)
+    # Internal engine terms must never reach the user.
+    t = _re.sub(r"\bp-?value\b", "reliability", t, flags=_re.IGNORECASE)
+    t = _re.sub(r"\bz-?scores?\b", "unusual pattern", t, flags=_re.IGNORECASE)
+    t = _re.sub(r"\bR\^2\b|\bR-squared\b", "pattern strength", t, flags=_re.IGNORECASE)
+    t = _re.sub(r"\bOLS\b", "trend analysis", t)
+    t = _re.sub(r"\bFK\b", "linked records", t)
+    t = _re.sub(r"\bIQR\b", "usual range", t)
+    t = _re.sub(r"\bCV\s*=\s*[\d.]+\b", "wide spread", t, flags=_re.IGNORECASE)
+    t = _re.sub(r"\bSkew\s*=\s*[-\d.]+\b", "lopsided spread", t, flags=_re.IGNORECASE)
+    return _re.sub(r"\s+", " ", t).strip()
+
+
+def _top_of_viz(viz_data):
+    """Top named entry from chart rows (real executed values only)."""
+    try:
+        rows = [r for r in (viz_data or []) if isinstance(r, dict)]
+        cands = []
+        for r in rows:
+            name = r.get("name", r.get("period", r.get("x")))
+            val = r.get("value", r.get("y"))
+            try:
+                f = float(val)
+            except (TypeError, ValueError):
+                continue
+            if name is not None and math.isfinite(f):
+                cands.append((str(name)[:40], f))
+        if not cands:
+            return None, None
+        cands.sort(key=lambda t: t[1], reverse=True)
+        return cands[0]
+    except Exception:
+        return None, None
+
+
+def _build_takeaways(evidence, affected_period, observations, support_metrics):
+    """2-4 conversational takeaways built ONLY from present numbers.
+
+    Human-scale numbers (42K), up/down direction words, short sentences.
+    Skips missing values — never invents. Falls back to the detector's own
+    observation strings (scrubbed) when fewer than 2 numeric lines exist.
+    Capped at 4.
     """
     takeaways: list = []
     ev = evidence or {}
@@ -315,34 +389,259 @@ def _build_takeaways(evidence, affected_period, observations, support_metrics):
         if cp is not None:
             cp_f = float(cp)
             if math.isfinite(cp_f):
-                takeaways.append(f"Changed {cp_f:+.1f}% versus the baseline.")
+                direction = "up" if cp_f > 0 else ("down" if cp_f < 0 else "flat")
+                takeaways.append(_scrub_line(f"{direction.capitalize()} {abs(cp_f):.0f}% vs the usual level."))
     except (TypeError, ValueError):
         pass
     try:
         if baseline is not None and current is not None:
             b_f, c_f = float(baseline), float(current)
             if math.isfinite(b_f) and math.isfinite(c_f):
-                takeaways.append(f"Moved from {_fmt(b_f)} to {_fmt(c_f)}.")
+                if c_f > b_f:
+                    takeaways.append(_scrub_line(f"Up from {_human_scale(b_f)} to {_human_scale(c_f)}."))
+                elif c_f < b_f:
+                    takeaways.append(_scrub_line(f"Down from {_human_scale(b_f)} to {_human_scale(c_f)}."))
+                else:
+                    takeaways.append(_scrub_line(f"Holding steady near {_human_scale(c_f)}."))
         elif baseline is not None:
             b_f = float(baseline)
             if math.isfinite(b_f):
-                takeaways.append(f"Baseline level: {_fmt(b_f)}.")
+                takeaways.append(_scrub_line(f"Usually around {_human_scale(b_f)}."))
         elif current is not None:
             c_f = float(current)
             if math.isfinite(c_f):
-                takeaways.append(f"Current level: {_fmt(c_f)}.")
+                takeaways.append(_scrub_line(f"Now at {_human_scale(c_f)}."))
     except (TypeError, ValueError):
         pass
-    if affected_period:
-        takeaways.append(f"Observed in {affected_period}.")
-    # Fill to at least 2 with existing evidence strings (no new numbers).
+    if affected_period and len(takeaways) < 3:
+        takeaways.append(_scrub_line(f"Seen in {affected_period}."))
+    # Fill to at least 2 with existing evidence strings (scrubbed, no new numbers).
     if len(takeaways) < 2:
         for s in list(observations or []) + list(support_metrics or []):
             if isinstance(s, str) and s.strip() and s not in takeaways:
-                takeaways.append(s)
+                clean = _scrub_line(s)
+                if clean and clean not in takeaways:
+                    takeaways.append(clean)
                 if len(takeaways) >= 4:
                     break
     return takeaways[:4]
+
+
+def build_recommendation_detail(ins: dict) -> dict:
+    """Evidence-backed recommendation: title + 1-2 steps + outcome in words.
+
+    Derives ONLY from the insight's own computed evidence (change percent,
+    baseline/current values, top chart entry, period) or returns an honest
+    'not enough evidence' card. Never generic filler, never internal terms,
+    fully schema-agnostic (humanized names only).
+    """
+    ins = ins if isinstance(ins, dict) else {}
+    itype = str(ins.get("type", "") or "").lower()
+    ev = ins.get("evidence") if isinstance(ins.get("evidence"), dict) else {}
+    metric_raw = (ins.get("metric") or "").split(" (")[0].strip()
+    metric = _human_label(metric_raw) or "this measure"
+    metric_low = metric[:1].lower() + metric[1:] if metric else "this measure"
+    period = str(ins.get("affectedPeriod") or "").strip()
+    viz = (ins.get("visualization") or {}) if isinstance(ins.get("visualization"), dict) else {}
+    top_name, top_val = _top_of_viz(viz.get("data"))
+
+    def _num(v):
+        try:
+            f = float(v)
+            return f if math.isfinite(f) else None
+        except (TypeError, ValueError):
+            return None
+
+    cp = _num(ev.get("changePercent"))
+    baseline = _num(ev.get("baseline"))
+    current = _num(ev.get("currentValue"))
+    if current is None:
+        current = _num(ins.get("metricValue"))
+    ss = ev.get("sampleSize")
+    try:
+        n = int(ss) if ss is not None else 0
+    except (TypeError, ValueError):
+        n = 0
+
+    has_numbers = (
+        cp is not None
+        or (baseline is not None and current is not None)
+        or (current is not None and (period or top_name))
+        or top_val is not None
+    )
+    if not has_numbers and n < 10:
+        return {
+            "title": "Not enough evidence for a next step",
+            "steps": [
+                "Gather a little more history first — a few more periods or segments to compare.",
+                f"Keep watching {metric_low} so the next change has something to measure against.",
+            ],
+            "outcome": "Once there is more to go on, ARIA will suggest a concrete next step.",
+            "honest": True,
+        }
+
+    direction_up = (cp is not None and cp > 0) or (
+        cp is None and baseline is not None and current is not None and current > baseline
+    )
+    direction_down = (cp is not None and cp < 0) or (
+        cp is None and baseline is not None and current is not None and current < baseline
+    )
+    pct_s = f"{abs(cp):.0f}%" if cp is not None else ""
+    cur_s = _human_scale(current) if current is not None else ""
+    base_s = _human_scale(baseline) if baseline is not None else ""
+    where = f" in {period}" if period else ""
+    move_bits = ""
+    if pct_s and cur_s and base_s:
+        move_bits = f" ({pct_s} move from {base_s} to {cur_s})"
+    elif pct_s and cur_s:
+        move_bits = f" ({pct_s}, now at {cur_s})"
+    elif cur_s and base_s:
+        move_bits = f" (from {base_s} to {cur_s})"
+    elif cur_s:
+        move_bits = f" (now at {cur_s})"
+
+    if "opportunit" in itype or "concentrat" in itype or "pareto" in itype or "segment" in itype:
+        who = f"'{top_name}'" if top_name else f"your top group{where}"
+        return {
+            "title": f"Lean into {top_name or 'your top group'} — it carries the weight",
+            "steps": [
+                f"Give {who} extra attention this week — check stock, staffing and follow-up{move_bits}.",
+                "Find what makes it work and repeat it in one weaker group.",
+            ],
+            "outcome": f"If the pattern holds, {metric_low} stays concentrated where it performs best.",
+            "honest": False,
+        }
+    if "anomal" in itype or "outlier" in itype:
+        return {
+            "title": f"Check the unusual {metric_low}{where}",
+            "steps": [
+                f"Confirm the {cur_s or 'unusual'} reading{where} is real data, not a recording blip.",
+                "Ask what changed around then — one answer usually explains it.",
+            ],
+            "outcome": "You will know whether to act on it or safely set it aside.",
+            "honest": False,
+        }
+    if "correl" in itype or "relation" in itype:
+        return {
+            "title": "Test the link before acting on it",
+            "steps": [
+                f"Pick one small change affecting {metric_low} and compare matched periods.",
+                "Only scale up what the comparison confirms.",
+            ],
+            "outcome": "You avoid spending on a link that only looked real in the chart.",
+            "honest": False,
+        }
+    if "distribut" in itype:
+        return {
+            "title": f"Look at what drives the spread in {metric_low}",
+            "steps": [
+                "Pull the highest and lowest cases side by side and note what differs.",
+                "Fix the one difference you can control first.",
+            ],
+            "outcome": "Less spread means a more predictable result next time.",
+            "honest": False,
+        }
+    if direction_up or "growth" in itype or ("trend" in itype and not direction_down):
+        return {
+            "title": f"Keep the momentum in {metric_low}",
+            "steps": [
+                f"Put a bit more behind what worked{where}{move_bits} — do not change the mix yet.",
+                "Write down what changed so you can repeat it next period.",
+            ],
+            "outcome": f"If the lift holds, {metric_low} stays up near {cur_s or 'its new level'}.",
+            "honest": False,
+        }
+    if direction_down or "decline" in itype or "risk" in itype:
+        return {
+            "title": f"Steady the dip in {metric_low}",
+            "steps": [
+                f"Find what slipped{where}{move_bits} — talk to the team closest to it this week.",
+                "Protect your strongest group first, then win back one weak spot.",
+            ],
+            "outcome": "You stop the slide early, before it becomes the new normal.",
+            "honest": False,
+        }
+    # Fallback with real numbers when the type is generic.
+    if has_numbers:
+        return {
+            "title": f"Follow up on {metric_low}{where}",
+            "steps": [
+                f"Review what moved{move_bits} and note the likely cause.",
+                "Decide one small action to take before the next period.",
+            ],
+            "outcome": "A quick review now makes the next change easier to read.",
+            "honest": False,
+        }
+    return {
+        "title": "Not enough evidence for a next step",
+        "steps": [
+            "Gather a little more history first — a few more periods or segments to compare.",
+            f"Keep watching {metric_low} so the next change has something to measure against.",
+        ],
+        "outcome": "Once there is more to go on, ARIA will suggest a concrete next step.",
+        "honest": True,
+    }
+
+
+def build_explains(ins: dict) -> str:
+    """Short conversational reading of one insight (2-3 sentences).
+
+    Built only from the insight's own title/description/evidence numbers.
+    Returns '' when there is nothing meaningful to say (caller hides it).
+    """
+    try:
+        ins = ins if isinstance(ins, dict) else {}
+        title = str(ins.get("title") or "").strip()
+        desc = str(ins.get("description") or ins.get("summary") or "").strip()
+        ev = ins.get("evidence") if isinstance(ins.get("evidence"), dict) else {}
+        metric = _human_label(str(ins.get("metric") or "").split(" (")[0]) or "this measure"
+        metric_low = metric[:1].lower() + metric[1:] if metric else "this measure"
+        period = str(ins.get("affectedPeriod") or "").strip()
+        itype = str(ins.get("type") or "").lower()
+
+        def _num(v):
+            try:
+                f = float(v)
+                return f if math.isfinite(f) else None
+            except (TypeError, ValueError):
+                return None
+
+        cp = _num(ev.get("changePercent"))
+        current = _num(ev.get("currentValue"))
+        baseline = _num(ev.get("baseline"))
+        if not title and not desc:
+            return ""
+        # Thin evidence -> say so honestly, briefly.
+        if cp is None and current is None and baseline is None:
+            base = title or desc
+            base = _scrub_line(base)
+            if len(base) < 20:
+                return ""
+            if "opportunit" in itype:
+                return _scrub_line(f"Here is the short version: {base} Worth exploring while it holds.")
+            if "risk" in itype or "decline" in itype:
+                return _scrub_line(f"Here is the short version: {base} Worth a closer look soon.")
+            return _scrub_line(f"Here is the short version: {base}")
+        if cp is not None and cp > 0:
+            move = f"{metric} is up {abs(cp):.0f}%"
+        elif cp is not None and cp < 0:
+            move = f"{metric} is down {abs(cp):.0f}%"
+        elif baseline is not None and current is not None:
+            move = f"{metric} moved from {_human_scale(baseline)} to {_human_scale(current)}"
+        elif current is not None:
+            move = f"{metric} is at {_human_scale(current)}"
+        else:
+            move = title
+        where = f" in {period}" if period else ""
+        kind = "an opportunity" if "opportunit" in itype else ("a risk" if ("risk" in itype or "decline" in itype) else "the pattern")
+        action = ("Worth exploring while it holds." if "opportunit" in itype
+                  else ("Worth a closer look soon." if ("risk" in itype or "decline" in itype or (cp is not None and cp < 0))
+                        else "That is the shape of it."))
+        text = f"{move}{where}. In plain terms — {_scrub_line(title or desc)} {action} This is {kind} the numbers point to."
+        text = _scrub_line(text)
+        return text[:600] if len(text) > 600 else text
+    except Exception:
+        return ""
 
 
 def _enrich_insight(ins: dict) -> dict:
@@ -379,12 +678,34 @@ def _enrich_insight(ins: dict) -> dict:
     obs = ev.get("observations") or ins.get("observations") or []
     sup = ev.get("supportingMetrics") or ins.get("support_metrics") or []
     ins["takeaways"] = _build_takeaways(ev, ins.get("affectedPeriod"), obs, sup)
-    # recommendation: reuse existing next-step / impact text, never invent.
+    # Conversational explainer (new prose field for the Insights page).
+    try:
+        _exp = build_explains(ins)
+        if _exp:
+            ins["explains"] = _exp
+    except Exception:
+        pass
+    # Recommendation: evidence-backed detail (title + steps + outcome) is
+    # canonical. The legacy string field carries a one-line rendering for
+    # backward compatibility — never generic filler.
+    try:
+        _det = build_recommendation_detail(ins)
+        if isinstance(_det, dict) and _det.get("title"):
+            ins["recommendation_detail"] = _det
+            _steps = _det.get("steps") or []
+            _one = _det["title"].strip()
+            if _steps:
+                _one += " — " + str(_steps[0]).strip()
+            if _det.get("outcome"):
+                _one += " Expected: " + str(_det["outcome"]).strip()
+            ins["recommendation"] = _scrub_line(_one)[:400]
+    except Exception:
+        pass
     if not ins.get("recommendation"):
         nxt = ins.get("recommendedNextAnalysis") or {}
         rec = (nxt.get("question") if isinstance(nxt, dict) else "") or ins.get("next_question") or ""
         if rec:
-            ins["recommendation"] = rec
+            ins["recommendation"] = _scrub_line(rec)[:400]
     scen, mon = _capability_flags(ss)
     ins["scenario_supported"] = scen
     ins["monitoring_supported"] = mon

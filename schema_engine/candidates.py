@@ -86,11 +86,23 @@ class CandidateGenerator:
                 if ref_flavored:
                     reasons.append("ref_flavored_name")
                 else:
-                    # Only data can find non-ref-flavored candidates; the column
-                    # must still be a plausible key-ish type to be worth sampling.
-                    if not (self.profiler and self.profiler.should_profile(col)):
-                        continue
-                    reasons.append("key_typed_numeric_or_idlike")
+                    # Structural lead (PART 18): membership in ANOTHER table's
+                    # composite PK is itself a generation signal — lexical
+                    # flavor is not required (e.g. separator-less `personid`).
+                    _structural_lead = any(
+                        t != table_name
+                        and len(self.primary_keys.get(t, []) or []) > 1
+                        and col_name in (self.primary_keys.get(t, []) or [])
+                        for t in self.primary_keys
+                    )
+                    if _structural_lead:
+                        reasons.append("composite_pk_member_elsewhere")
+                    else:
+                        # Only data can find non-ref-flavored candidates; the column
+                        # must still be a plausible key-ish type to be worth sampling.
+                        if not (self.profiler and self.profiler.should_profile(col)):
+                            continue
+                        reasons.append("key_typed_numeric_or_idlike")
 
                 # Lexical target hints (never an acceptance decision).
                 name_targets, name_targets_from_name = self._lexical_targets(table_name, col_name)

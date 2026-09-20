@@ -67,6 +67,7 @@ def _schema_terms_for(schema_path) -> set:
 def _build_why(*, goal, tables, columns, row_count, sql, explanation,
                confidence, warnings) -> dict:
     """Structured Why block (§21): stored at analysis time, shown on demand."""
+    from core.analytical_result import natural_label as _nl
     limitations = []
     if not row_count:
         limitations.append("The query returned no rows, so no conclusion can be drawn.")
@@ -77,7 +78,7 @@ def _build_why(*, goal, tables, columns, row_count, sql, explanation,
         "what_happened": (explanation or "Analysis completed over the connected data.").strip()[:800],
         "why_it_matters": (
             f"Answers '{goal}' from {row_count} row(s) across "
-            f"{', '.join(tables[:3]) or 'the connected source'}."
+            f"{', '.join(_nl(t) for t in tables[:3]) or 'the connected source'}."
         ),
         "evidence": {
             "tables": tables,
@@ -85,7 +86,7 @@ def _build_why(*, goal, tables, columns, row_count, sql, explanation,
             "row_count": row_count,
             "sql": sql,
         },
-        "contributing_factors": columns[1:4] if len(columns) > 1 else [],
+        "contributing_factors": [_nl(c) for c in (columns[1:4] if len(columns) > 1 else [])],
         "comparisons": [],
         "confidence": confidence,
         "limitations": limitations,
@@ -94,17 +95,18 @@ def _build_why(*, goal, tables, columns, row_count, sql, explanation,
 
 def _build_story(*, goal, tables, columns, result_data, why_block) -> str:
     """Coherent data story (§23): finding → evidence → contributors → next step."""
+    from core.analytical_result import natural_label as _nl
     n = len(result_data or [])
     first = (result_data or [{}])[0] if result_data else {}
     if isinstance(first, dict) and first:
         lead_col = next(iter(first.keys()))
         lead_val = first[lead_col]
-        finding = f"Top result: {lead_col} = {lead_val} across {n} row(s)."
+        finding = f"Top result: {_nl(lead_col)} is {lead_val} across {n} row(s)."
     elif n:
-        finding = f"Query returned {n} row(s) from {', '.join(tables[:3]) or 'the source'}."
+        finding = f"Query returned {n} row(s) from {', '.join(_nl(t) for t in tables[:3]) or 'the source'}."
     else:
         finding = "No matching rows were found for this question."
-    evidence = f"Evidence: {why_block['evidence']['row_count']} row(s), columns {', '.join(columns[:5]) or '—'}."
+    evidence = f"Evidence: {why_block['evidence']['row_count']} row(s), covering {', '.join(_nl(c) for c in columns[:5]) or '—'}."
     factors = ""
     if why_block["contributing_factors"]:
         factors = f" Segmented by {', '.join(why_block['contributing_factors'])}."
@@ -140,24 +142,72 @@ def _chart_spec_for_result(columns, result_data) -> dict:
     if not options:
         return {"chart_type": "table", "reason": "no compatible chart for this shape"}
     top = options[0]
-    return {"chart_type": top["chart_type"], "label": top["label"],
+    ctype = top["chart_type"]
+    # Validation gate 3: x/y must point at REAL columns in the data, and the
+    # chart family must fit the shape — else the frontend renders a wrong
+    # chart. Deterministic downgrade, never a faulty viz.
+    cols = list(columns or [])
+    x_col, y_col = None, None
+    try:
+        num_cols = [c for c in cols if isinstance(first.get(c), (int, float))
+                    and not isinstance(first.get(c), bool)]
+        cat_cols = [c for c in cols if c not in num_cols and first.get(c) is not None]
+        dt_cols = [c for c in cols if any(k in c.lower() for k in
+                   ("date", "time", "month", "year", "day", "period"))]
+        if ctype in ("line", "area") and dt_cols and num_cols:
+            x_col, y_col = dt_cols[0], num_cols[0]
+        elif ctype in ("bar", "column", "pie", "doughnut") and cat_cols and num_cols:
+            x_col, y_col = cat_cols[0], num_cols[0]
+            if ctype in ("pie", "doughnut"):
+                card_n = len(set(str((r or {}).get(x_col)) for r in rows[:200]))
+                if card_n < 2 or card_n > 8:
+                    ctype = "bar"  # pie with 1 or 9+ slices misleads
+        elif num_cols:
+            x_col, y_col = (cat_cols + dt_cols + num_cols[:1])[0], num_cols[0]
+        else:
+            ctype = "table"
+    except Exception:
+        ctype = "table"
+        x_col, y_col = None, None
+    if not rows or not cols:
+        ctype = "table"
+    return {"chart_type": ctype, "x": x_col, "y": y_col, "label": top["label"],
             "reason": top["analyst_use"], "compatible": [o["chart_type"] for o in options[1:4]]}
 
 
 def _summarize_result(goal, columns, result_data) -> str:
     """Deterministic answer sentence from real rows (fallback when the agent
     returns no message, so the Answer section is never empty on success)."""
+    from core.analytical_result import natural_label as _nl
     rows = result_data or []
     if not rows:
-        return f"No matching rows were found for '{goal}'."
+        return "No matching rows were found for this question."
     first = rows[0] if isinstance(rows[0], dict) else {}
     if first:
+        keys = list(first.keys())
+        # Name the LEADERS, not just the count: for multi-row results, name
+        # the top 3 entries (e.g. artists, regions) with their values so the
+        # answer reads naturally and matches the chart. Generic — works for
+        # any columns on any unseen schema. Raw table/column identifiers are
+        # humanized; table names never surface.
+        if len(rows) > 1 and len(keys) >= 2:
+            name_col = next((k for k in keys
+                             if not isinstance(first.get(k), (int, float))
+                             or isinstance(first.get(k), bool)), keys[0])
+            val_col = next((k for k in keys
+                            if k != name_col and isinstance(first.get(k), (int, float))
+                            and not isinstance(first.get(k), bool)), None)
+            if val_col:
+                leaders = ", ".join(
+                    f"{r.get(name_col)} ({r.get(val_col)})" for r in rows[:3])
+                return (f"Top {len(rows)} {_nl(name_col)}s by {_nl(val_col)}: "
+                        f"{leaders}.")
         lead_col = next(iter(first.keys()))
         lead_val = first[lead_col]
         extra = ""
         if len(rows) > 1:
             extra = f" ({len(rows)} rows, led by {lead_val})"
-        return f"Top result: {lead_col} = {lead_val}{extra}."
+        return f"Top result: {_nl(lead_col)} is {lead_val}{extra}."
     return f"Query returned {len(rows)} row(s)."
 
 
@@ -222,6 +272,51 @@ def _check_consistency(chart_spec, result_data, why_block) -> dict:
     return {"consistent": not issues, "issues": issues, "chart_spec": chart_spec}
 
 
+def _suggestion_column_holds_data(session: dict, table: str, column: str,
+                                    sample: int = 20, numeric: bool = False) -> bool:
+    """Best-effort live check that a candidate column holds usable values.
+
+    Mirrors api.copilot_routes._column_holds_data (kept local to avoid a
+    router import cycle). Never raises: on any failure return True so a
+    transient DB hiccup never blanks the suggestion list.
+    """
+    try:
+        from api.copilot_routes import _column_holds_data as _shared
+        return bool(_shared(session or {}, table, column, sample=sample, numeric=numeric))
+    except Exception:
+        return True
+
+
+def _suggestion_measure_ok(session: dict, table: str, column: str) -> bool:
+    return _suggestion_column_holds_data(session, table, column, numeric=True)
+
+
+def _suggestion_datetime_ok(session: dict, table: str, column: str) -> bool:
+    return _suggestion_column_holds_data(session, table, column, numeric=False)
+
+
+# Plain-ask blocklist: outlier / correlation / forecast / what-if need
+# drivers or history and live on their own tabs — never as plain suggestions.
+_BLOCKED_SUGGESTION_RES = None
+
+
+def _is_blocked_suggestion(text: str) -> bool:
+    import re as _re
+    global _BLOCKED_SUGGESTION_RES
+    if _BLOCKED_SUGGESTION_RES is None:
+        _BLOCKED_SUGGESTION_RES = [
+            _re.compile(p, _re.IGNORECASE) for p in (
+                r"\boutlier\w*\b", r"\banomal\w*\b", r"\bunusual\b",
+                r"\bcorrelat\w*\b", r"\brelationship between\b",
+                r"\bforecast\w*\b", r"\bpredict\w*\b",
+                r"\bwhat if\b", r"\bwhat-if\b",
+                r"\bscenario\b", r"\bdata quality\b",
+            )
+        ]
+    s = str(text or "")
+    return any(p.search(s) for p in _BLOCKED_SUGGESTION_RES)
+
+
 @router.post("/api/suggestions")
 def get_suggestions(request: Request, payload: dict | None = None, user: dict = Depends(require_writable)):
     """LLM-driven + template-driven suggested search goals. Works with any
@@ -229,7 +324,12 @@ def get_suggestions(request: Request, payload: dict | None = None, user: dict = 
     than hardcoded table/column references."""
     session = get_session(user["user_id"])
     provider = require_data(request)
-    limit = (payload or {}).get("limit", 8)
+    try:
+        limit = int((payload or {}).get("limit", 8))
+    except Exception:
+        limit = 8
+    # Cap to the 4-8 window.
+    limit = max(4, min(8, limit))
     try:
         # Read the schema mapping directly (no slow agent initialization) so
         # suggestions work instantly regardless of database size.
@@ -240,60 +340,91 @@ def get_suggestions(request: Request, payload: dict | None = None, user: dict = 
                 schema_data = json.load(f)
         tables = list(schema_data.get("tables", {}).keys()) if schema_data else []
         if not tables:
-            # If schema file missing or empty, return intelligent generic
-            # suggestions based on common business-analytics patterns.
+            # No schema context: only plain-ask answerable generics. Trend /
+            # outlier / correlation / forecast / what-if need verified
+            # columns, drivers or history — never here.
             suggestions = [
                 "How many total records are in the data?",
-                "What is the total of the main numeric measure?",
                 "Which categories or segments appear most frequently?",
-                "How has the key metric changed over time?",
                 "What are the top items by value or quantity?",
                 "What is the average of the primary measure?",
-                "Are there any unusual patterns or outliers?",
                 "How is the main metric distributed across categories?",
+                "What is the total of the main numeric measure?",
             ][:limit]
         else:
             # Build suggestions from actual table/column names — fully dynamic.
-            from api.schema_intel import SchemaIntelligence
+            from api.schema_intel import SchemaIntelligence, _is_id_like
+            from core.analytical_result import natural_label as _nl, _plural as _pl
             intel = SchemaIntelligence(schema_data)
             suggestions = []
 
-            # Find best measure and dimension per table
-            for tname in intel.tables[:5]:
+            # Find best measure and dimension per table (natural English:
+            # labels are humanized and table names never surface in prose).
+            # A trend is only suggested when a real datetime column exists
+            # AND it holds data; a SUM is only suggested when the measure is
+            # verified numeric-with-data, else COUNT/records. ID-like
+            # dimensions are never suggested.
+            for tname in list(intel.tables)[:5]:
                 measure = intel.find_best_measure(tname)
+                if measure and not _suggestion_measure_ok(session, tname, measure):
+                    measure = None
                 dim = intel.find_best_dimension(tname)
+                if dim and _is_id_like(str(dim)):
+                    dim = None
+                dt = intel.find_best_datetime(tname)
+                if dt and not _suggestion_datetime_ok(session, tname, dt):
+                    dt = None
                 if measure:
-                    suggestions.append(f"What is the total {measure} in {tname}?")
+                    _ml = _nl(measure)
+                    if _ml.strip().lower() in ("total", "sum", "count", "value", "amount"):
+                        suggestions.append("What is the overall total value?")
+                    else:
+                        suggestions.append(f"What is the total {_ml}?")
+                else:
+                    suggestions.append("How many records are in the data?")
                 if dim:
-                    suggestions.append(f"Which {dim} has the most records in {tname}?")
-                if measure and intel.find_best_datetime(tname):
-                    suggestions.append(f"How has {measure} changed over time in {tname}?")
+                    suggestions.append(f"Which {_nl(dim)} has the most records?")
+                if measure and dt:
+                    suggestions.append(f"How has {_nl(measure)} changed over time?")
                 if measure and dim:
-                    suggestions.append(f"What are the top {dim} by {measure} in {tname}?")
+                    suggestions.append(f"What are the top {_pl(_nl(dim))} by {_nl(measure)}?")
 
-            # Add generic analytical patterns if we need more
+            # Pad with answerable patterns only if we need more (never
+            # outlier / correlation / forecast / what-if / data-quality).
             generic = [
-                "Are there any outliers or unusual patterns?",
-                "What is the overall data quality?",
-                "Which tables have the most records?",
-                "What relationships exist between tables?",
+                "How many records are in the data?",
+                "Which categories appear most frequently?",
+                "What are the top items by value?",
             ]
             for g in generic:
-                if len(suggestions) < limit:
+                if len(suggestions) < limit and g not in suggestions:
                     suggestions.append(g)
 
             suggestions = suggestions[:limit]
     except Exception:
         suggestions = [
             "How many total records are in the data?",
-            "What is the total of the main numeric measure?",
             "Which categories or segments appear most frequently?",
-            "How has the key metric changed over time?",
             "What are the top items by value or quantity?",
             "What is the average of the primary measure?",
-            "Are there any unusual patterns or outliers?",
             "How is the main metric distributed across categories?",
+            "What is the total of the main numeric measure?",
         ][:limit]
+
+    # Defensive filter + dedupe (keeps business wording, drops any blocked
+    # pattern that slipped in from older templates).
+    suggestions = [s for s in suggestions if not _is_blocked_suggestion(s)]
+    suggestions = list(dict.fromkeys(suggestions))[:limit]
+    # Guarantee the 4-8 window when the schema yielded too few: pad with
+    # honest answerable generics rather than returning 1-2 items.
+    if len(suggestions) < 4:
+        for _pad in ("How many records are in the data?",
+                     "Which categories appear most frequently?",
+                     "What are the top items by value?"):
+            if _pad not in suggestions:
+                suggestions.append(_pad)
+            if len(suggestions) >= 4:
+                break
 
     # ── Preference-aware ranking ───────────────────────────────────────
     # Boost suggestions similar to previously clicked ones.
@@ -336,6 +467,13 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     """
     session = get_session(user["user_id"])
     provider = require_data(request)
+    # Fail fast: never query the wrong DB. A relational session without a
+    # rebuilt db_uri (undecryptable/missing credentials) must reconnect.
+    if session.get("source_type") == "relational" and not session.get("db_uri"):
+        raise HTTPException(
+            status_code=400,
+            detail="No database connection in session — reconnect first",
+        )
     # P3 §31: structured pipeline log (internal only, never returned).
     import time as _t0
     import uuid as _uuid
@@ -351,9 +489,83 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     # Retrieve conversation history from session
     conv_history = session.get("conversation_history", [])
 
-    # Build goal with multi-turn context
+    # DEFECT 1: pure conversational inputs (greetings, thanks, bye, help,
+    # 'who are you', empty) must NEVER inherit multi-turn history (which
+    # turned 'hi' into a data answer) and must NEVER hit validate_goal_text
+    # (which 400s single-word inputs). Detect on the CURRENT question only,
+    # schema-agnostic, before any history augmentation or validation.
+    def _is_conversational_text(_t):
+        import re as _re2
+        try:
+            _cur = str(_t or "")
+            _m = _re2.search(r"current question\s*:\s*(.+)$", _cur,
+                             _re2.IGNORECASE | _re2.DOTALL)
+            if _m and _m.group(1).strip():
+                _cur = _m.group(1).strip()
+            _low = _cur.strip().lower()
+            if not _low or not _re2.search(r"[a-z]", _low):
+                return True
+            _norm = _re2.sub(r"[^a-z ]+", " ", _low)
+            _norm = _re2.sub(r"\s+", " ", _norm).strip()
+            if not _norm:
+                return True
+            _words = _norm.split()
+            if len(_words) > 8:
+                return False
+            _hints = ("total", "sum", "count", "average", "avg", "revenue",
+                      "sales", "profit", "quantity", "amount", "value",
+                      "price", "cost", "trend", "monthly", "growth",
+                      "decline", "decrease", "increase", "change", "drop",
+                      "fall", "top", "compare", "distribution", "breakdown",
+                      "share", "month", "year", "over time", "how many",
+                      "number of")
+            _stripped = _re2.sub(
+                r"^(hi+|hello|helo|heloo|hey|yo|howdy|greetings|good\s+"
+                r"(morning|afternoon|evening))[\s,!\.]*", "", _norm).strip()
+            if _stripped and _stripped != _norm and any(
+                    h in f" {_stripped} " for h in _hints):
+                return False
+            if any(h in f" {_norm} " for h in _hints) and _norm not in (
+                    "hi", "hello", "hey", "thanks", "thank you",
+                    "thankyou", "thx"):
+                return False
+            if _norm in ("hi", "hii", "hiii", "hello", "helo", "heloo",
+                         "hey", "yo", "howdy", "greetings", "hi there",
+                         "hello there", "hey there", "hi aria",
+                         "hello aria", "hey aria", "thanks", "thank you",
+                         "thankyou", "thx", "ty", "thanks a lot",
+                         "thank you so much", "thank you very much",
+                         "many thanks", "bye", "goodbye", "good bye",
+                         "see you", "see you soon", "cya", "farewell",
+                         "help", "help me", "help please", "i need help",
+                         "what can you do", "what can u do",
+                         "what do you do", "how does this work",
+                         "how do i use this", "how do i use", "how to use",
+                         "guide", "guide me", "show help", "ok", "okay",
+                         "k", "got it", "gotit", "cool", "nice", "great",
+                         "perfect", "sure", "yes", "yeah", "yep", "fine",
+                         "sounds good", "?", "hi?", "hello?", "hey?"):
+                return True
+            if _re2.search(r"\b(who are you|what are you|your name|about you|"
+                           r"who is aria|what is aria|introduce yourself)\b",
+                           _norm) and len(_words) <= 8:
+                return True
+            if _re2.fullmatch(
+                    r"(good\s+morning|good\s+afternoon|good\s+evening)"
+                    r"(\s+aria)?", _norm):
+                return True
+            return False
+        except Exception:
+            return False
+
+    _is_convo = _is_conversational_text(req.goal)
+
+    # Build goal with multi-turn context (conversational turns skip history
+    # so 'hi' never inherits previous tables).
     full_goal = req.goal
-    if req.previous_goal and req.previous_result:
+    if _is_convo:
+        full_goal = str(req.goal or "")
+    elif req.previous_goal and req.previous_result:
         prev_data = req.previous_result.get("data", [])
         prev_cols = req.previous_result.get("columns", [])
         prev_tables = req.previous_result.get("data_selection", {}).get("tables", [])
@@ -373,7 +585,10 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
                 context_parts.append(f"Tables: {', '.join(turn['tables'][:3])}")
         full_goal = "Conversation context:\n" + "\n".join(context_parts) + f"\nCurrent question: {req.goal}"
 
-    goal = validate_goal_text(full_goal)
+    if _is_convo:
+        goal = str(full_goal or "").strip()
+    else:
+        goal = validate_goal_text(full_goal)
     # Explicit-intent-wins (§12): a fresh COUNT/ranking-of-records question
     # must not inherit measures from previous turns ("most readings" means
     # COUNT, even after discussing averages). Only when no measure word is
@@ -418,6 +633,10 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             agent._active_session_id = str(user.get("user_id", ""))
             agent._active_dataset_id = str(session.get("db_name", "") or Path(str(session.get("schema_path", ""))).stem)
             agent._provider_name = session.get("provider_name", provider)
+            # Multi-turn isolation: the raw current question tells the agent
+            # exactly which line of full_goal is current, so history keywords
+            # (e.g. a previous turn's 'average') never poison this turn's IR.
+            agent._active_current_question = str(req.goal or "").strip()
         except Exception:
             pass
         # Use a bounded execution so slow LLM calls never hang the endpoint.
@@ -481,7 +700,97 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         }
     processed = json.loads(session["processed_path"].read_text(encoding="utf-8"))
     processed = sanitize_json(processed)
+    # DEFECT 1 passthrough: status=conversation flows untouched — message +
+    # suggestions, empty data, no SQL, no fallback, no analytical rewrite.
+    if str(processed.get("status") or "") == "conversation":
+        try:
+            _conv_sugg = list(processed.get("suggested_questions", []) or [])[:8]
+        except Exception:
+            _conv_sugg = []
+        try:
+            conv_history.append({
+                "goal": req.goal,
+                "tables": [],
+                "columns": [],
+                "sql": None,
+                "row_count": 0,
+                "timestamp": datetime.now().isoformat(),
+            })
+            session["conversation_history"] = conv_history[-10:]
+            save_session(user["user_id"], session)
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "provider": session.get("provider_name", provider),
+            "status": "conversation",
+            "message": processed.get("message") or processed.get("question") or "",
+            "question": processed.get("question") or processed.get("message") or "",
+            "data": [],
+            "columns": [],
+            "row_count": 0,
+            "sql_used": None,
+            "suggested_questions": _conv_sugg,
+            "suggestedQuestions": _conv_sugg,
+            "follow_up_questions": _conv_sugg,
+            "conversation_id": conv_id,
+            "turn_number": len(conv_history),
+            "warnings": [],
+        }
     columns = list(processed.get("data", [{}])[0].keys()) if processed.get("data") else []
+
+    # ── Deterministic fallback: never return empty when the schema can answer.
+    # Vague/business questions ("electronics sales down", "compare segments")
+    # used to end as query_failed with no graph. If the agent left no rows,
+    # run a simple top-breakdown so the UI always has numbers + chart + 360.
+    try:
+        _needs_fb = (not processed.get("data")) or (processed.get("status") == "query_failed")
+        if _needs_fb:
+            from api.schema_intel import SchemaIntelligence as _SI
+            _sp = Path(str(session.get("schema_path", "")))
+            if _sp.exists():
+                _sdata = json.loads(_sp.read_text(encoding="utf-8"))
+                _intel_fb = _SI(_sdata)
+                _tables = list((_sdata.get("tables", {}) or {}).keys())
+                _fb_done = False
+                for _t in _tables[:5]:
+                    if _fb_done:
+                        break
+                    try:
+                        _m = _intel_fb.find_best_measure(_t)
+                        _d = _intel_fb.find_best_dimension(_t)
+                        if not _m:
+                            continue
+                        from sqlalchemy import create_engine as _mk_fb, text as _txt_fb
+                        _eng_fb = _mk_fb(session["db_uri"])
+                        try:
+                            with _eng_fb.connect() as _conn:
+                                if _d:
+                                    _sql_fb = f'SELECT "{_d}" AS seg, SUM("{_m}") AS val FROM "{_t}" GROUP BY "{_d}" ORDER BY val DESC LIMIT 10'
+                                else:
+                                    _sql_fb = f'SELECT SUM("{_m}") AS val FROM "{_t}"'
+                                _rows_fb = [dict(r._mapping) for r in _conn.execute(_txt_fb(_sql_fb))]
+                            if _rows_fb:
+                                processed["data"] = _rows_fb
+                                processed["row_count"] = len(_rows_fb)
+                                columns = list(_rows_fb[0].keys())
+                                processed["sql_used"] = _sql_fb
+                                processed["status"] = "success"
+                                processed["message"] = (
+                                    f"Showing the top breakdown of {_m} "
+                                    f"{'by ' + _d if _d else ''} from {_t} "
+                                    f"(fallback when the exact question could not be parsed)."
+                                )
+                                _fb_done = True
+                        finally:
+                            try:
+                                _eng_fb.dispose()
+                            except Exception:
+                                pass
+                    except Exception:
+                        continue
+    except Exception:
+        pass
 
     # ── Analytical validation / repair / answer synthesis (spec §5-§11) ──
     analysis = analyze_result(
@@ -574,31 +883,49 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     }
 
     # ── Enhanced follow-up suggestions ─────────────────────────────────
-    base_suggestions = processed.get("suggested_questions", []) or []
+    # Humanized labels only: raw column/table identifiers never surface in
+    # user-facing suggestion prose. Every suggestion must be answerable as a
+    # plain ask: verified measures/datetimes only, never ID-like segments,
+    # never outlier / correlation / forecast / what-if (those need
+    # drivers/history and live on their own tabs).
+    from core.analytical_result import natural_label as _nl
+    base_suggestions = [s for s in (processed.get("suggested_questions", []) or [])
+                        if s and not _is_blocked_suggestion(str(s))]
     proactive_suggestions = []
     if result_data and columns:
         first_row = result_data[0] if result_data else {}
         num_cols = []
         cat_cols = []
         for c in columns:
+            # Raw SQL expressions (SUM(x), COUNT(*)) and keys are data
+            # plumbing, never suggestion prose. ID-like columns (any
+            # separator: order_id, "Order ID") are never suggested as
+            # measures or breakdowns.
+            if "(" in str(c) or "*" in str(c):
+                continue
+            try:
+                from api.schema_intel import _is_id_like as _id_like
+                if _id_like(str(c)):
+                    continue
+            except Exception:
+                if str(c).lower() == "id" or str(c).lower().endswith("_id"):
+                    continue
             v = first_row.get(c) if isinstance(first_row, dict) else None
             if isinstance(v, (int, float)):
                 num_cols.append(c)
-            elif v and not c.lower().endswith("_id"):
+            elif v:
                 cat_cols.append(c)
         if num_cols:
-            proactive_suggestions.append(f"What is the average {num_cols[0]}?")
-            proactive_suggestions.append(f"What is the distribution of {num_cols[0]}?")
+            proactive_suggestions.append(f"What is the average {_nl(num_cols[0])}?")
+            proactive_suggestions.append(f"How is {_nl(num_cols[0])} distributed?")
         if cat_cols and num_cols:
-            proactive_suggestions.append(f"Show {num_cols[0]} by {cat_cols[0]}")
-            proactive_suggestions.append(f"Which {cat_cols[0]} has the highest {num_cols[0]}?")
-        if len(num_cols) >= 2:
-            proactive_suggestions.append(f"Is there a correlation between {num_cols[0]} and {num_cols[1]}?")
+            proactive_suggestions.append(f"Show {_nl(num_cols[0])} by {_nl(cat_cols[0])}")
+            proactive_suggestions.append(f"Which {_nl(cat_cols[0])} has the highest {_nl(num_cols[0])}?")
     # Schema-derived fallback suggestions (spec §21): built from the actual
     # connected schema, never a static generic list.
     general_suggestions = []
     try:
-        from api.schema_intel import SchemaIntelligence
+        from api.schema_intel import SchemaIntelligence, _is_id_like as _id_like2
 
         _schema_path = Path(str(session.get("schema_path", "")))
         if _schema_path.exists():
@@ -607,15 +934,27 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             _intel = SchemaIntelligence(_schema_data)
             for _t in list(_intel.tables.keys())[:3]:
                 _m = _intel.find_best_measure(_t)
+                if _m and not _suggestion_measure_ok(session, _t, _m):
+                    _m = None
                 _d = _intel.find_best_dimension(_t)
+                if _d and _id_like2(str(_d)):
+                    _d = None
                 _dt = _intel.find_best_datetime(_t)
+                if _dt and not _suggestion_datetime_ok(session, _t, _dt):
+                    _dt = None
                 if _m and _d:
-                    general_suggestions.append(f"Show {_m} breakdown by {_d}")
-                    general_suggestions.append(f"Which {_d} has the highest {_m}?")
+                    general_suggestions.append(f"Show {_nl(_m)} breakdown by {_nl(_d)}")
+                    general_suggestions.append(f"Which {_nl(_d)} has the highest {_nl(_m)}?")
                 elif _m:
-                    general_suggestions.append(f"What is the total {_m}?")
+                    _ml2 = _nl(_m)
+                    if _ml2.strip().lower() in ("total", "sum", "count", "value", "amount"):
+                        general_suggestions.append("What is the overall total value?")
+                    else:
+                        general_suggestions.append(f"What is the total {_ml2}?")
+                else:
+                    general_suggestions.append("How many records are in the data?")
                 if _m and _dt:
-                    general_suggestions.append(f"How has {_m} changed over time?")
+                    general_suggestions.append(f"How has {_nl(_m)} changed over time?")
                 if len(general_suggestions) >= 6:
                     break
     except Exception as exc:
@@ -623,7 +962,9 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     if not general_suggestions:
         # No schema context at all: say so honestly instead of inventing specifics.
         general_suggestions = ["What data is currently connected?"]
-    all_suggestions = list(dict.fromkeys(base_suggestions + proactive_suggestions + general_suggestions))[:8]
+    all_suggestions = list(dict.fromkeys(
+        [s for s in (base_suggestions + proactive_suggestions + general_suggestions)
+         if s and not _is_blocked_suggestion(str(s))]))[:8]
 
     # ── Preference-aware follow-up ranking ──────────────────────────────
     try:
@@ -837,10 +1178,44 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
                     "confidence": "low",
                     "drivers": [],
                 }
-        _follow = _followups(req.goal, _primary, _metric_label, _dims,
-                             _cmp.get("granularity", ""), _drivers_list)
+        _follow_dims = []
+        try:
+            from api.schema_intel import _is_id_like as _env_id_like
+            for d in _dims:
+                if "(" in str(d) or "*" in str(d):
+                    continue
+                if _env_id_like(str(d)):
+                    continue
+                _follow_dims.append(d)
+        except Exception:
+            _follow_dims = [d for d in _dims
+                            if "(" not in str(d) and "*" not in str(d)][:4]
+        _follow_dims = _follow_dims[:4]
+        # Trend follow-ups only when a real datetime column with data exists.
+        _has_dt = False
+        try:
+            from api.schema_intel import SchemaIntelligence as _SI_env
+            _sp_env = Path(str(session.get("schema_path", "")))
+            if _sp_env.exists():
+                _sd_env = json.loads(_sp_env.read_text(encoding="utf-8"))
+                _intel_env = _SI_env(_sd_env)
+                for _et in (_tables_used or list(_intel_env.tables.keys())[:1]):
+                    _cand_dt = _intel_env.find_best_datetime(_et)
+                    if _cand_dt and _suggestion_datetime_ok(session, _et, _cand_dt):
+                        _has_dt = True
+                        break
+        except Exception:
+            _has_dt = False
+        _follow = _followups(req.goal, _primary, _metric_label,
+                             _follow_dims,
+                             _cmp.get("granularity", ""), _drivers_list,
+                             has_datetime=_has_dt)
         # Merge result-derived follow-ups first, keep backend suggestions.
-        _merged_follow = list(dict.fromkeys(_follow + list(all_suggestions or [])))[:8]
+        # Blocked patterns (outlier/correlation/forecast/what-if) never
+        # surface as plain ask questions; dedupe + cap 4-8.
+        _merged_follow = list(dict.fromkeys(
+            [s for s in (list(_follow) + list(all_suggestions or []))
+             if s and not _is_blocked_suggestion(str(s))]))[:8]
         _clar = bool(processed.get("status") == "needs_clarification"
                      or "clarification" in str(processed.get("status", "")))
         _rstatus = _decide(valid=bool(analysis.get("valid", True)),
@@ -895,9 +1270,54 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             "result_message": ("Partial result: extended analytics metadata "
                                "was unavailable. Core findings above are intact."),
         }
+    # ── Business 360 (non-technical 360° view: what + why + what-to-do) ──
+    # Best-effort, never fatal. Powers the AI Analytics inline card.
+    _b360 = None
+    try:
+        from services.business_360 import build_business360 as _build360
+        _rx_for_360 = None
+        try:
+            _tables_360 = list(tables_used or []) or list(
+                (processed.get("data_selection", {}) or {}).get("tables", []) or [])
+            _t360 = _tables_360[0] if _tables_360 else None
+            if _t360 and _metric_col:
+                from sqlalchemy import create_engine as _mk360
+                from api.schema_intel import SchemaIntelligence as _SI360
+                _sp360 = Path(str(session.get("schema_path", "")))
+                if _sp360.exists():
+                    _sd360 = json.loads(_sp360.read_text(encoding="utf-8"))
+                    _eng360 = _mk360(session["db_uri"])
+                    try:
+                        from prescription_engine.engine import analyze as _rx_analyze
+                        _rx_for_360 = _rx_analyze(
+                            _eng360, session.get("dialect", "postgresql"),
+                            _SI360(_sd360), _t360, _metric_col,
+                            question=req.goal)
+                    finally:
+                        try:
+                            _eng360.dispose()
+                        except Exception:
+                            pass
+        except Exception:
+            _rx_for_360 = None
+        _b360 = _build360(
+            question=req.goal,
+            result_data=result_data,
+            columns=columns,
+            metric_label=_analytics_envelope.get("metric") if "_analytics_envelope" in dir() else None,
+            metric_col=_metric_col if "_metric_col" in dir() else None,
+            dims=_dims if "_dims" in dir() else [],
+            drivers=_drivers_list if "_drivers_list" in dir() else [],
+            hypothesis=_hypothesis if "_hypothesis" in dir() else None,
+            prescription=_rx_for_360,
+            chart_spec=chart_spec,
+        )
+    except Exception:
+        _b360 = None
     return {
         "ok": True,
         "provider": session["provider_name"],
+        "business360": _b360,
         "status": processed.get("status", "success"),
         "question": processed.get("question"),
         "user_goal": processed.get("user_goal"),

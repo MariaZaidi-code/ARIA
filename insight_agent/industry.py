@@ -26,6 +26,7 @@ class IndustryInsightAgent(AdvancedInsightAgent):
     """ARIA Insight Agent with evidence-backed decision intelligence."""
 
     VERSION = "3.0"
+    ANOMALY_METHOD = "iqr"
 
     def __init__(self, provider=None):
         super().__init__(provider=provider)
@@ -59,6 +60,7 @@ class IndustryInsightAgent(AdvancedInsightAgent):
             )
 
             insights["analysis_version"] = self.VERSION
+            insights["anomaly_method"] = self.ANOMALY_METHOD
             insights["decision_intelligence"] = decision
 
             # Expose the most useful decision fields at top-level as well so the

@@ -24,6 +24,50 @@ SAMPLE_LIMIT = 5000
 MIN_ABS_R = 0.30
 
 # --------------------------------------------------------------------------
+# AUDIT (FYP top-notch): which lever shapes produce scenario actions today,
+# and why the rest refuse. Decision recorded here where the gates live.
+#
+# SCENARIO actions require ALL of the following (thresholds UNCHANGED):
+#   1. Numeric driver: same-table numeric column, cross-table numeric over a
+#      declared FK edge, or the derived length_of_stay driver (2+ date cols).
+#      Text dims NEVER qualify — classify_driver() returns "segmentation" for
+#      non-numeric columns or segment-hint names (region/category/product/...),
+#      and analyze() skips non-numeric same-table candidates outright, so a
+#      field like ProductCategory can only ever seed investigate-type cards.
+#   2. Correlation gates: |r| >= MIN_ABS_R (0.30) AND p < 0.05 (Pearson, with
+#      a Spearman agreement backstop downstream). Weak correlations refuse
+#      with no_prescription naming the tested columns — association without
+#      strength is supporting evidence only, never an intervention.
+#   3. Controllability gate: classify_driver() level must be controllable /
+#      potentially_controllable. not_controllable / segmentation refuse (or
+#      fall back to investigate). Technical/system + identifier/FK/date roles
+#      (NON_LEVER_ROLES) refuse even earlier via semantic-role validation.
+#   4. Justified direction: improvement_up() must establish whether higher or
+#      lower metric values are better (recognized outcome semantics, else an
+#      EXPLICIT recorded assumption with capped confidence). Unknown → refuse.
+#   5. Full actionability verdict: assess_actionability() 8-point check —
+#      correlation alone can never carry a lever.
+#   6. Non-degenerate data: driver mean/variance must be non-zero; |r| >= 0.999
+#      is rejected as a self-join/constant-column artifact.
+# Consequence: retail-style CSVs (one metric + one text dim, no numeric
+# lever) ALWAYS refuse scenarios — honest, but thin coverage for the FYP
+# demo. The segment-focus + monitor actions below broaden coverage WITHOUT
+# weakening honesty: each keeps its own evidence gates (share/gap/n and
+# momentum/points) plus an explicit honest note, and engine-level validation
+# drops anything that arrives with neither quantified impact nor note.
+# --------------------------------------------------------------------------
+MIN_REL_PCT_ALIAS = None  # (real floors live with quality_gate below)
+SEGMENT_FOCUS_MIN_SHARE = 0.30   # dominant segment: top group holds >=30% of rows
+SEGMENT_FOCUS_MIN_GAP = 0.20     # large-gap segment: top-vs-median mean gap >=20%
+SEGMENT_FOCUS_MIN_N = 10         # total usable observations floor (== MIN_N)
+SEGMENT_FOCUS_MIN_GROUP_N = 5    # per-group stability floor (matches investigate)
+MONITOR_MIN_POINTS = 6           # momentum needs >=6 ordered points
+MONITOR_MIN_MOMENTUM = 0.15      # |last-first|/mean >= 15% counts as strong
+HONEST_IMPACT_NOTE = ("Impact could not be reliably estimated from the available "
+                      "data — this card directs attention; it does not promise "
+                      "a sized outcome.")
+
+# --------------------------------------------------------------------------
 # Structured error codes (§29)
 # --------------------------------------------------------------------------
 CODE_NO_CONNECTION = "NO_CONNECTION"
@@ -422,24 +466,35 @@ def _spearman(x, y):
 
 
 def fit_relationship(x, y):
-    """OLS of y on x with slope SE, residual sigma, CIs. Returns None if unfit."""
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    n = len(x)
-    if n < MIN_N or float(x.std()) == 0 or float(y.std()) == 0:
+    """OLS of y on x with slope SE, residual sigma, CIs. Returns None if unfit.
+
+    Numerical failures (e.g. SVD non-convergence in polyfit on extreme
+    scales) also return None — "cannot model", never an exception — so
+    every caller degrades to its honest refusal path instead of a 500.
+    """
+    try:
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n = len(x)
+        if n < MIN_N or float(x.std()) == 0 or float(y.std()) == 0:
+            return None
+        r = float(np.corrcoef(x, y)[0, 1])
+        p = _pearson_p(r, n)
+        rs, ps = _spearman(x, y)
+        slope, intercept = (float(v) for v in np.polyfit(x, y, 1))
+    except Exception:
         return None
-    r = float(np.corrcoef(x, y)[0, 1])
-    p = _pearson_p(r, n)
-    rs, ps = _spearman(x, y)
-    slope, intercept = (float(v) for v in np.polyfit(x, y, 1))
-    pred = slope * x + intercept
-    resid = y - pred
-    sigma = float(resid.std(ddof=1)) if n > 2 else 0.0
-    sxx = float(np.sum((x - x.mean()) ** 2))
-    se_slope = sigma / math.sqrt(sxx) if sxx > 0 else 0.0
-    z = 0.5 * math.log((1 + r) / (1 - r)) if abs(r) < 1 else 0.0
-    se = 1.0 / math.sqrt(max(1, n - 3))
-    ci = [round(math.tanh(z - 1.96 * se), 3), round(math.tanh(z + 1.96 * se), 3)]
+    try:
+        pred = slope * x + intercept
+        resid = y - pred
+        sigma = float(resid.std(ddof=1)) if n > 2 else 0.0
+        sxx = float(np.sum((x - x.mean()) ** 2))
+        se_slope = sigma / math.sqrt(sxx) if sxx > 0 else 0.0
+        z = 0.5 * math.log((1 + r) / (1 - r)) if abs(r) < 1 else 0.0
+        se = 1.0 / math.sqrt(max(1, n - 3))
+        ci = [round(math.tanh(z - 1.96 * se), 3), round(math.tanh(z + 1.96 * se), 3)]
+    except Exception:
+        return None
     return {"n": n, "r": round(r, 3), "p_value": p,
             "spearman_r": round(rs, 3), "spearman_p": ps,
             "slope": slope, "intercept": intercept,
@@ -757,6 +812,12 @@ def dedupe_key(rec: dict) -> tuple:
     else:
         basis = "none"
     finding = rec.get("action_type") or rec.get("scenario_label") or ""
+    # Non-scenario cards are keyed by type+label so a segment-focus card and a
+    # plain investigate card on the same dimension stay distinct findings
+    # (ranked segment-focus > investigate). Scenario variants keep collapsing
+    # (ONE finding → ONE decision; variants travel inside scenario_options).
+    if str(finding or "").lower() != "scenario" and rec.get("scenario_label"):
+        finding = f"{finding}|{rec.get('scenario_label')}"
     _m = str(metric or "").lower().strip()
     _d = str(driver or "").lower().strip()
     _pair = tuple(sorted([_m, _d]))
@@ -1010,23 +1071,498 @@ def _investigate_cands(engine, dialect, intel, table, metric, m_h,
     return out[:2]
 
 
-def _investigate_response(inv, metric, table, m_h, priors):
-    """Completed response carrying only investigate prescriptions (no
-    scenarios exist, but real segment evidence does)."""
-    for i, c in enumerate(inv):
-        c["rank"] = i + 1
-    top = inv[0]
-    from core.semantic import humanize as _hh
-    story = (f"No adjustable driver for {m_h} cleared the evidence bar, but "
-             f"{m_h} differs meaningfully across {_hh(top['evidence']['driver'])} "
-             f"({top['evidence']['effect_gap_pct']:+.1f}% gap). "
-             f"Investigation is warranted before any intervention.")
-    # hyp.txt §10-11: investigate path carries real group evidence, so it
-    # must also carry a chart-ready spec (bar of group means). Never None
-    # when groups exist — _build_visual renders this without re-querying.
-    _viz = None
+def _segment_focus_cands(engine, dialect, intel, table, metric, m_h,
+                         review=None, review_basis=None):
+    """Segment-focus prescriptions: dominant / large-gap segments.
+
+    Evidence gates (honest, descriptive — never a modeled intervention):
+      * 2–12 groups, total n >= SEGMENT_FOCUS_MIN_N (10), top + median groups
+        each n >= SEGMENT_FOCUS_MIN_GROUP_N (5) for stability;
+      * FIRES when top-group row share >= 30% OR top-vs-median mean gap >= 20%.
+    The Kruskal p-value rides along as INFORMATION in evidence (when scipy
+    is present) but is NOT a firing gate: concentration (share of rows) is a
+    descriptive Pareto-style fact, not a mean-difference claim. No impact
+    numbers are invented — impact stays unquantified with an explicit
+    HONEST_IMPACT_NOTE, which the engine-level validator requires.
+    """
+    from core.semantic import humanize
+    out = []
+    for dim in intel.find_all_dimensions(table)[:3]:
+        try:
+            rows = _fetch_pairs(engine, dialect, table, dim, metric)
+        except Exception:
+            continue
+        groups = {}
+        for g, v in rows:
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            groups.setdefault(str(g), []).append(fv)
+        groups = {g: vs for g, vs in groups.items()
+                  if len(vs) >= SEGMENT_FOCUS_MIN_GROUP_N}
+        if not (2 <= len(groups) <= 12):
+            continue
+        n = sum(len(vs) for vs in groups.values())
+        if n < SEGMENT_FOCUS_MIN_N:
+            continue
+        means = {g: sum(vs) / len(vs) for g, vs in groups.items()}
+        overall = sum(sum(vs) for vs in groups.values()) / n if n else 0.0
+        ordered = sorted(groups, key=lambda g: means[g], reverse=True)
+        mean_top, median = ordered[0], ordered[len(ordered) // 2]
+        # Dominant segment = largest group BY ROW COUNT (Pareto concentration),
+        # not top-by-mean: a high-share group with an average mean still
+        # deserves review. The gap branch uses the top-by-mean group instead.
+        biggest = max(groups, key=lambda g: len(groups[g]))
+        share = len(groups[biggest]) / n if n else 0.0
+        gap = ((means[mean_top] - means[median]) / abs(overall)) if overall else 0.0
+        if not (share >= SEGMENT_FOCUS_MIN_SHARE
+                or abs(gap) >= SEGMENT_FOCUS_MIN_GAP):
+            continue
+        top = biggest if share >= SEGMENT_FOCUS_MIN_SHARE else mean_top
+        p = _kruskal_p([np.asarray(groups[g], dtype=float) for g in groups])
+        share_pct = round(share * 100, 1)
+        d_h = humanize(dim)
+        segs = sorted(((g, means[g], len(groups[g])) for g in groups),
+                      key=lambda t: t[1], reverse=True)[:6]
+        conf = ("high" if p is not None and p < 0.01 and n >= 50 else "moderate")
+        out.append({
+            "id": f"rxseg_{table}_{metric}_{dim}",
+            "rank": 0,
+            "title": f"Review {top} — {share_pct:g}% of {m_h}",
+            "summary": (f"{top} accounts for {share_pct:g}% of observed {m_h.lower()} rows "
+                        f"(averaging {means[top]:,.1f} vs a midpoint segment at "
+                        f"{means[median]:,.1f}, a {gap * 100:+.1f}% gap, n={n:,}). "
+                        f"This is observed concentration — association only, so review "
+                        f"what drives the segment before acting."),
+            "action_type": "investigate", "scenario_label": "segment-focus",
+            "decision_type": "insight",
+            "confidence": conf, "risk": "low",
+            "risk_reasons": ["No intervention is modeled — this only directs attention."],
+            "score": round(min(55.0, share * 100) + min(20.0, abs(gap) * 100)
+                           + min(10.0, n / 50), 1),
+            "score_breakdown": {"concentration": round(min(30.0, share * 100), 1),
+                                "observed_gap": round(min(20.0, abs(gap) * 100), 1),
+                                "data_quality": round(min(10.0, n / 50), 1)},
+            "evidence": {"metric": metric, "driver": dim, "table": table,
+                         "effect_gap_pct": round(gap * 100, 1),
+                         "share_pct": share_pct, "p_value": p, "n": n,
+                         "groups": [{"label": g, "mean": round(mn, 2), "n": cn}
+                                    for g, mn, cn in segs],
+                         "top": top, "median": median, "segment": None},
+            "success_metric": {"metric": metric,
+                               "direction": f"understand {top} concentration",
+                               "target_pct": None,
+                               "baseline": round(means[top], 2),
+                               "note": "No modeled target yet — set one once review names the driver."},
+            "review_period": review,
+            "review_basis": review_basis,
+            # Impact mirrors the OBSERVED top-vs-median gap (same precedent as
+            # investigate cards) — measured group means, labeled OBSERVED, NOT
+            # a modeled intervention effect. The honest note below carries the
+            # unestimable-intervention disclaimer, so no impact is invented.
+            "impact": {"baseline": round(means[median], 2),
+                       "scenario": round(means[top], 2),
+                       "delta": round(means[top] - means[median], 2),
+                       "rel_pct": round(gap * 100, 1),
+                       "range": [round(means[median], 2), round(means[top], 2)],
+                       "driver_pct": 0, "driver_value": None,
+                       "labels": {"baseline": "OBSERVED", "scenario": "OBSERVED"}},
+            "impact_note": HONEST_IMPACT_NOTE,
+            "assumptions": ["Groups observed as-is; mix and other factors not separated."],
+            "limitations": [
+                HONEST_IMPACT_NOTE,
+                f"Concentration computed over {n} rows; smaller groups "
+                f"({min(len(v) for v in groups.values())} rows) are noisier.",
+                "A concentration shows where to look — it does not say what to change.",
+                "Historical data shows an association; it does not establish causality.",
+            ],
+            "recommended_next_analysis": {
+                "type": "hypothesis",
+                "label": f"Test what drives {m_h} concentration in {top} ({d_h})."},
+        })
+    out.sort(key=lambda c: c["score"], reverse=True)
+    return out[:2]
+
+
+def _monitor_cands(engine, dialect, intel, table, metric, m_h,
+                   review=None, review_basis=None):
+    """Monitor prescriptions: strong trend momentum, no causal claim.
+
+    Evidence gates: >= MONITOR_MIN_POINTS (6) ordered points over a date-like
+    column with |last - first| / |mean| >= MONITOR_MIN_MOMENTUM (15%).
+    The card names metric + direction only ("Monitor Revenue — up 22% over 12
+    periods") and carries HONEST_IMPACT_NOTE instead of a sized impact, which
+    the engine-level validator requires. Never claims the movement will
+    continue or names a cause.
+    """
+    from core.semantic import humanize
+    dts = _date_like_cols(intel, table)[:1]
+    if not dts:
+        return []
     try:
-        _groups = top.get("evidence", {}).get("groups") or []
+        from api.schema_intel import _safe_name
+        rows = _exec(engine,
+                     f"SELECT {_safe_name(dts[0], dialect)}, {_safe_name(metric, dialect)} "
+                     f"FROM {_safe_name(table, dialect)} "
+                     f"WHERE {_safe_name(dts[0], dialect)} IS NOT NULL "
+                     f"AND {_safe_name(metric, dialect)} IS NOT NULL "
+                     f"LIMIT {int(SAMPLE_LIMIT)}")
+    except Exception:
+        return []
+    import pandas as pd
+    ts = pd.to_datetime([r[0] for r in rows], errors="coerce")
+    vals = pd.Series(pd.to_numeric([r[1] for r in rows], errors="coerce"))
+    ok = ts.notna() & vals.notna()
+    if int(ok.sum()) < MONITOR_MIN_POINTS:
+        return []
+    frame = pd.DataFrame({"t": ts[ok], "v": vals[ok]}).sort_values("t")
+    vs = frame["v"].to_numpy(dtype=float)
+    if len(vs) < MONITOR_MIN_POINTS:
+        return []
+    first, last = float(vs[0]), float(vs[-1])
+    mean = float(vs.mean()) if len(vs) else 0.0
+    if not mean:
+        return []
+    momentum = (last - first) / abs(mean)
+    if abs(momentum) < MONITOR_MIN_MOMENTUM:
+        return []
+    direction = "up" if momentum > 0 else "down"
+    pct = abs(momentum) * 100
+    n = len(vs)
+    conf = "moderate" if n >= 12 else "low"
+    _ = humanize  # (titles use m_h, passed in humanized)
+    return [{
+        "id": f"rxmon_{table}_{metric}",
+        "rank": 0,
+        "title": f"Monitor {m_h} — {direction} {pct:.0f}% over {n} periods",
+        "summary": (f"{m_h} moved {direction} {pct:.1f}% from {first:,.1f} to {last:,.1f} "
+                    f"across {n} ordered periods (mean {mean:,.1f}). This is an observed "
+                    f"movement only — no cause is established and continuation is not "
+                    f"promised, so keep watching before acting."),
+        "action_type": "monitor", "scenario_label": "monitor",
+        "decision_type": "insight",
+        "confidence": conf, "risk": "low",
+        "risk_reasons": ["No intervention is modeled — this only tracks momentum."],
+        "score": round(min(40.0, pct) + min(10.0, n / 10), 1),
+        "score_breakdown": {"momentum": round(min(30.0, pct), 1),
+                            "data_quality": round(min(10.0, n / 10), 1)},
+        "evidence": {"metric": metric, "table": table,
+                     "n_points": n, "n": n,
+                     "momentum_pct": round(momentum * 100, 1),
+                     "direction": direction,
+                     "first": round(first, 2), "last": round(last, 2),
+                     "mean": round(mean, 2), "segment": None},
+        "success_metric": {"metric": metric,
+                           "direction": f"confirm whether the {direction}ward movement persists",
+                           "target_pct": None,
+                           "baseline": round(last, 2),
+                           "note": "Watch-list only — set a target once a driver is established."},
+        "review_period": review,
+        "review_basis": review_basis,
+        "impact": {"baseline": round(last, 2), "scenario": None, "delta": None,
+                   "rel_pct": None, "range": [None, None],
+                   "driver_pct": None, "driver_value": None,
+                   "labels": {"baseline": "OBSERVED", "scenario": "NOT MODELED"}},
+        "impact_note": HONEST_IMPACT_NOTE,
+        "assumptions": ["Ordered by the data's own date column; sampling is as-stored."],
+        "limitations": [
+            HONEST_IMPACT_NOTE,
+            f"Momentum computed over {n} ordered points — short histories are noisy.",
+            "A movement shows what happened, not why, and not what happens next.",
+        ],
+        "recommended_next_analysis": {
+            "type": "hypothesis",
+            "label": f"Test what is associated with the {direction}ward movement in {m_h}."},
+    }]
+
+
+_HONEST_NOTE_MARKERS = ("could not be reliably estimated", "not modeled",
+                         "no causal claim", "association only",
+                         "does not promise", "not a promise")
+
+
+def _monthly_buckets(engine, dialect, intel, table, metric):
+    """Monthly (year, month) -> total for metric, dialect-free via pandas.
+
+    Returns ([(y, m, total)], date_col) or ([], None). Buckets with zero
+    rows are omitted (never fabricated); caller decides sufficiency.
+    """
+    dts = _date_like_cols(intel, table)[:1]
+    if not dts:
+        return [], None
+    try:
+        from api.schema_intel import _safe_name
+        rows = _exec(engine,
+                     f"SELECT {_safe_name(dts[0], dialect)}, {_safe_name(metric, dialect)} "
+                     f"FROM {_safe_name(table, dialect)} "
+                     f"WHERE {_safe_name(dts[0], dialect)} IS NOT NULL "
+                     f"AND {_safe_name(metric, dialect)} IS NOT NULL "
+                     f"LIMIT {int(SAMPLE_LIMIT)}")
+    except Exception:
+        return [], None
+    import pandas as pd
+    ts = pd.to_datetime([r[0] for r in rows], errors="coerce")
+    vals = pd.Series(pd.to_numeric([r[1] for r in rows], errors="coerce"))
+    ok = ts.notna() & vals.notna()
+    if int(ok.sum()) < MIN_N:
+        return [], dts[0]
+    frame = pd.DataFrame({"t": ts[ok], "v": vals[ok]})
+    frame["ym"] = frame["t"].dt.to_period("M")
+    sums = frame.groupby("ym")["v"].sum().sort_index()
+    return [(_p.year, _p.month, float(_v)) for _p, _v in sums.items()], dts[0]
+
+
+def inaction_cost(engine, dialect, intel, table, metric, m_h=None):
+    """Cost of doing nothing: project the recent monthly run-rate forward.
+
+    Uses least-squares slope over up to the last 6 monthly buckets. Returns
+    a dict with monthly_burn (positive = losing that much per month),
+    direction, months_observed, and an honest note. If the trend is flat/up
+    or history is short, monthly_burn is 0 with the reason stated — never
+    a scary invented number.
+    """
+    from core.semantic import humanize as _hh
+    m_h = m_h or _hh(metric)
+    buckets, dcol = _monthly_buckets(engine, dialect, intel, table, metric)
+    if len(buckets) < 3:
+        return {"ok": True, "metric": metric, "table": table,
+                "monthly_burn": 0.0, "direction": "unknown",
+                "months_observed": len(buckets),
+                "headline": f"Not enough monthly history to price inaction for {m_h.lower()}.",
+                "note": "Needs at least 3 months of dated records."}
+    import numpy as np
+    recent = buckets[-6:]
+    xs = np.arange(len(recent), dtype=float)
+    ys = np.array([b[2] for b in recent], dtype=float)
+    slope = float(np.polyfit(xs, ys, 1)[0]) if len(recent) >= 2 else 0.0
+    mean = float(ys.mean()) if len(ys) else 0.0
+    burn = round(-slope, 2) if slope < 0 else 0.0
+    direction = "down" if slope < 0 else ("up" if slope > 0 else "flat")
+    rel = abs(slope) / abs(mean) * 100 if mean else 0.0
+    if burn > 0:
+        headline = (f"If nothing changes, {m_h.lower()} is drifting down "
+                    f"about {burn:,.0f} per month on the recent run-rate.")
+    else:
+        headline = (f"No monthly bleed detected for {m_h.lower()} — "
+                    f"recent run-rate is {direction}.")
+    return {"ok": True, "metric": metric, "table": table,
+            "monthly_burn": burn, "monthly_slope": round(slope, 2),
+            "monthly_pct": round(rel, 1), "direction": direction,
+            "months_observed": len(buckets),
+            "window": {"from": f"{recent[0][0]}-{recent[0][1]:02d}",
+                       "to": f"{recent[-1][0]}-{recent[-1][1]:02d}"},
+            "headline": headline,
+            "display": {"action_text": headline,
+                        "outcome_text": (f"~{burn:,.0f}/month at stake" if burn > 0 else "No bleed detected"),
+                        "confidence_label": "Moderate confidence" if len(buckets) >= 6 else "Early signal",
+                        "why_summary": (f"Straight-line run-rate over the last {len(recent)} months. "
+                                        "Trend holding steady is assumed — a shift in the business breaks this.")},
+            "note": ("Straight-line projection of the recent monthly run-rate; "
+                     "assumes the current mix holds. Not a forecast.")}
+
+
+def detect_alerts(engine, dialect, intel, table, measures=None, max_alerts=5):
+    """Alerts that matter: latest month vs prior month per measure.
+
+    Threshold is data-driven: |change| must exceed max(2x stdev of past
+    month-to-month deltas, 5%). Returns list of {metric, headline,
+    change_pct, direction, severity, months_observed}. Empty list (not an
+    error) when nothing moved unusually.
+    """
+    from core.semantic import humanize as _hh
+    import numpy as np
+    measures = measures or _usable_measures(intel, table)[:6]
+    alerts = []
+    for metric in measures:
+        buckets, _ = _monthly_buckets(engine, dialect, intel, table, metric)
+        if len(buckets) < 4:
+            continue
+        vals = np.array([b[2] for b in buckets], dtype=float)
+        deltas = np.diff(vals)
+        prev = vals[-2]
+        if not prev:
+            continue
+        change = (vals[-1] - prev) / abs(prev) * 100
+        scale = float(np.std(deltas[:-1])) if len(deltas) > 1 else 0.0
+        thresh = max(2 * (scale / abs(prev) * 100 if prev else 0.0), 5.0)
+        if abs(change) < thresh:
+            continue
+        direction = "down" if change < 0 else "up"
+        m_h = _hh(metric)
+        ym = buckets[-1]
+        alerts.append({
+            "metric": metric, "table": table,
+            "headline": (f"{m_h} moved {direction} {abs(change):.0f}% in "
+                         f"{ym[0]}-{ym[1]:02d} vs the prior month."),
+            "change_pct": round(float(change), 1), "direction": direction,
+            "severity": "high" if abs(change) >= 2 * thresh else "watch",
+            "threshold_pct": round(float(thresh), 1),
+            "months_observed": len(buckets),
+            "display": {"action_text": f"Look at {m_h.lower()} this week.",
+                        "outcome_text": f"{abs(change):.0f}% {direction} month-on-month",
+                        "confidence_label": "Early signal",
+                        "why_summary": (f" latest month broke the usual month-to-month wobble "
+                                        f"(±{thresh:.0f}%). Worth a look, not proof of anything.")},
+        })
+    alerts.sort(key=lambda a: abs(a["change_pct"]), reverse=True)
+    return alerts[:max_alerts]
+
+
+def _validate_prescriptions(recs: list) -> tuple:
+    """Engine-level validation: every emitted prescription must carry
+    non-empty evidence AND (a quantified impact OR an explicit honest note).
+
+    Returns (kept, dropped_count). Anything failing is dropped — never
+    repaired with invented numbers — and the drop count rides in the
+    response diagnostics so honesty stays observable.
+    """
+    kept, dropped = [], 0
+    for r in (recs or []):
+        if not isinstance(r, dict):
+            dropped += 1
+            continue
+        ev = r.get("evidence")
+        if not isinstance(ev, dict) or not ev:
+            dropped += 1
+            continue
+        if not (ev.get("metric") or ev.get("document")):
+            dropped += 1
+            continue
+        imp = r.get("impact") if isinstance(r.get("impact"), dict) else {}
+        quantified = any(imp.get(k) is not None
+                         for k in ("baseline", "scenario", "delta", "rel_pct"))
+        hay = " ".join([
+            str(r.get("impact_note") or ""),
+            str((imp.get("note") if isinstance(imp, dict) else "") or ""),
+            *[str(x) for x in (r.get("limitations") or [])],
+            *[str(x) for x in (r.get("assumptions") or [])],
+        ]).lower()
+        honest = any(m in hay for m in _HONEST_NOTE_MARKERS)
+        if not (quantified or honest):
+            dropped += 1
+            continue
+        kept.append(r)
+    return kept, dropped
+
+
+def _rank_coverage(recs: list) -> list:
+    """Rank: scenario > segment-focus > monitor > investigate; score within
+    type. Segment-focus rides action_type 'investigate' with scenario_label
+    'segment-focus', so it is keyed on the label, not the type."""
+    def _tier(r):
+        r = r if isinstance(r, dict) else {}
+        if str(r.get("action_type") or "").lower() == "scenario":
+            return 0
+        if str(r.get("scenario_label") or "").lower() == "segment-focus":
+            return 1
+        if str(r.get("action_type") or "").lower() == "monitor":
+            return 2
+        return 3
+
+    def _score(r):
+        try:
+            return float((r or {}).get("priority_score", (r or {}).get("score", 0)) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return sorted(recs or [], key=lambda r: (_tier(r), -_score(r)))
+
+
+def _scenario_meta_for_fit(driver_used, fit, move):
+    """Backend-declared supported range for What-If sliders (never hardcoded).
+
+    The in-range pct edges come from THIS fit's observed driver range, capped
+    by the ±50% refusal boundary (safety rails, not findings). The frontend
+    slider must use scenario_meta.supported_pct — never a hardcoded ±30%.
+    """
+    try:
+        mean = abs(float(fit["x_mean"])) or 0.0
+    except (TypeError, ValueError, KeyError):
+        return None
+    if not mean:
+        return None
+    try:
+        up_edge = (float(fit["x_max"]) - float(fit["x_mean"])) / mean * 100
+        down_edge = (float(fit["x_mean"]) - float(fit["x_min"])) / mean * 100
+    except (TypeError, ValueError, KeyError):
+        return None
+    up_edge = max(0.0, min(50.0, up_edge if up_edge == up_edge else 0.0))
+    down_edge = max(0.0, min(50.0, down_edge if down_edge == down_edge else 0.0))
+    return {"driver": driver_used,
+            "supported_pct": {"min": -round(down_edge, 1),
+                              "max": round(up_edge, 1)},
+            "hard_limit_pct": 50,
+            "observed": {"min": fit["x_min"], "max": fit["x_max"],
+                         "mean": round(fit["x_mean"], 4)},
+            "improve_direction": "increase" if move > 0 else "decrease"}
+
+
+def _coverage_response(items, metric, table, m_h, priors, tested=None):
+    """Completed response with NO scenario decision (no adjustable driver
+    cleared the bar) but real segment-focus / monitor / investigate evidence.
+
+    Items are deduped, validated (evidence + quantified-impact-or-honest-note)
+    and capped at 5; the drop count rides in diagnostics. Refusal is preserved
+    when nothing survives validation — the caller falls back to
+    no_prescription.
+    """
+    pres = _rank_coverage(dedupe_prescriptions(items or []))
+    pres, dropped = _validate_prescriptions(pres)
+    pres = pres[:5]
+    # NOTE: display/details/refusal are attached downstream by analyze()
+    # via _finalize_output — nothing is attached here.
+    if not pres:
+        return {"ok": True, "success": True, "status": "no_prescription",
+                "reason": (f"No adjustable driver for {_disp(metric)} cleared the evidence bar, "
+                           f"and no segment or trend pattern met the attention gates either."),
+                "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "tested": [dict(t) for t in (tested or [])][:12],
+                "metric": metric, "table": table,
+                "diagnostics": {"dropped_invalid": dropped, "emitted": 0}}
+    for i, c in enumerate(pres):
+        c["rank"] = i + 1
+    top = pres[0]
+    from core.semantic import humanize as _hh
+    _top_ev = top.get("evidence", {}) if isinstance(top.get("evidence"), dict) else {}
+    _top_label = str(top.get("scenario_label") or "").lower()
+    if _top_label == "segment-focus":
+        story = (f"No adjustable driver for {m_h} cleared the evidence bar, but "
+                 f"{_top_ev.get('top')} holds {_top_ev.get('share_pct')}% of observed {m_h} rows. "
+                 f"Review is warranted before any intervention.")
+    elif str(top.get("action_type") or "").lower() == "monitor":
+        story = (f"No adjustable driver for {m_h} cleared the evidence bar, but "
+                 f"{m_h} shows strong momentum ({_top_ev.get('momentum_pct'):+.1f}% over "
+                 f"{_top_ev.get('n_points')} periods). "
+                 f"Monitoring is warranted before any intervention.")
+    else:
+        story = (f"No adjustable driver for {m_h} cleared the evidence bar, but "
+                 f"{m_h} differs meaningfully across {_hh(_top_ev.get('driver', ''))} "
+                 f"({_top_ev.get('effect_gap_pct', 0.0):+.1f}% gap). "
+                 f"Investigation is warranted before any intervention.")
+    _viz = _groups_bar_viz(top, m_h)
+    return {"ok": True, "success": True, "status": "completed",
+            "analysis_id": f"rxa_{table}_{metric}_coverage",
+            "metric": metric, "driver": _top_ev.get("driver"),
+            "table": table, "driver_table": table, "join": None, "join_ref": None,
+            "control": {"level": "investigation",
+                        "reason": "No intervention modeled — evidence directs attention."},
+            "auto_note": None, "fit": None, "evidence_viz": _viz,
+            "prescriptions": pres,
+            "scenario_meta": None,
+            "diagnostics": {"dropped_invalid": dropped,
+                            "emitted": len(pres),
+                            "tested": [dict(t) for t in (tested or [])][:12]},
+            "signals": {"supporting": 1,
+                        "priors_origin": (priors or {}).get("origin")},
+            "story": story,
+            "summary_plain": _plain_summary(m_h, _top_ev.get("driver") or m_h, None, top)}
+
+
+def _groups_bar_viz(top, m_h):
+    """Chart-ready bar spec from a prescription's group evidence (or None)."""
+    from core.semantic import humanize as _hh2
+    try:
+        _groups = (top.get("evidence", {}) or {}).get("groups") or []
         _rows = []
         for g in _groups:
             if not isinstance(g, dict):
@@ -1041,36 +1577,39 @@ def _investigate_response(inv, metric, table, m_h, priors):
                 continue
             _rows.append({"name": str(g.get("label")), "value": _val})
         if len(_rows) >= 2:
-            _title = f"{m_h} by {_hh(top['evidence']['driver'])}"
+            _drv = (top.get("evidence", {}) or {}).get("driver", "")
+            _title = f"{m_h} by {_hh2(_drv)}"
             try:
                 from api.insights_routes import _normalize_chart_spec as _norm
                 _spec = _norm("bar", _rows[:200], _title)
                 if isinstance(_spec, dict) and not _spec.get("unsupported") \
                         and not _spec.get("insufficient") and _spec.get("data"):
-                    _viz = {"type": "bar", "data": _spec["data"],
+                    return {"type": "bar", "data": _spec["data"],
                             "title": _spec.get("title") or _title,
                             "x": _spec.get("x") or "name",
                             "y": _spec.get("y") or "value"}
-                else:
-                    _viz = {"type": "bar", "data": _rows[:200],
-                            "title": _title, "x": "name", "y": "value"}
+                return {"type": "bar", "data": _rows[:200],
+                        "title": _title, "x": "name", "y": "value"}
             except Exception:
-                _viz = {"type": "bar", "data": _rows[:200],
+                return {"type": "bar", "data": _rows[:200],
                         "title": _title, "x": "name", "y": "value"}
     except (TypeError, ValueError):
-        _viz = None
-    return {"ok": True, "success": True, "status": "completed",
-            "analysis_id": f"rxa_{table}_{metric}_investigate",
-            "metric": metric, "driver": top["evidence"]["driver"],
-            "table": table, "driver_table": table, "join": None, "join_ref": None,
-            "control": {"level": "investigation",
-                        "reason": "No intervention modeled — evidence directs investigation."},
-            "auto_note": None, "fit": None, "evidence_viz": _viz,
-            "prescriptions": inv,
-            "signals": {"supporting": 1,
-                        "priors_origin": (priors or {}).get("origin")},
-            "story": story,
-            "summary_plain": _plain_summary(m_h, top["evidence"]["driver"], None, top)}
+        pass
+    return None
+
+
+def _investigate_response(inv, metric, table, m_h, priors):
+    """Completed response carrying only investigate prescriptions (no
+    scenarios exist, but real segment evidence does).
+
+    Thin wrapper over _coverage_response so investigate-only results share
+    the dedupe → validate → cap-5 → diagnostics pipeline; the analysis_id
+    keeps its legacy `_investigate` suffix.
+    """
+    out = _coverage_response(inv, metric, table, m_h, priors)
+    if out.get("status") == "completed":
+        out["analysis_id"] = f"rxa_{table}_{metric}_investigate"
+    return out
 
 
 def _date_like_cols(intel, table):
@@ -1198,6 +1737,14 @@ def _dynamic_limitations(fit, scen, targeted, driver_h):
 def _plain_summary(m_h, d_h, fit, rec, join_phrase=None):
     """Plain-English summary of the whole analysis — a normal person reads
     only this and understands what was tested, found, and recommended."""
+    if str(rec.get("action_type") or "").lower() == "monitor":
+        ev = rec.get("evidence", {}) if isinstance(rec.get("evidence"), dict) else {}
+        return (
+            f"We tracked {m_h.lower()} across {ev.get('n_points', 0)} ordered periods and found "
+            f"strong momentum ({ev.get('direction', '?')} {ev.get('momentum_pct', 0.0):+.1f}%). "
+            f"Our recommendation: {rec['title']}. This is an observed movement only — "
+            f"no cause is established, so keep watching before acting."
+        )
     if rec.get("action_type") == "investigate":
         ev = rec.get("evidence", {})
         gs = ev.get("groups", [])
@@ -1228,12 +1775,16 @@ def _plain_summary(m_h, d_h, fit, rec, join_phrase=None):
     )
 
 
-def analyze(engine, dialect, intel, table, metric, driver=None,
+
+def _analyze_core(engine, dialect, intel, table, metric, driver=None,
             dimensions=None, segment=None, question=None, priors=None):
     """Full prescription pipeline. Returns ranked prescriptions or a
     no_prescription refusal (§23) — never an invented action."""
     from core.semantic import humanize
     priors = priors or {}
+    # Diagnostic trail for the whole run (populated during candidate
+    # testing below; empty on early validation exits — still honest).
+    tested: list = []
 
     # 1) Validate metric (§34/§35: schema-discovered, never assumed).
     # hyp.txt §10-11: the metric must be a genuine business outcome,
@@ -1256,6 +1807,7 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                                    f"measurements into actionable recommendations. Association is evidence of "
                                    f"association, not evidence of an actionable driver."),
                         "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "tested": [dict(t) for t in tested][:12],
                         "metric": metric, "table": table}
         return _fail(CODE_INVALID_METRIC,
                      f"ARIA couldn't find a measurable '{metric}' in this data.",
@@ -1293,6 +1845,9 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                                f"moved as an intervention. Association is evidence of association, not evidence "
                                f"of an actionable driver."),
                     "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "tested": ([{"driver": driver, "verdict": "skipped",
+                             "note": f"{_disp(driver)} is a {_drole.lower().replace('_', ' ')} — categories and system fields cannot be adjusted as interventions."}]
+                           + [dict(t) for t in tested])[:12],
                     "metric": metric, "driver": driver, "table": table}
     neighbors = _edge_neighbors(intel, table)
     auto_note = None
@@ -1312,6 +1867,7 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                     "reason": (f"ARIA measured stay length against {_disp(metric)} but the link "
                                f"is too weak to justify an intervention."),
                     "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "tested": [dict(t) for t in tested][:12],
                     "metric": metric, "table": table}
         best, best_fit, best_xy, best_join = "length_of_stay", f, (nights, ys), None
         cands = []
@@ -1352,6 +1908,10 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                 cands.append((c, None))
     if driver != "length_of_stay":
         best, best_fit, best_xy, best_join = None, None, None, None
+    # Diagnostic trail: every candidate driver with its gate outcome.
+    # Attached to refusals (and completions) so the UI can show what was
+    # tested and why each item passed or failed — never a blank page.
+    tested: list = []
     tried_stay = False
     if not driver:
         # Derived stay-length driver: days between the first two date columns
@@ -1371,6 +1931,8 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
         if str(c).lower() == str(metric).lower():
             continue
         if join is None and _col_kind(intel, table, c) != "numeric":
+            tested.append({"driver": c, "verdict": "skipped",
+                           "note": "Text or category — it cannot be turned up or down, so it was not modeled."})
             continue
         try:
             if join is None:
@@ -1378,20 +1940,62 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
             else:
                 ot, sc, oc = join
                 rows = _fetch_joined(engine, dialect, table, metric, ot, c, sc, oc)
-            xs = [float(r[0]) for r in rows]
-            ys = [float(r[1]) for r in rows]
+            # TEXT-stored numerics (currency symbols, commas, percents)
+            # parse via the shared text-numeric parser; unparsable pairs
+            # are dropped instead of failing the whole driver.
+            try:
+                from core.text_numeric import try_parse_text_number as _tpn
+            except Exception:
+                _tpn = None
+            if _tpn is not None:
+                _pairs = [(_tpn(r[0]), _tpn(r[1])) for r in rows]
+                _pairs = [(x, y) for x, y in _pairs
+                          if x is not None and y is not None]
+                if not _pairs:
+                    raise ValueError("no parseable numeric pairs")
+                xs = [p[0] for p in _pairs]
+                ys = [p[1] for p in _pairs]
+            else:
+                xs = [float(r[0]) for r in rows]
+                ys = [float(r[1]) for r in rows]
         except (TypeError, ValueError):
+            tested.append({"driver": c, "verdict": "skipped",
+                           "note": "Values could not be read as numbers."})
             continue
         except Exception:
+            tested.append({"driver": c, "verdict": "skipped",
+                           "note": "Data could not be loaded for this driver."})
             continue
-        f = fit_relationship(xs, ys)
+        try:
+            f = fit_relationship(xs, ys)
+        except Exception:
+            # Numerical failure (e.g. SVD non-convergence on extreme
+            # scales) is a per-driver modeling miss, never a 500: the
+            # driver is rejected and the remaining candidates still run.
+            tested.append({"driver": c, "n": len(xs), "verdict": "rejected",
+                           "note": "Could not be modeled reliably on the observed values."})
+            continue
         # Perfect correlation is a self-join/constant-column artifact, not a
         # discovery (|r|>=0.999 cannot be a controllable lever).
         if f and abs(f["r"]) >= 0.999:
+            tested.append({"driver": c, "n": f.get("n"), "verdict": "rejected",
+                           "note": "Moves in lockstep with the metric — a self-match, not a lever."})
             continue
         if f and abs(f["r"]) >= MIN_ABS_R and f["p_value"] < 0.05:
             if best_fit is None or abs(f["r"]) > abs(best_fit["r"]):
                 best, best_fit, best_xy, best_join = c, f, (xs, ys), join
+        elif f:
+            _why = []
+            if abs(f["r"]) < MIN_ABS_R:
+                _why.append(f"link strength |r|={abs(f['r']):.2f} is below the {MIN_ABS_R:.2f} bar")
+            if f["p_value"] >= 0.05:
+                _why.append(f"not statistically solid (p={f['p_value']:.2f})")
+            tested.append({"driver": c, "n": f.get("n"),
+                           "r": round(float(f["r"]), 2), "verdict": "rejected",
+                           "note": "; ".join(_why) + f" — measured on {f.get('n', 0)} rows."})
+        else:
+            tested.append({"driver": c, "verdict": "rejected",
+                           "note": "Too few usable rows to test."})
     if best_fit is None:
         # No evidence-backed driver — refuse (§3/§23), don't invent.
         # Name exactly what was testable so the refusal is data-specific.
@@ -1412,11 +2016,17 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
         from core.semantic import humanize as _hz
         inv = _investigate_cands(engine, dialect, intel, table, metric, _hz(metric),
                                  review=review, review_basis=review_basis)
-        if inv:
-            return _investigate_response(inv, metric, table, _hz(metric), priors)
+        seg = _segment_focus_cands(engine, dialect, intel, table, metric, _hz(metric),
+                                   review=review, review_basis=review_basis)
+        mon = _monitor_cands(engine, dialect, intel, table, metric, _hz(metric),
+                             review=review, review_basis=review_basis)
+        if seg or mon or inv:
+            return _coverage_response(seg + mon + inv, metric, table,
+_hz(metric), priors, tested=tested)
         return {"ok": True, "success": True, "status": "no_prescription",
                 "reason": reason,
                 "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "tested": [dict(t) for t in tested][:12],
                 "metric": metric, "table": table}
     driver_used, fit = best, best_fit
     join_used = best_join
@@ -1438,13 +2048,19 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
         from core.semantic import humanize as _hg
         inv0 = _investigate_cands(engine, dialect, intel, table, metric, _hg(metric),
                                   review=review, review_basis=review_basis)
-        if inv0:
-            return _investigate_response(inv0, metric, table, _hg(metric), priors)
+        seg0 = _segment_focus_cands(engine, dialect, intel, table, metric, _hg(metric),
+                                    review=review, review_basis=review_basis)
+        mon0 = _monitor_cands(engine, dialect, intel, table, metric, _hg(metric),
+                              review=review, review_basis=review_basis)
+        if seg0 or mon0 or inv0:
+            return _coverage_response(seg0 + mon0 + inv0, metric, table,
+_hg(metric), priors, tested=tested)
         return {"ok": True, "success": True, "status": "no_prescription",
                 "reason": (f"ARIA found a {control_level} pattern involving {_disp(driver_used)}, "
                            f"but the available data does not contain a controllable factor that can be "
                            f"reliably evaluated as an intervention. {control_reason}"),
                 "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "tested": [dict(t) for t in tested][:12],
                 "metric": metric, "driver": driver_used, "table": table,
                 "evidence": {"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]}}
 
@@ -1459,6 +2075,7 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                            f"are desirable ({up_assump}). Without a justified direction, no actionable "
                            f"recommendation can be generated — the association stays supporting evidence only."),
                 "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "tested": [dict(t) for t in tested][:12],
                 "metric": metric, "driver": driver_used, "table": table,
                 "evidence": {"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]}}
     # Explicit fallback assumption (no recognized outcome semantics): the
@@ -1477,13 +2094,19 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
         from core.semantic import humanize as _hg2
         inv0b = _investigate_cands(engine, dialect, intel, table, metric, _hg2(metric),
                                    review=review, review_basis=review_basis)
-        if inv0b:
-            return _investigate_response(inv0b, metric, table, _hg2(metric), priors)
+        seg0b = _segment_focus_cands(engine, dialect, intel, table, metric, _hg2(metric),
+                                     review=review, review_basis=review_basis)
+        mon0b = _monitor_cands(engine, dialect, intel, table, metric, _hg2(metric),
+                               review=review, review_basis=review_basis)
+        if seg0b or mon0b or inv0b:
+            return _coverage_response(seg0b + mon0b + inv0b, metric, table,
+_hg2(metric), priors, tested=tested)
         return {"ok": True, "success": True, "status": "no_prescription",
                 "reason": (f"{_disp(driver_used)} does not clear the actionability bar "
                            f"({'; '.join(_gate['notes']) or 'unmet conditions'}). The association with "
                            f"{_disp(metric)} stays supporting evidence only."),
                 "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "tested": [dict(t) for t in tested][:12],
                 "metric": metric, "driver": driver_used, "table": table,
                 "evidence": {"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]}}
     # Move the driver so the metric improves: sign = +1 means increase driver.
@@ -1503,6 +2126,7 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                 "reason": (f"Cannot compute scenario: driver '{humanize(driver_used)}' "
                            f"has zero mean or zero variance in the observed data."),
                 "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                "tested": [dict(t) for t in tested][:12],
                 "metric": metric, "driver": driver_used, "table": table,
                 "evidence": {"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]}}
     _typical = abs(_xstd / _xmean * 100) if _xmean else 10.0
@@ -1656,14 +2280,30 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
          "in_historical_range": c["impact"]["in_historical_range"]}
         for c in cands_out[:3]
     ]
-    pres = [rec]
-    # Investigate-type follow-ons are different findings (different driver /
-    # basis), so they may accompany the decision — capped, ranked after it.
+    # Broadened coverage: the scenario decision leads; segment-focus, monitor
+    # and investigate follow-ons are different findings (different driver /
+    # basis), so they may accompany the decision. Rank scenario >
+    # segment-focus > monitor > investigate, dedupe model-layer duplicates,
+    # validate (drop anything without evidence + quantified-impact-or-note),
+    # cap 5. Scenario thresholds above are UNCHANGED — only the supporting
+    # cast is new, and every new card keeps evidence gates + honesty notes.
+    seg = _segment_focus_cands(engine, dialect, intel, table, metric, m_h,
+                               review=review, review_basis=review_basis)
+    mon = _monitor_cands(engine, dialect, intel, table, metric, m_h,
+                         review=review, review_basis=review_basis)
     inv = _investigate_cands(engine, dialect, intel, table, metric, m_h,
                              review=review, review_basis=review_basis)
-    for c in inv[:4]:
-        c["rank"] = len(pres) + 1
-        pres.append(c)
+    pres = _rank_coverage(dedupe_prescriptions([rec] + seg + mon + inv))
+    pres, _dropped = _validate_prescriptions(pres)
+    # NOTE: display/details/refusal are attached downstream by analyze()
+    # via _finalize_output — nothing is attached here.
+    # The scenario decision must survive validation — if it was dropped, its
+    # evidence was somehow unquantified, which cannot happen by construction;
+    # fall back to the scenario alone rather than an empty completed set.
+    if not any(str(p.get("action_type") or "").lower() == "scenario" for p in pres):
+        pres = _rank_coverage(dedupe_prescriptions([rec]))
+        _dropped = 0
+    pres = pres[:5]
     for i, c in enumerate(pres):
         c["rank"] = i + 1
 
@@ -1691,6 +2331,10 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
                             "trend": {"slope": round(fit["slope"], 4),
                                       "intercept": round(fit["intercept"], 3)}},
             "prescriptions": pres,
+            "scenario_meta": _scenario_meta_for_fit(driver_used, fit, move),
+            "diagnostics": {"dropped_invalid": _dropped,
+                            "emitted": len(pres),
+                            "tested": [dict(t) for t in tested][:12]},
            "signals": {"supporting": 1 + (1 if (priors.get("evidence")) else 0),
                        "priors_origin": priors.get("origin")},
            "story": story,
@@ -1698,7 +2342,7 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
     return out
 
 
-def run_scenario(engine, dialect, intel, table, metric, driver, changes, filt=None,
+def _run_scenario_core(engine, dialect, intel, table, metric, driver, changes, filt=None,
                  join=None):
     """Scenario engine (§27, hyp.txt §9): read-only recompute. changes=[{field, operation,
     value}], filt=(field, value) equals on a dimension. join=(other_table,
@@ -1757,12 +2401,25 @@ def run_scenario(engine, dialect, intel, table, metric, driver, changes, filt=No
             return _fail(CODE_SCENARIO_UNSUPPORTED,
                          "Segment filters with cross-table drivers aren't supported yet — run the overall scenario instead.")
         filt_t = (f, v)
+    def _to_floats(rows):
+        """Parse raw pairs, TEXT-numeric aware; drops unparsable pairs."""
+        try:
+            from core.text_numeric import try_parse_text_number as _tpn
+        except Exception:
+            _tpn = None
+        if _tpn is None:
+            return [float(r[0]) for r in rows], [float(r[1]) for r in rows]
+        pairs = [(_tpn(r[0]), _tpn(r[1])) for r in rows]
+        pairs = [(x, y) for x, y in pairs if x is not None and y is not None]
+        if not pairs:
+            raise ValueError("no parseable numeric pairs")
+        return [p[0] for p in pairs], [p[1] for p in pairs]
+
     try:
         if join is not None:
             ot, sc, oc = join
             rows = _fetch_joined(engine, dialect, table, metric, ot, driver, sc, oc)
-            xs = [float(r[0]) for r in rows]
-            ys = [float(r[1]) for r in rows]
+            xs, ys = _to_floats(rows)
         elif derived_stay:
             dts = _date_like_cols(intel, table)[:3]
             if len(dts) < 2:
@@ -1772,11 +2429,13 @@ def run_scenario(engine, dialect, intel, table, metric, driver, changes, filt=No
                 return _fail(CODE_INSUFFICIENT_DATA, "Not enough dated rows to model stay length.")
         else:
             rows = _fetch_pairs(engine, dialect, table, driver, metric, filt=filt_t)
-            xs = [float(r[0]) for r in rows]
-            ys = [float(r[1]) for r in rows]
+            xs, ys = _to_floats(rows)
     except (TypeError, ValueError):
         return _fail(CODE_MODEL_FAILED, "Scenario fields contain non-numeric values that can't be modeled.")
-    fit = fit_relationship(xs, ys)
+    try:
+        fit = fit_relationship(xs, ys)
+    except Exception:
+        return _fail(CODE_MODEL_FAILED, "Scenario fields could not be modeled reliably.")
     if fit is None:
         return _fail(CODE_INSUFFICIENT_DATA,
                      f"Only {len(xs)} usable observations — at least {MIN_N} are needed to model a scenario.")
@@ -1852,7 +2511,7 @@ def _doc_title(chunk):
     return (head[:87] + "…") if len(head) > 90 else (head or "Untitled finding")
 
 
-def analyze_document(chunks, question, doc_name):
+def _analyze_document_core(chunks, question, doc_name):
     """Qualitative prescriptions from document passages (§6).
 
     Retrieval-free inside: chunks are pre-scored by the caller or scored
@@ -2024,3 +2683,641 @@ def scenario_supported_range(impact: dict | None):
     if lo is None or hi is None:
         return None
     return {"min": lo, "max": hi, "mean": mean}
+
+
+# ---------------------------------------------------------------------------
+# Display-safe contract (DYNAMIC ONLY): every prescription carries display{}
+# + details{} built from the live evidence — no table/column/database names
+# in this logic, no hardcoded levers. All names flow through
+# core.semantic humanize/display_name; all numbers through the money-aware
+# rounders below (percent 0-1dp, money $K/M, counts integer, never >2dp).
+# Additive: existing keys are never removed here — the routes layer strips
+# internals and the frontend migrates to display/details.
+# ---------------------------------------------------------------------------
+try:
+    from core.semantic import humanize as _sem_humanize
+    from core.semantic import display_name as _sem_display
+    from core.semantic import classify_semantic_type as _sem_type
+except Exception:  # pragma: no cover - helper fallback, never blocks analysis
+    def _sem_humanize(name):
+        import re as _re
+        return _re.sub(r"\s+", " ", str(name or "").replace("_", " ")).strip().title() \
+            or str(name or "")
+
+    def _sem_display(raw, fallback="this metric"):
+        return _sem_humanize(raw) if str(raw or "").strip() else fallback
+
+    def _sem_type(column_name, db_type=""):
+        return "measure"
+
+
+_MONEY_NAME_HINTS = (
+    "revenue", "revenues", "profit", "profits", "margin", "margins",
+    "income", "sales", "price", "pricing", "cost", "amount", "total",
+    "payment", "spend", "spending", "budget", "discount", "wage",
+    "salary", "fee", "fare", "freight", "tuition", "premium",
+)
+
+# Confidence labels reuse the engine's own confidence vocabulary — a pure
+# mapping, no new numeric thresholds.
+_CONFIDENCE_LABELS = {
+    "high": "High",
+    "moderate": "Moderate",
+    "medium": "Moderate",
+    "low": "Early",
+    "limited": "Early",
+    "unknown": "Early",
+    "none": "Early",
+    "": "Early",
+}
+
+
+def confidence_label_for(confidence) -> str:
+    """High/Moderate/Early derived from the existing confidence value."""
+    return _CONFIDENCE_LABELS.get(str(confidence or "").strip().lower(), "Early")
+
+
+def _is_money_metric(name) -> bool:
+    """Money-aware flag from the live name only (never a column literal)."""
+    try:
+        if _sem_type(str(name or ""), "") == "money":
+            return True
+    except Exception:
+        pass
+    return _has_hint(name, _MONEY_NAME_HINTS)
+
+
+def _trim_num(v, max_dp=2) -> str:
+    """Round to <=max_dp decimals, trimming trailing zeros (never >2dp)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f != f:  # NaN-safe
+        return str(v)
+    neg = f < 0
+    f = abs(f)
+    for dp in range(max_dp, -1, -1):
+        r = round(f, dp)
+        s = f"{r:.{dp}f}" if dp else str(int(r))
+        if dp == 0 or abs(f - r) < 0.5 * 10 ** -dp + 1e-12:
+            if "." in s:
+                s = s.rstrip("0").rstrip(".")
+            return ("-" if neg else "") + s
+    return ("-" if neg else "") + str(round(f, max_dp))
+
+
+def _fmt_money_short(v) -> str:
+    """$312K / $2.1M style — money-aware, never more than 1 decimal."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f != f:
+        return str(v)
+    neg = "-" if f < 0 else ""
+    a = abs(f)
+    if a >= 1_000_000_000:
+        return f"{neg}${_trim_num(a / 1_000_000_000, 1)}B"
+    if a >= 1_000_000:
+        return f"{neg}${_trim_num(a / 1_000_000, 1)}M"
+    if a >= 1_000:
+        return f"{neg}${_trim_num(a / 1_000, 1)}K"
+    if a >= 100:
+        return f"{neg}${int(round(a)):,}"
+    return f"{neg}${_trim_num(a, 2)}"
+
+
+def _fmt_pct_short(v) -> str:
+    """+10% / -2.5% style — percent, 0-1dp with sign."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f != f:
+        return str(v)
+    return f"{'+' if f >= 0 else ''}{_trim_num(f, 1)}%"
+
+
+def _fmt_count_short(v) -> str:
+    """Counts render as integers with thousands separators."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f != f:
+        return str(v)
+    return f"{int(round(f)):,}"
+
+
+def _human_amount(v, metric):
+    """Money-aware humanized amount for an outcome number."""
+    if v is None:
+        return None
+    if _is_money_metric(metric):
+        return _fmt_money_short(v)
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f != f:
+        return str(v)
+    if abs(f) >= 1000:
+        a = abs(f)
+        neg = "-" if f < 0 else ""
+        if a >= 1_000_000_000:
+            return f"{neg}{_trim_num(a / 1_000_000_000, 1)}B"
+        if a >= 1_000_000:
+            return f"{neg}{_trim_num(a / 1_000_000, 1)}M"
+        return f"{neg}{_trim_num(a / 1_000, 1)}K"
+    if float(f).is_integer():
+        return _fmt_count_short(f)
+    return _trim_num(f, 1)
+
+
+def _rec_names(rec: dict):
+    """Dynamic humanized names only (metric/driver/top/bottom/direction)."""
+    rec = rec if isinstance(rec, dict) else {}
+    ev = rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {}
+    metric = rec.get("metric") or ev.get("metric")
+    driver = rec.get("driver") or ev.get("driver")
+    return {
+        "metric": metric,
+        "driver": driver,
+        "M": _sem_display(metric),
+        "D": _sem_display(driver, "this factor"),
+        "top": ev.get("top"),
+        "bottom": ev.get("bottom"),
+        "direction": ev.get("direction"),
+        "ev": ev,
+    }
+
+
+def _why_summary_for(rec: dict) -> str:
+    """One plain sentence from the evidence: leader/gap/momentum wording.
+
+    Qualitative only — never r/p/n or any statistic.
+    """
+    n = _rec_names(rec)
+    atype = str((rec or {}).get("action_type") or "").lower()
+    label = str((rec or {}).get("scenario_label") or "").lower()
+    if atype == "scenario":
+        return (f"{n['D']} is the strongest linked factor for {n['M']} "
+                f"in your data, so testing a change there is the most supported move.")
+    if label == "segment-focus":
+        top = n["top"] or n["D"]
+        return (f"{top} holds the largest share of {n['M']} rows, "
+                f"so reviewing it first focuses effort where it counts.")
+    if atype == "monitor":
+        direction = str(n["direction"] or "").lower() or "shifting"
+        return (f"{n['M']} is moving {direction}, "
+                f"so keep watching it before deciding anything.")
+    if atype == "investigate":
+        top, bottom = n["top"], n["bottom"]
+        if top and bottom:
+            return (f"{top} stands out against {bottom} on {n['M']}, "
+                    f"so that gap is where to look first.")
+        return (f"{n['D']} shows the clearest gap for {n['M']}, "
+                f"so start the investigation there.")
+    if atype == "qualitative":
+        return "This passage speaks to your question, so review it before acting."
+    drv = n["driver"] or n["metric"]
+    return (f"{_sem_display(drv, n['M'])} shows the clearest pattern "
+            f"for {n['M']}, so start there.")
+
+
+def _action_text_for(rec: dict) -> str:
+    """Plain verb phrase for the card (dynamic names only)."""
+    rec = rec if isinstance(rec, dict) else {}
+    n = _rec_names(rec)
+    atype = str(rec.get("action_type") or "").lower()
+    label = str(rec.get("scenario_label") or "").lower()
+    imp = rec.get("impact") if isinstance(rec.get("impact"), dict) else {}
+    if atype == "scenario":
+        pct = imp.get("driver_pct")
+        try:
+            pct = float(pct) if pct is not None else None
+        except (TypeError, ValueError):
+            pct = None
+        seg = n["ev"].get("segment")
+        seg_txt = ""
+        if isinstance(seg, dict) and seg.get("value") is not None:
+            seg_txt = f" for {seg.get('value')}"
+        if pct is None:
+            return f"Adjust {n['D']}{seg_txt} to shift {n['M']}"
+        verb = "increase" if pct > 0 else "decrease" if pct < 0 else "adjust"
+        return f"Try {abs(pct):g}% {verb} in {n['D']}{seg_txt}"
+    if label == "segment-focus":
+        return f"Review {n['top'] or n['D']} for {n['M']}"
+    if atype == "monitor":
+        return f"Keep watching {n['M']}"
+    if atype == "investigate":
+        if n["top"] and n["bottom"]:
+            return f"Look into {n['top']} vs {n['bottom']} for {n['M']}"
+        return f"Look into {n['D']} for {n['M']}"
+    if atype == "qualitative":
+        return "Review the cited passage"
+    return f"Review {n['D']} for {n['M']}"
+
+
+def _outcome_text_for(rec: dict) -> str:
+    """Humanized, rounded outcome: $312K / +10% style, never >2 decimals."""
+    rec = rec if isinstance(rec, dict) else {}
+    n = _rec_names(rec)
+    atype = str(rec.get("action_type") or "").lower()
+    imp = rec.get("impact") if isinstance(rec.get("impact"), dict) else {}
+    ev = n["ev"]
+    metric = n["metric"]
+
+    def _num(v):
+        try:
+            f = float(v)
+            return f if f == f else None
+        except (TypeError, ValueError):
+            return None
+
+    if atype == "monitor":
+        mom = _num(ev.get("momentum_pct"))
+        pts = ev.get("n_points", ev.get("n"))
+        direction = str(ev.get("direction") or "").lower()
+        if mom is not None:
+            word = direction.capitalize() if direction else ("Up" if mom >= 0 else "Down")
+            pts_txt = f" over {int(pts)} periods" if pts else ""
+            return f"{word} {_trim_num(abs(mom), 0)}%{pts_txt}"
+        return "Movement observed — watch before acting."
+    base, scen = _num(imp.get("baseline")), _num(imp.get("scenario"))
+    rel = _num(imp.get("rel_pct"))
+    if base is not None and scen is not None:
+        hb, hs = _human_amount(base, metric), _human_amount(scen, metric)
+        if rel is not None:
+            tag = "observed gap" if atype in ("investigate",) or str(
+                rec.get("scenario_label") or "").lower() == "segment-focus" else "vs baseline"
+            return f"{hb} → {hs} ({_fmt_pct_short(rel)} {tag})"
+        return f"{hb} → {hs}"
+    if rel is not None:
+        return f"{_fmt_pct_short(rel)} vs baseline"
+    if atype == "qualitative":
+        return "No sized outcome — review only."
+    note = str(rec.get("impact_note") or "")
+    if note:
+        return "No sized outcome — review only."
+    return "No sized outcome — review only."
+
+
+def _evidence_pass_for(rec: dict) -> bool:
+    """Quality-gate verdict backing details.evidence_pass (never invented)."""
+    try:
+        atype = str((rec or {}).get("action_type") or "").lower()
+        probe = gate_input_from_prescription(rec, require_baseline=(atype == "scenario"))
+        gate = quality_gate(probe, require_baseline=(atype == "scenario"))
+        return bool(gate.get("pass"))
+    except Exception:
+        return False
+
+
+def _checks_for(rec: dict) -> list:
+    """Named gates this card actually passed (computed from live evidence)."""
+    rec = rec if isinstance(rec, dict) else {}
+    ev = rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {}
+    imp = rec.get("impact") if isinstance(rec.get("impact"), dict) else {}
+    checks = []
+
+    def _num(v):
+        try:
+            f = float(v)
+            return f if f == f else None
+        except (TypeError, ValueError):
+            return None
+
+    nn = ev.get("n")
+    try:
+        nn = int(nn) if nn is not None else None
+    except (TypeError, ValueError):
+        nn = None
+    if nn is not None and nn >= MIN_N:
+        checks.append("sample_size")
+    p = _num(ev.get("p_value"))
+    if p is not None and p < 0.05:
+        checks.append("significance")
+    r = _num(ev.get("effect_r", ev.get("r")))
+    if r is not None and abs(r) >= MIN_ABS_R:
+        checks.append("strength")
+    gap = _num(ev.get("effect_gap_pct"))
+    share = _num(ev.get("share_pct"))
+    mom = _num(ev.get("momentum_pct"))
+    if ((gap is not None and abs(gap) >= MIN_REL_PCT)
+            or (share is not None and share >= SEGMENT_FOCUS_MIN_SHARE * 100)
+            or (mom is not None and abs(mom) >= MONITOR_MIN_MOMENTUM * 100)):
+        checks.append("pattern_strength")
+    ctrl = str(rec.get("control_level") or "").lower()
+    if ctrl in ("controllable", "potentially_controllable"):
+        checks.append("controllability")
+    sm = rec.get("success_metric") if isinstance(rec.get("success_metric"), dict) else {}
+    if sm.get("direction") or str(rec.get("action_type") or "").lower() != "scenario":
+        checks.append("direction")
+    if any(imp.get(k) is not None for k in ("baseline", "scenario", "delta", "rel_pct")):
+        checks.append("impact_quantified")
+    else:
+        hay = " ".join([str(rec.get("impact_note") or "")]
+                        + [str(x) for x in (rec.get("limitations") or [])]).lower()
+        if any(m in hay for m in _HONEST_NOTE_MARKERS):
+            checks.append("honest_note")
+    return checks
+
+
+_NUMERIC_EVIDENCE_KEYS = (
+    "n", "n_points", "effect_r", "r", "spearman_r", "p_value", "slope",
+    "effect_gap_pct", "share_pct", "momentum_pct", "first", "last", "mean",
+)
+_NUMERIC_IMPACT_KEYS = (
+    "baseline", "scenario", "delta", "rel_pct", "driver_pct", "driver_value",
+)
+_LABEL_EVIDENCE_KEYS = ("top", "bottom", "median", "direction")
+
+
+def _numbers_for(rec: dict) -> dict:
+    """Existing raw evidence/impact numbers for the expander (flat, raw)."""
+    rec = rec if isinstance(rec, dict) else {}
+    ev = rec.get("evidence") if isinstance(rec.get("evidence"), dict) else {}
+    imp = rec.get("impact") if isinstance(rec.get("impact"), dict) else {}
+    out = {}
+    for k in _NUMERIC_EVIDENCE_KEYS:
+        v = ev.get(k)
+        try:
+            f = float(v) if v is not None else None
+        except (TypeError, ValueError):
+            f = None
+        if f is not None and f == f:
+            out[k] = f if k == "p_value" else (int(f) if k in ("n", "n_points") else f)
+    for k in _NUMERIC_IMPACT_KEYS:
+        v = imp.get(k)
+        try:
+            f = float(v) if v is not None else None
+        except (TypeError, ValueError):
+            f = None
+        if f is not None and f == f:
+            out[k] = f
+    for k in _LABEL_EVIDENCE_KEYS:
+        v = ev.get(k)
+        if v is not None and str(v).strip() != "":
+            out[k] = v
+    seg = ev.get("segment")
+    if isinstance(seg, dict) and seg.get("value") is not None:
+        out["segment"] = f"{seg.get('field') or seg.get('column') or ''}={seg.get('value')}".strip("=")
+    return out
+
+
+def _details_for(rec: dict) -> dict:
+    """details:{evidence_pass, checks[], numbers{}, limitations[]}."""
+    rec = rec if isinstance(rec, dict) else {}
+    lims = rec.get("limitations") if isinstance(rec.get("limitations"), list) else []
+    return {
+        "evidence_pass": _evidence_pass_for(rec),
+        "checks": _checks_for(rec),
+        "numbers": _numbers_for(rec),
+        "limitations": [str(x) for x in lims],
+    }
+
+
+def build_display(rec: dict) -> dict:
+    """display:{title, action_text, outcome_text, confidence_label, why_summary}."""
+    rec = rec if isinstance(rec, dict) else {}
+    return {
+        "title": str(rec.get("title") or "Recommendation"),
+        "action_text": _action_text_for(rec),
+        "outcome_text": _outcome_text_for(rec),
+        "confidence_label": confidence_label_for(rec.get("confidence")),
+        "why_summary": _why_summary_for(rec),
+    }
+
+
+def attach_display(rec: dict) -> dict:
+    """Attach the display-safe contract to one prescription (additive)."""
+    if not isinstance(rec, dict):
+        return rec
+    try:
+        rec["display"] = build_display(rec)
+        rec["why_summary"] = rec["display"]["why_summary"]
+        rec["confidence_label"] = rec["display"]["confidence_label"]
+        rec["details"] = _details_for(rec)
+        rec["evidence_pass"] = rec["details"]["evidence_pass"]
+    except Exception:
+        log.debug("attach_display failed", exc_info=True)
+    return rec
+
+
+# ---------------------------------------------------------------------------
+# Computed refusal alternatives (DYNAMIC ONLY): numeric controllable drivers
+# for the same metric (existing controllability classifier + a bounded
+# n>=MIN_N quality-gate probe), else the table's top segment-focus dims.
+# Never a static list — every entry is measured against the live schema.
+# ---------------------------------------------------------------------------
+def compute_refusal_alternatives(engine, dialect, intel, table, metric,
+                                 exclude=None, limit=3) -> list:
+    """[{metric, driver, label}] alternatives, max `limit` (default 3)."""
+    alts, seen = [], set()
+    try:
+        tables = list(getattr(intel, "tables", []) or [])
+    except Exception:
+        tables = []
+    if intel is None or not table or not metric or table not in tables:
+        return alts
+    try:
+        measures = [c for c in _usable_measures(intel, table)
+                    if c != metric and str(c).lower() != str(exclude or "").lower()]
+    except Exception:
+        measures = []
+    for cand in measures[:8]:  # bounded probe budget — never a full scan
+        if len(alts) >= limit:
+            break
+        try:
+            kind = _col_kind(intel, table, cand) or "numeric"
+            level, _ = classify_driver(cand, kind)
+            if level not in ("controllable", "potentially_controllable"):
+                continue
+            if classify_semantic_role(cand, kind) in NON_LEVER_ROLES:
+                continue
+            rows = _fetch_pairs(engine, dialect, table, cand, metric, limit=500)
+            n = len(rows or [])
+            if n < MIN_N:  # quality-gate precheck: enough rows to test
+                continue
+            key = str(cand).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            alts.append({"metric": metric, "driver": cand,
+                         "label": f"Try {_sem_humanize(cand)} for {_sem_humanize(metric)}"})
+        except Exception:
+            continue
+    if len(alts) < limit:
+        try:
+            dims = list(intel.find_all_dimensions(table) or [])[:3]
+        except Exception:
+            dims = []
+        for dim in dims:
+            if len(alts) >= limit:
+                break
+            key = str(dim).lower()
+            if key in seen or key == str(metric or "").lower():
+                continue
+            seen.add(key)
+            alts.append({"metric": metric, "driver": dim,
+                         "label": f"Compare {_sem_humanize(metric)} across {_sem_humanize(dim)}"})
+    return alts[:limit]
+
+
+def _infer_refusal_code(out: dict) -> str:
+    """Reuse an existing refusal code (never invent one)."""
+    out = out if isinstance(out, dict) else {}
+    if out.get("code"):
+        return str(out["code"])
+    reason = f"{out.get('reason') or ''} {out.get('detail') or ''}".lower()
+    if ("controllab" in reason or "intervention" in reason
+            or "direction" in reason or "scenario" in reason):
+        return CODE_SCENARIO_UNSUPPORTED
+    if "stay length" in reason or "join" in reason or "link" in reason:
+        return CODE_SCENARIO_UNSUPPORTED
+    return CODE_INSUFFICIENT_DATA
+
+
+def build_refusal(out: dict, *, engine=None, dialect=None, intel=None,
+                  table=None, metric=None, driver=None) -> dict:
+    """refusal:{headline, reason_code, alternatives[]} — all dynamic."""
+    out = out if isinstance(out, dict) else {}
+    m = metric or out.get("metric")
+    d = driver or out.get("driver")
+    headline = f"No supported action for {_sem_display(m)}"
+    if d:
+        headline += f" using {_sem_display(d, 'this factor')}"
+    headline += "."
+    try:
+        alternatives = compute_refusal_alternatives(
+            engine, dialect, intel, table or out.get("table"), m, exclude=d)
+    except Exception:
+        alternatives = []
+    return {"headline": headline,
+            "reason_code": _infer_refusal_code(out),
+            "alternatives": alternatives[:3]}
+
+
+def _finalize_output(out: dict, *, engine=None, dialect=None, intel=None,
+                      table=None, metric=None, driver=None) -> dict:
+    """Attach display/details to prescriptions + refusal to refusals.
+
+    Additive only: existing keys are never removed or renamed here — the
+    routes layer owns internal-key stripping.
+    """
+    if not isinstance(out, dict):
+        return out
+    pres = out.get("prescriptions")
+    if isinstance(pres, list):
+        for r in pres:
+            if isinstance(r, dict) and "display" not in r:
+                attach_display(r)
+    scens = out.get("scenarios")
+    if isinstance(scens, list) and out.get("ok"):
+        for s in scens:
+            if isinstance(s, dict) and "display" not in s:
+                try:
+                    s["display"] = _scenario_display(
+                        s, metric or out.get("metric"), driver or out.get("driver"),
+                        n=out.get("n"))
+                except Exception:
+                    log.debug("scenario display failed", exc_info=True)
+    if out.get("status") == "no_prescription" or out.get("ok") is False:
+        if "refusal" not in out:
+            try:
+                out["refusal"] = build_refusal(
+                    out, engine=engine, dialect=dialect, intel=intel,
+                    table=table, metric=metric, driver=driver)
+            except Exception:
+                log.debug("refusal build failed", exc_info=True)
+    return out
+
+
+def _scenario_display(item: dict, metric, driver, n=None) -> dict:
+    """Display contract for one recomputed scenario (read-only result)."""
+    item = item if isinstance(item, dict) else {}
+    M, D = _sem_display(metric), _sem_display(driver, "this factor")
+    ch = item.get("change") if isinstance(item.get("change"), dict) else {}
+    try:
+        pct = float(ch.get("value")) if ch.get("operation") == "percent" else None
+    except (TypeError, ValueError):
+        pct = None
+    if pct is None:
+        try:
+            pct = float(item.get("driver_pct")) if item.get("driver_pct") is not None else 0.0
+        except (TypeError, ValueError):
+            pct = 0.0
+    action_text = f"Apply {'+' if pct >= 0 else ''}{_trim_num(pct, 1)}% to {D}"
+
+    def _num(v):
+        try:
+            f = float(v)
+            return f if f == f else None
+        except (TypeError, ValueError):
+            return None
+
+    base, scen, rel = _num(item.get("baseline")), _num(item.get("scenario")), _num(item.get("rel_pct"))
+    if base is not None and scen is not None:
+        outcome = f"{_human_amount(base, metric)} → {_human_amount(scen, metric)}"
+        if rel is not None:
+            outcome += f" ({_fmt_pct_short(rel)} vs baseline)"
+    elif rel is not None:
+        outcome = f"{_fmt_pct_short(rel)} vs baseline"
+    else:
+        outcome = "No sized outcome — review only."
+    risk = str(item.get("risk") or "").lower()
+    conf = {"low": "High", "medium": "Moderate", "high": "Early"}.get(risk, "Moderate")
+    n_txt = f"{int(n):,} past observations" if n else "past data"
+    return {"title": str(item.get("title") or f"Scenario: {D} {_trim_num(pct, 1)}%"),
+            "action_text": action_text,
+            "outcome_text": outcome,
+            "confidence_label": conf,
+            "why_summary": (f"Modeled from {n_txt} — a simulation from the observed link "
+                            f"between {D} and {M}, not a promise.")}
+
+
+def analyze(engine, dialect, intel, table, metric, driver=None,
+            dimensions=None, segment=None, question=None, priors=None):
+    """Full prescription pipeline + display-safe contract (additive wrapper)."""
+    out = _analyze_core(engine, dialect, intel, table, metric, driver=driver,
+                        dimensions=dimensions, segment=segment,
+                        question=question, priors=priors)
+    try:
+        return _finalize_output(out, engine=engine, dialect=dialect,
+                                intel=intel, table=table, metric=metric,
+                                driver=driver)
+    except Exception:
+        log.debug("analyze display finalize failed", exc_info=True)
+        return out
+
+
+def run_scenario(engine, dialect, intel, table, metric, driver, changes, filt=None,
+                 join=None):
+    """Read-only scenario recompute + display-safe contract (additive wrapper)."""
+    out = _run_scenario_core(engine, dialect, intel, table, metric, driver,
+                             changes, filt=filt, join=join)
+    try:
+        return _finalize_output(out, engine=engine, dialect=dialect,
+                                intel=intel, table=table, metric=metric,
+                                driver=driver)
+    except Exception:
+        log.debug("run_scenario display finalize failed", exc_info=True)
+        return out
+
+
+def analyze_document(chunks, question, doc_name):
+    """Qualitative document prescriptions + display-safe contract (wrapper)."""
+    out = _analyze_document_core(chunks, question, doc_name)
+    try:
+        out = _finalize_output(out, metric=None, driver=None)
+        if isinstance(out, dict) and out.get("status") == "no_prescription" \
+                and isinstance(out.get("refusal"), dict):
+            # Document refusals have no engine to probe: keep the computed
+            # (empty) alternatives honest instead of static suggestions.
+            out["refusal"]["reason_code"] = _infer_refusal_code(out)
+        return out
+    except Exception:
+        log.debug("analyze_document display finalize failed", exc_info=True)
+        return out

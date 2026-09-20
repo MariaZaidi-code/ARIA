@@ -37,7 +37,21 @@ PRIORITY_ORDER = [
 
 def _events_path(user_id: str | int, base_dir: Path | None = None) -> Path:
     root = base_dir or (Path(__file__).resolve().parent.parent / "data" / "preferences")
-    return root / f"user_{user_id}" / "rl_events.jsonl"
+    # Contain (mirrors core.config): only alnum/_/- tokens, so a crafted
+    # user_id cannot escape preferences/ via ../ segments. Numeric IDs keep
+    # the user_<id> convention; other safe tokens are used verbatim.
+    import re as _re
+    _tok = str(user_id).strip()
+    if not _tok or not _re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", _tok) or ".." in _tok:
+        raise ValueError("Invalid user id.")
+    try:
+        _dirname = f"user_{int(_tok)}"
+    except (TypeError, ValueError):
+        _dirname = f"user_{_tok}"
+    candidate = (root / _dirname).resolve()
+    if candidate.parent != root.resolve():
+        raise ValueError("Invalid user id.")
+    return candidate / "rl_events.jsonl"
 
 
 def record_event(
@@ -75,6 +89,18 @@ def record_event(
             blob = json.dumps(record, default=str)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(blob + "\n")
+        # Rotation: oldest-first trim so a long-lived server cannot fill
+        # the disk. Atomic tmp+replace so a concurrent append cannot
+        # interleave a half-written file. Cap 5k lines / ~5MB per file.
+        try:
+            if path.stat().st_size > 5 * 1024 * 1024:
+                import os as _os
+                _lines = path.read_text(encoding="utf-8").splitlines()
+                _tmp = path.with_suffix(".jsonl.tmp")
+                _tmp.write_text("\n".join(_lines[-5000:]) + "\n", encoding="utf-8")
+                _os.replace(_tmp, path)
+        except Exception:
+            pass
     except Exception as exc:  # telemetry is best-effort
         log.debug("RL record_event failed: %s", exc)
 

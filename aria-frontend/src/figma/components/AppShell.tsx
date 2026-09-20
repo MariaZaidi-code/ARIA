@@ -179,7 +179,17 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
             <Menu size={15} />
           </button>
           <div className="flex items-center gap-2 animate-fade-in">
-            <h1 className="text-[15px] font-semibold text-foreground tracking-tight flex items-center gap-2">{pageTitles[page]}{dbName ? <span className="text-[11px] text-muted-foreground font-normal">· {dbName}</span> : null}</h1>
+            <h1 className="text-[15px] font-semibold text-foreground tracking-tight flex items-center gap-2">{pageTitles[page]}{dbName ? (
+              <button
+                onClick={() => setPage("data")}
+                title={`Analyzing: ${dbName} — click to switch dataset`}
+                aria-label={`Analyzing ${dbName}. Switch dataset`}
+                className="inline-flex items-center gap-1 text-[11px] text-muted-foreground font-normal bg-secondary/70 border border-border/60 rounded-full px-2.5 py-0.5 hover:text-foreground hover:border-primary/50 transition-colors"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
+                {dbName}
+              </button>
+            ) : null}</h1>
           </div>
 
           <div className="flex-1" />

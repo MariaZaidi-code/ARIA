@@ -62,3 +62,6 @@ test-results/
 *.p12
 service-account*.json
 test_copilot_e2e.py
+# coverage outputs (local only)
+.coverage
+coverage.xml

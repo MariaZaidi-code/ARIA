@@ -167,8 +167,39 @@ class SemanticMixin:
         corrections = []
         if not user_goal:
             return user_goal, corrections
+        # Conversational turns are never typo-corrected: 'hi' must not
+        # become a schema word and greetings must survive untouched.
+        try:
+            if self._is_conversational(user_goal):
+                return user_goal, corrections
+        except Exception:
+            pass
         vocab = self._schema_word_tokens
         protected = self._PROTECTED_GOAL_WORDS
+        # Conversational tokens are protected from correction as well.
+        try:
+            _conv_tokens = set()
+            for _w in ("hi hii hello helo hey yo howdy thanks thank you "
+                       "thankyou thx bye goodbye help ok okay who are you "
+                       "good morning afternoon evening").split():
+                _conv_tokens.add(_w)
+            protected = set(protected) | _conv_tokens
+        except Exception:
+            pass
+        # Generic business vocabulary (schema-agnostic, no table/column
+        # names): lets typo'd measure words ('revenuw' -> 'revenue')
+        # correct even when the schema names the column differently
+        # ('total'/'amount'). Only used as correction TARGETS, never as
+        # schema grounding.
+        _BUSINESS_VOCAB = {
+            "revenue", "revenues", "sales", "profit", "margin", "income",
+            "turnover", "quantity", "qty", "units", "amount", "value",
+            "price", "cost", "total", "count", "average", "avg", "mean",
+            "maximum", "minimum", "trend", "monthly", "yearly", "daily",
+            "weekly", "growth", "decline", "decrease", "increase",
+            "change", "drop", "fall", "month", "year", "customer",
+            "customers", "order", "orders", "product", "products",
+        }
         corrected = user_goal
         seen = set()
         # Pre-index vocab by first 2 chars for O(bucket_size) lookups.
@@ -192,6 +223,17 @@ class SemanticMixin:
                 ratio = difflib.SequenceMatcher(None, low, cand).ratio()
                 if ratio > score:
                     best, score = cand, ratio
+            # Fall back to the generic business vocabulary for measure-word
+            # typos ('revenuw' -> 'revenue') that no schema token matches.
+            # Requires a strong match and a measure-like intent so random
+            # words are never rewritten.
+            if (not best or score < 0.8) and len(low) >= 5:
+                for cand in _BUSINESS_VOCAB:
+                    if abs(len(cand) - len(low)) > 2:
+                        continue
+                    ratio = difflib.SequenceMatcher(None, low, cand).ratio()
+                    if ratio > score:
+                        best, score = cand, ratio
             if best and score >= 0.8:
                 corrections.append((word, best))
                 corrected = re.sub(
@@ -235,25 +277,42 @@ class SemanticMixin:
     def _classify_column(self, table_name, col):
         # Shared path: delegate to the universal Data Intelligence Layer so
         # PostgreSQL, MySQL, SQLite and CSV/SQLite types classify identically.
-        # Legacy labels ("numeric"/"date"/"text") are preserved for callers.
+        # Legacy labels ("numeric"/"date"/"text") are preserved for callers,
+        # plus "identifier" for id/key/code-like columns (any separator):
+        # identifiers are join keys, never automatic measures, labels or
+        # breakdown dimensions, so grouping "by Order ID" can only happen
+        # when the user explicitly names it.
         try:
             from core.data_intelligence import classify_column as _shared_classify
-            data_type = self.tables[table_name]["columns"][col].get("data_type", "")
+            data_type = self._get_column_data_type(table_name, col)
             role = _shared_classify(col, data_type)
             if role == "numerical":
                 return "numeric"
             if role == "datetime":
                 return "date"
+            if role == "identifier":
+                return "identifier"
             return "text"
         except Exception:
-            data_type = str(
-                self.tables[table_name]["columns"][col].get("data_type", "")
-            ).lower()
+            data_type = str(self._get_column_data_type(table_name, col)).lower()
             if any(token in data_type for token in self._NUMERIC_TYPES):
                 return "numeric"
             if any(token in data_type for token in self._DATE_TYPES):
                 return "date"
             return "text"
+
+    def _get_column_data_type(self, table_name, col):
+        """Extract data_type from columns stored as dict OR list format."""
+        info = self.tables.get(table_name, {}) or {}
+        cols = info.get("columns", [])
+        if isinstance(cols, dict):
+            meta = cols.get(col, {})
+            return meta.get("data_type", "") if isinstance(meta, dict) else ""
+        if isinstance(cols, list):
+            for c in cols:
+                if isinstance(c, dict) and c.get("column") == col:
+                    return str(c.get("data_type", ""))
+        return ""
 
     # ---- _is_entity_table (_is_entity_table) ----
 

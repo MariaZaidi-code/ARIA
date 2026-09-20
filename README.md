@@ -30,7 +30,7 @@ python -m pytest tests/ -q    # backend suite must stay green
 
 | Layer | Location | Role |
 |---|---|---|
-| API | `app.py`, `api/` (17 routers) | FastAPI routes, auth, CORS, static serving |
+| API | `app.py`, `api/` (19 routers) | FastAPI routes, auth, CORS, static serving |
 | Auth | `auth.py`, `api/auth_routes.py` | PBKDF2 passwords, HS256 JWT, per-user history |
 | Shared | `core/` | config+DPAPI secrets, session store, guards, semantic helpers (`semantic.py`), RL (`rl.py`) |
 | NL→SQL | `goal_agent/` | intent → semantic grounding → SQL contract → execution + validation |
@@ -54,7 +54,7 @@ python -c "import sys; sys.path.insert(0,'.'); from core.secret_box import encry
 ```
 
 Never commit `.env`, `data/.jwt_secret`, `*.db`, or token files (all gitignored).
-`TOKEN_TTL_DAYS` (default 7, capped at 30) and login rate limits live in `auth.py` /
+`TOKEN_TTL_DAYS` (default 1, clamped to 1-7) and login rate limits live in `auth.py` /
 `api/auth_routes.py`. Relational `db_uri` is never written to disk (rebuilt from
 encrypted `db` config on restart). Rotate provider keys in their dashboards if ever exposed.
 
@@ -74,3 +74,24 @@ No mock data in production responses; insufficient data → clear `detail`
 (`needs_clarification` contract, `valid: false` forecasts, `ok: false` hypothesis);
 every prescription carries "Impact could not be reliably estimated…";
 document content is data, never instructions.
+
+## Storage model / scaling (single-worker vs Redis)
+
+Single-worker (default) uses local stores and needs no extra config:
+file `data/session_store.json` for sessions, in-memory sliding windows for
+rate limits (`core/ratelimit.py`) and the login limiter
+(`api/auth_routes.py`, 30 req / 5 min / IP, pruned + capped at 10k IPs).
+
+Multi-worker production requires a shared store:
+
+```bash
+ARIA_REDIS_URL=redis://localhost:6379/0
+ARIA_REQUIRE_SHARED_STORE=1
+UVICORN_WORKERS=4   # or WEB_CONCURRENCY / ARIA_WORKERS
+```
+
+Without `ARIA_REDIS_URL`, >1 workers diverge per-process. Startup then
+fails fast (`RuntimeError`) and requests fail closed (`503`) when
+`ARIA_REQUIRE_SHARED_STORE=1`, or when `ARIA_ENV=production` without an
+explicit `ARIA_REQUIRE_SHARED_STORE=0` opt-out. Single-worker runs never
+fail this check.

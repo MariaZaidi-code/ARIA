@@ -46,11 +46,15 @@ def is_ref_flavored(name) -> bool:
     low = name.lower()
     if low == "id":
         return True
+    # Split camelCase first so MediaTypeId/SupportRepID behave like
+    # snake_case (separator-less "valid"/"grid" still correctly rejected).
+    low = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name)).lower()
     for suffix in REF_FLAVORED_SUFFIXES:
         if low.endswith(suffix):
             return True
-    if low.endswith("id") and len(low) > 2:
-        return True
+    # NOTE: bare endswith("id") was removed — it misclassified ordinary
+    # words ("valid", "grid", "liquid"). Separator-less forms are only
+    # accepted via tokenize_words() ID_TOKENS by callers that need them.
     return False
 
 

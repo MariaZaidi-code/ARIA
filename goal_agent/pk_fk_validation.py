@@ -15,6 +15,31 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_IDENT_RE = None
+
+
+def _quote_ident(name: str) -> str:
+    """Quote an SQL identifier safely. Raises ValueError on invalid names.
+
+    Only letters/digits/underscore/space/dot-free simple names are allowed;
+    embedded double quotes are escaped by doubling. Prevents identifier
+    injection vs the previous raw f-string interpolation.
+    """
+    import re as _re
+    if not isinstance(name, str) or not name or len(name) > 128:
+        raise ValueError("Invalid identifier.")
+    if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_ ]*", name):
+        raise ValueError(f"Unsafe identifier: {name!r}")
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _bound_sample(n: int, default: int = 10000, cap: int = 100000) -> int:
+    try:
+        v = int(n)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(v, cap))
+
 
 def validate_schema_references(
     tables: dict[str, Any],
@@ -63,22 +88,25 @@ def validate_pk_quality(
         pk_cols = tinfo.get("primary_key", []) or []
         if not pk_cols:
             continue
+        try:
+            _t = _quote_ident(tname)
+        except ValueError:
+            continue
         for pk_col in pk_cols:
-            col_info = tinfo.get("columns", {})
-            if isinstance(col_info, dict):
-                col_meta = col_info.get(pk_col, {})
-            elif isinstance(col_info, list):
-                col_meta = next((c for c in col_info if c.get("column") == pk_col), {})
-            else:
-                col_meta = {}
-            if col_meta.get("is_primary_key") is not True and pk_cols:
+            try:
+                _c = _quote_ident(pk_col)
+            except ValueError:
                 continue
+            # NOTE: pk_cols comes from the declared/inferred primary_key list,
+            # so every entry is validated. (Previous `is_primary_key is not True`
+            # guard skipped ALL PKs because mappings never set that key.)
 
             try:
+                sample = _bound_sample(max_sample)
                 cur = conn.execute(
-                    f'SELECT COUNT(*), COUNT(DISTINCT "{pk_col}"), '
-                    f'SUM(CASE WHEN "{pk_col}" IS NULL THEN 1 ELSE 0 END) '
-                    f'FROM "{tname}" LIMIT {max_sample}'
+                    f'SELECT COUNT(*), COUNT(DISTINCT sub.col), '
+                    f'SUM(CASE WHEN sub.col IS NULL THEN 1 ELSE 0 END) '
+                    f'FROM (SELECT {_c} AS col FROM {_t} LIMIT {sample}) sub'
                 )
                 total, distinct, nulls = cur.fetchone()
                 if total and distinct and distinct < total:
@@ -122,21 +150,29 @@ def validate_fk_quality(
                 continue
             if ref_table not in tables:
                 continue
+            try:
+                _t = _quote_ident(tname)
+                _fc = _quote_ident(fk_col)
+                _rt = _quote_ident(ref_table)
+                _rc = _quote_ident(ref_col)
+            except ValueError:
+                continue
 
             try:
+                sample = _bound_sample(max_sample)
                 cur = conn.execute(
                     f'SELECT COUNT(*) FROM ('
-                    f'SELECT "{fk_col}" FROM "{tname}" '
-                    f'WHERE "{fk_col}" IS NOT NULL '
-                    f'LIMIT {max_sample}'
+                    f'SELECT {_fc} FROM {_t} '
+                    f'WHERE {_fc} IS NOT NULL '
+                    f'LIMIT {sample}'
                     f') sub'
                 )
                 total_fks = cur.fetchone()[0]
 
                 cur = conn.execute(
-                    f'SELECT COUNT(*) FROM "{tname}" t '
-                    f'LEFT JOIN "{ref_table}" r ON t."{fk_col}" = r."{ref_col}" '
-                    f'WHERE t."{fk_col}" IS NOT NULL AND r."{ref_col}" IS NULL '
+                    f'SELECT COUNT(*) FROM {_t} t '
+                    f'LEFT JOIN {_rt} r ON t.{_fc} = r.{_rc} '
+                    f'WHERE t.{_fc} IS NOT NULL AND r.{_rc} IS NULL '
                     f'LIMIT 100'
                 )
                 orphan_count = cur.fetchone()[0]
@@ -151,7 +187,7 @@ def validate_fk_quality(
                     })
 
                 cur = conn.execute(
-                    f'SELECT COUNT(*) FROM "{tname}" WHERE "{fk_col}" IS NULL'
+                    f'SELECT COUNT(*) FROM (SELECT {_fc} FROM {_t} WHERE {_fc} IS NULL LIMIT 10001) sub'
                 )
                 null_count = cur.fetchone()[0]
                 if null_count > 0:

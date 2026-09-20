@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 import types
 import secrets
@@ -33,8 +34,15 @@ HOSTED_PROVIDERS = {"cloud", "deepseek", "omniroute", "grok"}
 
 # Upload bounds (§40): enforced while streaming so oversized bodies never
 # fill the disk. CSV cap matches the handler's 100 MB post-write check.
-MAX_UPLOAD_BYTES_CSV = int(os.getenv("ARIA_MAX_UPLOAD_CSV_MB", "100")) * 1024 * 1024
-MAX_UPLOAD_BYTES_PDF = int(os.getenv("ARIA_MAX_UPLOAD_PDF_MB", "50")) * 1024 * 1024
+def _upload_limit_mb(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_UPLOAD_BYTES_CSV = _upload_limit_mb("ARIA_MAX_UPLOAD_CSV_MB", 512) * 1024 * 1024
+MAX_UPLOAD_BYTES_PDF = _upload_limit_mb("ARIA_MAX_UPLOAD_PDF_MB", 50) * 1024 * 1024
 
 
 def _spool_limited(upload_file, dest: Path, max_bytes: int, label: str) -> int:
@@ -59,7 +67,89 @@ def _spool_limited(upload_file, dest: Path, max_bytes: int, label: str) -> int:
     return total
 
 
-_BLOCKED_DB_HOSTS = {"169.254.169.254", "metadata.google.internal"}
+_BLOCKED_DB_HOSTS = {"169.254.169.254", "metadata.google.internal", "metadata.google.internal."}
+_METADATA_IPS = {"169.254.169.254", "fd00:ec2::254"}
+
+
+def _normalize_host_ip(host: str) -> str | None:
+    """Return canonical IP string for decimal/octal/hex forms, else None.
+
+    Handles bypasses like 2852039166 (decimal), 0xA9FEA9FE (hex),
+    0251.0376.0251.0376 (octal) via ipaddress. Never raises.
+    """
+    import ipaddress as _ip
+    h = (host or "").strip().rstrip(".")
+    if not h:
+        return None
+    # Pure decimal integer form (e.g. 2852039166 -> 169.254.169.254)
+    if h.isdigit():
+        try:
+            return str(_ip.ip_address(int(h)))
+        except Exception:
+            return None
+    # Hex integer form (e.g. 0xA9FEA9FE)
+    if h.lower().startswith("0x"):
+        try:
+            return str(_ip.ip_address(int(h, 16)))
+        except Exception:
+            return None
+    try:
+        return str(_ip.ip_address(h))
+    except Exception:
+        return None
+
+
+def _ip_is_blocked(ip_str: str, *, allow_loopback: bool) -> bool:
+    """True when an IP must be refused. Loopback allowed only for DB-local dev."""
+    import ipaddress as _ip
+    try:
+        ip = _ip.ip_address(ip_str)
+    except Exception:
+        return False
+    if ip_str in _METADATA_IPS:
+        return True
+    try:
+        if ip.is_loopback:
+            return not allow_loopback
+        if ip.is_link_local or ip.is_multicast or ip.is_reserved:
+            return True
+        # Cloud metadata + private ranges are never valid DB/LLM targets
+        # (except loopback for local dev, handled above).
+        if ip.is_private:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _resolve_host_ips(host: str) -> list[str]:
+    """Best-effort DNS resolution for SSRF check. Empty on failure (fail-open to connect error)."""
+    import socket as _sock
+    try:
+        infos = _sock.getaddrinfo(host, None, family=_sock.AF_UNSPEC, type=_sock.SOCK_STREAM)
+        out = []
+        for fam, _typ, _proto, _canon, sockaddr in infos:
+            try:
+                out.append(str(sockaddr[0]))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def _host_is_numeric(host: str) -> bool:
+    h = (host or "").strip().rstrip(".")
+    if not h:
+        return False
+    if h.isdigit() or h.lower().startswith("0x"):
+        return True
+    try:
+        import ipaddress as _ip
+        _ip.ip_address(h)
+        return True
+    except Exception:
+        return False
 
 
 def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql") -> int:
@@ -67,12 +157,31 @@ def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql") 
 
     Used by both the real connect path and /api/database/test so probing
     via error oracle is blocked consistently. Returns validated port int.
+
+    Loopback (localhost/127.0.0.1/::1) stays allowed for local-dev DBs;
+    cloud-metadata (169.254.169.254 in any numeric form), private ranges,
+    link-local/multicast/reserved, and DNS names resolving to them are blocked.
     """
     host = (host or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", host) or len(host) > 253:
         raise HTTPException(status_code=400, detail="Invalid host.")
-    if host.lower() in _BLOCKED_DB_HOSTS or host.startswith("169.254."):
+    low = host.lower().rstrip(".")
+    if low in _BLOCKED_DB_HOSTS or low.startswith("169.254."):
         raise HTTPException(status_code=400, detail="Host is blocked.")
+    # Numeric-form bypasses (decimal/octal/hex/integer IP).
+    norm = _normalize_host_ip(host)
+    if norm is not None:
+        # allow loopback for local dev, block everything else private/reserved
+        if _ip_is_blocked(norm, allow_loopback=True):
+            raise HTTPException(status_code=400, detail="Host is blocked.")
+    else:
+        # Hostname: block nip.io-style suffixes and resolve-then-check.
+        if ".nip.io" in low or ".sslip.io" in low:
+            # e.g. 169.254.169.254.nip.io — resolves to the embedded IP
+            raise HTTPException(status_code=400, detail="Host is blocked.")
+        for rip in _resolve_host_ips(host):
+            if _ip_is_blocked(rip, allow_loopback=True):
+                raise HTTPException(status_code=400, detail="Host resolves to a blocked address.")
     try:
         port_int = int(port)
     except (TypeError, ValueError):
@@ -236,6 +345,38 @@ async def stream_upload_progress(user: dict = Depends(require_writable)):
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+def _validate_hosted_base_url(base_url: str | None) -> None:
+    """Strict validator for hosted LLM endpoint overrides (no userinfo, public https only).
+
+    Raises HTTPException 400 on violation. `None`/empty passes (provider default).
+    Local provider is exempt (loopback http allowed) — callers check provider first.
+    """
+    if not base_url:
+        return
+    from urllib.parse import urlparse as _urlparse
+    try:
+        parts = _urlparse(base_url.strip())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base_url.")
+    if parts.scheme != "https" or not parts.hostname:
+        raise HTTPException(status_code=400, detail="Custom base_url must use https:// (http/internal hosts blocked).")
+    if parts.username or parts.password or "@" in (parts.netloc or ""):
+        raise HTTPException(status_code=400, detail="Custom base_url must not contain credentials.")
+    host = parts.hostname.rstrip(".")
+    low = host.lower()
+    if low in _BLOCKED_DB_HOSTS or ".nip.io" in low or ".sslip.io" in low:
+        raise HTTPException(status_code=400, detail="Custom base_url host is blocked.")
+    norm = _normalize_host_ip(host)
+    if norm is not None:
+        # Hosted LLM endpoints must be public — loopback also blocked here.
+        if norm == "127.0.0.1" or norm == "::1" or _ip_is_blocked(norm, allow_loopback=False):
+            raise HTTPException(status_code=400, detail="Custom base_url host is blocked.")
+    else:
+        for rip in _resolve_host_ips(host):
+            if _ip_is_blocked(rip, allow_loopback=False):
+                raise HTTPException(status_code=400, detail="Custom base_url resolves to a blocked address.")
+
+
 class ProviderSwitchRequest(BaseModel):
     provider: str = "local"
     api_key: str | None = None      # optional key override for hosted providers
@@ -251,16 +392,23 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
     # SSRF guard: custom endpoints only over https for hosted providers.
     # Local provider (ollama) may use loopback http; hosted must not probe internal http.
     if request.base_url and request.provider != "local":
-        if not request.base_url.startswith("https://"):
-            raise HTTPException(status_code=400, detail="Custom base_url must use https:// (http/internal hosts blocked).")
+        _validate_hosted_base_url(request.base_url)
     current = session.get("provider_name")
     if current == request.provider:
         return {"ok": True, "provider": current, "changed": False}
 
     try:
+        # Prefer the key the user just typed; otherwise reuse the saved
+        # per-provider key (e.g. switching back to Cloud LLM after a restart
+        # must keep working with the user's Groq key, not the server env).
+        from core.config import resolve_provider_key as _resolve_key
+        try:
+            _saved = _resolve_key(request.provider, (session.get("api_keys") or {}))
+        except Exception:
+            _saved = None
         llm = create_provider(
             provider=request.provider,
-            api_key=request.api_key,
+            api_key=request.api_key or _saved,
             base_url=request.base_url,
         )
     except Exception as exc:
@@ -434,7 +582,13 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
         safe_config["password"] = _encrypt_secret(str(safe_config["password"]))
     session["db"] = safe_config
     session["db_type"] = db_type
-    session["db_uri"] = build_db_uri(config, db_type)
+    # Never persist a password-bearing URI: core.config rebuilds relational
+    # db_uri from the encrypted db config at session load. CSV sqlite URIs
+    # carry no secret and are kept so file sources survive restarts.
+    if safe_config.get("password"):
+        session["db_uri"] = None
+    else:
+        session["db_uri"] = build_db_uri(config, db_type)
     session["db_name"] = db_name
     session["dialect"] = db_type
 
@@ -567,6 +721,148 @@ def connect_mysql(request: ConnectRequest, user: dict = Depends(require_writable
     return _do_connect(request, user, "mysql")
 
 
+def _finish_csv_connect(*, file_path, upload_dir, safe_name, stamp, filename,
+                        uid, llm, provider, _upaths, background=False):
+    """Run CSV profiling + SQLite load + session wiring after spool.
+
+    Shared by the inline path (small files, returns result / raises HTTP)
+    and the background path (large files, reports via progress only and
+    never raises to a client). Returns the result dict, or None when the
+    outcome was reported through progress (background errors).
+    """
+    import logging as _logging
+    _log = _logging.getLogger("aria.connect")
+    _set_progress(uid, "validating", 25, "Validating CSV structure...")
+    try:
+        from csv_handler import CsvSchemaExtractor
+        table_name = csv_orchestrator.safe_table_name(safe_name)
+        profile = CsvSchemaExtractor(
+            file_path,
+            max_file_size_mb=int(os.getenv("ARIA_MAX_UPLOAD_CSV_MB", "512")),
+        ).extract()
+        mapping = csv_orchestrator.build_csv_schema_mapping(
+            file_path, table_name=table_name, profile=profile)
+    except CsvValidationError as exc:
+        _set_progress(uid, "error", 0, f"Invalid CSV: {exc}", error=str(exc))
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if background:
+            return None
+        _msg = str(exc).lower()
+        if "limit" in _msg or "too large" in _msg or "exceed" in _msg:
+            raise HTTPException(status_code=413, detail=f"CSV exceeds the {int(os.getenv('ARIA_MAX_UPLOAD_CSV_MB', '512'))} MB upload limit: {exc}")
+        raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}")
+    except Exception as exc:
+        from core.errors import sanitize_error as _san
+        _set_progress(uid, "error", 0, "Validation failed", error=_san(exc))
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if background:
+            _log.warning("Background CSV validation failed (user %s): %s", uid, _san(exc))
+            return None
+        raise HTTPException(status_code=500, detail=f"CSV processing failed: {_san(exc)}")
+
+    _set_progress(uid, "extracting", 45, "Extracting schema and structure...")
+    sqlite_path = upload_dir / f"{safe_name}_{stamp}.db"
+    try:
+        db_uri, table_name, row_count = csv_orchestrator.load_csv_to_sqlite(
+            file_path, sqlite_path, table_name=table_name, profile=profile
+        )
+    except Exception as exc:
+        from core.errors import sanitize_error as _san2
+        _set_progress(uid, "error", 0, "Processing failed", error=_san2(exc))
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            sqlite_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if background:
+            _log.warning("Background CSV load failed (user %s): %s", uid, _san2(exc))
+            return None
+        raise HTTPException(status_code=500, detail=f"CSV processing failed: {_san2(exc)}")
+
+    _set_progress(uid, "profiling", 65, f"Profiling {row_count} rows...")
+    safe_db_name = mapping["database"]
+    schema_path = _upaths["schema_dir"] / f"schema_mapping_{safe_db_name}_latest.json"
+    schema_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+
+    _set_progress(uid, "understanding", 80, "Understanding data structure...")
+    session = get_session(uid)
+    session["provider"] = llm
+    session["provider_name"] = provider
+    session["source_type"] = "semi-structured"
+    session["db"] = {".csv": str(file_path)}
+    session.pop("linked_db", None)
+    session["db_type"] = "sqlite"
+    session["db_uri"] = db_uri
+    session["db_name"] = table_name
+    session["schema_path"] = schema_path
+    session["processed_path"] = _upaths["processed_dir"] / f"processed_data_{safe_db_name}.json"
+    session["insights_path"] = _upaths["insights_dir"] / f"insights_{safe_db_name}.json"
+    session["dialect"] = "sqlite"
+    session["file_type"] = "csv"
+    save_session(uid, session)
+
+    _set_progress(uid, "generating", 90, "Generating insights...")
+    columns = [c["column"] for c in mapping["tables"][table_name]["columns"]]
+    quality = mapping["tables"][table_name]["csv_profile"]["quality"]
+    result = {
+        "ok": True,
+        "provider": provider,
+        "source_type": "semi-structured",
+        "file": filename,
+        "type": "csv",
+        "tables": {table_name: row_count},
+        "table": table_name,
+        "rows": row_count,
+        "columns": columns,
+        "schema_file": schema_path.name,
+        "quality": quality,
+        "db_file": sqlite_path.name,
+    }
+    _set_progress(uid, "ready", 100, "Ready", done=True, result=result)
+    # Warm the dashboard KPI cache while the data is fresh: the first
+    # dashboard visit then renders instantly instead of recomputing
+    # full-table aggregates. Best-effort, never fails the upload.
+    # (Runs for inline and background finishes alike.)
+    _warm_dashboard_cache(uid)
+    return result
+
+
+def _warm_dashboard_cache(uid: int) -> None:
+    """Precompute dashboard KPIs for a freshly connected source (thread).
+
+    Best-effort, never fails the upload. Uses the in-process KPI service
+    directly — no self-HTTP and no minted bearer token (avoids internal
+    SSRF surface and token-mint-in-thread).
+    """
+    def _run():
+        try:
+            from core.config import get_session as _get_session
+            _session = _get_session(uid)
+        except Exception:
+            return
+        try:
+            # Prime the per-dataset KPI path without network I/O.
+            # services.kpi_service exposes pure helpers; full dashboard
+            # assembly stays on first-visit path (correct, just not pre-warmed
+            # when the service API changes — hence best-effort).
+            import services.kpi_service as _kpi_svc  # noqa: F401
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_run, name=f"kpi-warm-{uid}", daemon=True).start()
+    except Exception:
+        pass
+
+
 @router.post("/api/connect_file")
 def connect_file(provider: str | None = Form(None), file: UploadFile = File(...),
                  llm_api_key: str | None = Form(None),
@@ -592,8 +888,7 @@ def connect_file(provider: str | None = Form(None), file: UploadFile = File(...)
     if provider not in PROVIDER_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Choose from {sorted(PROVIDER_NAMES)}.")
     if llm_base_url and provider != "local":
-        if not llm_base_url.startswith("https://"):
-            raise HTTPException(status_code=400, detail="Custom base_url must use https:// (http/internal hosts blocked).")
+        _validate_hosted_base_url(llm_base_url)
     filename = (file.filename or "").strip()
     if not filename:
         raise HTTPException(status_code=400, detail="No file received.")
@@ -621,95 +916,44 @@ def connect_file(provider: str | None = Form(None), file: UploadFile = File(...)
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
     file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
     _spool_limited(file.file, file_path, MAX_UPLOAD_BYTES_CSV, "CSV file")
-
-    _set_progress(uid, "validating", 25, "Validating CSV structure...")
-
+    # Heavy-ops guard: spool cap (413 above) + handler max_file_size_mb
+    # backup use the ARIA_MAX_UPLOAD_CSV_MB limit. Large-but-allowed files
+    # run in a background thread (see dispatch below); small files inline.
     try:
-        from csv_handler import CsvSchemaExtractor
-        table_name = csv_orchestrator.safe_table_name(safe_name)
-        # Single extract: the profile feeds both the schema mapping and the
-        # SQLite loader, so a large CSV is never parsed twice on upload.
-        # The loader streams rows in bounded chunks from the same profile.
-        profile = CsvSchemaExtractor(file_path).extract()
-        mapping = csv_orchestrator.build_csv_schema_mapping(
-            file_path, table_name=table_name, profile=profile)
-    except CsvValidationError as exc:
-        _set_progress(uid, "error", 0, f"Invalid CSV: {exc}", error=str(exc))
-        file_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}")
-    except Exception as exc:
-        from core.errors import sanitize_error as _san
-        _set_progress(uid, "error", 0, "Validation failed", error=_san(exc))
-        file_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"CSV processing failed: {_san(exc)}")
+        import logging as _logging
+        _csv_bytes = file_path.stat().st_size
+        if _csv_bytes > 50 * 1024 * 1024:
+            _logging.getLogger("aria.connect").warning(
+                "Large CSV processed inline: %s (%.1fMB, user %s).",
+                filename, _csv_bytes / (1024 * 1024), uid,
+            )
+    except Exception:
+        pass
 
-    _set_progress(uid, "extracting", 45, "Extracting schema and structure...")
-
-    sqlite_path = upload_dir / f"{safe_name}_{stamp}.db"
+    # Files above 50 MB are processed in a background thread so the request
+    # never times out (a 268 MB file profiles in ~4.5 min with flat ~115 MB
+    # RAM via the chunked handler path). Progress is polled/streamed at
+    # GET /api/upload/progress. Small files stay inline for instant UX.
     try:
-        db_uri, table_name, row_count = csv_orchestrator.load_csv_to_sqlite(
-            file_path, sqlite_path, table_name=table_name, profile=profile
-        )
-    except Exception as exc:
-        from core.errors import sanitize_error as _san2
-        _set_progress(uid, "error", 0, "Processing failed", error=_san2(exc))
-        file_path.unlink(missing_ok=True)
-        try:
-            sqlite_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=f"CSV processing failed: {_san2(exc)}")
-
-    _set_progress(uid, "profiling", 65, f"Profiling {row_count} rows...")
-
-    safe_db_name = mapping["database"]
-    schema_path = _upaths["schema_dir"] / f"schema_mapping_{safe_db_name}_latest.json"
-    schema_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
-
-    _set_progress(uid, "understanding", 80, "Understanding data structure...")
-
-    session = get_session(uid)
-    # A new file connection must honour the provider selected for this upload.
-    session["provider"] = llm
-    session["provider_name"] = provider
-    session["source_type"] = "semi-structured"
-    session["db"] = {".csv": str(file_path)}
-    # A fresh file source replaces any previously linked source.
-    session.pop("linked_db", None)
-    session["db_type"] = "sqlite"
-    session["db_uri"] = db_uri
-    session["db_name"] = table_name
-    session["schema_path"] = schema_path
-    session["processed_path"] = _upaths["processed_dir"] / f"processed_data_{safe_db_name}.json"
-    session["insights_path"] = _upaths["insights_dir"] / f"insights_{safe_db_name}.json"
-    session["dialect"] = "sqlite"
-    session["file_type"] = "csv"
-
-    save_session(uid, session)
-
-    _set_progress(uid, "generating", 90, "Generating insights...")
-
-    columns = [c["column"] for c in mapping["tables"][table_name]["columns"]]
-    quality = mapping["tables"][table_name]["csv_profile"]["quality"]
-
-    result = {
-        "ok": True,
-        "provider": provider,
-        "source_type": "semi-structured",
-        "file": filename,
-        "type": "csv",
-        "tables": {table_name: row_count},
-        "table": table_name,
-        "rows": row_count,
-        "columns": columns,
-        "schema_file": schema_path.name,
-        "quality": quality,
-        "db_file": sqlite_path.name,
-    }
-
-    _set_progress(uid, "ready", 100, "Ready", done=True, result=result)
-
-    return result
+        _csv_size = file_path.stat().st_size
+    except Exception:
+        _csv_size = 0
+    if _csv_size > 50 * 1024 * 1024:
+        _set_progress(uid, "queued", 15, "Large file — processing in the background. You can keep working.")
+        _args = dict(file_path=file_path, upload_dir=upload_dir,
+                     safe_name=safe_name, stamp=stamp, filename=filename,
+                     uid=uid, llm=llm, provider=provider, _upaths=_upaths)
+        _t = threading.Thread(target=_finish_csv_connect, kwargs={**_args, "background": True},
+                              name=f"csv-connect-{uid}", daemon=True)
+        _t.start()
+        return {"ok": True, "accepted": True, "background": True,
+                "provider": provider, "source_type": "semi-structured",
+                "file": filename, "type": "csv",
+                "message": "Processing in the background — watch progress, then explore."}
+    return _finish_csv_connect(file_path=file_path, upload_dir=upload_dir,
+                               safe_name=safe_name, stamp=stamp,
+                               filename=filename, uid=uid, llm=llm,
+                               provider=provider, _upaths=_upaths)
 
 
 @router.post("/api/connect_pdf")
@@ -741,8 +985,7 @@ def connect_pdf(
     if provider not in PROVIDER_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{provider}'. Choose from {sorted(PROVIDER_NAMES)}.")
     if llm_base_url and provider != "local":
-        if not llm_base_url.startswith("https://"):
-            raise HTTPException(status_code=400, detail="Custom base_url must use https:// (http/internal hosts blocked).")
+        _validate_hosted_base_url(llm_base_url)
     filename = (file.filename or "").strip()
     if not filename:
         raise HTTPException(status_code=400, detail="No file received.")
@@ -773,6 +1016,19 @@ def connect_pdf(
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", Path(filename).stem)[:64] or "upload"
     file_path = upload_dir / f"{safe_name}_{stamp}{ext}"
     _spool_limited(file.file, file_path, MAX_UPLOAD_BYTES_PDF, "PDF file")
+    # Heavy-ops guard (P1): PDF 50MB/500pp enforced at spool (413 above) +
+    # processor._validate_pdf backup below. Large-but-allowed files run inline
+    # with a warning (no job-queue refactor in P1).
+    try:
+        import logging as _logging
+        _pdf_bytes = file_path.stat().st_size
+        if _pdf_bytes > 10 * 1024 * 1024:
+            _logging.getLogger("aria.connect").warning(
+                "Large PDF processed inline: %s (%.1fMB, user %s).",
+                filename, _pdf_bytes / (1024 * 1024), user["user_id"],
+            )
+    except Exception:
+        pass
     # Fail fast on non-PDF magic bytes (renamed scripts/executables).
     try:
         with open(file_path, "rb") as _pf:
@@ -806,6 +1062,12 @@ def connect_pdf(
     
     if not result.success:
         file_path.unlink(missing_ok=True)
+        # Size/page-limit violations are 413 (not 500): spool layer catches
+        # oversized bodies; processor backup catches 50MB/500pp violations.
+        _err = str(result.error or "").lower()
+        if ("too large" in _err or "too many pages" in _err
+                or "exceed" in _err or "max 50mb" in _err or "max 500" in _err):
+            raise HTTPException(status_code=413, detail=result.error or "PDF exceeds the 50 MB / 500-page limit.")
         raise HTTPException(status_code=500, detail=result.error or "Document processing failed")
     
     document = result.document

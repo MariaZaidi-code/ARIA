@@ -29,6 +29,328 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 class IntentMixin:
+    # ---- conversational inputs (greetings/thanks/bye/help/who/ack/empty) ----
+
+    def _extract_current_question(self, user_goal):
+        """Current-question slice of a (possibly multi-turn) goal string.
+
+        Multi-turn callers prepend history ("Previous question:…" /
+        "Conversation context:…Q:…Current question:…"). Conversational
+        detection must judge ONLY the current turn — otherwise a 'hi'
+        following an analytical question inherits the previous tables and
+        answers with data. Schema-agnostic, no table/column names.
+        """
+        try:
+            _m = re.search(r"current question\s*:\s*(.+)$", str(user_goal or ""),
+                           re.IGNORECASE | re.DOTALL)
+            if _m and _m.group(1).strip():
+                return _m.group(1).strip()
+        except Exception:
+            pass
+        return str(user_goal or "")
+
+    # ---- multi-turn current-question isolation (schema-agnostic) ----
+    # History lines ("Q: …", "Previous question: …") must never leak
+    # measure/aggregation words (e.g. a previous turn's 'average') into the
+    # current turn's IR. Every measure/aggregation scan below runs on the
+    # CURRENT question only; history is inherited solely for elliptical
+    # follow-ups that name no measure of their own.
+
+    @staticmethod
+    def _strip_history_marker(text):
+        """Text after the last 'Current question:' marker, else text as-is."""
+        try:
+            _m = re.search(r"current question\s*:\s*(.+)$", str(text or ""),
+                           re.IGNORECASE | re.DOTALL)
+            if _m and _m.group(1).strip():
+                return _m.group(1).strip()
+        except Exception:
+            pass
+        return str(text or "")
+
+    def _current_question_text(self, user_goal):
+        """Raw current question: explicit metadata wins, else the marker."""
+        try:
+            _active = getattr(self, "_active_current_question", None)
+            if _active and str(_active).strip():
+                return str(_active).strip()
+        except Exception:
+            pass
+        return self._strip_history_marker(user_goal)
+
+    def _history_text(self, user_goal):
+        """Everything before the last 'Current question:' marker (may be '')."""
+        try:
+            _m = re.search(r"current question\s*:\s*(.+)$", str(user_goal or ""),
+                           re.IGNORECASE | re.DOTALL)
+            if _m:
+                return str(user_goal or "")[:_m.start()]
+        except Exception:
+            pass
+        return ""
+
+    def _is_count_explicit_text(self, text):
+        """True when the text itself asks for a count (schema-agnostic)."""
+        try:
+            return bool(re.search(
+                r"\bhow many\b|\bnumber of\b|\bcount of\b|\bcounts\b|\bcount\b",
+                str(text or "").lower()))
+        except Exception:
+            return False
+
+    def _is_elliptical_followup_text(self, current_text):
+        """True when the current question names NO measure/aggregation word
+        but carries a pronoun/continuation cue ('that', 'those', 'it',
+        'them', 'and by', 'for that', 'compare them', 'why did it', leading
+        'and'/'then'/'also', 'what/how about'). Only then may history lend
+        a measure/aggregation; a turn naming its own aggregation ('how many'
+        = COUNT) never inherits."""
+        try:
+            cur = str(current_text or "")
+            cur_l = cur.lower()
+            if not cur_l.strip():
+                return False
+            for keyword in (getattr(self, "kpi_index", None) or {}):
+                try:
+                    if re.search(r"\b" + re.escape(keyword) + r"\b", cur_l):
+                        return False
+                except Exception:
+                    continue
+            if self._detect_aggregation(cur) is not None:
+                return False
+            return bool(re.search(
+                r"\b(that|those|it|them|they|this|these|same|above|previous|"
+                r"earlier|also)\b|^\s*and\b|\band by\b|\bfor that\b|"
+                r"\bcompare them\b|\bwhy did it\b|^\s*(then|also|what about|"
+                r"how about|which|who)\b",
+                cur_l))
+        except Exception:
+            return False
+
+    def _conversational_kind(self, user_goal):
+        """Kind of pure-conversational input, or None when analytical.
+
+        Matches ONLY pure conversational turns (greetings, thanks, bye,
+        help, 'who are you', acknowledgements, empty). Any turn carrying
+        analytical content (metric/operation wording beyond the greeting
+        itself) returns None so 'hi, show total sales' stays analytical.
+        Case-insensitive; handles all-caps and surrounding punctuation.
+        """
+        try:
+            cur = self._extract_current_question(user_goal)
+            low = str(cur or "").strip().lower()
+            if not low or not re.search(r"[a-z]", low):
+                # Empty / whitespace / punctuation-only: conversational.
+                return "empty"
+            # Normalise punctuation to spaces for matching.
+            norm = re.sub(r"[^a-z ]+", " ", low)
+            norm = re.sub(r"\s+", " ", norm).strip()
+            if not norm:
+                return "empty"
+            words = norm.split()
+            # A pure conversational turn is short. Longer turns naming data
+            # concepts stay analytical (never swallow a real question).
+            if len(words) > 8:
+                return None
+            # Greeting prefix with an analytical remainder stays analytical:
+            # "hi, show total sales" must not become a greeting.
+            _ANALYTICAL_HINTS = (
+                "total", "sum", "count", "average", "avg", "mean", "max",
+                "minimum", "maximum", "min", "revenue", "revenues", "sales",
+                "profit", "margin", "income", "turnover", "quantity", "qty",
+                "units", "amount", "value", "price", "cost", "trend",
+                "monthly", "daily", "weekly", "yearly", "growth", "decline",
+                "decrease", "increase", "change", "drop", "dropped", "fall",
+                "fell", "top", "best", "worst", "highest", "lowest", "most",
+                "least", "compare", "comparison", "versus", "distribution",
+                "breakdown", "share", "month", "year", "over time", "by ",
+                "per ", "show", "list", "how many", "number of",
+            )
+            def _has_analytical_remainder(text):
+                t = f" {text} "
+                for h in _ANALYTICAL_HINTS:
+                    if h in t:
+                        return True
+                return False
+            # Strip a leading greeting then check the remainder.
+            _stripped = re.sub(
+                r"^(hi+|hello|helo|heloo|hey|yo|howdy|greetings|good\s+"
+                r"(morning|afternoon|evening))[\s,!\.]*", "", norm).strip()
+            if _stripped and _stripped != norm and _has_analytical_remainder(
+                    f" {_stripped} "):
+                return None
+            if _has_analytical_remainder(f" {norm} ") and not re.fullmatch(
+                    r"(hi|hello|helo|hey|yo|howdy|thanks|thank you|thankyou|"
+                    r"thx|ok|okay|bye|goodbye|help)", norm):
+                # Longer analytical phrasing (e.g. "overall sales",
+                # "thank you for the sales report, now show…") is not pure.
+                # Short exact conversational forms are whitelisted below;
+                # anything else carrying analytical wording stays analytical.
+                _pure_ok = False
+                if norm in ("thank you", "thanks", "thankyou", "thx",
+                            "hi", "hello", "hey"):
+                    _pure_ok = True
+                if not _pure_ok:
+                    # Allow "thanks + short tail" only when the tail has no
+                    # analytical hint (checked above it does) → analytical.
+                    return None
+            # Exact short forms.
+            if norm in ("hi", "hii", "hiii", "hello", "helo", "heloo",
+                        "hey", "yo", "howdy", "greetings", "hi there",
+                        "hello there", "hey there", "hi aria", "hello aria",
+                        "hey aria"):
+                return "greeting"
+            if re.fullmatch(
+                    r"(good\s+morning|good\s+afternoon|good\s+evening)"
+                    r"(\s+aria)?", norm):
+                return "greeting"
+            if norm in ("thanks", "thank you", "thankyou", "thx", "ty",
+                        "thanks a lot", "thank you so much",
+                        "thank you very much", "many thanks",
+                        "thanks so much", "appreciated", "thank u"):
+                return "thanks"
+            if re.fullmatch(r"thank(s| you).*", norm) and len(words) <= 4 \
+                    and not _has_analytical_remainder(f" {norm} "):
+                return "thanks"
+            if norm in ("bye", "goodbye", "good bye", "see you",
+                        "see you soon", "cya", "farewell", "good night"):
+                return "bye"
+            if norm in ("help", "help me", "help please", "i need help",
+                        "what can you do", "what can u do",
+                        "what do you do", "how does this work",
+                        "how do i use this", "how do i use",
+                        "how to use", "guide", "guide me", "show help"):
+                return "help"
+            if re.search(r"\b(who are you|what are you|your name|about you|"
+                         r"who is aria|what is aria|introduce yourself)\b",
+                         norm) and len(words) <= 8:
+                return "who"
+            if norm in ("ok", "okay", "k", "got it", "gotit", "cool",
+                        "nice", "great", "perfect", "sure", "yes", "yeah",
+                        "yep", "nope", "alright", "all right", "fine",
+                        "sounds good", "thank ok"):
+                return "ack"
+            if norm in ("?", "hi?", "hello?", "hey?"):
+                return "greeting"
+            return None
+        except Exception:
+            return None
+
+    def _is_conversational(self, user_goal):
+        """True for pure conversational inputs (no SQL may execute)."""
+        try:
+            return self._conversational_kind(user_goal) is not None
+        except Exception:
+            return False
+
+    def _conversational_message(self, kind, suggestions):
+        """Warm natural reply naming real starter questions (schema-driven)."""
+        try:
+            _s = [str(s).strip() for s in (suggestions or []) if str(s).strip()]
+            _s = _s[:3]
+        except Exception:
+            _s = []
+        if _s:
+            if len(_s) >= 2:
+                _q = "; ".join(f"'{s}'" for s in _s)
+            else:
+                _q = f"'{_s[0]}'"
+            _invite = f" Try asking something like {_q}."
+        else:
+            _invite = " Try asking about totals, top items, or trends over time."
+        if kind == "thanks":
+            return ("You're very welcome! Happy to help with your data."
+                    + _invite)
+        if kind == "bye":
+            return ("Goodbye! I'll be here whenever you want to explore "
+                    "your data." + _invite)
+        if kind == "help":
+            return ("I can answer questions about your connected data — "
+                    "totals, rankings, breakdowns, and trends over time."
+                    + _invite)
+        if kind == "who":
+            return ("I'm ARIA, your data analyst — I answer questions "
+                    "directly from your connected data." + _invite)
+        if kind == "ack":
+            return ("Got it! Let me know what you'd like to explore in "
+                    "your data." + _invite)
+        if kind == "empty":
+            return ("Tell me what you'd like to know about your data."
+                    + _invite)
+        return ("Hi there! I'm ARIA, your data analyst." + _invite)
+
+    def _converse(self, user_goal, output_path="processed_data.json"):
+        """Write the ``conversation`` contract without running any SQL.
+
+        Status ``conversation`` is new and frontend-friendly: NOT
+        ``success`` with data, NOT ``query_failed``, NOT clarification.
+        Carries a warm natural reply plus 2-3 real schema-derived starter
+        questions. No SQL executes on this path by construction.
+        """
+        try:
+            kind = self._conversational_kind(user_goal) or "greeting"
+        except Exception:
+            kind = "greeting"
+        try:
+            suggestions = self._template_suggestions(3)
+        except Exception:
+            suggestions = []
+        try:
+            suggestions = [s for s in (suggestions or []) if s][:3]
+        except Exception:
+            suggestions = []
+        if len(suggestions) < 2:
+            # Schema yielded too few: pad with honest answerable generics
+            # (never invented specifics, never hardcoded columns).
+            for _pad in ("How many records are in the data?",
+                         "What are the top items by value?",
+                         "How has the main metric changed over time?"):
+                if _pad not in suggestions:
+                    suggestions.append(_pad)
+                if len(suggestions) >= 3:
+                    break
+        message = self._conversational_message(kind, suggestions)
+        original = user_goal
+        try:
+            if getattr(self, "_active_original_goal", None):
+                original = self._active_original_goal
+        except Exception:
+            pass
+        output = {
+            "user_goal": original,
+            "status": "conversation",
+            "conversation_kind": kind,
+            "message": message,
+            "question": message,
+            "goal": {
+                "original_question": original,
+                "intent": "conversation",
+                "analysis_type": "conversational",
+            },
+            "kpi_alignment": {},
+            "join_path": [],
+            "goal_ir": {"intent": "conversation", "original_goal": original},
+            "data_selection": {"tables": [], "columns": [],
+                               "filters": [], "joins": []},
+            "analysis_plan": {
+                "measures": [], "dimensions": [], "aggregation": [],
+                "group_by": [], "order_by": [], "limit": None,
+            },
+            "sql": None,
+            "sql_used": None,
+            "execution": {"success": False, "row_count": 0,
+                          "execution_time_ms": 0},
+            "row_count": 0,
+            "data": [],
+            "columns": [],
+            "suggested_questions": suggestions,
+            "warnings": [],
+        }
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text(
+            json.dumps(output, indent=2, default=str), encoding="utf-8")
+        return output_path
+
     # ---- _needs_clarification (_needs_clarification) ----
 
     def _needs_clarification(self, user_goal):
@@ -42,6 +364,14 @@ class IntentMixin:
         ("top brands by model year", "overall sales") must NOT be rejected just
         because the user phrased a concept rather than a physical column.
         """
+        # Conversational inputs never clarify — process_goal answers them as
+        # status=conversation before reaching here; this guard keeps direct
+        # _needs_clarification callers honest too.
+        try:
+            if self._is_conversational(user_goal):
+                return False, None
+        except Exception:
+            pass
         tokens = self._normalize_tokens(user_goal)
         if not tokens:
             return True, (
@@ -50,6 +380,32 @@ class IntentMixin:
             )
 
         goal_l = str(user_goal).lower()
+
+        # 1-0) Pure count questions NEVER clarify (spec §7): "how many
+        #    records/orders/rows", "number of X", "count of X" always ground
+        #    to COUNT(*) on the most relevant table. Generic, no schema names.
+        try:
+            if re.search(
+                r"\bhow many\b|\bhow much\b|\bnumber of\b|\bcount of\b"
+                r"|\bcounts\b|\bnumber of rows\b|\bnumber of records\b",
+                goal_l,
+            ) or re.search(r"\bcount\b", goal_l):
+                return False, None
+        except Exception:
+            pass
+
+        # 1-0b) Revenue/measure-like questions ground via the measure column
+        #    (+ a sampled cell-value filter), never via literal table names:
+        #    "revenue for electronics" must not clarify. Generic, no names.
+        try:
+            if re.search(
+                r"\b(revenue|revenues|sales|turnover|income|gmv|aov)\b"
+                r"|\b(amount|total|quantity|qty|units|value|price|cost)\b",
+                goal_l,
+            ):
+                return False, None
+        except Exception:
+            pass
 
         # 1) Table-level + column-level semantic matching (synonym-aware).
         tables = self._match_tables(goal_l)
@@ -201,6 +557,11 @@ class IntentMixin:
         Deterministic: no LLM. Concrete goals ('total sales by customer') never
         match because they do not use metric/overview vocabulary.
         """
+        try:
+            if self._is_conversational(user_goal):
+                return None
+        except Exception:
+            pass
         if not re.search(self._OVERVIEW_RE, user_goal):
             return None
         goal_tokens = self._normalize_tokens(user_goal)
@@ -312,13 +673,34 @@ class IntentMixin:
 
     def map_goal_to_kpi(self, user_goal):
         """Return detected KPIs + dimensions for a user goal."""
-        goal_lower = user_goal.lower()
+        # Current question only: history keywords must not become KPIs.
+        try:
+            _cur = self._current_question_text(user_goal)
+        except Exception:
+            _cur = str(user_goal or "")
+        goal_lower = _cur.lower()
         kpis = []
         dimensions = set()
+        seen = set()
 
         for keyword, (agg, label) in self.kpi_index.items():
-            if keyword in goal_lower:
+            if keyword in goal_lower and (label, agg) not in seen:
+                seen.add((label, agg))
                 kpis.append({"aggregate": agg, "description": label, "match": keyword})
+        if not kpis:
+            # Elliptical follow-up ("and which category sells most?"): lend
+            # the history's measure words instead of the generic fallback.
+            try:
+                _hist = self._history_text(user_goal)
+                if _hist.strip() and self._is_elliptical_followup_text(_cur):
+                    _hl = _hist.lower()
+                    for keyword, (agg, label) in self.kpi_index.items():
+                        if keyword in _hl and (label, agg) not in seen:
+                            seen.add((label, agg))
+                            kpis.append({"aggregate": agg, "description": label,
+                                         "match": keyword, "inherited": True})
+            except Exception:
+                pass
         if not kpis:
             kpis = [{"aggregate": "SUM", "description": "general KPI", "match": None}]
 
@@ -335,7 +717,11 @@ class IntentMixin:
         must never rely on a naive universal mapping — every hint that resolves
         to a measure column records the resolved expression/aggregation. The
         'general KPI' fallback binds to the first resolved IR metric so an
-        inferred COUNT or a computed measure still reaches the SQL prompt."""
+        inferred COUNT or a computed measure still reaches the SQL prompt.
+
+        Also propagates resolved IR dimensions into kpi_map['dimensions'] so
+        the LLM prompt always includes the actual breakdown columns (e.g.
+        'region, product' for 'Compare segments breakdown')."""
         if not ir:
             return kpi_map
         resolved = []
@@ -355,12 +741,23 @@ class IntentMixin:
                     k["computed_measure"] = True
                 if r.get("inferred"):
                     k["inferred"] = True
+        # Propagate IR dimensions to kpi_map so the LLM prompt includes them.
+        ir_dims = [d.get("resolved_column") for d in ir.get("dimensions", [])
+                   if d.get("resolved_column")]
+        if ir_dims:
+            existing = set(kpi_map.get("dimensions", []))
+            for d in ir_dims:
+                if d not in existing:
+                    kpi_map.setdefault("dimensions", []).append(d)
         return kpi_map
 
     # ---- _detect_aggregation (_detect_aggregation) ----
 
     def _detect_aggregation(self, goal):
-        g = str(goal).lower()
+        try:
+            g = self._strip_history_marker(goal).lower()
+        except Exception:
+            g = str(goal).lower()
         if re.search(r"\b(total|sum|amount of|sum of)\b", g):
             return "SUM"
         if re.search(r"\b(count|how many|number of|total number)\b", g):
@@ -434,6 +831,21 @@ class IntentMixin:
         comparison. `_resolve_semantics` later binds the concepts to real schema
         columns/tables so the LLM is no longer the authority on the plan.
         """
+        # Multi-turn calls prepend conversation history ("Previous question:…"
+        # / "Conversation context:…Q:…Current question:…"). The IR must reflect
+        # ONLY the current question — otherwise keywords from earlier turns
+        # ("how many", "total", "average") poison this turn's intent and the
+        # plan answers a previous question. History still reaches the LLM
+        # prompt via the unmodified goal text upstream.
+        _full_goal = str(goal or "")
+        try:
+            goal = self._current_question_text(_full_goal)
+        except Exception:
+            goal = self._strip_history_marker(_full_goal)
+        try:
+            _history = self._history_text(_full_goal)
+        except Exception:
+            _history = ""
         goal_l = str(goal).lower()
         ir = {
             "original_goal": goal,
@@ -471,8 +883,110 @@ class IntentMixin:
                         "resolved_table": None,
                         "resolved_column": None,
                     })
+        # One question, one primary aggregation: wording can trigger several
+        # aggregates at once ("how many total records" hits COUNT + SUM,
+        # "average amount" hits AVG + SUM) which makes the semantic plan
+        # unsatisfiable and the answer degrades. Explicit function words
+        # outrank generic measure words (COUNT > AVG > MAX/MIN > SUM), unless
+        # the goal joins measures with "and" ("total and average amount"
+        # genuinely wants both).
+        try:
+            _aggs = {m.get("aggregation") for m in ir["metrics"]}
+            if len(_aggs) > 1 and " and " not in f" {goal_l} ":
+                _order = ("COUNT", "AVG", "MAX", "MIN", "SUM")
+                _triggers = {
+                    "COUNT": ("how many", "number of", "count"),
+                    "AVG": ("average", "avg", "mean"),
+                    "MAX": ("max", "maximum", "highest", "largest"),
+                    "MIN": ("min", "minimum", "lowest", "smallest"),
+                    "SUM": ("total", "sum"),
+                }
+                _hit = {a for a, words in _triggers.items()
+                        if any(w in goal_l for w in words)}
+                for _winner in _order:
+                    if _winner in _hit and _winner in _aggs:
+                        ir["metrics"] = [m for m in ir["metrics"]
+                                         if m.get("aggregation") == _winner]
+                        break
+        except Exception:
+            pass
+        # COUNT-explicit current questions ('how many records', 'number of
+        # rows', 'count of') DROP every metric from history/current wording
+        # (not just note it): semantic validation must never demand an
+        # aggregation over an unresolvable measure for a pure count.
+        # A turn naming its own aggregation never inherits history measures.
+        try:
+            _count_explicit = self._is_count_explicit_text(goal)
+        except Exception:
+            _count_explicit = False
+        if _count_explicit:
+            ir["aggregation"] = "COUNT"
+            ir["metrics"] = [{
+                "concept": "row count",
+                "aggregation": "COUNT",
+                "expression": None,
+                "resolved_expression": None,
+                "resolved_table": None,
+                "resolved_column": None,
+                "inferred": False,
+                "confidence": 0.95,
+                "reason": "current question explicitly asks for a count; "
+                          "history measures dropped",
+            }]
+        elif _history.strip():
+            # Elliptical follow-up ("and which category sells most?"): lend
+            # the history's measure/aggregation words. Non-elliptical turns
+            # keep their current-only IR.
+            try:
+                _elliptical = self._is_elliptical_followup_text(goal)
+            except Exception:
+                _elliptical = False
+            if _elliptical:
+                try:
+                    _hist_l = _history.lower()
+                    _have = {(m.get("concept"), m.get("aggregation"))
+                             for m in ir["metrics"]}
+                    for keyword, (aggregate, description) in (
+                            self.kpi_index or {}).items():
+                        try:
+                            if re.search(r"\b" + re.escape(keyword) + r"\b",
+                                         _hist_l):
+                                _key = (description,
+                                        None if keyword == "growth" else aggregate)
+                                if _key not in _have:
+                                    _have.add(_key)
+                                    ir["metrics"].append({
+                                        "concept": description,
+                                        "aggregation": None if keyword == "growth"
+                                        else aggregate,
+                                        "expression": None,
+                                        "resolved_expression": None,
+                                        "resolved_table": None,
+                                        "resolved_column": None,
+                                        "inherited": True,
+                                        "confidence": 0.55,
+                                        "reason": "elliptical follow-up; measure "
+                                                  "inherited from conversation history",
+                                    })
+                        except Exception:
+                            continue
+                    if ir.get("aggregation") is None:
+                        try:
+                            _h_agg = self._detect_aggregation(_history)
+                            if _h_agg:
+                                ir["aggregation"] = _h_agg
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
         if any(k in goal_l for k in ("growth", "trend", "over time", "increase",
-                                     "decrease", "change")):
+                                     "decrease", "decline", "declined",
+                                     "declining", "drop", "dropped",
+                                     "dropping", "fall", "fell", "falling",
+                                     "falls", "change")) or re.search(
+                r"\b(decline|declined|declining|drop|dropped|dropping|"
+                r"fall|fell|falling|falls|decrease|decreased|decreasing)\b",
+                goal_l):
             ir["intent"] = "trend"
             ir["analysis_type"] = "trend_analysis"
         ir["ranking"] = self._detect_ranking(goal)
@@ -533,12 +1047,15 @@ class IntentMixin:
 
     def _detect_intent(self, user_goal):
         """Heuristic intent classification (no LLM call) for the goal contract."""
-        g = str(user_goal).lower()
+        try:
+            g = self._strip_history_marker(user_goal).lower()
+        except Exception:
+            g = str(user_goal).lower()
         if re.search(r"\b(top\b|best\b|worst\b|highest\b|lowest\b|most\b|least\b|rank\b|leader\b|bottom\b)", g):
             return "ranking"
         if re.search(r"\b(compare|comparison|versus|difference|among|between)\b", g):
             return "comparison"
-        if re.search(r"\b(trend|over\s+time|monthly|daily|weekly|yearly|growth|decline|increase|decrease|change)\b", g):
+        if re.search(r"\b(trend|over\s+time|monthly|daily|weekly|yearly|growth|decline|declined|declining|increase|decrease|decreased|decreasing|change|drop|dropped|dropping|fall|fell|falling|falls|dip|down)\b", g):
             return "trend"
         if re.search(r"\b(distribution|breakdown|per\b|by\b|count)\b", g):
             return "distribution"
@@ -548,7 +1065,10 @@ class IntentMixin:
 
     def _detect_analysis_type(self, user_goal):
         """Heuristic analysis-type classification for the goal contract."""
-        g = str(user_goal).lower()
+        try:
+            g = self._strip_history_marker(user_goal).lower()
+        except Exception:
+            g = str(user_goal).lower()
         if any(k in g for k in ("predict", "forecast", "future", "expected",
                                 "will ", "what if", "what-if", "scenario",
                                 "simulate", "projection")):
