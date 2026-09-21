@@ -43,3 +43,13 @@ tbats==1.1.3
 pytest==9.0.3
 httpx==0.28.1
 pytest-cov==7.1.0
+
+# Security pins (pip-audit gate): transitive deps with known CVEs.
+# Keep these at-or-above the fixed versions; re-run pip-audit after bumps.
+anyio==4.14.2
+kafka-python==2.3.2
+protobuf==5.29.6
+setuptools==83.0.0
+soupsieve==2.9.0
+sqlparse==0.6.0
+transformers==5.10.0
