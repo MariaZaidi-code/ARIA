@@ -88,6 +88,15 @@ natural-English questions. Never mention raw table or column identifiers
         'orders.total' -> 'order value', 'order_details.unit_price' -> 'unit price'."""
         col_label = self._natural_label(col)
         if col_label in self._GENERIC_TOTAL_WORDS:
+            # Single-table/file datasets name the table after the upload
+            # (never a business concept): use a neutral noun instead of
+            # leaking the filename into the question. Multi-table schemas
+            # keep the table-derived noun (generic, data-driven).
+            try:
+                if len(getattr(self, "tables", {}) or {}) <= 1:
+                    return "overall total value"
+            except Exception:
+                pass
             return f"{self._natural_label(fact_table)} value"
         return col_label
 

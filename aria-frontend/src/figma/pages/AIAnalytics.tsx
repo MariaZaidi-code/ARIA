@@ -8,7 +8,7 @@ import {
   ChevronRight, Plus, Bookmark, Clock, FlaskConical, SlidersHorizontal,
   Target, FileText, Sparkles, ArrowUpRight, ArrowDownRight, Database,
   Copy, MoreHorizontal, Brain, Lightbulb, GitCompareArrows, Zap,
-  Compass, Share2, X, Info,
+  Compass, Share2, X, Info, CheckCircle2,
 } from "lucide-react";
 import {
   BarChart, Bar, LineChart, Line, AreaChart, Area,
@@ -17,6 +17,7 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   ResponsiveContainer, ReferenceLine,
 } from "recharts";
+import { useTheme } from "../App";
 import { colorForName } from "../lib/charts";
 import { fmtPctBiz } from "../lib/format";
 import {
@@ -98,6 +99,7 @@ function palette(n: number): string[] {
 /* ------------------------------------------------------------------ */
 
 function DynamicChart({ data, chartSpec, metric }: { data: any[]; chartSpec: any; metric: string }) {
+  const { isDark } = useTheme();
   const spec: any = chartSpec || {};
   const chartType: string = spec.chart_type || "bar";
   const xField: string = spec.x || "";
@@ -124,9 +126,9 @@ function DynamicChart({ data, chartSpec, metric }: { data: any[]; chartSpec: any
      of all rendering the same blue. */
   const lineColor = colorForName(strOf(metric || yField || "value") || "value");
   const fmtVal = (v: number) => fmtMetric(v, metric);
-  const tickStyle = { fontSize: 11, fill: "#9CA3AF" };
-  const gridStyle = { strokeDasharray: "3 3", stroke: "#E5E7EB" };
-  const tooltipStyle = { fontSize: 12, borderRadius: 8 };
+  const tickStyle = { fontSize: 11, fill: "var(--muted-foreground)" };
+  const gridStyle = { strokeDasharray: "3 3", stroke: isDark ? "#2A2A35" : "#E5E7EB" };
+  const tooltipStyle = { fontSize: 12, borderRadius: 8, background: "var(--card)", border: "1px solid var(--border)", color: "var(--foreground)" };
 
   /* ---- Bar family (per-category colors) ---- */
   if (chartType === "bar" || chartType === "column") {
@@ -239,7 +241,7 @@ function DynamicChart({ data, chartSpec, metric }: { data: any[]; chartSpec: any
           <XAxis dataKey="label" tick={tickStyle} axisLine={false} tickLine={false} minTickGap={24} />
           <YAxis tick={tickStyle} axisLine={false} tickLine={false} width={52} tickFormatter={fmtVal} />
           <Tooltip formatter={(v: number) => [fmtVal(v), humanize(metric)]} contentStyle={tooltipStyle} />
-          <ReferenceLine y={0} stroke="#CBD5E1" />
+          <ReferenceLine y={0} stroke="var(--border)" />
           <Bar dataKey="value" name="Current" radius={[4, 4, 0, 0]} isAnimationActive animationDuration={500}>
             {data.slice(0, 60).map((r: any, i: number) => {
               const val = numOf(r?.[yField] ?? r?.value) ?? 0;
@@ -392,10 +394,10 @@ function DynamicChart({ data, chartSpec, metric }: { data: any[]; chartSpec: any
           const pct = (p.value / maxVal) * 100;
           return (
             <div key={i} className="flex items-center gap-2">
-              <span className="w-[120px] text-right text-[11px] text-slate-600 truncate flex-shrink-0">{p.label}</span>
-              <div className="flex-1 bg-slate-100 rounded-md h-6 relative overflow-hidden">
+              <span className="w-[120px] text-right text-[11px] text-secondary-foreground truncate flex-shrink-0">{p.label}</span>
+              <div className="flex-1 bg-secondary rounded-md h-6 relative overflow-hidden">
                 <div className="absolute inset-y-0 left-0 rounded-md transition-all duration-500" style={{ width: `${pct}%`, backgroundColor: colors[i % colors.length] }} />
-                <span className="absolute inset-0 flex items-center justify-center text-[10.5px] font-medium text-[#0F2440] z-10">{fmtVal(p.value)}</span>
+                <span className="absolute inset-0 flex items-center justify-center text-[10.5px] font-medium text-foreground z-10">{fmtVal(p.value)}</span>
               </div>
             </div>
           );
@@ -621,9 +623,9 @@ function DynamicChart({ data, chartSpec, metric }: { data: any[]; chartSpec: any
     return (
       <ResponsiveContainer width="100%" height="100%">
         <RadarChart data={radarData} cx="50%" cy="50%" outerRadius="70%">
-          <PolarGrid stroke="#E5E7EB" />
-          <PolarAngleAxis dataKey="subject" tick={{ fontSize: 11, fill: "#9CA3AF" }} />
-          <PolarRadiusAxis tick={{ fontSize: 10, fill: "#9CA3AF" }} />
+          <PolarGrid stroke="var(--border)" />
+          <PolarAngleAxis dataKey="subject" tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} />
+          <PolarRadiusAxis tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} />
           <Tooltip contentStyle={tooltipStyle} />
           <Legend wrapperStyle={{ fontSize: 11 }} />
           {radarKeys.map((rk: string, i: number) => (
@@ -658,11 +660,11 @@ function DynamicChart({ data, chartSpec, metric }: { data: any[]; chartSpec: any
       <div className="overflow-auto">
         <div className="inline-grid gap-px" style={{ gridTemplateColumns: `60px repeat(${xLabels.length}, minmax(28px, 1fr))` }}>
           <div />
-          {xLabels.map((xl: string) => <div key={xl} className="text-[9px] text-slate-500 text-center truncate px-0.5">{xl}</div>)}
+          {xLabels.map((xl: string) => <div key={xl} className="text-[9px] text-muted-foreground text-center truncate px-0.5">{xl}</div>)}
           {yLabels.map((yl: string) => {
             const rowKey = `row-${yl}`;
             return [
-              <div key={`y-${rowKey}`} className="text-[9px] text-slate-500 text-right pr-1.5 truncate flex items-center justify-end">{yl}</div>,
+              <div key={`y-${rowKey}`} className="text-[9px] text-muted-foreground text-right pr-1.5 truncate flex items-center justify-end">{yl}</div>,
               ...xLabels.map((xl: string) => {
                 const cell = hmData.find((d: any) => d.x === xl && d.y === yl);
                 const v = cell?.value ?? 0;
@@ -680,8 +682,8 @@ function DynamicChart({ data, chartSpec, metric }: { data: any[]; chartSpec: any
     const kpiVal = numOf(data[0]?.[yField] ?? data[0]?.value) ?? 0;
     return (
       <div className="flex flex-col items-center justify-center py-6">
-        <span className="text-[36px] font-bold text-[#0F2440] tabular-nums">{fmtVal(kpiVal)}</span>
-        <span className="text-[12px] text-slate-500 mt-1">{spec.label || humanize(metric)}</span>
+        <span className="text-[36px] font-bold text-foreground tabular-nums">{fmtVal(kpiVal)}</span>
+        <span className="text-[12px] text-muted-foreground mt-1">{spec.label || humanize(metric)}</span>
       </div>
     );
   }
@@ -695,15 +697,15 @@ function DynamicChart({ data, chartSpec, metric }: { data: any[]; chartSpec: any
       <div className="flex flex-col items-center justify-center py-6">
         <div className="relative w-32 h-32">
           <svg viewBox="0 0 120 120" className="w-full h-full -rotate-90">
-            <circle cx="60" cy="60" r="50" fill="none" stroke="#E5E7EB" strokeWidth="10" />
+            <circle cx="60" cy="60" r="50" fill="none" stroke="var(--border)" strokeWidth="10" />
             <circle cx="60" cy="60" r="50" fill="none" stroke={CHART_PALETTE[0]} strokeWidth="10" strokeDasharray={`${Math.PI * 100}`} strokeDashoffset={`${Math.PI * 100 * (1 - pct / 100)}`} strokeLinecap="round" className="transition-all duration-1000" />
           </svg>
           <div className="absolute inset-0 flex flex-col items-center justify-center">
-            <span className="text-[20px] font-bold text-[#0F2440] tabular-nums">{fmtVal(gaugeVal)}</span>
-            <span className="text-[10px] text-slate-500">/ {fmtVal(gaugeMax)}</span>
+            <span className="text-[20px] font-bold text-foreground tabular-nums">{fmtVal(gaugeVal)}</span>
+            <span className="text-[10px] text-muted-foreground">/ {fmtVal(gaugeMax)}</span>
           </div>
         </div>
-        <span className="text-[12px] text-slate-500 mt-2">{spec.label || humanize(metric)}</span>
+        <span className="text-[12px] text-muted-foreground mt-2">{spec.label || humanize(metric)}</span>
       </div>
     );
   }
@@ -822,38 +824,38 @@ function AnalysisCard({ item, onOpen }: { item: any; onOpen: () => void }) {
   const total = numOf(item?.result?.total);
 
   return (
-    <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] hover:shadow-md hover:border-blue-200 transition-all group">
+    <div className="bg-card border border-border/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] hover:shadow-md hover:border-blue-200 dark:hover:border-blue-500/25 transition-all group">
       <div className="p-4">
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-2.5 min-w-0">
-            <span className="inline-flex items-center justify-center w-9 h-9 rounded-xl bg-blue-50 text-blue-700 flex-shrink-0">
+            <span className="inline-flex items-center justify-center w-9 h-9 rounded-xl bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 flex-shrink-0">
               <BarChart3 size={16} />
             </span>
             <div className="min-w-0">
-              <h4 className="text-[13px] font-semibold text-[#0F2440] truncate">{title}</h4>
-              <p className="text-[11px] text-slate-400 flex items-center gap-1">
+              <h4 className="text-[13px] font-semibold text-foreground truncate">{title}</h4>
+              <p className="text-[11px] text-muted-foreground flex items-center gap-1">
                 {timeAgo && <><Clock size={10} />{timeAgo}</>}
                 {!timeAgo && metric && <>{humanize(metric)}</>}
               </p>
             </div>
           </div>
-          <button onClick={onOpen} className="text-[11px] font-medium text-blue-700 hover:text-blue-800 px-2 py-1 rounded-md hover:bg-blue-50 opacity-0 group-hover:opacity-100 transition-opacity" aria-label="Open analysis">Open</button>
+          <button onClick={onOpen} className="text-[11px] font-medium text-blue-700 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 px-2 py-1 rounded-md hover:bg-blue-50 dark:hover:bg-blue-500/10 opacity-0 group-hover:opacity-100 transition-opacity" aria-label="Open analysis">Open</button>
         </div>
         {total !== null && (
           <div className="mt-3 flex items-baseline gap-2">
-            <span className="text-[20px] font-bold text-[#0F2440] tabular-nums">{fmtMetric(total, metric)}</span>
+            <span className="text-[20px] font-bold text-foreground tabular-nums">{fmtMetric(total, metric)}</span>
             {changePct !== null && (
-              <span className={`inline-flex items-center gap-0.5 text-[11px] font-semibold ${changePct >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+              <span className={`inline-flex items-center gap-0.5 text-[11px] font-semibold ${changePct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                 {changePct >= 0 ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
                 {fmtPctBiz(changePct)}
               </span>
             )}
           </div>
         )}
-        {summary && <p className="mt-2 text-[11.5px] text-slate-500 line-clamp-2 leading-relaxed">{summary}</p>}
+        {summary && <p className="mt-2 text-[11.5px] text-muted-foreground line-clamp-2 leading-relaxed">{summary}</p>}
       </div>
       <div className="px-4 pb-3">
-        <button onClick={onOpen} className="w-full text-left text-[12px] font-semibold text-blue-700 hover:text-blue-800 flex items-center justify-between py-1.5 border-t border-slate-100 mt-1">
+        <button onClick={onOpen} className="w-full text-left text-[12px] font-semibold text-blue-700 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 flex items-center justify-between py-1.5 border-t border-border mt-1">
           Explore this analysis <ChevronRight size={13} />
         </button>
       </div>
@@ -952,6 +954,54 @@ export default function AIAnalytics({
     if (onNavigate) { try { onNavigate("intelligence"); } catch { /* ignore */ } }
   }, [onNavigate]);
 
+  /* ---- Hypothesis handoffs (existing mechanisms, dynamic values only) ----
+     Test-this: Explore handoff via sessionStorage `aria_explore_prefill`
+     plus the drill-context pattern (localStorage `aria_dashboard_drill`). */
+  const hypothesisHandoff = useCallback(() => {
+    try {
+      const data: any = (result as any)?.data || result || {};
+      const env: any = data?.analytics_envelope || data || {};
+      const hyp: any = env?.hypothesis || {};
+      const drv: any = ((env?.possible_drivers || [])[0]) || {};
+      const ex: any = hyp?.explore_handoff || {};
+      const metric = strOf(ex?.metric || env?.metric || chartMetricFallback());
+      const breakdown = strOf(ex?.breakdown || (env?.dimensions || [])[0] || drv?.dimension || "");
+      const segment = strOf(ex?.segment || drv?.value || "");
+      return { metric, breakdown, segment };
+    } catch {
+      return { metric: "", breakdown: "", segment: "" };
+    }
+    function chartMetricFallback(): string {
+      try {
+        const d: any = (result as any)?.data || result || {};
+        return strOf(d?.metric || d?.display?.metric || "");
+      } catch {
+        return "";
+      }
+    }
+  }, [result]);
+
+  const testHypothesis = useCallback(() => {
+    const h = hypothesisHandoff();
+    try {
+      if (h.metric || h.breakdown) {
+        sessionStorage.setItem("aria_explore_prefill", JSON.stringify({
+          ...(h.metric ? { metric: h.metric } : {}),
+          ...(h.breakdown ? { breakdown: h.breakdown } : {}),
+        }));
+      }
+    } catch { /* best-effort */ }
+    try {
+      localStorage.setItem("aria_dashboard_drill", JSON.stringify({
+        at: Date.now(), kind: "hypothesis",
+        ...(h.metric ? { metric: h.metric } : {}),
+        ...(h.breakdown ? { dimension: h.breakdown, breakdown: h.breakdown } : {}),
+        ...(h.segment ? { segment: h.segment, value: h.segment } : {}),
+      }));
+    } catch { /* best-effort */ }
+    gotoTab("explore");
+  }, [hypothesisHandoff, gotoTab]);
+
   /* ---- Run analysis on-page ---- */
   const runOnPage = useCallback(async (question: string) => {
     const q = question.trim();
@@ -1016,10 +1066,112 @@ export default function AIAnalytics({
   const vizType = gd?.visualization?.type || "bar";
   const chartMetric = strOf(gd?.metric || gd?.display?.metric || gd?.processedDataSummary?.columns?.[0] || "");
   const columns: string[] = gd?.processedDataSummary?.columns || gd?.columns || [];
-  const followUps: string[] = gd?.followUpQuestions || gd?.suggestedQuestions || [];
+  const followUps: string[] = asList(gd?.followUpQuestions || gd?.suggestedQuestions || (gd as any)?.follow_up_questions || (gd as any)?.suggested_questions);
   const story = strOf(gd?.story || "");
   const limitations: string[] = asList(gd?.limitations || gd?.why?.limitations || []);
   const b360: any = (gd as any)?.business360 || (result as any)?.business360 || null;
+  /* Structured insight fields (backend envelope): possible drivers with
+     shares, hypothesis, and recommendations. Rendered in plain words —
+     raw table.column identifiers are humanized, statistician phrasing
+     ("statistical association") is reworded. Generic, no schema names. */
+  const drivers: any[] = asList((gd as any)?.possible_drivers || (gd as any)?.possibleDrivers || []);
+  const hypothesis: any = (gd as any)?.hypothesis || null;
+  const recommendations: any[] = asList((gd as any)?.recommendations || []).map((r: any) =>
+    typeof r === "string" ? { text: r } : r);
+  const plainWords = (s: string): string => {
+    let t = strOf(s);
+    if (!t) return "";
+    t = t.replace(/statistical association/gi, "pattern in the data");
+    t = t.replace(/Statistical association only,? not proven cause\.?/gi,
+      "Things moving together does not prove what causes what.");
+    t = t.replace(/not a proven cause/gi, "not proof of what causes it");
+    return t;
+  };
+  // Short identifier-safe labeler (columns/dims only — never sentences).
+  const identLabel = (s: any): string => {
+    const t = strOf(s);
+    if (!t || t.length > 80 || /\s{2,}/.test(t)) return t;
+    try {
+      return humanize(t.split(".").pop() || t);
+    } catch {
+      return t;
+    }
+  };
+  const hasInsightsBase = findings.length > 0 || drivers.length > 0 || !!hypothesis || recommendations.length > 0;
+  void hasInsightsBase;
+  /* Question-aware Key Insights ordering + temporal gating — derived only
+     from existing gd fields (interpreted_intent, comparison_period
+     granularity, findings, drivers). No new fetches, no fabricated numbers.
+     - ranking intent leads with winner + share (from drivers[0])
+     - trend intent leads with the direction/change finding (from findings)
+     - the backend comparison blurb ("Compared current month vs previous
+       month…") renders only when the answer is temporal. */
+  const intentPrimary: string = (() => {
+    try {
+      const raw: any = (gd as any)?.interpreted_intent ?? (gd as any)?.interpretedIntent ?? "";
+      const p = typeof raw === "string" ? raw : raw?.primary || "";
+      return strOf(p).toLowerCase();
+    } catch { return ""; }
+  })();
+  const comparisonPeriod: any = (gd as any)?.comparison_period ?? (gd as any)?.comparisonPeriod ?? null;
+  const comparisonGranularity = strOf(comparisonPeriod?.granularity || "").toLowerCase();
+  void comparisonGranularity;
+  const comparisonDescription = strOf(comparisonPeriod?.description || "");
+  const isRankingIntent = /rank/.test(intentPrimary);
+  const isTrendIntent = /trend|forecast|change_detection|anomaly|period_over_period/.test(intentPrimary);
+  const isComparisonIntent = /compar|period_over_period|contribution/.test(intentPrimary);
+  const temporalHint = /day|week|month|quarter|year|over time|previous|current period|trend|growth|declin|increas|decreas|\bmom\b|\byoy\b|\bqoq\b/i;
+  const answerTemporal = temporalHint.test(`${answerMessage} ${askedQuestion} ${findings.join(" ")}`);
+  const isTemporalAnswer = isTrendIntent || isComparisonIntent || intentPrimary === "period_over_period" || answerTemporal;
+  const isComparisonFinding = (f: string): boolean => {
+    const t = strOf(f);
+    if (!t) return false;
+    if (comparisonDescription && t.trim() === comparisonDescription.trim()) return true;
+    return /compared\s+current\s+\w+.*vs\s+previous\s+\w+|period-over-period\s+on\s+\w+\s+granularity|current\s+month\s+vs\s+previous\s+month/i.test(t);
+  };
+  const visibleFindings: string[] = findings.filter((f) => (isTemporalAnswer ? true : !isComparisonFinding(f)));
+  /* Ranking lead (winner + share) synthesized from the existing drivers[0]
+     entry — real share only, humanized identifiers, never fabricated. */
+  const topDriverVal = strOf((drivers[0] as any)?.value || "");
+  const topDriverShare = numOf((drivers[0] as any)?.contribution_pct ?? (drivers[0] as any)?.share_pct);
+  const rankingLead: string | null = (isRankingIntent && topDriverVal)
+    ? (topDriverShare !== null
+      ? `${humanize(topDriverVal.split(".").pop() || topDriverVal)} leads with about ${Math.round(topDriverShare)}% of the total`
+      : `${humanize(topDriverVal.split(".").pop() || topDriverVal)} leads`)
+    : null;
+  const trendSignal = /increas|decreas|\bgrowth\b|\bdeclin|\brose\b|\bfell\b|\bdropped\b|\btrend\b|change[sd]?\s+by|\+?-?\d+(\.\d+)?%/i;
+  let orderedFindings: string[] = [...visibleFindings];
+  if (isTrendIntent) {
+    const idx = orderedFindings.findIndex((f) => trendSignal.test(f));
+    if (idx > 0) {
+      const [t] = orderedFindings.splice(idx, 1);
+      orderedFindings.unshift(t);
+    }
+  }
+  if (rankingLead) {
+    const winnerLc = topDriverVal.split(".").pop()?.toLowerCase() || "";
+    const alreadyLeads = orderedFindings.length > 0 && winnerLc
+      ? orderedFindings[0].toLowerCase().includes(winnerLc.slice(0, Math.min(12, winnerLc.length)))
+      : false;
+    if (!alreadyLeads) orderedFindings = [rankingLead, ...orderedFindings.filter((f) => f !== rankingLead)];
+  }
+  /* Leak lockdown: humanize raw identifiers inside insight sentences
+     (table.column, snake_case) without rewriting prose. SQL never renders
+     in this card — it lives only in the evidence drawer. */
+  const humanizeIdentifiers = (s: string): string => {
+    let t = strOf(s);
+    if (!t) return "";
+    t = t.replace(/([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_.]*)/g, (m) => {
+      try { return humanize((m.split(".").pop() || m).replace(/["'`]/g, "")); } catch { return m; }
+    });
+    t = t.replace(/\b([A-Za-z]+_[A-Za-z0-9_]+)\b/g, (m) => {
+      if (m.length > 80) return m;
+      try { return humanize(m); } catch { return m; }
+    });
+    return t;
+  };
+  const insightText = (s: string): string => humanizeIdentifiers(plainWords(s));
+  const hasInsights = orderedFindings.length > 0 || drivers.length > 0 || !!hypothesis || recommendations.length > 0;
 
   const hasDataset = meta && (meta?.metrics?.length > 0 || meta?.measures?.length > 0);
   const showResults = result || running || error;
@@ -1040,7 +1192,7 @@ export default function AIAnalytics({
   const isChartType = chartSpec.chart_type !== "table" && chartSpec.chart_type !== "text";
   const showChart = hasChartData && hasAxes && isChartType;
   /* Is the answer text-only (no chart, no findings, just narrative)? */
-  const isTextOnly = !showChart && findings.length === 0 && !story;
+  const isTextOnly = !showChart && visibleFindings.length === 0 && !story;
 
   /* ------------------------------------------------------------------ */
   /*  Not connected / Loading / Error / No dataset                       */
@@ -1048,13 +1200,13 @@ export default function AIAnalytics({
 
   if (connectionStatus !== undefined && connectionStatus !== "connected") {
     return (
-      <div className="min-h-full bg-[#F7F8FB]">
+      <div className="min-h-full bg-background">
         <div className="p-6 max-w-screen-xl mx-auto">
-          <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">ARIA</p>
-          <h1 className="text-[28px] font-bold text-[#0F2440] tracking-tight mt-1">Analytics</h1>
-          <p className="text-[14px] text-slate-500 mt-0.5">Turn your data into answers.</p>
-          <div className="mt-8 text-center py-16 bg-white border border-slate-200 rounded-2xl">
-            <Database size={28} className="mx-auto text-slate-400 mb-3" />
+          <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">ARIA</p>
+          <h1 className="text-[28px] font-bold text-foreground tracking-tight mt-1">Analytics</h1>
+          <p className="text-[14px] text-muted-foreground mt-0.5">Turn your data into answers.</p>
+          <div className="mt-8 text-center py-16 bg-card border border-border rounded-2xl">
+            <Database size={28} className="mx-auto text-muted-foreground mb-3" />
             <p className="text-sm font-medium">No data source connected</p>
             {onNavigate && <button onClick={() => onNavigate("data")} className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-xl text-[13px] font-semibold text-white bg-blue-700 hover:bg-blue-800">Go to Data</button>}
           </div>
@@ -1062,30 +1214,30 @@ export default function AIAnalytics({
       </div>
     );
   }
-  if (metaLoading) return <div className="min-h-full bg-[#F7F8FB]"><div className="p-6 max-w-screen-xl mx-auto"><LoadingPanel label="Loading analytics…" /></div></div>;
-  if (metaError && !meta) return <div className="min-h-full bg-[#F7F8FB]"><div className="p-6 max-w-screen-xl mx-auto"><ErrorPanel message={metaError} onRetry={loadMeta} retryLabel="Reload" /></div></div>;
-  if (meta && !hasDataset) return <div className="min-h-full bg-[#F7F8FB]"><div className="p-6 max-w-screen-xl mx-auto"><NoDatasetPanel onRetry={loadMeta} hint={(() => { try { return (getNoSchemaInfo(meta).hint as string) || undefined; } catch { return undefined; } })()} /></div></div>;
+  if (metaLoading) return <div className="min-h-full bg-background"><div className="p-6 max-w-screen-xl mx-auto"><LoadingPanel label="Loading analytics…" /></div></div>;
+  if (metaError && !meta) return <div className="min-h-full bg-background"><div className="p-6 max-w-screen-xl mx-auto"><ErrorPanel message={metaError} onRetry={loadMeta} retryLabel="Reload" /></div></div>;
+  if (meta && !hasDataset) return <div className="min-h-full bg-background"><div className="p-6 max-w-screen-xl mx-auto"><NoDatasetPanel onRetry={loadMeta} hint={(() => { try { return (getNoSchemaInfo(meta).hint as string) || undefined; } catch { return undefined; } })()} /></div></div>;
 
   /* ------------------------------------------------------------------ */
   /*  Render                                                             */
   /* ------------------------------------------------------------------ */
 
   return (
-    <div className="min-h-full bg-[#F7F8FB]">
+    <div className="min-h-full bg-background">
       <div className="flex gap-6 p-4 md:p-6 max-w-[1440px] mx-auto">
         {/* ---- Main column ---- */}
         <div className="flex-1 min-w-0 space-y-5">
           {/* Header */}
           <div>
-            <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">ARIA <span className="text-slate-400 font-normal tracking-normal">/ Analytics</span></p>
+            <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">ARIA <span className="text-muted-foreground font-normal tracking-normal">/ Analytics</span></p>
             <div className="flex items-start justify-between gap-3 mt-1">
               <div>
-                <h1 className="text-[28px] font-bold text-[#0F2440] tracking-tight">Analytics</h1>
-                <p className="text-[14px] text-slate-500 mt-0.5">Turn your data into answers. Explore, compare, and uncover what matters.</p>
+                <h1 className="text-[28px] font-bold text-foreground tracking-tight">Analytics</h1>
+                <p className="text-[14px] text-muted-foreground mt-0.5">Turn your data into answers. Explore, compare, and uncover what matters.</p>
               </div>
               <div className="flex items-center gap-2 flex-shrink-0">
                 {!showResults && (
-                  <button onClick={() => gotoTab("explore")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium text-slate-600 border border-slate-200 hover:text-[#0F2440] hover:border-slate-300 bg-white transition-colors">
+                  <button onClick={() => gotoTab("explore")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium text-secondary-foreground border border-border hover:text-foreground hover:border-border bg-card transition-colors">
                     <Bookmark size={13} /> Saved analyses
                   </button>
                 )}
@@ -1105,8 +1257,8 @@ export default function AIAnalytics({
           {/* Compact search bar — always visible when results are shown */}
           {showResults && (
             <div className="relative">
-              <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2.5 focus-within:border-blue-400 transition-colors shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
-                <Search size={15} className="text-slate-400 flex-shrink-0" />
+              <div className="flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-2.5 focus-within:border-blue-400 transition-colors shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+                <Search size={15} className="text-muted-foreground flex-shrink-0" />
                 <input
                   value={searchQuery}
                   onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
@@ -1114,7 +1266,7 @@ export default function AIAnalytics({
                   onBlur={() => setTimeout(() => setAcOpen(false), 200)}
                   onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); runOnPage(searchQuery); } }}
                   placeholder="Ask another question..."
-                  className="flex-1 bg-transparent outline-none text-[13px] text-[#0F2440] placeholder:text-slate-400"
+                  className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground"
                   aria-label="Ask a question"
                 />
                 <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
@@ -1122,11 +1274,11 @@ export default function AIAnalytics({
                 </button>
               </div>
               {acOpen && acOptions.length > 0 && (
-                <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
+                <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
                   {acOptions.map((s, i) => (
                     <button key={s + i} onMouseDown={() => { setAcOpen(false); setSearchQuery(s); runOnPage(s); }}
-                      className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-[#0F2440] hover:bg-slate-50 transition-colors text-left">
-                      <Zap size={13} className="text-blue-600 flex-shrink-0" />
+                      className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left">
+                      <Zap size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
                       <span className="truncate">{s}</span>
                     </button>
                   ))}
@@ -1137,17 +1289,17 @@ export default function AIAnalytics({
 
           {/* Start a new analysis — only show when no results */}
           {!showResults && (
-            <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-5">
+            <div className="bg-card border border-border/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-5">
               <div className="flex items-center gap-2.5 mb-1">
                 <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 text-white"><Sparkles size={15} /></span>
                 <div>
-                  <h3 className="text-[14px] font-semibold text-[#0F2440]">Start a new analysis</h3>
-                  <p className="text-[11.5px] text-slate-500">Ask a question or choose from common analysis types.</p>
+                  <h3 className="text-[14px] font-semibold text-foreground">Start a new analysis</h3>
+                  <p className="text-[11.5px] text-muted-foreground">Ask a question or choose from common analysis types.</p>
                 </div>
               </div>
               <div className="mt-3 relative">
-                <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/60 px-3 py-2.5 focus-within:border-blue-400 focus-within:bg-white transition-colors">
-                  <Search size={15} className="text-slate-400 flex-shrink-0" />
+                <div className="flex items-center gap-2 rounded-xl border border-border bg-secondary/60 px-3 py-2.5 focus-within:border-blue-400 focus-within:bg-card transition-colors">
+                  <Search size={15} className="text-muted-foreground flex-shrink-0" />
                   <input
                     value={searchQuery}
                     onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
@@ -1155,7 +1307,7 @@ export default function AIAnalytics({
                     onBlur={() => setTimeout(() => setAcOpen(false), 200)}
                     onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); runOnPage(searchQuery); } }}
                     placeholder="E.g. Why did revenue drop last month?"
-                    className="flex-1 bg-transparent outline-none text-[13px] text-[#0F2440] placeholder:text-slate-400"
+                    className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground"
                     aria-label="Ask a question"
                   />
                   <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
@@ -1163,11 +1315,11 @@ export default function AIAnalytics({
                   </button>
                 </div>
                 {acOpen && acOptions.length > 0 && (
-                  <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
+                  <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
                     {acOptions.map((s, i) => (
                       <button key={s + i} onMouseDown={() => { setAcOpen(false); setSearchQuery(s); runOnPage(s); }}
-                        className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-[#0F2440] hover:bg-slate-50 transition-colors text-left">
-                        <Zap size={13} className="text-blue-600 flex-shrink-0" />
+                        className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left">
+                        <Zap size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
                         <span className="truncate">{s}</span>
                       </button>
                     ))}
@@ -1175,10 +1327,10 @@ export default function AIAnalytics({
                 )}
               </div>
               <div className="mt-3">
-                <p className="text-[11px] font-medium text-slate-400 mb-2">Popular actions</p>
+                <p className="text-[11px] font-medium text-muted-foreground mb-2">Popular actions</p>
                 <div className="flex items-center gap-2 flex-wrap">
                   {POPULAR_ACTIONS.map((a) => (
-                    <button key={a.label} onClick={() => handlePopularAction(a)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-slate-600 border border-slate-200 hover:border-blue-300 hover:text-blue-700 hover:bg-blue-50/50 transition-colors">
+                    <button key={a.label} onClick={() => handlePopularAction(a)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-secondary-foreground border border-border hover:border-blue-300 dark:hover:border-blue-500/25 hover:text-blue-700 dark:hover:text-blue-400 hover:bg-blue-50/50 dark:hover:bg-blue-500/10 transition-colors">
                       <a.icon size={13} /> {a.label}
                     </button>
                   ))}
@@ -1186,10 +1338,10 @@ export default function AIAnalytics({
               </div>
               {suggestions.length > 0 && (
                 <div className="mt-3">
-                  <p className="text-[11px] font-medium text-slate-400 mb-2">Suggested questions</p>
+                  <p className="text-[11px] font-medium text-muted-foreground mb-2">Suggested questions</p>
                   <div className="flex items-center gap-2 flex-wrap">
                     {suggestions.map((s, i) => (
-                      <button key={s + i} onClick={() => runOnPage(s)} className="px-3 py-1.5 rounded-lg text-[12px] font-medium text-blue-700 border border-blue-200 hover:bg-blue-50 transition-colors">
+                      <button key={s + i} onClick={() => runOnPage(s)} className="px-3 py-1.5 rounded-lg text-[12px] font-medium text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/25 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-colors">
                         {s}
                       </button>
                     ))}
@@ -1208,8 +1360,8 @@ export default function AIAnalytics({
               {/* Error */}
               {!running && error && (
                 <Card className="p-5">
-                  <p className="text-[13px] text-rose-600 font-medium">{error}</p>
-                  <button onClick={() => runOnPage(searchQuery || history[history.length - 1]?.q || "")} className="mt-2 text-[12px] font-semibold text-blue-700 hover:underline">Try again</button>
+                  <p className="text-[13px] text-rose-600 dark:text-rose-400 font-medium">{error}</p>
+                  <button onClick={() => runOnPage(searchQuery || history[history.length - 1]?.q || "")} className="mt-2 text-[12px] font-semibold text-blue-700 dark:text-blue-400 hover:underline">Try again</button>
                 </Card>
               )}
 
@@ -1218,13 +1370,13 @@ export default function AIAnalytics({
                 <div className="space-y-4 chart-reveal">
                   {/* Asked question — stays until the user dismisses it */}
                   {askedQuestion && (
-                    <div className="flex items-start gap-2.5 rounded-xl border border-slate-200 bg-slate-50/70 px-4 py-3">
-                      <Search size={14} className="text-slate-400 flex-shrink-0 mt-0.5" />
+                    <div className="flex items-start gap-2.5 rounded-xl border border-border bg-secondary/70 px-4 py-3">
+                      <Search size={14} className="text-muted-foreground flex-shrink-0 mt-0.5" />
                       <div className="flex-1 min-w-0">
-                        <p className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-slate-400">Your question</p>
-                        <p className="text-[13px] font-medium text-[#0F2440] leading-snug break-words">{askedQuestion}</p>
+                        <p className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Your question</p>
+                        <p className="text-[13px] font-medium text-foreground leading-snug break-words">{askedQuestion}</p>
                       </div>
-                      <button onClick={() => setAskedQuestion("")} className="inline-flex items-center justify-center w-6 h-6 rounded-md text-slate-400 hover:text-slate-600 hover:bg-slate-200/70 transition-colors flex-shrink-0" aria-label="Dismiss question" title="Dismiss">
+                      <button onClick={() => setAskedQuestion("")} className="inline-flex items-center justify-center w-6 h-6 rounded-md text-muted-foreground hover:text-secondary-foreground hover:bg-border/70 transition-colors flex-shrink-0" aria-label="Dismiss question" title="Dismiss">
                         <X size={13} />
                       </button>
                     </div>
@@ -1235,7 +1387,7 @@ export default function AIAnalytics({
                       <div className="flex items-start gap-3">
                         <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 text-white flex-shrink-0"><Sparkles size={15} /></span>
                         <div>
-                          <p className="text-[13px] text-[#0F2440] leading-relaxed">{answerMessage}</p>
+                          <p className="text-[13px] text-foreground leading-relaxed">{answerMessage}</p>
                         </div>
                       </div>
                     </Card>
@@ -1243,13 +1395,13 @@ export default function AIAnalytics({
 
                   {/* Follow-up suggestion chips */}
                   {(() => {
-                    const fus = asList(result?.followUpQuestions || result?.suggested_questions);
+                    const fus = asList(gd?.followUpQuestions || gd?.suggestedQuestions || (gd as any)?.follow_up_questions || (gd as any)?.suggested_questions);
                     if (!fus.length) return null;
                     return (
                       <div className="flex items-center gap-2 flex-wrap">
                         {fus.slice(0, 4).map((fq: string, i: number) => (
-                          <button key={fq + i} onClick={() => runOnPage(fq)} className="px-3 py-1.5 rounded-lg text-[12px] font-medium text-blue-700 border border-blue-200 hover:bg-blue-50 transition-colors">
-                            {fq}
+                          <button key={fq + i} onClick={() => runOnPage(fq)} className="px-3 py-1.5 rounded-lg text-[12px] font-medium text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/25 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-colors">
+                            {humanize(fq)}
                           </button>
                         ))}
                       </div>
@@ -1276,62 +1428,151 @@ export default function AIAnalytics({
                         <div className="mt-3 overflow-x-auto">
                           <table className="w-full text-[12px]">
                             <thead>
-                              <tr className="border-b border-slate-200">
+                              <tr className="border-b border-border">
                                 {keys.map((k) => (
-                                  <th key={k} className="text-left font-semibold text-slate-600 px-3 py-2 whitespace-nowrap">{humanize(k)}</th>
+                                  <th key={k} className="text-left font-semibold text-secondary-foreground px-3 py-2 whitespace-nowrap">{humanize(k)}</th>
                                 ))}
                               </tr>
                             </thead>
                             <tbody>
                               {vizData.slice(0, 20).map((row: any, i: number) => (
-                                <tr key={i} className="border-b border-slate-100 hover:bg-slate-50/50">
+                                <tr key={i} className="border-b border-border hover:bg-secondary/50">
                                   {keys.map((k) => (
-                                    <td key={k} className="px-3 py-2 text-[#0F2440] tabular-nums whitespace-nowrap">{typeof row[k] === "number" ? row[k].toLocaleString() : String(row[k] ?? "—")}</td>
+                                    <td key={k} className="px-3 py-2 text-foreground tabular-nums whitespace-nowrap">{typeof row[k] === "number" ? row[k].toLocaleString() : String(row[k] ?? "—")}</td>
                                   ))}
                                 </tr>
                               ))}
                             </tbody>
                           </table>
-                          {vizData.length > 20 && <p className="mt-2 text-[11px] text-slate-400">Showing first 20 of {vizData.length} rows.</p>}
+                          {vizData.length > 20 && <p className="mt-2 text-[11px] text-muted-foreground">Showing first 20 of {vizData.length} rows.</p>}
                         </div>
                       </Card>
                     );
                   })()}
 
-                  {/* Key Insights / Findings */}
-                  {findings.length > 0 && (
+                  {/* Key Insights: findings + what stands out + what it might
+                      mean + what to do — plain words, never raw identifiers
+                      or statistician phrasing. Sections appear only when the
+                      backend actually provided them. */}
+                  {hasInsights && (
                     <Card className="p-5">
-                      <h3 className="text-[14px] font-semibold text-[#0F2440] tracking-tight flex items-center gap-1.5">
-                        <Sparkles size={14} className="text-blue-700" /> Key Insights
+                      <h3 className="text-[14px] font-semibold text-foreground tracking-tight flex items-center gap-1.5">
+                        <Sparkles size={14} className="text-blue-700 dark:text-blue-400" /> Key Insights
                       </h3>
-                      <ul className="mt-2 space-y-2">
-                        {findings.map((f, i) => (
-                          <li key={i} className="flex items-start gap-2 text-[12.5px] text-slate-700 leading-relaxed">
-                            <span className="w-1.5 h-1.5 rounded-full bg-blue-600 flex-shrink-0 mt-1.5" />{f}
-                          </li>
-                        ))}
-                      </ul>
-                    </Card>
-                  )}
-
-                  {/* Follow-up suggestions */}
-                  {followUps.length > 0 && (
-                    <Card className="p-5">
-                      <h3 className="text-[13px] font-semibold text-[#0F2440] mb-2">Suggested follow-ups</h3>
-                      <div className="flex flex-wrap gap-2">
-                        {followUps.slice(0, 6).map((fq, i) => (
-                          <button key={i} onClick={() => runOnPage(fq)} className="text-[11.5px] text-slate-600 border border-slate-200 rounded-full px-3 py-1.5 hover:border-blue-300 hover:text-blue-700 transition-colors">
-                            {fq}
-                          </button>
-                        ))}
-                      </div>
+                      {orderedFindings.length > 0 && (
+                        <ul className="mt-2 space-y-2">
+                          {orderedFindings.map((f, i) => (
+                            <li key={i} className="flex items-start gap-2 text-[12.5px] text-secondary-foreground leading-relaxed">
+                              <span className="w-1.5 h-1.5 rounded-full bg-blue-600 flex-shrink-0 mt-1.5" />{insightText(f)}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {drivers.length > 0 && (
+                        <div className="mt-3">
+                          <p className="text-[12px] font-semibold text-foreground">What stands out</p>
+                          <ul className="mt-1.5 space-y-1.5">
+                            {drivers.slice(0, 3).map((d: any, i: number) => {
+                              const share = numOf(d?.contribution_pct ?? d?.share_pct);
+                              return (
+                                <li key={i} className="flex items-start gap-2 text-[12.5px] text-secondary-foreground leading-relaxed">
+                                  <span className="inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-md bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 text-[11px] font-bold flex-shrink-0 mt-0.5">{i + 1}</span>
+                                  <span>
+                                    <span className="font-semibold text-foreground">{identLabel(d?.value)}</span>
+                                    {strOf(d?.dimension) && (
+                                      <span className="text-muted-foreground"> ({identLabel(d?.dimension)})</span>
+                                    )}
+                                    {share !== null && (
+                                      <span> — about <span className="font-semibold text-foreground tabular-nums">{Math.round(share)}%</span> of the total</span>
+                                    )}
+                                  </span>
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        </div>
+                      )}
+                      {(strOf(hypothesis?.text) || (hypothesis && strOf(hypothesis))) && (
+                        <div className="mt-3 rounded-xl bg-secondary border border-border px-3 py-2.5">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <p className="text-[12px] font-semibold text-foreground">What this might mean</p>
+                            {(() => {
+                              const g = strOf((hypothesis as any)?.evidence_grade || "").toLowerCase();
+                              if (!g) return null;
+                              const tone = /strong/.test(g)
+                                ? "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25"
+                                : /mixed/.test(g)
+                                  ? "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25"
+                                  : "bg-secondary text-secondary-foreground border-border";
+                              const label = /strong/.test(g) ? "Strong evidence" : /mixed/.test(g) ? "Mixed evidence" : "Weak evidence";
+                              return (
+                                <span className={`text-[10.5px] font-semibold px-2 py-0.5 rounded-full border ${tone}`} title={strOf((hypothesis as any)?.evidence_reason || "")}>
+                                  {label}
+                                </span>
+                              );
+                            })()}
+                          </div>
+                          <p className="mt-0.5 text-[12.5px] text-secondary-foreground leading-relaxed">
+                            {insightText(strOf(hypothesis?.text) || strOf(hypothesis))}
+                          </p>
+                          {strOf((hypothesis as any)?.evidence_reason) && (
+                            <p className="mt-1 text-[11.5px] text-muted-foreground leading-relaxed">
+                              {insightText(strOf((hypothesis as any)?.evidence_reason))}
+                            </p>
+                          )}
+                          {(() => {
+                            const rivals: string[] = asList((hypothesis as any)?.rivals)
+                              .map((r: any) => strOf(typeof r === "string" ? r : r?.text))
+                              .filter(Boolean)
+                              .slice(0, 2);
+                            if (!rivals.length) return null;
+                            return (
+                              <div className="mt-2">
+                                <p className="text-[11.5px] font-semibold text-foreground">Other possibilities checked</p>
+                                <ul className="mt-1 space-y-1">
+                                  {rivals.map((r, i) => (
+                                    <li key={i} className="text-[11.5px] text-secondary-foreground leading-relaxed">· {insightText(r)}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            );
+                          })()}
+                          {strOf((hypothesis as any)?.data_needed) && (
+                            <p className="mt-2 text-[11.5px] text-muted-foreground leading-relaxed">
+                              <span className="font-semibold text-secondary-foreground">What would settle it: </span>
+                              {insightText(strOf((hypothesis as any)?.data_needed))}
+                            </p>
+                          )}
+                          <div className="mt-2 pt-2 border-t border-border/70 flex items-center gap-3 flex-wrap">
+                            <button
+                              onClick={() => testHypothesis()}
+                              className="inline-flex items-center gap-1 text-[11.5px] font-semibold text-blue-700 dark:text-blue-400 hover:underline"
+                              aria-label="Test this hypothesis in Explore">
+                              <FlaskConical size={12} /> Test this
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                      {recommendations.length > 0 && (
+                        <div className="mt-3">
+                          <p className="text-[12px] font-semibold text-foreground">What to do next</p>
+                          <ul className="mt-1.5 space-y-1.5">
+                              {recommendations.slice(0, 3).map((r: any, i: number) => (
+                                <li key={i} className="flex items-start gap-2 text-[12.5px] text-secondary-foreground leading-relaxed">
+                                  <CheckCircle2 size={13} className="text-emerald-600 dark:text-emerald-400 flex-shrink-0 mt-0.5" />
+                                  <span>{insightText(strOf(r?.text ?? r))}</span>
+                                </li>
+                              ))}
+                          </ul>
+                        </div>
+                      )}
                     </Card>
                   )}
 
                   {/* Limitations */}
                   {limitations.length > 0 && (
-                    <div className="flex items-start gap-1.5 text-[11px] text-slate-500 bg-blue-50/60 border border-blue-100 rounded-xl px-3 py-2">
-                      <Info size={13} className="text-blue-600 flex-shrink-0 mt-px" />
+                    <div className="flex items-start gap-1.5 text-[11px] text-muted-foreground bg-blue-50/60 dark:bg-blue-500/10 border border-blue-100 dark:border-blue-500/20 rounded-xl px-3 py-2">
+                      <Info size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0 mt-px" />
                       <span>{limitations[0]}</span>
                     </div>
                   )}
@@ -1342,8 +1583,8 @@ export default function AIAnalytics({
               {showResults && !running && (
                 <Card className="p-4">
                   <div className="relative">
-                    <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/60 px-3 py-2.5 focus-within:border-blue-400 focus-within:bg-white transition-colors">
-                      <Search size={15} className="text-slate-400 flex-shrink-0" />
+                    <div className="flex items-center gap-2 rounded-xl border border-border bg-secondary/60 px-3 py-2.5 focus-within:border-blue-400 focus-within:bg-card transition-colors">
+                      <Search size={15} className="text-muted-foreground flex-shrink-0" />
                       <input
                         value={followUpQuery}
                         onChange={(e) => { setFollowUpQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
@@ -1351,7 +1592,7 @@ export default function AIAnalytics({
                         onBlur={() => setTimeout(() => setAcOpen(false), 200)}
                         onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); submitFollowUp(); } }}
                         placeholder="Ask a follow-up..."
-                        className="flex-1 bg-transparent outline-none text-[13px] text-[#0F2440] placeholder:text-slate-400"
+                        className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground"
                         aria-label="Ask a follow-up question"
                       />
                       <button onClick={() => { setAcOpen(false); submitFollowUp(); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Send">
@@ -1359,11 +1600,11 @@ export default function AIAnalytics({
                       </button>
                     </div>
                     {acOpen && acOptions.length > 0 && (
-                      <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
+                      <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
                         {acOptions.map((s, i) => (
                           <button key={s + i} onMouseDown={() => { setAcOpen(false); setFollowUpQuery(s); runOnPage(s); }}
-                            className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-[#0F2440] hover:bg-slate-50 transition-colors text-left">
-                            <Zap size={13} className="text-blue-600 flex-shrink-0" />
+                            className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left">
+                            <Zap size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
                             <span className="truncate">{s}</span>
                           </button>
                         ))}
@@ -1378,12 +1619,12 @@ export default function AIAnalytics({
           {/* Tab bar — only when no results */}
           {!showResults && (
             <>
-              <div className="flex items-center gap-1 border-b border-slate-200" role="tablist" aria-label="Analysis sections">
+              <div className="flex items-center gap-1 border-b border-border" role="tablist" aria-label="Analysis sections">
                 {([ { id: "recent" as const, label: "Recent" }, { id: "saved" as const, label: "Saved" }, { id: "collections" as const, label: "Collections" }, { id: "shared" as const, label: "Shared" } ]).map((t) => {
                   const on = homeTab === t.id;
                   return (
                     <button key={t.id} role="tab" aria-selected={on} onClick={() => setHomeTab(t.id)}
-                      className={`px-3.5 py-2.5 text-[12.5px] font-medium border-b-2 -mb-px transition-colors whitespace-nowrap ${on ? "border-blue-700 text-blue-800" : "border-transparent text-slate-400 hover:text-slate-600"}`}>
+                      className={`px-3.5 py-2.5 text-[12.5px] font-medium border-b-2 -mb-px transition-colors whitespace-nowrap ${on ? "border-blue-700 text-blue-800 dark:text-blue-300" : "border-transparent text-muted-foreground hover:text-secondary-foreground"}`}>
                       {t.label}
                     </button>
                   );
@@ -1393,7 +1634,7 @@ export default function AIAnalytics({
               {/* Tab content */}
               {(homeTab === "recent" || homeTab === "saved") ? (
                 <div>
-                  {recentError && homeTab === "recent" && <p className="text-[12px] text-rose-600 mb-3">{recentError}</p>}
+                  {recentError && homeTab === "recent" && <p className="text-[12px] text-rose-600 dark:text-rose-400 mb-3">{recentError}</p>}
                   {tabItems.length > 0 ? (
                     <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                       {tabItems.map((item: any, i: number) => (
@@ -1401,17 +1642,17 @@ export default function AIAnalytics({
                       ))}
                     </div>
                   ) : (
-                    <div className="text-center py-12 bg-white border border-slate-200 rounded-2xl">
-                      <BarChart3 size={24} className="mx-auto text-slate-300 mb-2" />
-                      <p className="text-[13px] font-medium text-slate-500">{homeTab === "recent" ? "No recent analyses yet." : "No saved analyses yet."}</p>
+                    <div className="text-center py-12 bg-card border border-border rounded-2xl">
+                      <BarChart3 size={24} className="mx-auto text-slate-300 dark:text-muted-foreground mb-2" />
+                      <p className="text-[13px] font-medium text-muted-foreground">{homeTab === "recent" ? "No recent analyses yet." : "No saved analyses yet."}</p>
                       <button onClick={() => gotoTab("explore")} className="mt-3 inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[12.5px] font-semibold text-white bg-blue-700 hover:bg-blue-800"><Plus size={13} /> New analysis</button>
                     </div>
                   )}
                 </div>
               ) : (
-                <div className="text-center py-12 bg-white border border-slate-200 rounded-2xl">
-                  <Compass size={24} className="mx-auto text-slate-300 mb-2" />
-                  <p className="text-[13px] font-medium text-slate-500">{homeTab === "collections" ? "No collections yet." : "No shared analyses yet."}</p>
+                <div className="text-center py-12 bg-card border border-border rounded-2xl">
+                  <Compass size={24} className="mx-auto text-slate-300 dark:text-muted-foreground mb-2" />
+                  <p className="text-[13px] font-medium text-muted-foreground">{homeTab === "collections" ? "No collections yet." : "No shared analyses yet."}</p>
                 </div>
               )}
 
@@ -1419,8 +1660,8 @@ export default function AIAnalytics({
               {homeTab === "recent" && asList(savedCols).length > 0 && (
                 <div>
                   <div className="flex items-center justify-between mb-3">
-                    <h3 className="text-[14px] font-semibold text-[#0F2440]">Saved Analyses</h3>
-                    <button onClick={() => setHomeTab("saved")} className="text-[12px] font-medium text-blue-700 hover:text-blue-800 flex items-center gap-0.5">View all <ChevronRight size={12} /></button>
+                    <h3 className="text-[14px] font-semibold text-foreground">Saved Analyses</h3>
+                    <button onClick={() => setHomeTab("saved")} className="text-[12px] font-medium text-blue-700 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 flex items-center gap-0.5">View all <ChevronRight size={12} /></button>
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
                     {asList(savedCols).slice(0, 4).map((item: any, i: number) => (
@@ -1437,65 +1678,65 @@ export default function AIAnalytics({
         <aside className="w-[300px] flex-shrink-0 hidden lg:block space-y-4">
           {/* 360 degree business view — side panel keeps the main column short */}
           {b360 && (
-            <div className="bg-white border border-blue-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4 bg-gradient-to-b from-blue-50/60 to-white">
-              <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">360 DEGREE BUSINESS VIEW</p>
-              <h3 className="text-[14px] font-bold text-[#0F2440] tracking-tight mt-1 leading-snug">{strOf(b360?.headline || "Here's the full picture")}</h3>
-              <p className="mt-1.5 text-[12px] text-slate-700 leading-relaxed">{strOf(b360?.what_happened?.summary || "")}</p>
+            <div className="bg-card border border-blue-200/80 dark:border-blue-500/25 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4 bg-gradient-to-b from-blue-50/60 dark:from-blue-500/10 to-card">
+              <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">360 DEGREE BUSINESS VIEW</p>
+              <h3 className="text-[14px] font-bold text-foreground tracking-tight mt-1 leading-snug">{strOf(b360?.headline || "Here's the full picture")}</h3>
+              <p className="mt-1.5 text-[12px] text-secondary-foreground leading-relaxed">{strOf(b360?.what_happened?.summary || "")}</p>
               {asList(b360?.likely_causes).length > 0 && (
                 <div className="mt-2.5">
-                  <p className="text-[11px] font-semibold text-[#0F2440]">Most likely causes</p>
+                  <p className="text-[11px] font-semibold text-foreground">Most likely causes</p>
                   <ul className="mt-1 space-y-1">
                     {asList(b360.likely_causes).slice(0, 3).map((c: any, i: number) => (
-                      <li key={i} className="text-[12px] text-slate-600 leading-relaxed">· <span className="font-semibold text-[#0F2440]">{strOf(c?.cause)}</span> — {strOf(c?.why_plain)}</li>
+                      <li key={i} className="text-[12px] text-secondary-foreground leading-relaxed">· <span className="font-semibold text-foreground">{strOf(c?.cause)}</span> — {strOf(c?.why_plain)}</li>
                     ))}
                   </ul>
                 </div>
               )}
               {asList(b360?.what_to_do).length > 0 && (
                 <div className="mt-2.5">
-                  <p className="text-[11px] font-semibold text-[#0F2440]">What to do next</p>
+                  <p className="text-[11px] font-semibold text-foreground">What to do next</p>
                   <div className="mt-1 space-y-1.5">
                     {asList(b360.what_to_do).slice(0, 3).map((a: any, i: number) => (
-                      <details key={i} className="rounded-xl bg-emerald-50/60 border border-emerald-200 px-2.5 py-1.5">
-                        <summary className="text-[12px] font-bold text-emerald-900 cursor-pointer leading-snug">{strOf(a?.title)}</summary>
+                      <details key={i} className="rounded-xl bg-emerald-50/60 dark:bg-emerald-500/10 border border-emerald-200 dark:border-emerald-500/25 px-2.5 py-1.5">
+                        <summary className="text-[12px] font-bold text-emerald-900 dark:text-emerald-300 cursor-pointer leading-snug">{strOf(a?.title)}</summary>
                         <ul className="mt-1 space-y-0.5">
                           {asList(a?.steps).slice(0, 3).map((s: string, j: number) => (
-                            <li key={j} className="text-[11.5px] text-slate-700 leading-relaxed">✓ {strOf(s)}</li>
+                            <li key={j} className="text-[11.5px] text-secondary-foreground leading-relaxed">✓ {strOf(s)}</li>
                           ))}
                         </ul>
-                        {strOf(a?.expected) && <p className="mt-1 text-[11.5px] text-slate-600">{strOf(a.expected)}</p>}
+                        {strOf(a?.expected) && <p className="mt-1 text-[11.5px] text-secondary-foreground">{strOf(a.expected)}</p>}
                       </details>
                     ))}
                   </div>
                 </div>
               )}
               {strOf(b360?.if_do_nothing) && (
-                <div className="mt-2.5 rounded-xl bg-amber-50 border border-amber-200 px-2.5 py-2">
-                  <p className="text-[11px] font-semibold text-amber-900">If you do nothing</p>
-                  <p className="text-[11.5px] text-amber-800 leading-relaxed">{strOf(b360.if_do_nothing)}</p>
+                <div className="mt-2.5 rounded-xl bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/25 px-2.5 py-2">
+                  <p className="text-[11px] font-semibold text-amber-900 dark:text-amber-300">If you do nothing</p>
+                  <p className="text-[11.5px] text-amber-800 dark:text-amber-400 leading-relaxed">{strOf(b360.if_do_nothing)}</p>
                 </div>
               )}
             </div>
           )}
           {/* ARIA Assistant */}
-          <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
+          <div className="bg-card border border-border/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
             <div className="flex items-center gap-2.5 mb-4">
               <span className="inline-flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 text-white"><Sparkles size={16} /></span>
               <div>
-                <h3 className="text-[13px] font-semibold text-[#0F2440]">ARIA</h3>
-                <p className="text-[11px] text-slate-400">Your analysis assistant</p>
+                <h3 className="text-[13px] font-semibold text-foreground">ARIA</h3>
+                <p className="text-[11px] text-muted-foreground">Your analysis assistant</p>
               </div>
             </div>
             <div className="space-y-0.5">
               {SIDEBAR_ACTIONS.map((a) => (
                 <button key={a.label} onClick={() => handleSidebarAction(a)}
-                  className="w-full text-left py-2.5 px-2 -mx-2 flex items-center gap-2.5 hover:bg-blue-50/50 rounded-lg transition-colors group">
-                  <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-50 text-blue-700 flex-shrink-0"><a.icon size={14} /></span>
+                  className="w-full text-left py-2.5 px-2 -mx-2 flex items-center gap-2.5 hover:bg-blue-50/50 dark:hover:bg-blue-500/10 rounded-lg transition-colors group">
+                  <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 flex-shrink-0"><a.icon size={14} /></span>
                   <span className="min-w-0 flex-1">
-                    <span className="block text-[12px] font-medium text-[#0F2440] group-hover:text-blue-700">{a.label}</span>
-                    <span className="block text-[11px] text-slate-400">{a.sub}</span>
+                    <span className="block text-[12px] font-medium text-foreground group-hover:text-blue-700 dark:group-hover:text-blue-400">{a.label}</span>
+                    <span className="block text-[11px] text-muted-foreground">{a.sub}</span>
                   </span>
-                  <ChevronRight size={13} className="text-slate-300 group-hover:text-blue-500 flex-shrink-0" />
+                  <ChevronRight size={13} className="text-slate-300 dark:text-muted-foreground group-hover:text-blue-500 dark:group-hover:text-blue-400 flex-shrink-0" />
                 </button>
               ))}
             </div>
@@ -1503,52 +1744,52 @@ export default function AIAnalytics({
 
           {/* Context */}
           {sidebarCtx.metric && (
-            <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
-              <h4 className="text-[11px] font-medium text-slate-400 mb-2">Context</h4>
-              <div className="flex items-center gap-2.5 p-2.5 bg-slate-50 rounded-xl">
-                <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-50 text-blue-700 flex-shrink-0"><BarChart3 size={14} /></span>
+            <div className="bg-card border border-border/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
+              <h4 className="text-[11px] font-medium text-muted-foreground mb-2">Context</h4>
+              <div className="flex items-center gap-2.5 p-2.5 bg-secondary rounded-xl">
+                <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 flex-shrink-0"><BarChart3 size={14} /></span>
                 <div className="min-w-0">
-                  <p className="text-[12px] font-medium text-[#0F2440] truncate">{humanize(sidebarCtx.metric)}</p>
-                  <p className="text-[11px] text-slate-400">{sidebarCtx.breakdown ? `By ${humanize(sidebarCtx.breakdown)}` : "Overall"}</p>
+                  <p className="text-[12px] font-medium text-foreground truncate">{humanize(sidebarCtx.metric)}</p>
+                  <p className="text-[11px] text-muted-foreground">{sidebarCtx.breakdown ? `By ${humanize(sidebarCtx.breakdown)}` : "Overall"}</p>
                 </div>
               </div>
             </div>
           )}
 
           {/* Continue exploring */}
-          <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
-            <h4 className="text-[11px] font-medium text-slate-400 mb-2">Continue exploring</h4>
+          <div className="bg-card border border-border/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
+            <h4 className="text-[11px] font-medium text-muted-foreground mb-2">Continue exploring</h4>
             <div className="space-y-0.5">
               {CONTINUE_EXPLORING.map((a) => (
                 <button key={a.label} onClick={() => gotoTab(a.tab)}
-                  className="w-full text-left py-2.5 px-2 -mx-2 flex items-center gap-2.5 hover:bg-blue-50/50 rounded-lg transition-colors group">
-                  <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-slate-50 text-slate-600 flex-shrink-0"><a.icon size={14} /></span>
+                  className="w-full text-left py-2.5 px-2 -mx-2 flex items-center gap-2.5 hover:bg-blue-50/50 dark:hover:bg-blue-500/10 rounded-lg transition-colors group">
+                  <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-secondary text-secondary-foreground flex-shrink-0"><a.icon size={14} /></span>
                   <span className="min-w-0 flex-1">
-                    <span className="block text-[12px] font-medium text-[#0F2440] group-hover:text-blue-700">{a.label}</span>
-                    <span className="block text-[11px] text-slate-400">{a.sub}</span>
+                    <span className="block text-[12px] font-medium text-foreground group-hover:text-blue-700 dark:group-hover:text-blue-400">{a.label}</span>
+                    <span className="block text-[11px] text-muted-foreground">{a.sub}</span>
                   </span>
-                  <ChevronRight size={13} className="text-slate-300 group-hover:text-blue-500 flex-shrink-0" />
+                  <ChevronRight size={13} className="text-slate-300 dark:text-muted-foreground group-hover:text-blue-500 dark:group-hover:text-blue-400 flex-shrink-0" />
                 </button>
               ))}
             </div>
           </div>
 
           {/* Follow-up input */}
-          <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
-            <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/60 px-3 py-2 focus-within:border-blue-400 transition-colors">
+          <div className="bg-card border border-border/80 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4">
+            <div className="flex items-center gap-2 rounded-xl border border-border bg-secondary/60 px-3 py-2 focus-within:border-blue-400 transition-colors">
               <input
                 value={followUpQuery}
                 onChange={(e) => setFollowUpQuery(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter") submitFollowUp(); }}
                 placeholder="Ask a follow-up..."
-                className="flex-1 bg-transparent outline-none text-[12px] text-[#0F2440] placeholder:text-slate-400"
+                className="flex-1 bg-transparent outline-none text-[12px] text-foreground placeholder:text-muted-foreground"
                 aria-label="Ask a follow-up question"
               />
               <button onClick={submitFollowUp} className="inline-flex items-center justify-center w-7 h-7 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Send">
                 <Send size={12} />
               </button>
             </div>
-            <p className="text-[10.5px] text-slate-400 mt-2 leading-relaxed">ARIA can help you analyze, compare, and go deeper.</p>
+            <p className="text-[10.5px] text-muted-foreground mt-2 leading-relaxed">ARIA can help you analyze, compare, and go deeper.</p>
           </div>
         </aside>
       </div>

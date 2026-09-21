@@ -179,7 +179,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
               </div>
               <button onClick={toggleTheme}
                 className={`relative w-9 h-5 rounded-full transition-colors ${isDark ? "bg-primary" : "bg-secondary border border-border"}`}>
-                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${isDark ? "translate-x-4" : "translate-x-0.5"}`} />
+                <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-card transition-transform ${isDark ? "translate-x-4" : "translate-x-0.5"}`} />
               </button>
             </div>
           </div>
@@ -286,7 +286,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
                   <p className="text-sm text-foreground">{item.label}</p>
                   <button onClick={() => item.toggle(!item.state)}
                     className={`relative w-9 h-5 rounded-full transition-colors ${item.state ? "bg-primary" : "bg-secondary border border-border"}`}>
-                    <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${item.state ? "translate-x-4" : "translate-x-0.5"}`} />
+                    <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-card transition-transform ${item.state ? "translate-x-4" : "translate-x-0.5"}`} />
                   </button>
                 </div>
               ))}

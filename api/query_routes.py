@@ -744,10 +744,26 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     # Vague/business questions ("electronics sales down", "compare segments")
     # used to end as query_failed with no graph. If the agent left no rows,
     # run a simple top-breakdown so the UI always has numbers + chart + 360.
+    # The substitution is always labeled partial (never success) with an
+    # honest message, quoted dot-aware for multi-schema tables, and worded
+    # in plain business language. Generic — no table names.
     try:
         _needs_fb = (not processed.get("data")) or (processed.get("status") == "query_failed")
         if _needs_fb:
             from api.schema_intel import SchemaIntelligence as _SI
+            from api.schema_intel import _safe_name as _qn_fb
+            try:
+                from core.semantic import humanize as _hum_fb
+            except Exception:
+                _hum_fb = None
+
+            def _plain_fb(v):
+                try:
+                    s = str(v or "").split(".")[-1]
+                    return _hum_fb(s).lower() if _hum_fb else s
+                except Exception:
+                    return str(v or "")
+
             _sp = Path(str(session.get("schema_path", "")))
             if _sp.exists():
                 _sdata = json.loads(_sp.read_text(encoding="utf-8"))
@@ -762,25 +778,34 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
                         _d = _intel_fb.find_best_dimension(_t)
                         if not _m:
                             continue
-                        from sqlalchemy import create_engine as _mk_fb, text as _txt_fb
-                        _eng_fb = _mk_fb(session["db_uri"])
+                        from api.kpi_routes import _build_engine as _be_fb
+                        from sqlalchemy import text as _txt_fb
+                        _eng_fb, _dial_fb, _dbt_fb = _be_fb(session)
+                        if _eng_fb is None:
+                            break
                         try:
                             with _eng_fb.connect() as _conn:
                                 if _d:
-                                    _sql_fb = f'SELECT "{_d}" AS seg, SUM("{_m}") AS val FROM "{_t}" GROUP BY "{_d}" ORDER BY val DESC LIMIT 10'
+                                    _sql_fb = (f"SELECT {_qn_fb(_d, _dial_fb)} AS seg, "
+                                               f"SUM({_qn_fb(_m, _dial_fb)}) AS val "
+                                               f"FROM {_qn_fb(_t, _dial_fb)} "
+                                               f"GROUP BY {_qn_fb(_d, _dial_fb)} "
+                                               f"ORDER BY val DESC LIMIT 10")
                                 else:
-                                    _sql_fb = f'SELECT SUM("{_m}") AS val FROM "{_t}"'
+                                    _sql_fb = (f"SELECT SUM({_qn_fb(_m, _dial_fb)}) AS val "
+                                               f"FROM {_qn_fb(_t, _dial_fb)}")
                                 _rows_fb = [dict(r._mapping) for r in _conn.execute(_txt_fb(_sql_fb))]
                             if _rows_fb:
                                 processed["data"] = _rows_fb
                                 processed["row_count"] = len(_rows_fb)
                                 columns = list(_rows_fb[0].keys())
                                 processed["sql_used"] = _sql_fb
-                                processed["status"] = "success"
+                                processed["status"] = "partial"
                                 processed["message"] = (
-                                    f"Showing the top breakdown of {_m} "
-                                    f"{'by ' + _d if _d else ''} from {_t} "
-                                    f"(fallback when the exact question could not be parsed)."
+                                    f"Your exact question could not be parsed, so here is the top "
+                                    f"breakdown of {_plain_fb(_m)}"
+                                    f"{' by ' + _plain_fb(_d) if _d else ''}. "
+                                    f"Try rephrasing with a measure and a grouping."
                                 )
                                 _fb_done = True
                         finally:
@@ -1159,26 +1184,42 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         _hypothesis = None
         if _primary in ("explanation", "root_cause", "hypothesis",
                         "change_detection", "anomaly") or _drivers_list:
-            if _drivers_list:
-                _top = _drivers_list[0]
-                _hypothesis = {
-                    "text": (f"Observed association: {_top.get('value')} "
-                             f"({_top.get('dimension')}) accounts for about "
-                             f"{_top.get('contribution_pct')}% of "
-                             f"{_metric_label} in "
-                             f"{_top.get('period')}. This is a statistical "
-                             f"association in the data, not a proven cause."),
-                    "confidence": _top.get("confidence", "low"),
-                    "drivers": [d.get("driver") for d in _drivers_list[:3]],
-                }
-            else:
-                _hypothesis = {
-                    "text": (f"No strong association found for {_metric_label}: "
-                             "no single segment dominates in the returned "
-                             "data. Statistical association only, not proven cause."),
-                    "confidence": "low",
-                    "drivers": [],
-                }
+            try:
+                from goal_agent.analytics_intent import build_hypothesis as _build_hyp
+                _top_period = ""
+                try:
+                    _top_period = str((_drivers_list[0] or {}).get("period") or "")
+                except Exception:
+                    _top_period = ""
+                _hypothesis = _build_hyp(
+                    _drivers_list,
+                    metric_label=_metric_label,
+                    metric_col=_metric_col,
+                    period_label=_top_period or _cmp.get("granularity", ""),
+                    observation_count=len(result_data or []),
+                    dimensions=_dims,
+                )
+            except Exception:
+                if _drivers_list:
+                    _top = _drivers_list[0]
+                    _hypothesis = {
+                        "text": (f"Observed association: {_top.get('value')} "
+                                 f"({_top.get('dimension')}) accounts for about "
+                                 f"{_top.get('contribution_pct')}% of "
+                                 f"{_metric_label} in "
+                                 f"{_top.get('period')}. This is a statistical "
+                                 f"association in the data, not a proven cause."),
+                        "confidence": _top.get("confidence", "low"),
+                        "drivers": [d.get("driver") for d in _drivers_list[:3]],
+                    }
+                else:
+                    _hypothesis = {
+                        "text": (f"No strong association found for {_metric_label}: "
+                                 "no single segment dominates in the returned "
+                                 "data. Statistical association only, not proven cause."),
+                        "confidence": "low",
+                        "drivers": [],
+                    }
         _follow_dims = []
         try:
             from api.schema_intel import _is_id_like as _env_id_like
@@ -1225,7 +1266,13 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
                            clarification=_clar,
                            issues=analysis.get("issues", []) or [])
         if processed.get("status") not in ("success", "needs_clarification"):
-            _rstatus = "backend-failure" if _rstatus == "success" else _rstatus
+            if processed.get("status") == "partial" and result_data:
+                # Honest substitution (fallback answered a nearby question):
+                # keep partial so the UI shows the rephrase hint, never a
+                # failure banner and never a fake success.
+                _rstatus = "partial"
+            else:
+                _rstatus = "backend-failure" if _rstatus == "success" else _rstatus
         _analytics_envelope = {
             "interpreted_intent": {"primary": _primary,
                                    "capabilities": _capabilities,

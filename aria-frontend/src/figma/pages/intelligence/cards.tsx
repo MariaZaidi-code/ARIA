@@ -138,7 +138,7 @@ export function Card({
 }) {
   return (
     <div
-      className={`bg-white border border-slate-200/80 rounded-2xl shadow-[0_1px_2px_rgba(15,36,64,0.05)] ${className}`}
+      className={`bg-card border border-border/80 rounded-2xl shadow-[0_1px_2px_rgba(15,36,64,0.05)] ${className}`}
     >
       {children}
     </div>
@@ -157,8 +157,8 @@ export function CardHead({
   return (
     <div className="flex items-start justify-between gap-3 flex-wrap px-4 pt-4 md:px-5">
       <div className="min-w-0">
-        <h3 className="text-[14px] font-semibold text-[#0F2440] tracking-tight">{title}</h3>
-        {sub && <p className="text-[11px] text-slate-500 mt-0.5">{sub}</p>}
+        <h3 className="text-[14px] font-semibold text-foreground tracking-tight">{title}</h3>
+        {sub && <p className="text-[11px] text-muted-foreground mt-0.5">{sub}</p>}
       </div>
       {right}
     </div>
@@ -179,11 +179,11 @@ export function StatPill({
   title?: string;
 }) {
   const tones: Record<string, string> = {
-    neutral: "bg-slate-50 text-slate-600 border-slate-200",
-    info: "bg-blue-50 text-blue-800 border-blue-100",
-    up: "bg-emerald-50 text-emerald-700 border-emerald-200",
-    down: "bg-rose-50 text-rose-700 border-rose-200",
-    warn: "bg-amber-50 text-amber-700 border-amber-200",
+    neutral: "bg-secondary text-secondary-foreground border-border",
+    info: "bg-blue-50 dark:bg-blue-500/10 text-blue-800 dark:text-blue-300 border-blue-100 dark:border-blue-500/20",
+    up: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25",
+    down: "bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/25",
+    warn: "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25",
   };
   return (
     <span
@@ -238,21 +238,21 @@ export function ErrorPanel({
 }) {
   return (
     <div
-      className="bg-white border border-slate-200 rounded-2xl p-5 flex gap-3 shadow-sm"
+      className="bg-card border border-border rounded-2xl p-5 flex gap-3 shadow-sm"
       role="alert"
     >
-      <AlertTriangle size={18} className="text-rose-500 flex-shrink-0 mt-0.5" />
+      <AlertTriangle size={18} className="text-rose-500 dark:text-rose-400 flex-shrink-0 mt-0.5" />
       <div className="min-w-0">
-        <p className="text-sm font-medium text-[#0F2440]">ARIA couldn&apos;t load this section.</p>
-        <p className="text-xs text-slate-500 mt-1">
+        <p className="text-sm font-medium text-foreground">ARIA couldn&apos;t load this section.</p>
+        <p className="text-xs text-muted-foreground mt-1">
           {businessError(message) || "Something went wrong on this request."}
         </p>
         {requestId && (
-          <p className="text-[11px] text-slate-400 mt-1 font-mono">Request ID: {requestId}</p>
+          <p className="text-[11px] text-muted-foreground mt-1 font-mono">Request ID: {requestId}</p>
         )}
         <button
           onClick={onRetry}
-          className="mt-2 inline-flex items-center gap-1.5 text-xs font-semibold text-blue-700 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
+          className="mt-2 inline-flex items-center gap-1.5 text-xs font-semibold text-blue-700 dark:text-blue-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
         >
           <RefreshCw size={12} /> {retryLabel}
         </button>
@@ -274,10 +274,10 @@ export function EmptyState({
 }) {
   const I = Icon || Sparkles;
   return (
-    <div className="text-center py-10 bg-white border border-slate-200 rounded-2xl shadow-sm px-6">
-      <I size={22} className="mx-auto text-slate-400 mb-3" />
-      <p className="text-sm font-medium text-[#0F2440]">{title}</p>
-      <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto leading-relaxed">{body}</p>
+    <div className="text-center py-10 bg-card border border-border rounded-2xl shadow-sm px-6">
+      <I size={22} className="mx-auto text-muted-foreground mb-3" />
+      <p className="text-sm font-medium text-foreground">{title}</p>
+      <p className="text-xs text-muted-foreground mt-1 max-w-md mx-auto leading-relaxed">{body}</p>
       {action && <div className="mt-3">{action}</div>}
     </div>
   );
@@ -296,10 +296,10 @@ function goData() {
 
 export function NoDatasetPanel({ onRetry, hint }: { onRetry?: () => void; hint?: string }) {
   return (
-    <div className="text-center py-10 bg-white border border-slate-200 rounded-2xl shadow-sm px-6">
-      <Database size={22} className="mx-auto text-slate-400 mb-3" />
-      <p className="text-sm font-medium text-[#0F2440]">No data source connected</p>
-      <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto leading-relaxed">
+    <div className="text-center py-10 bg-card border border-border rounded-2xl shadow-sm px-6">
+      <Database size={22} className="mx-auto text-muted-foreground mb-3" />
+      <p className="text-sm font-medium text-foreground">No data source connected</p>
+      <p className="text-xs text-muted-foreground mt-1 max-w-md mx-auto leading-relaxed">
         {hint ||
           "Connect PostgreSQL, MySQL, or upload a CSV on the Data page — then every section here will populate and Run Analysis will generate results."}
       </p>
@@ -314,7 +314,7 @@ export function NoDatasetPanel({ onRetry, hint }: { onRetry?: () => void; hint?:
         {onRetry && (
           <button
             onClick={onRetry}
-            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium text-slate-600 border border-slate-200 hover:border-slate-300 bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium text-secondary-foreground border border-border hover:border-border bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
             aria-label="Retry loading options"
           >
             <RefreshCw size={12} /> Retry
@@ -338,7 +338,7 @@ export function Sparkline({
   height?: number;
   color?: string;
 }) {
-  if (!values || values.length < 2) return <span className="text-slate-300">—</span>;
+  if (!values || values.length < 2) return <span className="text-slate-300 dark:text-muted-foreground">—</span>;
   const min = Math.min(...values);
   const max = Math.max(...values);
   const span = max - min || 1;
@@ -386,17 +386,17 @@ export function Field({
 }) {
   return (
     <label htmlFor={htmlFor} className="block min-w-0">
-      <span className="block text-[11px] font-medium text-slate-500 mb-1">{label}</span>
+      <span className="block text-[11px] font-medium text-muted-foreground mb-1">{label}</span>
       {children}
     </label>
   );
 }
 
 export const selectCls =
-  "w-full bg-white border border-slate-200 rounded-lg px-2.5 py-2 text-[12.5px] text-[#0F2440] focus:border-blue-500 outline-none cursor-pointer min-w-0";
+  "w-full bg-card border border-border rounded-lg px-2.5 py-2 text-[12.5px] text-foreground focus:border-blue-500 outline-none cursor-pointer min-w-0";
 export const inputCls =
-  "w-full bg-white border border-slate-200 rounded-lg px-2.5 py-2 text-[12.5px] text-[#0F2440] placeholder:text-slate-400 focus:border-blue-500 outline-none min-w-0";
+  "w-full bg-card border border-border rounded-lg px-2.5 py-2 text-[12.5px] text-foreground placeholder:text-muted-foreground focus:border-blue-500 outline-none min-w-0";
 export const btnPrimary =
   "inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-[12.5px] font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1";
 export const btnGhost =
-  "inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium text-slate-600 border border-slate-200 hover:text-[#0F2440] hover:border-slate-300 bg-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500";
+  "inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12.5px] font-medium text-secondary-foreground border border-border hover:text-foreground hover:border-border bg-card transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500";

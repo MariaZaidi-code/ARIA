@@ -1,6 +1,11 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
 @import 'tailwindcss';
 
+/* Class-based dark mode: App.tsx toggles `.dark` on <html> via the theme
+   context, so `dark:` variants must respond to that class (Tailwind v4
+   defaults to prefers-color-scheme without this). */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   --background: #F8F9FC;
   --foreground: #0B0F1A;
@@ -80,6 +85,7 @@
 }
 
 .dark {
+  color-scheme: dark;
   --background: #09090B;
   --foreground: #FAFAFA;
   --card: #18181B;
@@ -752,7 +758,7 @@ html, body, #root {
 @keyframes intelFadeIn { from { opacity: 0; } to { opacity: 1; } }
 @keyframes chartReveal { from { opacity: 0; transform: scaleY(0.96); } to { opacity: 1; transform: scaleY(1); } }
 .chart-reveal { animation: chartReveal 0.45s cubic-bezier(0.16,1,0.3,1) both; transform-origin: bottom; }
-.skeleton { background: linear-gradient(90deg, #eef1f7 25%, #e2e8f5 50%, #eef1f7 75%); background-size: 200% 100%; animation: intelSkeleton 1.4s ease infinite; }
+.skeleton { background: linear-gradient(90deg, var(--secondary) 25%, var(--border) 50%, var(--secondary) 75%); background-size: 200% 100%; animation: intelSkeleton 1.4s ease infinite; }
 @keyframes intelSkeleton { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 .intel-hero-gradient { position: absolute; inset: 0; background: radial-gradient(600px 200px at 70% 0%, rgba(46,94,255,0.10), transparent 70%); }
 .intel-orb { position: absolute; border-radius: 9999px; filter: blur(60px); opacity: 0.5; }

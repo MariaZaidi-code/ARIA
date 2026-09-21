@@ -5,12 +5,12 @@ import { useToast } from "../../components/Toast";
 function StatusPill({ status }: { status?: string }) {
   const s = status || "unknown";
   const palette: Record<string, string> = {
-    ready: "from-emerald-500/20 to-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30",
-    partial: "from-amber-500/20 to-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30",
-    failed: "from-rose-500/20 to-rose-500/10 text-rose-600 dark:text-rose-400 border-rose-500/30",
+    ready: "from-emerald-500/20 to-emerald-500/10 text-emerald-600 dark:text-emerald-400 dark:text-emerald-400 border-emerald-500/30",
+    partial: "from-amber-500/20 to-amber-500/10 text-amber-600 dark:text-amber-400 dark:text-amber-400 border-amber-500/30",
+    failed: "from-rose-500/20 to-rose-500/10 text-rose-600 dark:text-rose-400 dark:text-rose-400 border-rose-500/30",
     uploading: "from-sky-500/20 to-sky-500/10 text-sky-600 dark:text-sky-400 border-sky-500/30",
   };
-  const grad = palette[s] || "from-slate-500/20 to-slate-500/10 text-slate-600 dark:text-slate-300 border-slate-500/30";
+  const grad = palette[s] || "from-slate-500/20 to-slate-500/10 text-secondary-foreground dark:text-slate-300 border-slate-500/30";
   return (
     <span className={`px-2.5 py-1 rounded-full text-[10px] font-semibold uppercase tracking-wider border bg-gradient-to-r ${grad}`}>
       {s}
@@ -132,7 +132,7 @@ export default function Documents() {
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && onSearch()}
               placeholder="Search across all documents…"
-              className="w-full px-4 py-2.5 rounded-xl bg-white/40 dark:bg-slate-900/40 border border-white/20 dark:border-slate-700/30 focus:outline-none focus:ring-2 focus:ring-primary/30 text-sm"
+              className="w-full px-4 py-2.5 rounded-xl bg-card/40 dark:bg-slate-900/40 border border-white/20 dark:border-slate-700/30 focus:outline-none focus:ring-2 focus:ring-primary/30 text-sm"
             />
           </div>
           <button
@@ -143,7 +143,7 @@ export default function Documents() {
             {searching ? "Searching…" : "Search"}
           </button>
           {results && (
-            <button onClick={clearSearch} className="px-4 py-2.5 rounded-xl text-sm font-medium border border-white/20 dark:border-slate-700/30 hover:bg-white/40 dark:hover:bg-slate-800/40">
+            <button onClick={clearSearch} className="px-4 py-2.5 rounded-xl text-sm font-medium border border-white/20 dark:border-slate-700/30 hover:bg-card/40 dark:hover:bg-slate-800/40">
               Clear
             </button>
           )}
@@ -195,22 +195,22 @@ export default function Documents() {
               </div>
 
               <div className="grid grid-cols-3 gap-2 text-center">
-                <div className="rounded-lg bg-white/30 dark:bg-slate-800/30 p-2">
+                <div className="rounded-lg bg-card/30 dark:bg-slate-800/30 p-2">
                   <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Elements</div>
                   <div className="text-sm font-semibold mt-0.5">{doc.element_count || 0}</div>
                 </div>
-                <div className="rounded-lg bg-white/30 dark:bg-slate-800/30 p-2">
+                <div className="rounded-lg bg-card/30 dark:bg-slate-800/30 p-2">
                   <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Chunks</div>
                   <div className="text-sm font-semibold mt-0.5">{doc.chunk_count || 0}</div>
                 </div>
-                <div className="rounded-lg bg-white/30 dark:bg-slate-800/30 p-2">
+                <div className="rounded-lg bg-card/30 dark:bg-slate-800/30 p-2">
                   <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Tables</div>
                   <div className="text-sm font-semibold mt-0.5">{doc.table_count || 0}</div>
                 </div>
               </div>
 
               {doc.error_message && (
-                <div className="text-[11px] rounded-lg bg-rose-500/10 border border-rose-500/20 px-3 py-2 text-rose-600 dark:text-rose-400">
+                <div className="text-[11px] rounded-lg bg-rose-500/10 border border-rose-500/20 px-3 py-2 text-rose-600 dark:text-rose-400 dark:text-rose-400">
                   {doc.error_message}
                 </div>
               )}
@@ -228,7 +228,7 @@ export default function Documents() {
                   <button
                     onClick={() => onRetry(doc)}
                     disabled={retrying === doc.id}
-                    className="flex-1 px-3 py-2 rounded-lg text-xs font-medium border border-white/30 dark:border-slate-700/30 hover:bg-white/40 dark:hover:bg-slate-800/40 disabled:opacity-50"
+                    className="flex-1 px-3 py-2 rounded-lg text-xs font-medium border border-white/30 dark:border-slate-700/30 hover:bg-card/40 dark:hover:bg-slate-800/40 disabled:opacity-50"
                   >
                     {retrying === doc.id ? "Retrying…" : "Retry"}
                   </button>
@@ -236,7 +236,7 @@ export default function Documents() {
                 <button
                   onClick={() => onDelete(doc.id)}
                   disabled={deleting === doc.id}
-                  className="px-3 py-2 rounded-lg text-xs font-medium bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20 hover:bg-rose-500/20 disabled:opacity-50"
+                  className="px-3 py-2 rounded-lg text-xs font-medium bg-rose-500/10 text-rose-600 dark:text-rose-400 dark:text-rose-400 border border-rose-500/20 hover:bg-rose-500/20 disabled:opacity-50"
                 >
                   {deleting === doc.id ? "…" : "Delete"}
                 </button>

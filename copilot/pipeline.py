@@ -184,6 +184,22 @@ def _summarize_rows(columns: list[str], rows: list[dict]) -> str:
     return f"Found {len(rows)} matching rows in the connected data."
 
 
+# What each app page is for (page ids are app constants, never data).
+# Used only to answer "what is this page showing?" from UI context.
+_PAGE_BLURBS: dict[str, tuple[str, str]] = {
+    "dashboard": ("Dashboard", "your business overview — live KPIs, charts, anomalies and recommendations"),
+    "analytics": ("AI Analytics", "ask anything and get charts, tables and key insights"),
+    "insights": ("Insights", "the anomalies, opportunities and risks ARIA found in your data"),
+    "predictive": ("Forecast", "future projections with likely ranges and what-if scenarios"),
+    "intelligence": ("Intelligence", "deep dives — explore, hypotheses, prescriptions and reports"),
+    "data": ("Data", "where you connect sources and inspect your schema"),
+    "documents": ("Documents", "where you chat with your uploaded documents"),
+    "history": ("History", "your past analyses"),
+    "settings": ("Settings", "providers, models and preferences"),
+    "copilot": ("Copilot", "full conversational analysis over your data"),
+}
+
+
 class CopilotPipeline:
     """One Copilot, interchangeable LLM backends."""
 
@@ -224,10 +240,249 @@ class CopilotPipeline:
 
     # -- main entry ------------------------------------------------------
 
-    def ask(self, question: str) -> CopilotAnswer:
+    def _context_snapshot(self, context: dict | None) -> dict:
+        """Collect visible page/chart fields by shape (generic, never data names).
+
+        Looks top-level plus one nested level (``chart``/``context``) since
+        drill links nest the snapshot. Missing fields stay None, never
+        invented. Never raises.
+        """
+        snap: dict = {"page": None, "metric": None, "chart": None,
+                      "label": None, "value": None, "segment": None,
+                      "period": None, "source": None}
+        try:
+            if not isinstance(context, dict):
+                return snap
+            snap["page"] = context.get("page")
+            node = context
+            for _ in range(2):
+                if not isinstance(node, dict):
+                    break
+                if any(k in node for k in ("metric", "label", "value", "chart",
+                                          "segment", "dimension", "period", "source")):
+                    break
+                nxt = node.get("chart") or node.get("context")
+                if not isinstance(nxt, dict):
+                    break
+                node = nxt
+            if isinstance(node, dict):
+                snap["metric"] = node.get("metric")
+                snap["chart"] = node.get("chart")
+                snap["label"] = node.get("label")
+                snap["value"] = node.get("value")
+                snap["segment"] = node.get("segment", node.get("dimension"))
+                snap["period"] = node.get("period")
+                snap["source"] = node.get("source")
+            # Fall back to top-level for fields the nested node lacked.
+            for k in ("metric", "chart", "label", "value", "segment",
+                      "period", "source"):
+                if snap.get(k) in (None, "") and isinstance(context, dict):
+                    if k == "segment":
+                        v = context.get("segment", context.get("dimension"))
+                    else:
+                        v = context.get(k)
+                    if v not in (None, ""):
+                        snap[k] = v
+        except Exception:
+            pass
+        return snap
+
+    @staticmethod
+    def _snapshot_has_substance(snap: dict) -> bool:
+        """True when the snapshot carries something answerable (generic)."""
+        try:
+            if str(snap.get("page") or "") in _PAGE_BLURBS:
+                return True
+            for k in ("metric", "chart", "label", "value", "segment",
+                      "period", "source"):
+                v = snap.get(k)
+                if v is not None and str(v).strip() != "":
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _describe_snapshot(self, snap: dict) -> str:
+        """One generic paragraph from the visible snapshot (no fixed data)."""
+        parts: list[str] = []
+        try:
+            page = str(snap.get("page") or "")
+            blurb = _PAGE_BLURBS.get(page, (None, None))
+            metric = snap.get("metric")
+            chart = snap.get("chart")
+            label = snap.get("label")
+            value = snap.get("value")
+            segment = snap.get("segment")
+            period = snap.get("period")
+            if chart or metric or label is not None or value is not None or segment:
+                head = []
+                if chart or metric:
+                    head.append(f"This {chart or 'chart'} shows {metric or 'the highlighted measure'}")
+                else:
+                    head.append("These results show the highlighted values")
+                bits = "".join(head)
+                if label not in (None, ""):
+                    bits += f" — {label}"
+                    if value is not None:
+                        try:
+                            bits += (f" at {float(value):,.2f}".rstrip("0").rstrip(".")
+                                     if isinstance(value, (int, float)) or str(value).replace('.', '', 1).lstrip('-').isdigit()
+                                     else f" at {value}")
+                        except Exception:
+                            bits += f" at {value}"
+                elif value is not None:
+                    try:
+                        bits += (f" at {float(value):,.2f}".rstrip("0").rstrip(".")
+                                 if isinstance(value, (int, float)) or str(value).replace('.', '', 1).lstrip('-').isdigit()
+                                 else f" at {value}")
+                    except Exception:
+                        bits += f" at {value}"
+                if segment not in (None, ""):
+                    bits += f" for {segment}"
+                if period not in (None, ""):
+                    bits += f" ({period})"
+                parts.append(bits + ".")
+                if blurb[0] is not None:
+                    parts.append(f"You're seeing this on {blurb[0]} — {blurb[1]}.")
+                parts.append("Ask me to break it down, compare segments, or explain why it matters.")
+                return " ".join(parts)
+            if blurb[0] is not None:
+                db = (self.mapping or {}).get("database") or "your connected data"
+                tables = (self.mapping or {}).get("tables", {})
+                n = len(tables) if isinstance(tables, dict) else 0
+                text = (f"You're on {blurb[0]} — {blurb[1]}. "
+                        f"Right now it's showing {db}"
+                        + (f" ({n} tables)." if n else "."))
+                return text
+        except Exception:
+            pass
+        return ""
+
+    def _answer_page_context(self, question: str,
+                               context: dict | None) -> str | None:
+        """Answer deictic page/chart questions from visible context.
+
+        Handles "what is this chart/page showing?" plus vague references
+        to visible results ("explain these results", "what does this
+        mean", "why is this happening") when page/chart context is
+        present. Generic: page ids are app constants, chart fields are
+        read by shape (metric/chart/label/value), never by database
+        names. Returns None when the question is not deictic or the
+        context lacks substance, letting normal flow proceed.
+        Never raises — callers fall through on any failure.
+        """
+        try:
+            if not isinstance(context, dict) or not context:
+                return None
+            ql = str(question or "").lower()
+            # Only explicit page/chart deixis ("what is this chart showing?",
+            # "tell me about this page"). Bare "explain this drop in sales"
+            # stays a data question — never hijack analytical wording.
+            is_explicit = bool(re.search(
+                r"\bthis (page|screen|chart|graph|visual|metric)\b|"
+                r"what am i looking at", ql))
+            # Vague references to the visible results. Only honored when
+            # the UI sent real page/chart substance (checked below), so
+            # bare analytical questions without context keep normal flow.
+            is_vague = bool(re.search(
+                r"explain\s+(these|this|the)\s+(results?|data|numbers?|figures?)|"
+                r"\bthese\s+results?\b|\bthis\s+data\b|"
+                r"what\s+does\s+(this|these|it)\s+mean|"
+                r"what\s+do\s+(these|this|the\s+results?)\s+(mean|show)|"
+                r"why\s+is\s+this\s+happening|"
+                r"what('s| is)\s+(going\s+on|happening)(\s+here)?|"
+                r"summar(y|ise|ize)\s+(this|these|the\s+results?)|"
+                r"what\s+does\s+it\s+show|tell\s+me\s+about\s+(these|this|the)\s+(results?|data)",
+                ql))
+            if not is_explicit and not is_vague:
+                return None
+            snap = self._context_snapshot(context)
+            if not self._snapshot_has_substance(snap):
+                return None
+            # Chart snapshot may sit top-level (drill links) or nested.
+            node = context
+            for _ in range(2):
+                if not isinstance(node, dict):
+                    break
+                if any(k in node for k in ("metric", "label", "value", "chart")):
+                    break
+                nxt = node.get("chart") or node.get("context")
+                if not isinstance(nxt, dict):
+                    break
+                node = nxt
+            metric = node.get("metric") if isinstance(node, dict) else None
+            chart = node.get("chart") if isinstance(node, dict) else None
+            label = node.get("label") if isinstance(node, dict) else None
+            value = node.get("value") if isinstance(node, dict) else None
+            wants_chart = bool(re.search(
+                r"\b(chart|graph|visual|metric|results?|data|mean|happening|going on)\b", ql))
+            if wants_chart and (metric or chart or label is not None
+                                or value is not None or snap.get("segment")):
+                text = self._describe_snapshot(snap)
+                if text:
+                    return text
+                bits = []
+                if chart or metric:
+                    bits.append(f"This {chart or 'chart'} shows {metric or 'the highlighted measure'}")
+                else:
+                    bits.append("This chart")
+                if label not in (None, ""):
+                    bits.append(f" — {label}")
+                    if value is not None:
+                        try:
+                            bits.append(f" at {float(value):,.2f}".rstrip("0").rstrip(".")
+                                        if isinstance(value, (int, float)) or str(value).replace('.', '', 1).lstrip('-').isdigit()
+                                        else f" at {value}")
+                        except Exception:
+                            bits.append(f" at {value}")
+                text = "".join(bits) + "."
+                tables = (self.mapping or {}).get("tables", {})
+                if isinstance(tables, dict) and tables:
+                    text += " Ask me to break it down, compare it, or explain why it matters."
+                return text
+            page = context.get("page") if isinstance(context, dict) else None
+            blurb = _PAGE_BLURBS.get(str(page or ""), (None, None))
+            if blurb[0] is None:
+                text = self._describe_snapshot(snap)
+                return text or None
+            # Vague ask with both page + chart substance: lead with what is
+            # visible, not just the page description.
+            if is_vague:
+                text = self._describe_snapshot(snap)
+                if text:
+                    return text
+            db = (self.mapping or {}).get("database") or "your connected data"
+            tables = (self.mapping or {}).get("tables", {})
+            n = len(tables) if isinstance(tables, dict) else 0
+            text = (f"You're on {blurb[0]} — {blurb[1]}. "
+                    f"Right now it's showing {db}"
+                    + (f" ({n} tables)." if n else "."))
+            return text
+        except Exception:
+            return None
+
+    def ask(self, question: str, context: dict | None = None) -> CopilotAnswer:
         if not question or not question.strip():
             return CopilotAnswer(ok=False, answer="Please ask a question.",
                                  provider=self.provider_name)
+        # Page/chart context (sent by the Mini ARIA panel and chart drill
+        # links): deictic questions ("what is this chart showing?") are
+        # answered straight from the visible context — no SQL needed, and
+        # never an error when the context carries the substance.
+        try:
+            _page_answer = self._answer_page_context(question, context)
+        except Exception:
+            _page_answer = None
+        if _page_answer is not None:
+            try:
+                _pg = context.get("page") if isinstance(context, dict) else None
+            except Exception:
+                _pg = None
+            self._remember(question, {"page": _pg, "intent": "page-context"},
+                           _page_answer, None, "page-context")
+            return CopilotAnswer(ok=True, answer=_page_answer,
+                                 provider=self.provider_name,
+                                 intent="page-context")
         resolved = self.memory.resolve(question, dataset=self.dataset_fp)
         route = classify(resolved)
 
@@ -1124,6 +1379,19 @@ class CopilotPipeline:
             log.info("Copilot forecast LLM polish failed (%s).", exc)
         return det
 
+    def _guided_next_step(self) -> str:
+        """Data-relevant next step naming real tables (generic, no fixed data)."""
+        try:
+            tables = sorted((self.mapping or {}).get("tables", {}) or {})
+            if tables:
+                named = ", ".join(tables[:3])
+                return (f" Try asking about {named} — for example a total, "
+                        f"a breakdown, or how it changed over time.")
+        except Exception:
+            pass
+        return (" Try asking about a specific table, measure, or time period "
+                "— for example a total, a breakdown, or a trend over time.")
+
     def _explain_failure(self, result) -> str:
         err = (result.error or "").lower()
         if "rate limit" in err or "429" in err:
@@ -1138,11 +1406,12 @@ class CopilotPipeline:
                     "running (Local mode) or that the API key is valid (Cloud mode).")
         if "unknown table" in err or "unknown column" in err:
             return ("The generated query referenced tables/columns that don't exist in "
-                    "this schema. Try rephrasing with a clearer subject or measure.")
+                    "this schema. Ask with a clearer subject or measure."
+                    + self._guided_next_step())
         if "only read-only" in err:
             return "The generated query was rejected because it was not read-only."
-        return ("I couldn't answer that question from the connected data. "
-                "Try rephrasing or asking about a specific table, measure or period.")
+        return ("I couldn't answer that question from the connected data."
+                + self._guided_next_step())
 
 
 def _lexical_score(question: str, text: str) -> int:

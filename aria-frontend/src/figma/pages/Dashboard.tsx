@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { ArrowRight, ArrowUpRight, ArrowDownRight, Zap, Search, AlertTriangle, ChevronRight, RefreshCw, Database, DollarSign, Store, CalendarDays, Percent, TrendingUp, Users, ShoppingCart, RotateCcw, X, Sparkles, MessageSquare, Send, Lightbulb, Shield, BarChart3, GitBranch, Sun } from "lucide-react";
 import { AreaChart, Area, Line, BarChart, Bar, Cell, PieChart, Pie, ResponsiveContainer, Tooltip, CartesianGrid, XAxis, YAxis, Brush, ReferenceDot, ScatterChart, Scatter, ZAxis } from "recharts";
 import type { Page } from "../App";
+import { useTheme } from "../App";
 import { TimeRangeSelector } from "../components/TimeRangeSelector";
 import { colorForName } from "../lib/charts";
 import { fmtBiz } from "../lib/format";
@@ -53,12 +54,12 @@ function primaryCategory(type: string): Category {
 }
 
 const CAT_META: Record<Category, { label: string; Icon: typeof TrendingUp; pill: string; iconWrap: string }> = {
-  trends: { label: "Trend", Icon: TrendingUp, pill: "bg-violet-50 text-violet-700 border-violet-200", iconWrap: "bg-violet-50 text-violet-600" },
-  anomalies: { label: "Anomaly", Icon: AlertTriangle, pill: "bg-blue-50 text-blue-700 border-blue-200", iconWrap: "bg-blue-50 text-blue-600" },
+  trends: { label: "Trend", Icon: TrendingUp, pill: "bg-violet-50 dark:bg-violet-500/10 text-violet-700 dark:text-violet-400 border-violet-200 dark:border-violet-500/25", iconWrap: "bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400" },
+  anomalies: { label: "Anomaly", Icon: AlertTriangle, pill: "bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/25", iconWrap: "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400" },
   performance: { label: "Performance", Icon: BarChart3, pill: "bg-sky-50 text-sky-700 border-sky-200", iconWrap: "bg-sky-50 text-sky-600" },
-  relationships: { label: "Relationship", Icon: GitBranch, pill: "bg-indigo-50 text-indigo-700 border-indigo-200", iconWrap: "bg-indigo-50 text-indigo-600" },
-  opportunities: { label: "Opportunity", Icon: Lightbulb, pill: "bg-emerald-50 text-emerald-700 border-emerald-200", iconWrap: "bg-emerald-50 text-emerald-600" },
-  risks: { label: "Risk", Icon: Shield, pill: "bg-rose-50 text-rose-700 border-rose-200", iconWrap: "bg-rose-50 text-rose-600" },
+  relationships: { label: "Relationship", Icon: GitBranch, pill: "bg-indigo-50 dark:bg-indigo-500/10 text-indigo-700 dark:text-indigo-400 border-indigo-200 dark:border-indigo-500/25", iconWrap: "bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400" },
+  opportunities: { label: "Opportunity", Icon: Lightbulb, pill: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25", iconWrap: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" },
+  risks: { label: "Risk", Icon: Shield, pill: "bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/25", iconWrap: "bg-rose-50 dark:bg-rose-500/10 text-rose-600 dark:text-rose-400" },
 };
 
 /* ---------- timestamps: real values only, never synthesized ---------- */
@@ -91,9 +92,9 @@ function relTime(iso: string): string {
 }
 
 const fmt = (n: number | null | undefined, prefix = "") => {
-  if (n === null || n === undefined || (typeof n === "number" && isNaN(n))) return "—";
+  if (n === null || n === undefined) return "—";
   const v = Number(n);
-  if (isNaN(v)) return "—";
+  if (!Number.isFinite(v)) return "—";
   return v >= 1_000_000
     ? `${prefix}${(v / 1_000_000).toFixed(2)}M`
     : v >= 1_000
@@ -266,7 +267,7 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy }: { kpi: any; index
   }
 
   const changeNum = kpi?.change === null || kpi?.change === undefined || kpi?.change === "" ? null : Number(kpi.change);
-  const showChange = changeNum !== null && !isNaN(changeNum) && changeNum !== 0 && !isText;
+  const showChange = changeNum !== null && Number.isFinite(changeNum) && changeNum !== 0 && !isText;
   const positive = (changeNum ?? 0) >= 0;
   const spark = Array.isArray(kpi.spark) && kpi.spark.length > 1
     ? kpi.spark.map((v: any) => ({ v: Number(v) || 0 }))
@@ -283,7 +284,7 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy }: { kpi: any; index
       role="button"
       tabIndex={0}
       title={kpi?.reason ? `${kpi.label} — ${kpi.reason} Select for deeper analysis.` : `${kpi.label} — select for deeper analysis.`}
-      className="relative overflow-hidden bg-white border border-slate-200/80 rounded-2xl p-5 flex flex-col gap-3 text-left cursor-pointer shadow-[0_1px_2px_rgba(15,36,64,0.05)] hover:shadow-[0_10px_28px_rgba(47,111,173,0.14)] hover:border-blue-200 hover:-translate-y-0.5 transition-all duration-200 min-w-0"
+      className="relative overflow-hidden bg-card border border-border/80 rounded-2xl p-5 flex flex-col gap-3 text-left cursor-pointer shadow-[0_1px_2px_rgba(15,36,64,0.05)] hover:shadow-[0_10px_28px_rgba(47,111,173,0.14)] hover:border-blue-200 dark:hover:border-blue-500/25 hover:-translate-y-0.5 transition-all duration-200 min-w-0"
       style={{ animationDelay: `${Math.min(index, 5) * 60}ms` }}
     >
       <span
@@ -298,20 +299,20 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy }: { kpi: any; index
         >
           <Icon size={18} />
         </span>
-        <p className="text-[13px] font-medium text-slate-500 truncate">{kpi.label || "Metric"}</p>
+        <p className="text-[13px] font-medium text-muted-foreground truncate">{kpi.label || "Metric"}</p>
       </div>
       <div className="flex items-end justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-[28px] leading-tight font-semibold text-[#0F2440] tracking-tight tabular-nums truncate">
+          <p className="text-[28px] leading-tight font-semibold text-foreground tracking-tight tabular-nums truncate">
             {displayValue}
           </p>
           {showChange ? (
-            <p className={`flex items-center gap-1 text-[12px] font-semibold mt-1 ${positive ? "text-emerald-600" : "text-rose-600"}`}>
+            <p className={`flex items-center gap-1 text-[12px] font-semibold mt-1 ${positive ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
               {positive ? <ArrowUpRight size={13} /> : <ArrowDownRight size={13} />}
               {Math.abs(changeNum as number)}%
             </p>
           ) : (
-            <p className="text-[11px] text-slate-400 mt-1 truncate">{periodText}</p>
+            <p className="text-[11px] text-muted-foreground mt-1 truncate">{periodText}</p>
           )}
         </div>
         {spark.length > 0 && (
@@ -336,12 +337,12 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy }: { kpi: any; index
         )}
       </div>
       {showChange && (
-        <p className="text-[11px] text-slate-400 truncate">{periodText}</p>
+        <p className="text-[11px] text-muted-foreground truncate">{periodText}</p>
       )}
       {onAsk && (
         <button
           onClick={(e) => { e.stopPropagation(); onAsk(`What should I know about ${kpi?.label || "this metric"}?`); }}
-          className="self-start text-[11px] font-semibold text-blue-600 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
+          className="self-start text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
           aria-label={`Ask ARIA about ${kpi?.label || "this metric"}`}
         >
           Ask about this →
@@ -350,7 +351,7 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy }: { kpi: any; index
       {onWhy && (
         <button
           onClick={(e) => { e.stopPropagation(); onWhy(String(kpi?.label || "")); }}
-          className="self-start text-[11px] font-medium text-slate-500 hover:text-blue-700 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded -mt-2"
+          className="self-start text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded -mt-2"
           aria-label={`Why did ${kpi?.label || "this metric"} move?`}
         >
           Why did this move?
@@ -434,20 +435,32 @@ function grainOfChart(c: any, data: any[]): string {
 }
 
 function trendOf(data: any[], yKey: string): number | null {
-  const vals = data.map((r) => Number(r?.[yKey])).filter((v) => !isNaN(v));
+  const vals = data.map((r) => Number(r?.[yKey])).filter((v) => Number.isFinite(v));
   if (vals.length < 2 || vals[0] === 0) return null;
-  return ((vals[vals.length - 1] - vals[0]) / Math.abs(vals[0])) * 100;
+  const pct = ((vals[vals.length - 1] - vals[0]) / Math.abs(vals[0])) * 100;
+  return Number.isFinite(pct) ? pct : null;
 }
 
 function peakOf(data: any[], xKey: string, yKey: string): { label: string; value: number | null } {
   let best: any = null;
   for (const r of data) {
     const v = Number(r?.[yKey]);
-    if (isNaN(v)) continue;
+    if (!Number.isFinite(v)) continue;
     if (!best || v > Number(best[yKey])) best = r;
   }
   if (!best) return { label: "", value: null };
-  return { label: String(best[xKey] ?? ""), value: Number(best[yKey]) };
+  const bv = Number(best[yKey]);
+  return { label: String(best[xKey] ?? ""), value: Number.isFinite(bv) ? bv : null };
+}
+
+/** Share text "12.3%" or null when uncomputable (zero/empty/missing totals).
+    Central guard so no annotation, tooltip, or badge can print NaN/Infinity. */
+function sharePct(part: any, total: any): string | null {
+  const p = Number(part);
+  const t = Number(total);
+  if (!Number.isFinite(p) || !Number.isFinite(t) || t === 0) return null;
+  const v = (p / Math.abs(t)) * 100;
+  return Number.isFinite(v) ? v.toFixed(1) : null;
 }
 
 /** Backend insight/anomaly text mentioning this measure, else "". */
@@ -500,9 +513,9 @@ function toSelectedViz(c: any, kind: VizKind, insights: any[], anomalies: any[])
       const first = fmtPeriod(String(data[0]?.[xKey] ?? ""));
       annotation = `Peak ${fmtExact(peak.value, prefix)} in ${fmtPeriod(peak.label)}${trendPct !== null ? ` (${trendPct >= 0 ? "+" : ""}${trendPct.toFixed(1)}% since ${first})` : ""}.`;
     } else if (data.length) {
-      const total = data.reduce((s, r) => s + (Number(r?.[yKey]) || 0), 0) || 1;
-      const share = ((peak.value / total) * 100).toFixed(1);
-      annotation = `${peak.label} leads with ${fmtExact(peak.value, prefix)} (${share}% of ${measure.toLowerCase()}).`;
+      const total = data.reduce((s, r) => s + (Number(r?.[yKey]) || 0), 0);
+      const share = sharePct(peak.value, total);
+      annotation = `${peak.label} leads with ${fmtExact(peak.value, prefix)}${share !== null ? ` (${share}% of ${measure.toLowerCase()})` : ""}.`;
     }
   }
   return {
@@ -563,7 +576,7 @@ function derivedViz(from: SelectedViz): SelectedViz {
       data: ranked,
       xKey: "name",
       yKey: "value",
-      annotation: `${top.name} ranked first at ${fmtExact(top.value, from.format === "currency" ? "$" : "")} (${((top.value / total) * 100).toFixed(1)}% of shown ${from.measure.toLowerCase()}).`,
+      annotation: `${top.name} ranked first at ${fmtExact(top.value, from.format === "currency" ? "$" : "")}${(() => { const s = sharePct(top.value, total); return s !== null ? ` (${s}% of shown ${from.measure.toLowerCase()})` : ""; })()}.`,
       annotationFromBackend: false,
     };
   }
@@ -579,7 +592,7 @@ function derivedViz(from: SelectedViz): SelectedViz {
       title: `${from.measure} share by ${from.dim}`,
       subtitle: `Composition of top ${top.length} · same data, new view`,
       data: top,
-      annotation: `${String(lead?.[from.xKey] ?? "")} holds ${(((Number(lead?.[from.yKey]) || 0) / total) * 100).toFixed(1)}% of ${from.measure.toLowerCase()}.`,
+      annotation: `${String(lead?.[from.xKey] ?? "")} holds ${(() => { const s = sharePct(Number(lead?.[from.yKey]) || 0, total); return s !== null ? `${s}%` : "the largest share"; })()} of ${from.measure.toLowerCase()}.`,
       annotationFromBackend: false,
     };
   }
@@ -652,35 +665,44 @@ function DashTooltip({ active, payload, label, viz, total }: {
   const row = payload[0]?.payload || {};
   const raw = Number(row?.[viz.yKey]);
   const prefix = viz.format === "currency" ? "$" : "";
+  // Header name: Recharts passes no `label` for Pie/Scatter hovers, so fall
+  // back to the row's category field, then the payload series name — the
+  // header never renders blank (generic: works for every chart kind).
+  const headName = String(
+    label ?? row?.[viz.xKey] ?? (payload[0] as any)?.name ?? "",
+  );
   const idx = viz.data.findIndex((r) => String(r?.[viz.xKey]) === String(label ?? row?.[viz.xKey]));
   const prev = idx > 0 ? Number(viz.data[idx - 1]?.[viz.yKey]) : null;
-  const change = prev !== null && !isNaN(prev) && prev !== 0 && !isNaN(raw)
+  const change = prev !== null && Number.isFinite(prev) && prev !== 0 && Number.isFinite(raw)
     ? ((raw - prev) / Math.abs(prev)) * 100
     : null;
-  const share = total > 0 && !isNaN(raw) ? (raw / total) * 100 : null;
+  const share = total > 0 && Number.isFinite(raw) ? (raw / total) * 100 : null;
+  const changeTxt = change !== null && Number.isFinite(change)
+    ? `${change >= 0 ? "+" : ""}${change.toFixed(1)}%` : null;
+  const shareTxt = share !== null && Number.isFinite(share) ? `${share.toFixed(1)}%` : null;
   return (
-    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 shadow-md">
-      <p className="text-[11px] font-bold text-[#0F2440] mb-1">
-        {viz.kind === "time" || viz.kind === "ranking" ? fmtPeriod(String(label ?? "")) : String(label ?? "")}
+    <div className="rounded-lg border border-border bg-card px-3 py-2 shadow-md">
+      <p className="text-[11px] font-bold text-foreground mb-1">
+        {viz.kind === "time" || viz.kind === "ranking" ? fmtPeriod(headName) : (headName || humanize(String(viz.measure || viz.yKey || "Value")))}
       </p>
-      <p className="text-[11px] text-slate-500">
-        {viz.measure}: <span className="text-[#0F2440] font-semibold">{fmtExact(raw, prefix)}</span>
+      <p className="text-[11px] text-muted-foreground">
+        {humanize(String(viz.measure || viz.yKey || "Value"))}: <span className="text-foreground font-semibold">{fmtExact(raw, prefix)}</span>
       </p>
-      {change !== null && (
-        <p className="text-[11px] text-slate-500">
-          vs prior: <span className={`font-semibold ${change >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
-            {change >= 0 ? "+" : ""}{change.toFixed(1)}%
+      {changeTxt !== null && (
+        <p className="text-[11px] text-muted-foreground">
+          vs prior: <span className={`font-semibold ${change !== null && (change as number) >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+            {changeTxt}
           </span>
         </p>
       )}
-      {share !== null && (viz.kind === "category" || viz.kind === "composition" || viz.kind === "ranking") && (
-        <p className="text-[11px] text-slate-500">
-          share: <span className="text-[#0F2440] font-semibold">{share.toFixed(1)}%</span>
+      {shareTxt !== null && (viz.kind === "category" || viz.kind === "composition" || viz.kind === "ranking") && (
+        <p className="text-[11px] text-muted-foreground">
+          share: <span className="text-foreground font-semibold">{shareTxt}</span>
           <span className="opacity-70"> · {viz.data.length} groups</span>
         </p>
       )}
       {viz.kind === "time" && (
-        <p className="text-[10px] text-slate-400 opacity-70 mt-0.5">
+        <p className="text-[10px] text-muted-foreground opacity-70 mt-0.5">
           {idx + 1} of {viz.data.length} {viz.grain.toLowerCase()}s
         </p>
       )}
@@ -689,6 +711,44 @@ function DashTooltip({ active, payload, label, viz, total }: {
 }
 
 /* ---------------- one large visualization card ---------------- */
+
+function ScatterTooltip({ active, payload, viz }: {
+  active?: boolean; payload?: any[]; viz: SelectedViz;
+}) {
+  if (!active || !payload?.length) return null;
+  const row = payload[0]?.payload || {};
+  // Point name first (generic): the category field when present, else the
+  // first non-numeric descriptive field on the row — never numbers alone.
+  const rawName = row?.[viz.xKey];
+  const pointName = (typeof rawName === "string" && rawName.trim())
+    ? rawName
+    : (Object.entries(row).map(([k, v]) => ({ k, v }))
+        .find(({ k, v }) => k !== viz.xKey && k !== viz.yKey && k !== "x" && k !== "y"
+          && typeof v === "string" && (v as string).trim()
+          && !/^\d+(\.\d+)?$/.test((v as string).trim()))?.v as string) || "";
+  const xv = row?.x ?? row?.[viz.xKey];
+  const yv = row?.y ?? row?.[viz.yKey];
+  const prefix = viz.format === "currency" ? "$" : "";
+  return (
+    <div className="rounded-lg border border-border bg-card px-3 py-2 shadow-md">
+      <p className="text-[11px] font-bold text-foreground mb-1">
+        {pointName ? humanize(pointName) : humanize(String(viz.measure || viz.yKey || "Point"))}
+      </p>
+      <p className="text-[11px] text-muted-foreground">
+        {humanize(String(viz.xKey || "x"))}:{" "}
+        <span className="text-foreground font-semibold">
+          {typeof xv === "number" ? fmtExact(xv, "") : String(xv ?? "—")}
+        </span>
+      </p>
+      <p className="text-[11px] text-muted-foreground">
+        {humanize(String(viz.measure || viz.yKey || "y"))}:{" "}
+        <span className="text-foreground font-semibold">
+          {typeof yv === "number" ? fmtExact(yv, prefix) : String(yv ?? "—")}
+        </span>
+      </p>
+    </div>
+  );
+}
 
 export interface DrillSelection {
   chart: string;
@@ -761,14 +821,14 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
 
   if (viz.kind === "empty" || viz.data.length === 0) {
     return (
-      <div className="bg-white border border-slate-200 rounded-2xl p-5 flex flex-col gap-2 min-h-[320px] shadow-sm">
-        <p className="text-[13px] font-semibold text-[#0F2440]">{viz.title}</p>
+      <div className="bg-card border border-border rounded-2xl p-5 flex flex-col gap-2 min-h-[320px] shadow-sm">
+        <p className="text-[13px] font-semibold text-foreground">{viz.title}</p>
         <div className="flex-1 flex flex-col items-center justify-center text-center gap-2 py-10">
-          <span className="inline-flex items-center justify-center w-10 h-10 rounded-full bg-blue-50 text-blue-500">
+          <span className="inline-flex items-center justify-center w-10 h-10 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-500 dark:text-blue-400">
             <Database size={18} />
           </span>
-          <p className="text-[13px] font-medium text-[#0F2440]">{viz.title === "Trend over time" ? "No time-based trend available" : "No meaningful categorical breakdown available"}</p>
-          <p className="text-[12px] text-slate-500 leading-relaxed max-w-sm">{viz.emptyReason || "Not enough suitable data to draw this chart yet."}</p>
+          <p className="text-[13px] font-medium text-foreground">{viz.title === "Trend over time" ? "No time-based trend available" : "No meaningful categorical breakdown available"}</p>
+          <p className="text-[12px] text-muted-foreground leading-relaxed max-w-sm">{viz.emptyReason || "Not enough suitable data to draw this chart yet."}</p>
         </div>
       </div>
     );
@@ -780,18 +840,18 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
   const peakIdx = viewData.findIndex((r) => String(r?.[viz.xKey]) === viz.peakLabel);
 
   return (
-    <div className="bg-white border border-slate-200 rounded-2xl p-5 flex flex-col gap-3 min-h-[380px] shadow-sm hover:shadow-md transition-shadow min-w-0">
+    <div className="bg-card border border-border rounded-2xl p-5 flex flex-col gap-3 min-h-[380px] shadow-sm hover:shadow-md transition-shadow min-w-0">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div className="min-w-0">
-          <p className="text-[14px] font-semibold text-[#0F2440] tracking-tight truncate">{viz.title}</p>
-          <p className="text-[11px] text-slate-500 mt-0.5">{viz.subtitle || viz.periodLabel}</p>
+          <p className="text-[14px] font-semibold text-foreground tracking-tight truncate">{viz.title}</p>
+          <p className="text-[11px] text-muted-foreground mt-0.5">{viz.subtitle || viz.periodLabel}</p>
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">
           {viz.current !== null && (
-            <span className="text-sm font-bold text-[#0F2440] tabular-nums">{fmt(viz.current, prefix)}</span>
+            <span className="text-sm font-bold text-foreground tabular-nums">{fmt(viz.current, prefix)}</span>
           )}
           {viz.trendPct !== null && (
-            <span className={`flex items-center gap-0.5 text-[11px] font-semibold px-1.5 py-0.5 rounded-full ${viz.trendPct >= 0 ? "text-emerald-600 bg-emerald-50" : "text-rose-600 bg-rose-50"}`}>
+            <span className={`flex items-center gap-0.5 text-[11px] font-semibold px-1.5 py-0.5 rounded-full ${viz.trendPct >= 0 ? "text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-500/10" : "text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-500/10"}`}>
               {viz.trendPct >= 0 ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
               {Math.abs(viz.trendPct).toFixed(1)}%
             </span>
@@ -800,9 +860,9 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
       </div>
 
       {viz.annotation && (
-        <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-slate-500 bg-slate-50 border border-slate-100 rounded-xl px-2.5 py-1.5">
-          <Sparkles size={11} className="text-blue-600 flex-shrink-0 mt-0.5" />
-          <span><span className="font-semibold text-[#0F2440]">ARIA found: </span>{viz.annotation}</span>
+        <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-muted-foreground bg-secondary border border-border rounded-xl px-2.5 py-1.5">
+          <Sparkles size={11} className="text-blue-600 dark:text-blue-400 flex-shrink-0 mt-0.5" />
+          <span><span className="font-semibold text-foreground">ARIA found: </span>{viz.annotation}</span>
         </p>
       )}
 
@@ -812,7 +872,7 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
             <button
               onClick={() => setShowTrend((s) => !s)}
               aria-pressed={showTrend}
-              className={`text-[11px] font-medium px-2 py-1 rounded-md border transition-colors ${showTrend ? "border-blue-300 text-[#0F2440] bg-blue-50" : "border-slate-200 text-slate-400 line-through opacity-70"}`}
+              className={`text-[11px] font-medium px-2 py-1 rounded-md border transition-colors ${showTrend ? "border-blue-300 dark:border-blue-500/25 text-foreground bg-blue-50 dark:bg-blue-500/10" : "border-border text-muted-foreground line-through opacity-70"}`}
               title="Toggle 3-period moving average"
             >
               <span className="inline-block w-3 border-t-2 border-blue-600 mr-1.5 align-middle" />Trend
@@ -830,7 +890,7 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
                 key={n}
                 onClick={() => setTopN(n)}
                 aria-pressed={topN === n}
-                className={`text-[11px] font-medium px-2 py-1 rounded-md border transition-colors ${topN === n ? "border-blue-300 text-[#0F2440] bg-blue-50" : "border-slate-200 text-slate-500 hover:text-[#0F2440]"}`}
+                className={`text-[11px] font-medium px-2 py-1 rounded-md border transition-colors ${topN === n ? "border-blue-300 dark:border-blue-500/25 text-foreground bg-blue-50 dark:bg-blue-500/10" : "border-border text-muted-foreground hover:text-foreground"}`}
               >
                 Top {n}
               </button>
@@ -838,19 +898,19 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
             <button
               onClick={() => setTopN(Number.MAX_SAFE_INTEGER)}
               aria-pressed={topN === Number.MAX_SAFE_INTEGER}
-              className={`text-[11px] font-medium px-2 py-1 rounded-md border transition-colors ${topN === Number.MAX_SAFE_INTEGER ? "border-blue-300 text-[#0F2440] bg-blue-50" : "border-slate-200 text-slate-500 hover:text-[#0F2440]"}`}
+              className={`text-[11px] font-medium px-2 py-1 rounded-md border transition-colors ${topN === Number.MAX_SAFE_INTEGER ? "border-blue-300 dark:border-blue-500/25 text-foreground bg-blue-50 dark:bg-blue-500/10" : "border-border text-muted-foreground hover:text-foreground"}`}
             >
               All
             </button>
             {viz.data.length > 1 && (
-              <span className="text-[10px] text-slate-400">click legend names to hide/show</span>
+              <span className="text-[10px] text-muted-foreground">click legend names to hide/show</span>
             )}
           </>
         ) : null}
         {modified && (
           <button
             onClick={() => { setRange("all"); setTopN(8); setHidden([]); }}
-            className="ml-auto flex items-center gap-1 text-[11px] font-medium px-2 py-1 rounded-md border border-slate-200 text-slate-500 hover:text-[#0F2440] transition-colors"
+            className="ml-auto flex items-center gap-1 text-[11px] font-medium px-2 py-1 rounded-md border border-border text-muted-foreground hover:text-foreground transition-colors"
             title="Reset this chart"
           >
             <RotateCcw size={11} /> Reset
@@ -859,9 +919,9 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
       </div>
 
       {contextChip && (
-        <div className="flex items-center gap-2 text-[11px] text-slate-500 bg-blue-50/60 border border-blue-100 rounded-xl px-2.5 py-1.5">
-          <span className="truncate">Context from other chart: <span className="font-semibold text-[#0F2440]">{contextChip}</span></span>
-          <button onClick={onClearContext} className="ml-auto flex items-center gap-0.5 hover:text-[#0F2440] flex-shrink-0" title="Clear selection">
+        <div className="flex items-center gap-2 text-[11px] text-muted-foreground bg-blue-50/60 dark:bg-blue-500/10 border border-blue-100 dark:border-blue-500/20 rounded-xl px-2.5 py-1.5">
+          <span className="truncate">Context from other chart: <span className="font-semibold text-foreground">{contextChip}</span></span>
+          <button onClick={onClearContext} className="ml-auto flex items-center gap-0.5 hover:text-foreground flex-shrink-0" title="Clear selection">
             <X size={11} /> Clear
           </button>
         </div>
@@ -885,7 +945,7 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
               >
                 {viewData.map((row: any, i: number) => {
                   const active = mine && String(row?.[viz.xKey]) === mine.label;
-                  return <Cell key={i} fill={colorForName(String(row?.[viz.xKey] ?? i))} opacity={mine && !active ? 0.35 : 1} stroke={active ? "#0F2440" : "none"} strokeWidth={active ? 2 : 0} />;
+                  return <Cell key={i} fill={colorForName(String(row?.[viz.xKey] ?? i))} opacity={mine && !active ? 0.35 : 1} stroke={active ? "var(--foreground)" : "none"} strokeWidth={active ? 2 : 0} />;
                 })}
               </Pie>
             </PieChart>
@@ -894,7 +954,7 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
               <CartesianGrid strokeDasharray="3 3" stroke={grid} horizontal={false} />
               <XAxis type="number" tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} tickFormatter={(v: number) => fmtBiz(v)} />
               <YAxis type="category" dataKey={viz.xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={110} />
-              <Tooltip content={<DashTooltip viz={viz} total={total} />} cursor={{ fill: "#F1F5F9", opacity: 0.7 }} />
+              <Tooltip content={<DashTooltip viz={viz} total={total} />} cursor={{ fill: "var(--secondary)", opacity: 0.7 }} />
               <Bar dataKey={viz.yKey} radius={[0, 4, 4, 0]} onClick={(d: any) => handlePick(d?.payload || d)}>
                 {viewData.map((row: any, i: number) => {
                   const active = mine && String(row?.[viz.xKey]) === mine.label;
@@ -909,7 +969,7 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
               <XAxis dataKey="x" type="number" name={viz.xKey || "x"} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} />
               <YAxis dataKey="y" type="number" name={viz.yKey || "y"} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={56} />
               <ZAxis range={[40, 40]} />
-              <Tooltip cursor={{ strokeDasharray: "3 3" }} />
+              <Tooltip content={<ScatterTooltip viz={viz} />} cursor={{ strokeDasharray: "3 3" }} />
               <Scatter data={viewData} fill={measureColor} fillOpacity={0.6} onClick={(d: any) => handlePick(d?.payload || d)} />
             </ScatterChart>
           ) : isTime ? (
@@ -939,7 +999,7 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
               <CartesianGrid strokeDasharray="3 3" stroke={grid} vertical={false} />
               <XAxis dataKey={viz.xKey} tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} minTickGap={8} interval="preserveStartEnd" />
               <YAxis tick={{ fontSize: 11, fill: axis }} axisLine={false} tickLine={false} width={56} tickFormatter={(v: number) => fmtBiz(v)} />
-              <Tooltip content={<DashTooltip viz={viz} total={total} />} cursor={{ fill: "#F1F5F9", opacity: 0.7 }} />
+              <Tooltip content={<DashTooltip viz={viz} total={total} />} cursor={{ fill: "var(--secondary)", opacity: 0.7 }} />
               <Bar dataKey={viz.yKey} radius={[4, 4, 0, 0]} onClick={(d: any) => handlePick(d?.payload || d)}>
                 {viewData.map((row: any, i: number) => {
                   const active = mine && String(row?.[viz.xKey]) === mine.label;
@@ -965,10 +1025,10 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
                   key={name}
                   onClick={() => setHidden((h) => (h.includes(name) ? h.filter((x) => x !== name) : [...h, name]))}
                   aria-pressed={!off}
-                  className="inline-flex items-center gap-1.5 text-[11px] text-slate-500 hover:text-[#0F2440] transition-colors"
+                  className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
                   title={off ? `Show ${name}` : `Hide ${name}`}
                 >
-                  <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: off ? "#E2E8F0" : colorForName(name) }} />
+                  <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: off ? "var(--border)" : colorForName(name) }} />
                   <span className={off ? "line-through opacity-60" : ""}>{name.length > 18 ? `${name.slice(0, 17)}…` : name}</span>
                 </button>
               );
@@ -977,28 +1037,28 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
       )}
 
       {mine && (
-        <div className="rounded-xl border border-blue-200 bg-blue-50/60 px-3 py-2.5 space-y-2">
+        <div className="rounded-xl border border-blue-200 dark:border-blue-500/25 bg-blue-50/60 dark:bg-blue-500/10 px-3 py-2.5 space-y-2">
           <p className="text-[11px]">
-            <span className="font-semibold text-[#0F2440]">{mine.label || "Selected point"}</span>
-            <span className="text-slate-500"> · </span>
-            <span className="text-[#0F2440] font-semibold">
+            <span className="font-semibold text-foreground">{mine.label || "Selected point"}</span>
+            <span className="text-muted-foreground"> · </span>
+            <span className="text-foreground font-semibold">
               {typeof mine.value === "number" ? fmtExact(mine.value, prefix) : String(mine.value ?? "—")}
             </span>
-            <span className="text-slate-500"> — analyze this further:</span>
+            <span className="text-muted-foreground"> — analyze this further:</span>
           </p>
           <div className="flex flex-wrap gap-1.5">
             {([["analytics", "AI Analytics"], ["insights", "Insights"], ["predictive", "Forecast"]] as [Page, string][]).map(([target, label]) => (
               <button
                 key={target}
                 onClick={() => onDrill(target)}
-                className="text-[11px] font-medium px-2 py-1 rounded-md bg-white border border-slate-200 text-[#0F2440] hover:border-blue-400 transition-colors"
+                className="text-[11px] font-medium px-2 py-1 rounded-md bg-card border border-border text-foreground hover:border-blue-400 transition-colors"
               >
                 {label}
               </button>
             ))}
             <button
               onClick={() => onSelect(null, null)}
-              className="text-[11px] font-medium px-2 py-1 rounded-md text-slate-500 hover:text-[#0F2440] transition-colors"
+              className="text-[11px] font-medium px-2 py-1 rounded-md text-muted-foreground hover:text-foreground transition-colors"
             >
               Dismiss
             </button>
@@ -1010,6 +1070,7 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
 }
 
 export default function Dashboard({ setPage, onAsk, user, connectionStatus = "not-connected", dbName = "", insightResult = null, analysisResult = null, connectionError = "" }: DashboardProps) {
+  const { isDark } = useTheme();
   const [query, setQuery] = useState("");
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
@@ -1043,8 +1104,8 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     try { document.getElementById("dash-charts")?.scrollIntoView({ behavior: "smooth", block: "start" }); } catch { /* ignore */ }
   };
 
-  const grid = "#E5E7EB";
-  const axis = "#9CA3AF";
+  const grid = isDark ? "#2A2A35" : "#E5E7EB";
+  const axis = isDark ? "#8889A0" : "#9CA3AF";
 
   const trackSuggestionClick = async (text: string) => {
     try {
@@ -1120,56 +1181,6 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     })();
   }, [connectionStatus, dbName]);
 
-  /* Morning brief: 3 lines from live engines (alerts + inaction + top
-     prescription). Fetched once per connected source. */
-  const [brief, setBrief] = useState<any>(null);
-  const briefFor = useRef<string>("");
-  useEffect(() => {
-    if (connectionStatus !== "connected") return;
-    const firstMetric: string = String(
-      (config?.metrics || [])[0]?.name || (config?.metrics || [])[0]?.label || "",
-    );
-    const key = `${dbName}|${firstMetric}`;
-    if (!firstMetric || briefFor.current === key) return;
-    briefFor.current = key;
-    let cancelled = false;
-    // Defer: let KPIs/charts paint first; the brief fills in after.
-    // Hard 25s budget so a huge dataset never holds the page hostage.
-    const timer: any = setTimeout(() => {
-      if (cancelled) return;
-      const ctrl = new AbortController();
-      const killer: any = setTimeout(() => { try { ctrl.abort(); } catch {} }, 25000);
-      (async () => {
-        try {
-          const { prescriptionApi } = await import("../../services/api");
-          const opts: any = { signal: ctrl.signal };
-          const [a, b, c] = await Promise.all([
-            (prescriptionApi as any).alerts(opts).catch(() => ({ data: { alerts: [] } })),
-            firstMetric
-              ? (prescriptionApi as any).inaction({ metric: firstMetric }, opts).catch(() => ({ data: null }))
-              : Promise.resolve({ data: null }),
-            firstMetric
-              ? (prescriptionApi as any).analyze({ metric: firstMetric }, opts).catch(() => ({ data: null }))
-              : Promise.resolve({ data: null }),
-          ]);
-          if (!cancelled) {
-            const alerts = (a as any)?.data?.alerts || [];
-            const pres = ((c as any)?.data?.prescriptions || [])[0] || null;
-            setBrief({ alert: alerts[0] || null, burn: (b as any)?.data || null, action: pres });
-          }
-        } catch {
-          if (!cancelled) setBrief(null);
-        } finally {
-          clearTimeout(killer);
-        }
-      })();
-    }, 4000);
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [connectionStatus, dbName, config]);
-
   useEffect(() => {
     if (connectionStatus !== "connected") return;
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -1198,7 +1209,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     const isTransitional = connectionStatus === "connecting" || connectionStatus === "schema-loading";
     const hasFailed = connectionStatus === "error" || connectionStatus === "failed";
     return (
-      <div className="min-h-full bg-[#F6F8FC] text-[#0F2440]">
+      <div className="min-h-full bg-secondary text-foreground">
         <div className="p-6 max-w-screen-xl mx-auto">
           <div className="text-center py-20">
             <div className="w-16 h-16 rounded-2xl mx-auto mb-5 flex items-center justify-center bg-gradient-to-br from-blue-600 to-indigo-600">
@@ -1207,7 +1218,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
             <h2 className="text-2xl font-semibold tracking-tight mb-2">
               {isTransitional ? "Connecting…" : hasFailed ? "Connection Failed" : "Connect a Data Source"}
             </h2>
-            <p className="text-sm text-slate-500 mb-4 max-w-sm mx-auto">
+            <p className="text-sm text-muted-foreground mb-4 max-w-sm mx-auto">
               {isTransitional
                 ? "ARIA is reaching your data source — this takes a moment."
                 : hasFailed && connectionError ? businessError(connectionError) : "Get started by connecting your database to unlock AI-powered insights."}
@@ -1440,23 +1451,23 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
   const analyzing = loading && metrics.length === 0 && charts.length === 0 && pool.length === 0;
 
   return (
-    <div className="min-h-full bg-[#F6F8FC] text-[#0F2440] overflow-x-hidden">
+    <div className="min-h-full bg-secondary text-foreground overflow-x-hidden">
       <style>{`@keyframes dashCardIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}.dash-card-in{animation:dashCardIn .45s ease both}`}</style>
       <div className="p-4 md:p-6 max-w-[1400px] mx-auto space-y-5 min-w-0 max-w-full">
         {/* ---- Hero: greeting + actions + connected data ---- */}
         <section className="flex flex-col lg:flex-row lg:items-start gap-4">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2.5">
-              <span className="inline-flex items-center justify-center w-9 h-9 rounded-full bg-amber-50 text-amber-500 flex-shrink-0">
+              <span className="inline-flex items-center justify-center w-9 h-9 rounded-full bg-amber-50 dark:bg-amber-500/10 text-amber-500 dark:text-amber-400 flex-shrink-0">
                 <Sun size={18} />
               </span>
               <h1 className="text-[24px] md:text-[28px] font-semibold tracking-tight leading-tight truncate">{greeting}</h1>
             </div>
-            <p className="mt-1.5 text-[13px] text-slate-500">
+            <p className="mt-1.5 text-[13px] text-muted-foreground">
               {summary.title || (displayDbName ? `Here's what ARIA found in ${displayDbName}.` : "Here's what ARIA found in your data.")}
             </p>
             {summary.totalRows > 0 && (
-              <p className="text-[11px] text-slate-400 mt-0.5">
+              <p className="text-[11px] text-muted-foreground mt-0.5">
                 {summary.tableCount} tables · {summary.totalRows.toLocaleString()} records
               </p>
             )}
@@ -1464,7 +1475,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
               <button
                 onClick={handleRefresh}
                 disabled={loading}
-                className="inline-flex items-center gap-1.5 text-[12px] font-semibold px-3.5 py-2 rounded-xl bg-white border border-slate-200 shadow-sm hover:border-blue-300 hover:shadow transition-all disabled:opacity-50"
+                className="inline-flex items-center gap-1.5 text-[12px] font-semibold px-3.5 py-2 rounded-xl bg-card border border-border shadow-sm hover:border-blue-300 dark:hover:border-blue-500/25 hover:shadow transition-all disabled:opacity-50"
               >
                 <RefreshCw size={13} className={loading ? "animate-spin" : ""} /> Refresh
               </button>
@@ -1475,56 +1486,38 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                 <MessageSquare size={13} /> Ask ARIA
               </button>
               {lastUpdated && (
-                <span className="text-[11px] text-slate-400">Updated {new Date(lastUpdated).toLocaleTimeString()}</span>
+                <span className="text-[11px] text-muted-foreground">Updated {new Date(lastUpdated).toLocaleTimeString()}</span>
               )}
             </div>
           {/* Upper insight-category filter pills removed — Recent/Important Insights below show the full unfiltered pool. */}
           </div>
 
           {/* Connected data card — real source only */}
-          <div className="w-full lg:w-[300px] flex-shrink-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="w-full lg:w-[300px] flex-shrink-0 rounded-2xl border border-border bg-card p-4 shadow-sm">
             <div className="flex items-center gap-2">
-              <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-blue-50 text-blue-600">
+              <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400">
                 <Database size={15} />
               </span>
               <p className="text-[12px] font-semibold flex items-center gap-1.5">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
                 Connected Data
               </p>
-              <span className="ml-auto text-[10px] text-slate-400">Last analyzed</span>
+              <span className="ml-auto text-[10px] text-muted-foreground">Last analyzed</span>
             </div>
             <div className="mt-3 flex items-start justify-between gap-2">
               <div className="min-w-0">
                 <p className="text-[13px] font-semibold truncate">{displayDbName || "Connected source"}</p>
-                {displaySourceType && <p className="text-[11px] text-slate-500">{humanize(String(displaySourceType))}</p>}
+                {displaySourceType && <p className="text-[11px] text-muted-foreground">{humanize(String(displaySourceType))}</p>}
               </div>
-              <p className="text-[11px] font-medium text-slate-600 flex-shrink-0" title={lastUpdatedIso ? fmtWhen(lastUpdatedIso) : undefined}>
+              <p className="text-[11px] font-medium text-secondary-foreground flex-shrink-0" title={lastUpdatedIso ? fmtWhen(lastUpdatedIso) : undefined}>
                 {lastUpdatedIso ? relTime(lastUpdatedIso) : "—"}
               </p>
             </div>
-            <button onClick={() => setPage("data")} className="mt-2 text-[11px] font-semibold text-blue-600 hover:underline inline-flex items-center gap-1">
+            <button onClick={() => setPage("data")} className="mt-2 text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1">
               View details <ChevronRight size={12} />
             </button>
           </div>
         </section>
-
-        {/* ---- Morning brief: 30-second read from live engines ---- */}
-        {brief && (brief.alert || (brief.burn && brief.burn.monthly_burn > 0) || brief.action) && (
-          <section className="rounded-2xl border border-slate-200 bg-gradient-to-br from-blue-50/70 via-white to-indigo-50/50 p-4 md:p-5 shadow-sm dash-card-in">
-            <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">MORNING BRIEF</p>
-            <div className="mt-2 space-y-1.5">
-              {brief.alert && (
-                <p className="text-[13px] text-[#0F2440] leading-relaxed"><span className="font-semibold text-blue-700">Moved:</span> {String(brief.alert.headline || "")}</p>
-              )}
-              {brief.burn && brief.burn.monthly_burn > 0 && (
-                <p className="text-[13px] text-[#0F2440] leading-relaxed"><span className="font-semibold text-rose-700">At stake:</span> {String(brief.burn.headline || "")}</p>
-              )}
-              {brief.action && (
-                <p className="text-[13px] text-[#0F2440] leading-relaxed"><span className="font-semibold text-emerald-700">Next:</span> <span className="font-semibold">{String(brief.action?.display?.action_text || brief.action?.title || "")}</span></p>
-              )}
-            </div>
-          </section>
-        )}
 
         {/* ---- Tracked numbers: KPIs pinned from Analytics ---- */}
         {(() => {
@@ -1535,12 +1528,12 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           } catch { /* best-effort */ }
           if (!tracked.length) return null;
           return (
-            <section className="rounded-2xl border border-slate-200 bg-white p-4 md:p-5 shadow-sm dash-card-in">
+            <section className="rounded-2xl border border-border bg-card p-4 md:p-5 shadow-sm dash-card-in">
               <div className="flex items-center justify-between">
                 <h2 className="text-[14px] font-semibold tracking-tight">Tracked numbers</h2>
                 <button
                   onClick={() => { try { localStorage.removeItem("aria_tracked_numbers"); } catch {} window.location.reload(); }}
-                  className="text-[11px] font-medium text-slate-400 hover:text-rose-600"
+                  className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400"
                   aria-label="Clear tracked numbers"
                 >
                   Clear
@@ -1548,9 +1541,9 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
               </div>
               <div className="mt-2 grid grid-cols-2 md:grid-cols-3 gap-2">
                 {tracked.map((t: any, i: number) => (
-                  <div key={i} className="rounded-xl bg-slate-50 border border-slate-100 px-3 py-2">
-                    <p className="text-[11px] text-slate-500 truncate">{String(t?.label || "Metric")}</p>
-                    <p className="text-[18px] font-bold text-[#0F2440] tabular-nums">
+                  <div key={i} className="rounded-xl bg-secondary border border-border px-3 py-2">
+                    <p className="text-[11px] text-muted-foreground truncate">{String(t?.label || "Metric")}</p>
+                    <p className="text-[18px] font-bold text-foreground tabular-nums">
                       {typeof t?.value === "number" ? t.value.toLocaleString(undefined, { maximumFractionDigits: 1 }) : "—"}
                     </p>
                   </div>
@@ -1579,15 +1572,15 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           })();
           if (dismissed.includes(String(top.id))) return null;
           return (
-            <section className="rounded-2xl border border-rose-200 bg-gradient-to-r from-rose-50/80 to-white p-4 flex items-center gap-3 shadow-sm" role="alert">
-              <span className="inline-flex items-center justify-center w-9 h-9 rounded-full bg-rose-100 text-rose-700 flex-shrink-0">
+            <section className="rounded-2xl border border-rose-200 dark:border-rose-500/25 bg-gradient-to-r from-rose-50/80 dark:from-rose-500/10 to-card p-4 flex items-center gap-3 shadow-sm" role="alert">
+              <span className="inline-flex items-center justify-center w-9 h-9 rounded-full bg-rose-100 dark:bg-rose-500/15 text-rose-700 dark:text-rose-400 flex-shrink-0">
                 <AlertTriangle size={16} />
               </span>
               <div className="min-w-0 flex-1">
-                <p className="text-[13px] font-semibold text-[#0F2440] truncate">
+                <p className="text-[13px] font-semibold text-foreground truncate">
                   {sev.length} anomal{sev.length === 1 ? "y" : "ies"} flagged{sev.length > 1 ? ` — latest: ${top.title}` : `: ${top.title}`}
                 </p>
-                <p className="text-[11px] text-slate-500 truncate">{String(top.description || "Unusual movement detected in your data.")}</p>
+                <p className="text-[11px] text-muted-foreground truncate">{String(top.description || "Unusual movement detected in your data.")}</p>
               </div>
               <button
                 onClick={() => focusInsight(top)}
@@ -1604,7 +1597,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                   } catch { /* best-effort */ }
                   setAnomDismiss((n) => n + 1);
                 }}
-                className="flex-shrink-0 text-[11px] font-medium text-slate-400 hover:text-slate-600"
+                className="flex-shrink-0 text-[11px] font-medium text-muted-foreground hover:text-secondary-foreground"
                 aria-label="Dismiss anomaly banner"
               >
                 Dismiss
@@ -1615,12 +1608,12 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
 
         {/* ---- Business-worded error (never raw fetch text) ---- */}
         {error && (
-          <div className="rounded-2xl border border-rose-200 bg-white p-4 flex gap-3 shadow-sm">
-            <AlertTriangle size={18} className="text-rose-500 flex-shrink-0 mt-0.5" />
+          <div className="rounded-2xl border border-rose-200 dark:border-rose-500/25 bg-card p-4 flex gap-3 shadow-sm">
+            <AlertTriangle size={18} className="text-rose-500 dark:text-rose-400 flex-shrink-0 mt-0.5" />
             <div className="min-w-0">
               <p className="text-[13px] font-semibold">ARIA couldn&apos;t load this analysis</p>
-              <p className="text-[12px] text-slate-500 mt-0.5">{businessError(error)}</p>
-              <button onClick={handleRefresh} className="mt-1.5 text-[12px] font-semibold text-blue-600 hover:underline">Try again</button>
+              <p className="text-[12px] text-muted-foreground mt-0.5">{businessError(error)}</p>
+              <button onClick={handleRefresh} className="mt-1.5 text-[12px] font-semibold text-blue-600 dark:text-blue-400 hover:underline">Try again</button>
             </div>
           </div>
         )}
@@ -1630,7 +1623,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           <div className="flex items-center gap-2">
             <h2 className="text-[14px] font-semibold tracking-tight">Business Overview</h2>
             {qualityScore !== null && (
-              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-600">
+              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
                 Data quality {qualityScore}%
               </span>
             )}
@@ -1638,10 +1631,10 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           {analyzing ? (
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4" aria-busy="true">
               {[1, 2, 3, 4].map((i) => (
-                <div key={i} className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm animate-pulse" aria-hidden>
-                  <div className="h-3 bg-slate-100 rounded w-16 mb-3" />
-                  <div className="h-7 bg-slate-200 rounded w-24 mb-2" />
-                  <div className="h-10 bg-slate-100 rounded w-full" />
+                <div key={i} className="bg-card border border-border rounded-2xl p-4 shadow-sm animate-pulse" aria-hidden>
+                  <div className="h-3 bg-secondary rounded w-16 mb-3" />
+                  <div className="h-7 bg-border rounded w-24 mb-2" />
+                  <div className="h-10 bg-secondary rounded w-full" />
                 </div>
               ))}
             </div>
@@ -1661,9 +1654,9 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                 ))}
               </div>
             ) : !error ? (
-              <div className="bg-white border border-dashed border-slate-300 rounded-2xl p-6 text-center shadow-sm">
+              <div className="bg-card border border-dashed border-border rounded-2xl p-6 text-center shadow-sm">
                 <p className="text-[13px] font-medium">No KPIs available for this dataset yet.</p>
-                <p className="text-[11px] text-slate-500 mt-1">ARIA shows a KPI only when the data supports a meaningful measure — nothing is fabricated.</p>
+                <p className="text-[11px] text-muted-foreground mt-1">ARIA shows a KPI only when the data supports a meaningful measure — nothing is fabricated.</p>
               </div>
             ) : null;
           })()}
@@ -1672,8 +1665,8 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
         {/* ---- Executive summary strip ---- */}
         {summary.description && (
           <section aria-label="Executive summary">
-            <div className="flex items-center gap-3 bg-white border border-slate-200 rounded-2xl px-4 py-3 text-[13px] text-slate-500 leading-relaxed shadow-sm min-w-0">
-              <Sparkles size={14} className="text-blue-600 flex-shrink-0" />
+            <div className="flex items-center gap-3 bg-card border border-border rounded-2xl px-4 py-3 text-[13px] text-muted-foreground leading-relaxed shadow-sm min-w-0">
+              <Sparkles size={14} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
               <p className="flex-1 min-w-0">{summary.description}</p>
             </div>
           </section>
@@ -1685,7 +1678,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
             {/* Key Visualizations */}
             <section id="dash-charts" className="space-y-3 min-w-0 scroll-mt-4">
               <div className="flex items-center gap-2">
-                <Sparkles size={14} className="text-blue-600" />
+                <Sparkles size={14} className="text-blue-600 dark:text-blue-400" />
                 <h2 className="text-[14px] font-semibold tracking-tight">Key Visualizations</h2>
                 <div className="ml-auto flex items-center gap-2">
                   <TimeRangeSelector
@@ -1694,14 +1687,14 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                     onChange={(r) => setChartRange(r as any)}
                   />
                   {selection && (
-                    <button onClick={() => setSelection(null)} className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-[#0F2440] transition-colors" title="Clear chart selection">
+                    <button onClick={() => setSelection(null)} className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors" title="Clear chart selection">
                       <X size={11} /> Clear selection
                     </button>
                   )}
-                  <button onClick={globalReset} className="hidden sm:flex items-center gap-1 text-[11px] text-slate-400 hover:text-[#0F2440] transition-colors" title="Reset all chart controls">
+                  <button onClick={globalReset} className="hidden sm:flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors" title="Reset all chart controls">
                     <RotateCcw size={11} /> Reset
                   </button>
-                  <button onClick={() => setPage("analytics")} className="text-[11px] font-semibold text-blue-600 hover:underline">
+                  <button onClick={() => setPage("analytics")} className="text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline">
                     View all →
                   </button>
                 </div>
@@ -1709,10 +1702,10 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
               {loading && charts.length === 0 ? (
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-4" aria-busy="true">
                   {[1, 2].map((i) => (
-                    <div key={i} className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm animate-pulse" aria-hidden>
-                      <div className="h-4 bg-slate-200 rounded w-40 mb-2" />
-                      <div className="h-3 bg-slate-100 rounded w-56 mb-4" />
-                      <div className="h-[260px] bg-slate-100 rounded-xl w-full" />
+                    <div key={i} className="bg-card border border-border rounded-2xl p-5 shadow-sm animate-pulse" aria-hidden>
+                      <div className="h-4 bg-border rounded w-40 mb-2" />
+                      <div className="h-3 bg-secondary rounded w-56 mb-4" />
+                      <div className="h-[260px] bg-secondary rounded-xl w-full" />
                     </div>
                   ))}
                 </div>
@@ -1720,28 +1713,28 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                 <>
                   {/* Insight focus: live re-computed card for the clicked insight/anomaly */}
                   {(focusViz || focusLoading || focusError) && (
-                    <div className="rounded-2xl border border-blue-200 bg-blue-50/60 p-3 shadow-sm">
+                    <div className="rounded-2xl border border-blue-200 dark:border-blue-500/25 bg-blue-50/60 dark:bg-blue-500/10 p-3 shadow-sm">
                       <div className="flex items-center gap-2 mb-2 px-1">
-                        <Sparkles size={13} className="text-blue-600 flex-shrink-0" />
-                        <p className="text-[12px] font-semibold text-[#0F2440] truncate">
+                        <Sparkles size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
+                        <p className="text-[12px] font-semibold text-foreground truncate">
                           Insight focus{focusTitle ? `: ${focusTitle}` : ""}
                         </p>
                         <button
                           onClick={() => { clearFocus(); setSelection(null); }}
-                          className="ml-auto inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 hover:text-[#0F2440] transition-colors flex-shrink-0"
+                          className="ml-auto inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground hover:text-foreground transition-colors flex-shrink-0"
                           aria-label="Clear insight focus"
                         >
                           <X size={12} /> Back to overview
                         </button>
                       </div>
                       {focusLoading && (
-                        <div className="bg-white border border-blue-100 rounded-xl p-5" aria-busy="true">
-                          <div className="h-4 bg-slate-200 rounded w-40 mb-2 animate-pulse" />
-                          <div className="h-[220px] bg-slate-100 rounded-xl w-full animate-pulse" />
+                        <div className="bg-card border border-blue-100 dark:border-blue-500/20 rounded-xl p-5" aria-busy="true">
+                          <div className="h-4 bg-border rounded w-40 mb-2 animate-pulse" />
+                          <div className="h-[220px] bg-secondary rounded-xl w-full animate-pulse" />
                         </div>
                       )}
                       {!focusLoading && focusError && (
-                        <p className="text-[12px] text-rose-600 bg-white border border-rose-100 rounded-xl px-4 py-3">{focusError}</p>
+                        <p className="text-[12px] text-rose-600 dark:text-rose-400 bg-card border border-rose-100 dark:border-rose-500/25 rounded-xl px-4 py-3">{focusError}</p>
                       )}
                       {!focusLoading && focusViz && (
                         <VizCard
@@ -1775,25 +1768,25 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
             </section>
 
             {/* Important Insights */}
-            <section className="rounded-2xl border border-slate-200 bg-white shadow-sm p-4 space-y-3 min-w-0">
+            <section className="rounded-2xl border border-border bg-card shadow-sm p-4 space-y-3 min-w-0">
               <div className="flex items-center gap-2">
-                <Sparkles size={14} className="text-blue-600" />
+                <Sparkles size={14} className="text-blue-600 dark:text-blue-400" />
                 <h2 className="text-[14px] font-semibold tracking-tight">Important Insights</h2>
-                <button onClick={() => setPage("insights")} className="ml-auto text-[11px] font-semibold text-blue-600 hover:underline">
+                <button onClick={() => setPage("insights")} className="ml-auto text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline">
                   View all →
                 </button>
               </div>
               {analyzing ? (
                 <div className="space-y-2.5 animate-pulse" aria-hidden>
                   {[1, 2, 3].map((i) => (
-                    <div key={i} className="rounded-xl border border-slate-100 p-3">
-                      <div className="h-3.5 bg-slate-200 rounded w-3/4 mb-2" />
-                      <div className="h-3 bg-slate-100 rounded w-full" />
+                    <div key={i} className="rounded-xl border border-border p-3">
+                      <div className="h-3.5 bg-border rounded w-3/4 mb-2" />
+                      <div className="h-3 bg-secondary rounded w-full" />
                     </div>
                   ))}
                 </div>
               ) : importantInsights.length > 0 ? (
-                <div className="divide-y divide-slate-100">
+                <div className="divide-y divide-border">
                   {importantInsights.map((ins: any) => {
                     const meta = CAT_META[primaryCategory(ins.type)];
                     const Icon = meta.Icon;
@@ -1803,14 +1796,14 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                           <Icon size={14} />
                         </span>
                         <span className="min-w-0 flex-1">
-                          <span className="block text-[12px] font-semibold leading-snug group-hover:text-blue-700 line-clamp-2">{ins.title}</span>
-                          <span className="block text-[11px] text-slate-500 leading-snug line-clamp-2 mt-0.5">{ins.description}</span>
+                          <span className="block text-[12px] font-semibold leading-snug group-hover:text-blue-700 dark:group-hover:text-blue-400 line-clamp-2">{ins.title}</span>
+                          <span className="block text-[11px] text-muted-foreground leading-snug line-clamp-2 mt-0.5">{ins.description}</span>
                           <span className="mt-1 flex items-center gap-2">
                             <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${meta.pill}`}>{meta.label}</span>
-                            {ins.detectedAt && <span className="text-[10px] text-slate-400">{fmtWhen(ins.detectedAt)}</span>}
+                            {ins.detectedAt && <span className="text-[10px] text-muted-foreground">{fmtWhen(ins.detectedAt)}</span>}
                           </span>
                         </span>
-                        <ChevronRight size={14} className="text-slate-300 group-hover:text-blue-500 flex-shrink-0" />
+                        <ChevronRight size={14} className="text-slate-300 dark:text-muted-foreground group-hover:text-blue-500 dark:group-hover:text-blue-400 flex-shrink-0" />
                       </button>
                     );
                   })}
@@ -1818,28 +1811,28 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
               ) : (
                 <div className="text-center py-8">
                   <p className="text-[13px] font-medium">No signals under this filter.</p>
-                  <p className="text-[11px] text-slate-500 mt-1">The analysis ran — this view just has nothing notable in this category.</p>
+                  <p className="text-[11px] text-muted-foreground mt-1">The analysis ran — this view just has nothing notable in this category.</p>
                   {activeFilter !== "all" && (
-                    <button onClick={() => setActiveFilter("all")} className="mt-2 text-[11px] font-semibold text-blue-600 hover:underline">Clear filter</button>
+                    <button onClick={() => setActiveFilter("all")} className="mt-2 text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline">Clear filter</button>
                   )}
                 </div>
               )}
             </section>
 
             {/* Ask ARIA Anything — existing Copilot flow with autocomplete */}
-            <section className="rounded-2xl border border-blue-100 bg-gradient-to-r from-blue-50/80 to-indigo-50/80 p-4 flex flex-col sm:flex-row sm:items-center gap-3 shadow-sm">
+            <section className="rounded-2xl border border-blue-100 dark:border-blue-500/20 bg-gradient-to-r from-blue-50/80 dark:from-blue-500/10 to-indigo-50/80 dark:to-indigo-500/10 p-4 flex flex-col sm:flex-row sm:items-center gap-3 shadow-sm">
               <div className="flex items-center gap-3 min-w-0 sm:w-64 flex-shrink-0">
-                <span className="inline-flex items-center justify-center w-10 h-10 rounded-full bg-blue-100 text-blue-700 flex-shrink-0">
+                <span className="inline-flex items-center justify-center w-10 h-10 rounded-full bg-blue-100 dark:bg-blue-500/15 text-blue-700 dark:text-blue-400 flex-shrink-0">
                   <Sparkles size={16} />
                 </span>
                 <span className="min-w-0">
                   <span className="block text-[13px] font-semibold">Ask ARIA Anything</span>
-                  <span className="block text-[11px] text-slate-500 leading-snug">Get deeper insights, ask follow-up questions, or explore your data in natural language.</span>
+                  <span className="block text-[11px] text-muted-foreground leading-snug">Get deeper insights, ask follow-up questions, or explore your data in natural language.</span>
                 </span>
               </div>
               <div className="relative flex-1 min-w-0">
-                <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-xl pl-3 pr-1.5 py-1.5 shadow-sm focus-within:border-blue-400">
-                  <MessageSquare size={14} className="text-slate-400 flex-shrink-0" />
+                <div className="flex items-center gap-2 bg-card border border-border rounded-xl pl-3 pr-1.5 py-1.5 shadow-sm focus-within:border-blue-400">
+                  <MessageSquare size={14} className="text-muted-foreground flex-shrink-0" />
                   <input
                     ref={inputRef}
                     value={query}
@@ -1848,7 +1841,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                     onBlur={() => setTimeout(() => setShowSuggestions(false), 200)}
                     onKeyDown={(e) => { if (e.key === "Enter") handleSubmit(); }}
                     placeholder="Ask a question about your data…"
-                    className="flex-1 min-w-0 bg-transparent text-[12px] text-[#0F2440] placeholder:text-slate-400 outline-none"
+                    className="flex-1 min-w-0 bg-transparent text-[12px] text-foreground placeholder:text-muted-foreground outline-none"
                     aria-label="Ask ARIA anything"
                   />
                   <button onClick={handleSubmit} disabled={!query.trim()} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 transition-colors flex-shrink-0" title="Ask Copilot" aria-label="Send question">
@@ -1856,11 +1849,11 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                   </button>
                 </div>
                 {showSuggestions && (query.length > 0 ? suggestions.length > 0 : exampleQuestions.length > 0) && (
-                  <div className="absolute bottom-full left-0 right-0 mb-2 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 z-20 max-h-[240px] overflow-y-auto">
+                  <div className="absolute bottom-full left-0 right-0 mb-2 bg-card border border-border rounded-xl shadow-lg py-1.5 z-20 max-h-[240px] overflow-y-auto">
                     {(query.length > 0 ? suggestions : exampleQuestions).map((s: string, i: number) => (
                       <button key={s + i} onMouseDown={() => askExample(s)}
-                        className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-[#0F2440] hover:bg-slate-50 transition-colors text-left">
-                        <Zap size={13} className="text-blue-600 flex-shrink-0" />
+                        className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left">
+                        <Zap size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
                         <span className="truncate">{s}</span>
                       </button>
                     ))}
@@ -1872,27 +1865,27 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
 
           {/* Right rail: Recent Insights + Quick Actions */}
           <aside id="dash-insights" className="min-w-0 space-y-4 xl:sticky xl:top-4 scroll-mt-4">
-            <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
-              <div className="flex items-center gap-2 px-4 pt-3.5 pb-2.5 border-b border-slate-100">
-                <Sparkles size={14} className="text-blue-600" />
+            <div className="rounded-2xl border border-border bg-card shadow-sm overflow-hidden">
+              <div className="flex items-center gap-2 px-4 pt-3.5 pb-2.5 border-b border-border">
+                <Sparkles size={14} className="text-blue-600 dark:text-blue-400" />
                 <p className="text-[13px] font-semibold">Recent Insights</p>
-                <button onClick={() => setPage("insights")} className="ml-auto text-[11px] font-semibold text-blue-600 hover:underline">
+                <button onClick={() => setPage("insights")} className="ml-auto text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline">
                   View all →
                 </button>
               </div>
-              <div className="divide-y divide-slate-100">
+              <div className="divide-y divide-border">
                 {analyzing && (
                   <div className="px-4 py-3 space-y-2 animate-pulse" aria-hidden>
                     {[1, 2, 3].map((i) => (
                       <div key={i}>
-                        <div className="h-3 bg-slate-200 rounded w-3/4 mb-1.5" />
-                        <div className="h-2.5 bg-slate-100 rounded w-1/2" />
+                        <div className="h-3 bg-border rounded w-3/4 mb-1.5" />
+                        <div className="h-2.5 bg-secondary rounded w-1/2" />
                       </div>
                     ))}
                   </div>
                 )}
                 {!analyzing && recentInsights.length === 0 && (
-                  <p className="px-4 py-5 text-[11px] text-slate-400">
+                  <p className="px-4 py-5 text-[11px] text-muted-foreground">
                     {activeFilter !== "all"
                       ? `No ${activeFilter} insights right now — try All or another category.`
                       : "No insights loaded yet — connect data and they will appear here."}
@@ -1909,61 +1902,61 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                       role="button"
                       tabIndex={0}
                       title="Show this insight in the charts above"
-                      className="w-full text-left px-4 py-2.5 flex items-center gap-2.5 hover:bg-blue-50/50 transition-colors group min-w-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                      className="w-full text-left px-4 py-2.5 flex items-center gap-2.5 hover:bg-blue-50/50 dark:hover:bg-blue-500/10 transition-colors group min-w-0 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                     >
                       <span className={`inline-flex items-center justify-center w-7 h-7 rounded-full flex-shrink-0 ${meta.iconWrap}`}>
                         <Icon size={13} />
                       </span>
                       <span className="min-w-0 flex-1">
-                        <span className="block text-[12px] font-medium leading-snug line-clamp-2 group-hover:text-blue-700">{ins.title}</span>
+                        <span className="block text-[12px] font-medium leading-snug line-clamp-2 group-hover:text-blue-700 dark:group-hover:text-blue-400">{ins.title}</span>
                         <span className="mt-0.5 flex items-center gap-1.5">
                           <span className={`text-[10px] font-semibold px-1.5 py-px rounded-full border ${meta.pill}`}>{meta.label}</span>
-                          {ins.detectedAt && <span className="text-[10px] text-slate-400">{fmtWhen(ins.detectedAt)}</span>}
+                          {ins.detectedAt && <span className="text-[10px] text-muted-foreground">{fmtWhen(ins.detectedAt)}</span>}
                           <button
                             onClick={(e) => { e.stopPropagation(); askAbout(`Explain this finding: ${ins.title}`); }}
-                            className="text-[10px] font-semibold text-blue-600 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
+                            className="text-[10px] font-semibold text-blue-600 dark:text-blue-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
                             aria-label={`Ask ARIA about ${ins.title}`}
                           >
                             Ask
                           </button>
                           <button
                             onClick={(e) => { e.stopPropagation(); void askPrescription(ins); }}
-                            className="text-[10px] font-medium text-slate-500 hover:text-blue-700 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
+                            className="text-[10px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
                             aria-label={`What should I do about ${ins.title}`}
                           >
                             {rxBusy === String(ins.id || ins.title) ? "Checking…" : "What should I do?"}
                           </button>
                         </span>
                         {rxFor === String(ins.id || ins.title) && rxAns[String(ins.id || ins.title)] && (
-                          <span className="mt-1 block text-[11px] text-slate-600 leading-snug bg-blue-50/60 border border-blue-100 rounded-lg px-2 py-1.5">
+                          <span className="mt-1 block text-[11px] text-secondary-foreground leading-snug bg-blue-50/60 dark:bg-blue-500/10 border border-blue-100 dark:border-blue-500/20 rounded-lg px-2 py-1.5">
                             {rxAns[String(ins.id || ins.title)]}
                           </span>
                         )}
                       </span>
-                      <ChevronRight size={13} className="text-slate-300 group-hover:text-blue-500 flex-shrink-0" />
+                      <ChevronRight size={13} className="text-slate-300 dark:text-muted-foreground group-hover:text-blue-500 dark:group-hover:text-blue-400 flex-shrink-0" />
                     </div>
                   );
                 })}
               </div>
             </div>
 
-            <div className="rounded-2xl border border-slate-200 bg-white shadow-sm p-4">
+            <div className="rounded-2xl border border-border bg-card shadow-sm p-4">
               <p className="text-[13px] font-semibold">Quick Actions</p>
               <div className="mt-2.5 space-y-2">
-                <button onClick={focusAsk} className="w-full text-left rounded-xl border border-slate-200 px-3 py-2.5 hover:border-blue-300 hover:shadow-sm transition-all group">
-                  <span className="block text-[12px] font-semibold group-hover:text-blue-700">Ask a question</span>
-                  <span className="block text-[11px] text-slate-500">Ask ARIA about your data.</span>
+                <button onClick={focusAsk} className="w-full text-left rounded-xl border border-border px-3 py-2.5 hover:border-blue-300 dark:hover:border-blue-500/25 hover:shadow-sm transition-all group">
+                  <span className="block text-[12px] font-semibold group-hover:text-blue-700 dark:group-hover:text-blue-400">Ask a question</span>
+                  <span className="block text-[11px] text-muted-foreground">Ask ARIA about your data.</span>
                 </button>
                 <button
                   onClick={() => { storeDrillContext({ kind: "quick-action", action: "create-chart" }); setPage("analytics"); }}
-                  className="w-full text-left rounded-xl border border-slate-200 px-3 py-2.5 hover:border-blue-300 hover:shadow-sm transition-all group"
+                  className="w-full text-left rounded-xl border border-border px-3 py-2.5 hover:border-blue-300 dark:hover:border-blue-500/25 hover:shadow-sm transition-all group"
                 >
-                  <span className="block text-[12px] font-semibold group-hover:text-blue-700">Create a chart</span>
-                  <span className="block text-[11px] text-slate-500">Visualize using your connected data.</span>
+                  <span className="block text-[12px] font-semibold group-hover:text-blue-700 dark:group-hover:text-blue-400">Create a chart</span>
+                  <span className="block text-[11px] text-muted-foreground">Visualize using your connected data.</span>
                 </button>
-                <button onClick={() => setPage("insights")} className="w-full text-left rounded-xl border border-slate-200 px-3 py-2.5 hover:border-blue-300 hover:shadow-sm transition-all group">
-                  <span className="block text-[12px] font-semibold group-hover:text-blue-700">Generate insights</span>
-                  <span className="block text-[11px] text-slate-500">Open the insight workflow.</span>
+                <button onClick={() => setPage("insights")} className="w-full text-left rounded-xl border border-border px-3 py-2.5 hover:border-blue-300 dark:hover:border-blue-500/25 hover:shadow-sm transition-all group">
+                  <span className="block text-[12px] font-semibold group-hover:text-blue-700 dark:group-hover:text-blue-400">Generate insights</span>
+                  <span className="block text-[11px] text-muted-foreground">Open the insight workflow.</span>
                 </button>
               </div>
             </div>
@@ -1971,10 +1964,10 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
         </div>
 
         {anomalies.length > 0 && (
-          <p className="flex items-center gap-1.5 text-[11px] text-slate-400 pb-4">
+          <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground pb-4">
             <AlertTriangle size={11} />
             {anomalies.length} anomal{anomalies.length === 1 ? "y" : "ies"} flagged — see Insights for the full list.
-            <button onClick={() => setPage("insights")} className="ml-1 inline-flex items-center gap-0.5 font-semibold text-blue-600 hover:underline">
+            <button onClick={() => setPage("insights")} className="ml-1 inline-flex items-center gap-0.5 font-semibold text-blue-600 dark:text-blue-400 hover:underline">
               Explore <ArrowRight size={11} />
             </button>
           </p>

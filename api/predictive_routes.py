@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+from typing import Any
 
 from core.config import get_session
 from core.data_intelligence import hint_hit as _hint_hit
@@ -21,6 +22,19 @@ log = logging.getLogger("aria.predictive_routes")
 router = APIRouter()
 
 
+class ForecastFilter(BaseModel):
+    """Structured row filter: applied as SQL WHERE + in-memory post-filter.
+
+    Additive-only: optional ``filters`` on ForecastRequest. Generic —
+    column validated against the resolved table's schema, op from a fixed
+    allow-list, value bound as a query parameter (never interpolated).
+    """
+
+    column: str
+    op: str = "="
+    value: Any = None
+
+
 class ForecastRequest(BaseModel):
     question: str = ""
     column: str | None = None
@@ -28,6 +42,10 @@ class ForecastRequest(BaseModel):
     # None = auto-suggest from frequency + history length (dynamic default);
     # any integer overrides the suggestion.
     horizon: int | None = None
+    # Structured filters (additive-only): validated against schema and
+    # applied as WHERE in both the GoalAgent path (question intent +
+    # in-memory enforcement) and the deterministic fallback SQL.
+    filters: list[ForecastFilter] | None = None
 
 
 class PrescriptionRequest(BaseModel):
@@ -42,6 +60,211 @@ class ScenarioRequest(BaseModel):
 
 _DATE_NAME_HINTS = ("date", "time", "day", "month", "year", "created",
                     "updated", "timestamp", "period", "week", "quarter")
+
+# Allow-listed structured-filter ops (generic, no table/column literals).
+# Maps normalized op -> SQL operator. "IN" expects a list/tuple value.
+_FILTER_OP_SQL: dict[str, str] = {
+    "=": "=",
+    "==": "=",
+    "!=": "!=",
+    "<>": "<>",
+    ">": ">",
+    ">=": ">=",
+    "<": "<",
+    "<=": "<=",
+    "like": "LIKE",
+    "in": "IN",
+}
+
+# Single deterministic-fallback row cap (perf: bounded GROUP BY grain query).
+_DETERMINISTIC_LIMIT = 2000
+
+
+def _normalize_filter_op(op):
+    """Normalize a filter op to its SQL operator, or None if disallowed."""
+    try:
+        key = str(op or "").strip().lower()
+    except Exception:
+        return None
+    if key in ("=", "=="):
+        return "="
+    return _FILTER_OP_SQL.get(key) or _FILTER_OP_SQL.get(str(op or "").strip())
+
+
+def _validate_forecast_filters(filters, tables, table):
+    """Validate structured filters against the resolved table's schema.
+
+    Exact-only column resolution (no substring match): case-insensitive
+    exact match against real columns. Returns (applied, errors) where
+    applied = [{column, op, value}] with resolved column names. Generic.
+    """
+    if not filters:
+        return [], []
+    try:
+        valid_cols = {n for n, _d in _table_columns(tables, table)}
+    except Exception:
+        valid_cols = set()
+    low = {c.lower(): c for c in valid_cols}
+    applied: list[dict] = []
+    errors: list[str] = []
+    for f in filters:
+        try:
+            raw_col = str((f.column if isinstance(f, dict) else getattr(f, "column", "")) or "").strip()
+            raw_op = (f["op"] if isinstance(f, dict) and "op" in f else getattr(f, "op", "="))
+            raw_val = (f["value"] if isinstance(f, dict) and "value" in f else getattr(f, "value", None))
+        except Exception:
+            errors.append("Invalid filter entry; expected {column, op, value}.")
+            continue
+        if not raw_col:
+            errors.append("Filter is missing 'column'.")
+            continue
+        resolved = low.get(raw_col.lower())
+        # Exact-only: raw_col must equal a real column (case-insensitive).
+        if resolved is None and raw_col not in valid_cols:
+            errors.append(f"Filter column '{raw_col}' is not a column of '{table}'.")
+            continue
+        resolved = resolved or raw_col
+        sql_op = _normalize_filter_op(raw_op)
+        if sql_op is None:
+            errors.append(
+                f"Filter op '{raw_op}' is not supported. "
+                f"Use one of: =, !=, <>, >, >=, <, <=, LIKE, IN."
+            )
+            continue
+        if sql_op == "IN" and not isinstance(raw_val, (list, tuple)):
+            errors.append(f"Filter op 'IN' on '{resolved}' needs a list value.")
+            continue
+        applied.append({"column": resolved, "op": sql_op, "value": raw_val})
+    return applied, errors
+
+
+def _filter_where_clause(applied, dialect):
+    """Build (WHERE fragment, params) for validated filters. Param-bound."""
+    from api.schema_intel import _safe_name
+    if not applied:
+        return "", {}
+    parts: list[str] = []
+    params: dict = {}
+    for i, f in enumerate(applied):
+        try:
+            q = _safe_name(f["column"], dialect)
+        except Exception:
+            q = str(f["column"])
+        pname = f"flt_{i}"
+        if f["op"] == "IN":
+            vals = list(f["value"] or [])
+            if not vals:
+                parts.append("1 = 0")
+                continue
+            names = []
+            for j, v in enumerate(vals):
+                pn = f"{pname}_{j}"
+                names.append(f":{pn}")
+                params[pn] = v
+            parts.append(f"{q} IN ({', '.join(names)})")
+        else:
+            parts.append(f"{q} {f['op']} :{pname}")
+            params[pname] = f["value"]
+    return (" AND ".join(parts), params)
+
+
+def _apply_filters_in_memory(rows, applied):
+    """Enforce validated filters on in-memory GoalAgent result rows."""
+    if not applied or not rows:
+        return rows
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        keep = True
+        for f in applied:
+            col, op, val = f["column"], f["op"], f["value"]
+            # Exact-only column lookup (case-insensitive exact fallback).
+            if col in r:
+                rv = r[col]
+            else:
+                low = {str(k).lower(): k for k in r.keys()}
+                rv = r.get(low.get(str(col).lower(), col), None)
+            try:
+                if op == "=":
+                    ok = str(rv) == str(val) if isinstance(val, bool) is False and isinstance(rv, bool) is False else rv == val
+                    # Numeric leniency: "10" == 10 only when both parse.
+                    if not ok:
+                        try:
+                            ok = float(rv) == float(val)
+                        except Exception:
+                            ok = False
+                elif op in ("!=", "<>"):
+                    try:
+                        ok = not (float(rv) == float(val))
+                    except Exception:
+                        ok = str(rv) != str(val)
+                elif op in (">", ">=", "<", "<="):
+                    try:
+                        l, rr = float(rv), float(val)
+                        ok = (l > rr) if op == ">" else (l >= rr) if op == ">=" else (l < rr) if op == "<" else (l <= rr)
+                    except Exception:
+                        ok = (str(rv) > str(val)) if op == ">" else (str(rv) >= str(val)) if op == ">=" else (str(rv) < str(val)) if op == "<" else (str(rv) <= str(val))
+                elif op == "LIKE":
+                    import re as _re
+                    pat = "^" + _re.escape(str(val)).replace("%", ".*").replace("_", ".") + "$"
+                    ok = _re.match(pat, str(rv), _re.IGNORECASE) is not None
+                elif op == "IN":
+                    try:
+                        ok = rv in (val or []) or str(rv) in [str(v) for v in (val or [])]
+                    except Exception:
+                        ok = False
+                else:
+                    ok = True
+            except Exception:
+                ok = True
+            if not ok:
+                keep = False
+                break
+        if keep:
+            out.append(r)
+    return out
+
+
+def _describe_filters_for_question(applied):
+    """Natural-language filter intent appended to the GoalAgent question so its
+    generated SQL WHERE reflects the structured filters (generic)."""
+    if not applied:
+        return ""
+    bits = []
+    for f in applied:
+        try:
+            if f["op"] == "IN":
+                bits.append(f"{f['column']} IN ({', '.join(str(v) for v in (f['value'] or []))})")
+            else:
+                bits.append(f"{f['column']} {f['op']} {f['value']}")
+        except Exception:
+            continue
+    return (" Only include rows where " + " AND ".join(bits) + ".") if bits else ""
+
+
+def _horizon_info(requested, forecast):
+    """Top-level horizon disclosure {requested, used, capped, note}."""
+    try:
+        used = forecast.get("horizon") if isinstance(forecast, dict) else None
+    except Exception:
+        used = None
+    try:
+        capped = bool((forecast or {}).get("horizon_capped")) if isinstance(forecast, dict) else False
+    except Exception:
+        capped = False
+    try:
+        note = (forecast or {}).get("horizon_note") if isinstance(forecast, dict) else None
+    except Exception:
+        note = None
+    if used is None:
+        try:
+            used = int(requested) if requested is not None else 6
+        except Exception:
+            used = 6
+    if capped and not note:
+        note = f"Requested horizon {requested} exceeds available history; capped to {used}."
+    return {"requested": requested, "used": used, "capped": capped, "note": note}
 
 
 def _table_columns(tables, tname):
@@ -677,35 +900,144 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
     # Step 0: Validate the requested column against real measures. Keys,
     # FKs and id-like columns (e.g. reports_to) are not forecastable —
     # asking the GoalAgent to "forecast" one yields garbage like COUNT(*).
-    # Anything that is not a genuine measure falls back to auto-select.
+    # Exact-only resolution (no substring match): anything that is not a
+    # genuine measure falls back to auto-select with substituted=True.
     from api.schema_intel import SchemaIntelligence as _SI0
+    from insight_agent import sanitize_json as _sj_shared
     _mapping0 = json.loads(Path(str(schema_path)).read_text(encoding="utf-8"))
     _intel0 = _SI0(_mapping0)
-    _want0 = ((req.column or "").split(" (")[0]).strip()
-    _measure_tables: dict[str, str] = {}  # lower column -> table
+    _requested_measure_raw = ((req.column or "").split(" (")[0]).strip() or None
+    _want0 = _requested_measure_raw or ""
+    # Perf: single shared engine for all direct SQL in this request
+    # (row-count gate + deterministic fallback share it; GoalAgent keeps
+    # its own internal engine). Disposed in finally at each return site.
+    from api.kpi_routes import _build_engine as _kb_shared
+    from api.schema_intel import _safe_name as _sn_shared
+    _shared_engine, _shared_dialect = None, dialect
+    try:
+        _shared_engine, _shared_dialect_tmp, _ = _kb_shared(session)
+        if _shared_engine is not None and _shared_dialect_tmp:
+            _shared_dialect = _shared_dialect_tmp
+    except Exception:
+        _shared_engine = None
+
+    def _dispose_shared():
+        try:
+            if _shared_engine is not None:
+                _shared_engine.dispose()
+        except Exception:
+            pass
+
+    # Exact-only measure lookup across tables (case-insensitive exact;
+    # never substring): collect every (table, measure) whose measure
+    # exactly equals the request.
+    _measure_candidates: list[tuple] = []
+    if _want0:
+        for _tn in _mapping0.get("tables", {}):
+            try:
+                _ms = _intel0.find_all_measures(_tn) or []
+            except Exception:
+                _ms = []
+            for _m in _ms:
+                try:
+                    if str(_m).lower() == _want0.lower():
+                        _measure_candidates.append((_tn, _m))
+                except Exception:
+                    continue
+    _measure_tables: dict[str, str] = {}  # lower column -> table (first hit, compat)
     for _tn in _mapping0.get("tables", {}):
-        for _m in (_intel0.find_all_measures(_tn) or []):
-            _measure_tables.setdefault(str(_m).lower(), _tn)
-    if _want0 and _want0.lower() in _measure_tables:
-        valid_measure, valid_table = _want0, _measure_tables[_want0.lower()]
+        try:
+            for _m in (_intel0.find_all_measures(_tn) or []):
+                _measure_tables.setdefault(str(_m).lower(), _tn)
+        except Exception:
+            continue
+    if len(_measure_candidates) > 1:
+        # Ambiguous request: same measure name in several tables — return
+        # candidates for disambiguation instead of silently picking one.
+        _ambig = [{"table": t, "measure": m} for t, m in _measure_candidates]
+        try:
+            _dispose_shared()
+        except Exception:
+            pass
+        return _sj_shared({
+            "ok": False,
+            "question": req.question or f"Show {_want0} over time",
+            "reason": f"'{_want0}' exists in several tables; specify which one to forecast.",
+            "missing_field": "measure",
+            "suggestion": "Re-run with the table-qualified measure, e.g. "
+                          f"'{_measure_candidates[0][1]} ({_measure_candidates[0][0]})'.",
+            "target": _want0,
+            "candidates": _ambig,
+            "target_candidates": _ambig,
+            "selection": {"measure": None, "table": None, "time_dim": None,
+                          "requested_measure": _requested_measure_raw,
+                          "requested_time_dim": ((req.time_dim or "").split(" (")[0]).strip() or None,
+                          "substituted": False,
+                          "substitution_reason": "Ambiguous measure: candidates returned."},
+            "info": {"rows_analyzed": 0, "fallback_used": False, "goal_message": None,
+                     "requested_measure": _requested_measure_raw, "resolved_measure": None,
+                     "requested_time_dim": ((req.time_dim or "").split(" (")[0]).strip() or None,
+                     "resolved_time_dim": None, "substituted": False,
+                     "substitution_reason": "Ambiguous measure: candidates returned.",
+                     "filters_applied": []},
+            "horizon_info": {"requested": req.horizon, "used": int(req.horizon or 6),
+                             "capped": False, "note": None},
+            "reliability": "insufficient_data",
+            "n_obs": 0,
+        })
+    if _want0 and _measure_candidates:
+        valid_measure, valid_table = _measure_candidates[0][1], _measure_candidates[0][0]
     else:
         valid_measure, valid_table = None, None
         for _tn in _mapping0.get("tables", {}):
-            _m = _intel0.find_best_measure(_tn)
+            try:
+                _m = _intel0.find_best_measure(_tn)
+            except Exception:
+                _m = None
             if _m:
                 valid_measure, valid_table = _m, _tn
                 break
     if valid_measure is None:
+        try:
+            _dispose_shared()
+        except Exception:
+            pass
         raise HTTPException(
             status_code=400,
             detail="No forecastable number found in this data. Forecasting needs a numeric measure (not ids, keys or codes).",
         )
+    # Requested-vs-resolved echo for the measure (fixes silent swaps).
+    if _requested_measure_raw and _requested_measure_raw.lower() == str(valid_measure).lower():
+        _measure_substituted, _measure_reason = False, None
+    elif _requested_measure_raw:
+        _measure_substituted = True
+        _measure_reason = (
+            f"Requested column '{_requested_measure_raw}' is not an exact forecastable "
+            f"measure; using '{valid_measure}' from '{valid_table}'."
+        )
+    else:
+        _measure_substituted, _measure_reason = False, None
+    # Structured filters: validate against the resolved table's schema now
+    # so both the GoalAgent path and the deterministic SQL share them.
+    try:
+        _filter_applied, _filter_errors = _validate_forecast_filters(
+            list(req.filters or []) if req.filters else [],
+            _mapping0.get("tables", {}), valid_table)
+    except Exception:
+        _filter_applied, _filter_errors = [], ["Could not validate filters."]
+    if _filter_errors:
+        try:
+            _dispose_shared()
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="; ".join(_filter_errors)[:500])
 
     # Centralized global gate (core/evidence.py): rows < 10 -> refusal for
     # ALL substantive conclusions, BEFORE any GoalAgent/LLM work. Consume the
     # row counts the mapping exposes; fall back to a live COUNT(*) only when
-    # the mapping has no counts. Per-capability forecast minimum
-    # (min_points=5 history periods) is REUSED downstream in PredictionAgent.
+    # the mapping has no counts (reusing the single shared engine).
+    # Per-capability forecast minimum (min_points=5 history periods) is
+    # REUSED downstream in PredictionAgent.
     _fc_rows, _fc_known = None, False
     try:
         _tinfo0 = (_mapping0.get("tables") or {}).get(valid_table) or {}
@@ -713,21 +1045,13 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
             _fc_rows, _fc_known = max(0, int(_tinfo0["row_count"])), True
     except Exception:
         pass
-    if not _fc_known:
+    if not _fc_known and _shared_engine is not None:
         try:
-            from api.kpi_routes import _build_engine as _kb0
-            from api.schema_intel import _safe_name as _sn0
             from sqlalchemy import text as _t0
-            _eng0, _dial0, _ = _kb0(session)
-            if _eng0 is not None:
-                with _eng0.connect() as _c0:
-                    _fc_rows = int(_c0.execute(_t0(
-                        f"SELECT COUNT(*) FROM {_sn0(valid_table, _dial0)}")).fetchone()[0] or 0)
-                _fc_known = True
-                try:
-                    _eng0.dispose()
-                except Exception:
-                    pass
+            with _shared_engine.connect() as _c0:
+                _fc_rows = int(_c0.execute(_t0(
+                    f"SELECT COUNT(*) FROM {_sn_shared(valid_table, _shared_dialect)}")).fetchone()[0] or 0)
+            _fc_known = True
         except Exception:
             pass
     if _fc_known:
@@ -738,51 +1062,95 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
             _ev_fc = None
         if _ev_fc is not None and _ev_fc.get("status") != "supported":
             from insight_agent import sanitize_json as _sj_fc
-            return _sj_fc({
-                "ok": False,
-                "question": req.question or f"Show {valid_measure} over time",
-                "reason": _ev_fc.get("reason"),
-                "missing_field": "history",
-                "suggestion": "Connect at least 10 usable records, then try again.",
-                "target": valid_measure,
-                "selection": {"measure": valid_measure, "table": valid_table,
-                              "time_dim": None},
-                "info": {"rows_analyzed": _fc_rows, "fallback_used": False,
-                         "goal_message": None},
-                "evidence_state": _ev_fc,
-                "reliability": "insufficient_data",
-                "n_obs": _fc_rows,
-            })
+            try:
+                return _sj_fc({
+                    "ok": False,
+                    "question": req.question or f"Show {valid_measure} over time",
+                    "reason": _ev_fc.get("reason"),
+                    "missing_field": "history",
+                    "suggestion": "Connect at least 10 usable records, then try again.",
+                    "target": valid_measure,
+                    "selection": {"measure": valid_measure, "table": valid_table,
+                                  "time_dim": None,
+                                  "requested_measure": _requested_measure_raw,
+                                  "requested_time_dim": ((req.time_dim or "").split(" (")[0]).strip() or None,
+                                  "substituted": _measure_substituted,
+                                  "substitution_reason": _measure_reason},
+                    "info": {"rows_analyzed": _fc_rows, "fallback_used": False,
+                             "goal_message": None,
+                             "requested_measure": _requested_measure_raw,
+                             "resolved_measure": valid_measure,
+                             "requested_time_dim": ((req.time_dim or "").split(" (")[0]).strip() or None,
+                             "resolved_time_dim": None,
+                             "substituted": _measure_substituted,
+                             "substitution_reason": _measure_reason,
+                             "filters_applied": _filter_applied},
+                    "evidence_state": _ev_fc,
+                    "reliability": "insufficient_data",
+                    "n_obs": _fc_rows,
+                    "horizon_info": {"requested": req.horizon, "used": int(req.horizon or 6),
+                                     "capped": False, "note": None},
+                })
+            finally:
+                _dispose_shared()
 
     # Validate the requested time dimension against the table's real
-    # temporal candidates; fall back to the best-detected one.
+    # temporal candidates (exact-only, no substring); fall back to the
+    # best-detected one with substituted=True + reason (fixes silent swaps).
     _tcols = _table_columns(_mapping0.get("tables", {}), valid_table)
     _time_cands = [n for n, d in _tcols
                    if any(k in d.lower() for k in ("date", "time", "timestamp"))
                    or _hint_hit(n, _DATE_NAME_HINTS)]
-    _want_t = ((req.time_dim or "").split(" (")[0]).strip()
+    _requested_time_raw = ((req.time_dim or "").split(" (")[0]).strip() or None
+    _want_t = _requested_time_raw or ""
     valid_time = next((n for n in _time_cands if n.lower() == _want_t.lower()),
                       None) if _want_t else None
     if valid_time is None:
         valid_time = _intel0.find_best_datetime(valid_table)
+    if _requested_time_raw and valid_time and _requested_time_raw.lower() == str(valid_time).lower():
+        _time_substituted, _time_reason = False, None
+    elif _requested_time_raw and valid_time:
+        _time_substituted = True
+        _time_reason = (
+            f"Requested time dimension '{_requested_time_raw}' is not an exact temporal "
+            f"column of '{valid_table}'; using '{valid_time}'."
+        )
+    elif _requested_time_raw and not valid_time:
+        _time_substituted, _time_reason = True, (
+            f"Requested time dimension '{_requested_time_raw}' is not usable; "
+            "auto-detecting the time axis from the data."
+        )
+    else:
+        _time_substituted, _time_reason = False, None
+    _substituted = bool(_measure_substituted or _time_substituted)
+    _reasons = [r for r in [_measure_reason, _time_reason] if r]
+    _substitution_reason = "; ".join(_reasons) if _reasons else None
 
     # Step 1: Run GoalAgent to get time-series data. When the caller asked
     # for a non-measure column, ask about the validated measure instead —
-    # the raw request would only produce garbage SQL.
-    if req.question and _want0.lower() in _measure_tables:
-        question = req.question
+    # the raw request would only produce garbage SQL. Exact-only: the raw
+    # question is kept only when the request exactly names the resolved
+    # measure; otherwise the validated question is used (substitution is
+    # disclosed via selection/info). Structured filters are appended as
+    # natural-language intent so the generated SQL WHERE reflects them,
+    # and are additionally enforced in-memory + in deterministic SQL.
+    _filter_suffix = _describe_filters_for_question(_filter_applied)
+    if req.question and _measure_candidates:
+        question = req.question + _filter_suffix
     else:
         question = f"Show {valid_measure} by {valid_time} over time" if valid_time \
             else f"Show {valid_measure} over time"
-    output_dir = Path("artifacts/processed_data") / f"user_{user['user_id']}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"forecast_input_{int(time.time())}.json"
+        question = question + _filter_suffix
+    # Perf: pass dicts in-memory; GoalAgent still needs an output_path for
+    # its file contract, so use the OS temp dir (never artifacts/ files).
+    import tempfile as _tf
     try:
-        from core.config import prune_regenerable_outputs as _prune
-        _prune(output_dir)
+        _tmp_goal = Path(_tf.gettempdir()) / f"aria_forecast_{user['user_id']}_{int(time.time() * 1000)}.json"
     except Exception:
-        pass
+        _tmp_goal = Path(str(schema_path)).parent / f"forecast_input_{int(time.time())}.json"
+    output_path = _tmp_goal
     goal_error = None
+    goal_result = None
     try:
         from goal_agent.agent import GoalAgent
         from goal_agent.schema import load_user_overrides
@@ -805,39 +1173,102 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
         log.error("GoalAgent failed: %s\n%s", e, _tb.format_exc())
         goal_error = str(e)[:300]
 
-    # Step 2: Run PredictionAgent
+    # Step 2: Run PredictionAgent (dicts in-memory; single shared engine;
+    # single deterministic-fallback attempt; GROUP BY grain + LIMIT 2000).
+    processed_data: dict = {}
     try:
         from prediction.agent import PredictionAgent
 
-        processed_data = {}
-        if output_path.exists():
-            processed_data = json.loads(output_path.read_text(encoding="utf-8"))
+        # In-memory first: GoalAgent's return value when it is a dict;
+        # legacy file-contract fallback (temp path only) otherwise.
+        processed_data: dict = {}
+        try:
+            if isinstance(goal_result, dict):
+                processed_data = goal_result
+            elif isinstance(goal_result, (str, Path)) and Path(str(goal_result)).exists():
+                processed_data = json.loads(Path(str(goal_result)).read_text(encoding="utf-8"))
+            elif output_path.exists():
+                processed_data = json.loads(output_path.read_text(encoding="utf-8"))
+        except Exception:
+            processed_data = processed_data or {}
+        finally:
+            try:
+                if output_path.exists():
+                    output_path.unlink()
+            except Exception:
+                pass
+        # Enforce structured filters on the GoalAgent rows in-memory so the
+        # GoalAgent path honors the same WHERE semantics as the fallback SQL.
+        try:
+            if _filter_applied and isinstance(processed_data.get("data"), list):
+                processed_data["data"] = _apply_filters_in_memory(
+                    processed_data.get("data") or [], _filter_applied)
+        except Exception:
+            pass
 
         # Deterministic fallback: builds the time series directly from the
-        # schema — SELECT time, SUM(measure) GROUP BY time ORDER BY time —
-        # using the validated measure/table. Fully generic, no hardcoded
-        # tables or columns. Runs when the GoalAgent returned zero rows OR
-        # when its rows carry no usable time dimension (e.g. a bare COUNT).
+        # schema — SELECT grain(time), SUM(measure) GROUP BY grain ORDER BY
+        # grain — using the validated measure/table + filter WHERE. Fully
+        # generic, no hardcoded tables or columns. Reuses the single shared
+        # engine/connection; bounded with LIMIT 2000.
+        _fallback_attempted = False
+
         def _deterministic_series():
             try:
-                from api.kpi_routes import _build_engine as _kb
                 from api.schema_intel import _safe_name as _sn
                 from sqlalchemy import text as _t
 
-                _eng, _dial, _dbt = _kb(session)
-                _dt = valid_time or _intel0.find_best_datetime(valid_table)
-                if _eng is None or not _dt:
+                if _shared_engine is None:
                     return None
+                _dial = _shared_dialect or dialect
+                _dt = valid_time or _intel0.find_best_datetime(valid_table)
+                if not _dt:
+                    return None
+                # Real-date detection (generic, dtype-driven like scenario).
+                _dtype = ""
+                try:
+                    for _n, _d in _table_columns(_mapping0.get("tables", {}), valid_table):
+                        if _n == _dt:
+                            _dtype = str(_d or "").lower()
+                            break
+                except Exception:
+                    _dtype = ""
+                _is_date = any(k in _dtype for k in ("date", "time", "timestamp"))
                 _fref = _coerced_ref(_mapping0.get("tables", {}), valid_table,
                                      valid_measure, _dial)
-                with _eng.connect() as _conn:
-                    _rows = _conn.execute(_t(
-                        f"SELECT {_sn(_dt, _dial)} AS t, SUM({_fref}) AS v "
-                        f"FROM {_sn(valid_table, _dial)} "
-                        f"WHERE {_sn(_dt, _dial)} IS NOT NULL "
-                        f"GROUP BY {_sn(_dt, _dial)} "
-                        f"ORDER BY {_sn(_dt, _dial)} LIMIT 500"
-                    )).fetchall()
+                _flt_where, _flt_params = _filter_where_clause(_filter_applied, _dial)
+                _extra = f" AND {_flt_where}" if _flt_where else ""
+                try:
+                    with _shared_engine.connect() as _conn:
+                        try:
+                            _apply_stmt_timeout(_conn, _dial)
+                        except Exception:
+                            pass
+                        if _is_date:
+                            if _dial == "sqlite":
+                                _gexpr = f"strftime('%Y-%m', {_sn(_dt, _dial)})"
+                            elif _dial == "mysql":
+                                _gexpr = f"DATE_FORMAT({_sn(_dt, _dial)}, '%Y-%m')"
+                            else:
+                                _gexpr = f"TO_CHAR({_sn(_dt, _dial)}, 'YYYY-MM')"
+                            _rows = _conn.execute(_t(
+                                f"SELECT {_gexpr} AS t, SUM({_fref}) AS v "
+                                f"FROM {_sn(valid_table, _dial)} "
+                                f"WHERE {_sn(_dt, _dial)} IS NOT NULL{_extra} "
+                                f"GROUP BY {_gexpr} "
+                                f"ORDER BY {_gexpr} LIMIT {_DETERMINISTIC_LIMIT}"
+                            ), _flt_params).fetchall()
+                        else:
+                            _rows = _conn.execute(_t(
+                                f"SELECT {_sn(_dt, _dial)} AS t, SUM({_fref}) AS v "
+                                f"FROM {_sn(valid_table, _dial)} "
+                                f"WHERE {_sn(_dt, _dial)} IS NOT NULL{_extra} "
+                                f"GROUP BY {_sn(_dt, _dial)} "
+                                f"ORDER BY {_sn(_dt, _dial)} LIMIT {_DETERMINISTIC_LIMIT}"
+                            ), _flt_params).fetchall()
+                except Exception as _fe:
+                    log.warning("Forecast deterministic fallback failed: %s", _fe)
+                    return None
                 _series = [{_dt: r[0], valid_measure: float(r[1])}
                            for r in _rows if r[0] is not None and r[1] is not None]
                 if len(_series) >= 2:
@@ -851,22 +1282,45 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
                 log.warning("Forecast deterministic fallback failed: %s", _fe)
             return None
 
-        # The GoalAgent aggregates and aliases (e.g. amount -> total_amount),
-        # so resolve the validated schema column against the ACTUAL result
-        # columns (exact, case-insensitive, then substring either way).
-        # No match -> auto-select (numeric_col=None) instead of a guaranteed
-        # "column not found" failure.
+        def _try_fallback_once():
+            """Single fallback attempt across both call sites."""
+            nonlocal processed_data, _fallback_attempted
+            if _fallback_attempted:
+                return False
+            _fallback_attempted = True
+            try:
+                _fb = _deterministic_series()
+            except Exception:
+                _fb = None
+            finally:
+                pass
+            if _fb:
+                processed_data = _fb
+                return True
+            return False
+
+        # Exact-only target resolution (no substring match): exact
+        # case-sensitive, then case-insensitive exact. No match ->
+        # auto-select (numeric_col=None). Multiple case-insensitive hits ->
+        # ambiguous: return None + record candidates for disambiguation.
+        _target_candidates: list = []
+
         def _resolve_target(data):
             result_cols = list((data.get("data") or [{}])[0].keys()) \
                 if data.get("data") else []
-            low = {c.lower(): c for c in result_cols}
             if valid_measure in result_cols:
                 return valid_measure
-            if valid_measure.lower() in low:
-                return low[valid_measure.lower()]
-            sub = [c for c in result_cols
-                   if valid_measure.lower() in c.lower() or c.lower() in valid_measure.lower()]
-            return sub[0] if sub else None
+            _hits = [c for c in result_cols
+                     if str(c).lower() == str(valid_measure).lower()]
+            if len(_hits) == 1:
+                return _hits[0]
+            if len(_hits) > 1:
+                try:
+                    _target_candidates.extend(_hits)
+                except Exception:
+                    pass
+                return None
+            return None
 
         pred_agent = PredictionAgent(
             min_points=5,
@@ -874,20 +1328,20 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
         )
         goal_sql = processed_data.get("sql_used") or processed_data.get("sql")
         if not (processed_data.get("data") or []):
-            _fb = _deterministic_series()
-            if _fb:
-                processed_data = _fb
+            _try_fallback_once()
         # Pass the validated time dimension through only when it is really a
-        # column of the result rows — otherwise the agent auto-detects the
-        # time axis from the data (fully dynamic, never assumed).
+        # column of the result rows (exact-only) — otherwise the agent
+        # auto-detects the time axis from the data (fully dynamic).
         def _resolve_time(data):
             result_cols = list((data.get("data") or [{}])[0].keys()) \
                 if data.get("data") else []
             if valid_time in result_cols:
                 return valid_time
-            low = {c.lower(): c for c in result_cols}
-            if valid_time and valid_time.lower() in low:
-                return low[valid_time.lower()]
+            if valid_time:
+                _hits = [c for c in result_cols
+                         if str(c).lower() == str(valid_time).lower()]
+                if len(_hits) == 1:
+                    return _hits[0]
             return None
 
         forecast = pred_agent.forecast(
@@ -898,9 +1352,7 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
         )
         if not forecast.get("valid") and not (forecast.get("points") or []) \
                 and not processed_data.get("fallback"):
-            _fb = _deterministic_series()
-            if _fb:
-                processed_data = _fb
+            if _try_fallback_once():
                 forecast = pred_agent.forecast(
                     processed_data,
                     numeric_col=_resolve_target(processed_data),
@@ -939,6 +1391,8 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
             "target": valid_measure,
             "horizon": int(req.horizon or 6),
             "horizon_suggested": None,
+            "horizon_capped": False,
+            "horizon_note": None,
             "metrics": {"mae": None, "rmse": None, "mape": None},
             "selection_statement": None,
             "uncertainty_note": None,
@@ -967,6 +1421,27 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
                                dataset_name=valid_table)
         except Exception:
             _ev_uf = None
+        _uf_selection = {
+            "measure": valid_measure,
+            "table": valid_table,
+            "time_dim": valid_time,
+            "requested_measure": _requested_measure_raw,
+            "requested_time_dim": _requested_time_raw,
+            "substituted": _substituted,
+            "substitution_reason": _substitution_reason,
+        }
+        _uf_info = {
+            "rows_analyzed": len((processed_data.get("data") or [])),
+            "fallback_used": bool(processed_data.get("fallback")),
+            "goal_message": processed_data.get("message"),
+            "requested_measure": _requested_measure_raw,
+            "resolved_measure": valid_measure,
+            "requested_time_dim": _requested_time_raw,
+            "resolved_time_dim": valid_time,
+            "substituted": _substituted,
+            "substitution_reason": _substitution_reason,
+            "filters_applied": _filter_applied,
+        }
         _uf_payload = {
             "ok": False,
             "question": question,
@@ -976,23 +1451,28 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
             "suggestion": forecast.get("suggestion")
             or "Ask ARIA to analyze this dataset instead.",
             "target": forecast.get("target") or valid_measure,
-            "selection": {
-                "measure": valid_measure,
-                "table": valid_table,
-                "time_dim": valid_time,
-            },
-            "info": {
-                "rows_analyzed": len((processed_data.get("data") or [])),
-                "fallback_used": bool(processed_data.get("fallback")),
-                "goal_message": processed_data.get("message"),
-            },
+            "selection": _uf_selection,
+            "info": _uf_info,
             "preparation": forecast.get("preparation") or {},
             "reliability": forecast.get("reliability"),
             "n_obs": forecast.get("n_obs", 0),
+            "horizon_info": _horizon_info(req.horizon, forecast),
         }
+        # Exact-only ambiguity in result columns: surface candidates so the
+        # caller can disambiguate (additive; model candidates stay empty here).
+        try:
+            if _target_candidates:
+                _uf_payload["target_candidates"] = list(_target_candidates)
+                if not _uf_payload.get("candidates"):
+                    _uf_payload["candidates"] = list(_target_candidates)
+        except Exception:
+            pass
         if _ev_uf is not None:
             _uf_payload["evidence_state"] = _ev_uf
-        return sanitize_json(_uf_payload)
+        try:
+            return sanitize_json(_uf_payload)
+        finally:
+            _dispose_shared()
     _future_series = forecast.get("forecast") or []
     if isinstance(_future_series, dict):
         _future_series = []
@@ -1019,30 +1499,48 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
         "n_obs": forecast.get("n_obs", 0),
         "horizon": forecast.get("horizon") or int(req.horizon or 6),
         "horizon_suggested": forecast.get("horizon_suggested"),
+        "horizon_capped": forecast.get("horizon_capped") or False,
+        "horizon_note": forecast.get("horizon_note"),
+        "horizon_info": _horizon_info(req.horizon, forecast),
         "metrics": forecast.get("metrics") or {"mae": None, "rmse": None, "mape": None},
         "selection_statement": forecast.get("selection_statement"),
         "uncertainty_note": forecast.get("uncertainty_note"),
         "interval_method": forecast.get("interval_method")
         or ("pointwise" if (forecast.get("points") or []) else None),
     }
-    return sanitize_json({
-        "ok": True,
-        "question": question,
-        "forecast": forecast,
-        "selection": {
-            "measure": valid_measure,
-            "table": valid_table,
-            "time_dim": valid_time,
-        },
-        "info": {
-            "rows_analyzed": len((processed_data.get("data") or [])),
-            "fallback_used": bool(processed_data.get("fallback")),
-            "goal_message": processed_data.get("message"),
-        },
-        "evidence_state": _evidence_state_for_forecast(
-            forecast, _fc_rows if _fc_known else None, valid_table),
-        **contract,
-    })
+    try:
+        return sanitize_json({
+            "ok": True,
+            "question": question,
+            "forecast": forecast,
+            "selection": {
+                "measure": valid_measure,
+                "table": valid_table,
+                "time_dim": valid_time,
+                "requested_measure": _requested_measure_raw,
+                "requested_time_dim": _requested_time_raw,
+                "substituted": _substituted,
+                "substitution_reason": _substitution_reason,
+            },
+            "info": {
+                "rows_analyzed": len((processed_data.get("data") or [])),
+                "fallback_used": bool(processed_data.get("fallback")),
+                "goal_message": processed_data.get("message"),
+                "requested_measure": _requested_measure_raw,
+                "resolved_measure": valid_measure,
+                "requested_time_dim": _requested_time_raw,
+                "resolved_time_dim": valid_time,
+                "substituted": _substituted,
+                "substitution_reason": _substitution_reason,
+                "filters_applied": _filter_applied,
+            },
+            "evidence_state": _evidence_state_for_forecast(
+                forecast, _fc_rows if _fc_known else None, valid_table),
+            "horizon_info": _horizon_info(req.horizon, forecast),
+            **contract,
+        })
+    finally:
+        _dispose_shared()
 
 
 @router.post("/api/prescription/generate")

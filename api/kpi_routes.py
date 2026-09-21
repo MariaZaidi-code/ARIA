@@ -32,10 +32,35 @@ router = APIRouter()
 _KPI_CACHE: dict = {}
 _KPI_CACHE_TTL = 300
 _KPI_CACHE_MAX = 100
-from services.kpi_service import (_fmt, _is_currency_col, _safe, _validate_schema_ident, _bound_limit, _recommend_chart, _profile_numeric, _rollback, _variation, _score_kpi, _time_grain_expr, _parse_full_date, _parse_date_to_month, _pretty_month, _pretty_date, _discover_special_columns, _fetch_time_series, _holiday_lift, _retail_candidates_for_table, _measure_expr, _coerce_num, _SERIES_FALLBACK_MAX, _CHART_BY_INTENT, DASHBOARD_MIN_SCORE, _AMOUNT_HINTS, _ENTITY_HINTS, _DATE_HINTS, _STORE_HINTS, _HOLIDAY_HINTS, _SALES_HINTS, _DATE_PARSE_FORMATS, _MONTH_NAMES)  # noqa: F401,E402  # thin-wrapper re-export
+from services.kpi_service import (_fmt, _is_currency_col, _safe, _validate_schema_ident, _bound_limit, _recommend_chart, _profile_numeric, _rollback, _variation, _score_kpi, _time_grain_expr, _parse_full_date, _parse_date_to_month, _pretty_month, _pretty_date, _discover_special_columns, _fetch_time_series, _fetch_count_series, _holiday_lift, _retail_candidates_for_table, _measure_expr, _coerce_num, _SERIES_FALLBACK_MAX, _CHART_BY_INTENT, DASHBOARD_MIN_SCORE, _AMOUNT_HINTS, _ENTITY_HINTS, _DATE_HINTS, _STORE_HINTS, _HOLIDAY_HINTS, _SALES_HINTS, _DATE_PARSE_FORMATS, _MONTH_NAMES)  # noqa: F401,E402  # thin-wrapper re-export
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+def _sanitize_json_floats(value):
+    """Recursively replace non-finite floats (NaN/Infinity) with None.
+
+    Statistical code paths (z-scores, 0/0 shares, log(0)) can produce
+    non-finite floats on unseen data shapes; Starlette raises
+    "Out of range float values are not JSON compliant" and the endpoint
+    500s. Sanitizing at the response boundary keeps every dashboard
+    endpoint total. Tuples become lists (JSON has no tuples).
+    """
+    try:
+        import math as _math
+    except Exception:
+        return value
+    try:
+        if isinstance(value, float):
+            return value if _math.isfinite(value) else None
+        if isinstance(value, dict):
+            return {k: _sanitize_json_floats(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_sanitize_json_floats(v) for v in value]
+    except Exception:
+        return None
+    return value
+
 
 def _build_engine(session):
     """Create a SQLAlchemy engine for the session's DB."""
@@ -525,7 +550,14 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
         "message": None,
     }
 
-    # Generate smart recommendations based on schema
+    # Generate smart recommendations based on schema. All user-facing
+    # wording goes through humanize so raw snake_case / schema-qualified
+    # names never leak into suggested questions (generic, no literals).
+    def _qdesc(name):
+        try:
+            return humanize(str(name or "").split(".")[-1])
+        except Exception:
+            return humanize(str(name or ""))
     recommendations = []
     for tname in list(intel.tables.keys())[:5]:
         tdesc = intel.tables[tname].get("description", tname)
@@ -533,13 +565,15 @@ def get_dashboard_kpis(request: Request, user: dict = Depends(get_current_user))
         dim = intel.find_best_dimension(tname)
         dt = intel.find_best_datetime(tname)
         if measure and dim:
-            recommendations.append({"q": f"What are the top {dim} by {measure}?"})
+            recommendations.append({"q": f"What are the top {_qdesc(dim)} by {_qdesc(measure)}?"})
         if measure and dt:
-            recommendations.append({"q": f"How has {measure} changed over time?"})
+            recommendations.append({"q": f"How has {_qdesc(measure)} changed over time?"})
         if measure and dim and len(recommendations) < 6:
-            recommendations.append({"q": f"Show {measure} breakdown by {dim}"})
+            recommendations.append({"q": f"Show {_qdesc(measure)} breakdown by {_qdesc(dim)}"})
 
     out = {"ok": True, "kpis": kpis[:8], "charts": charts[:3], "summary": summary, "recommendations": recommendations[:6]}
+    # Same JSON-safety boundary as get_dashboard_config (see helper above).
+    out = _sanitize_json_floats(out)
     try:
         if _ckey is not None and out.get("kpis"):
             import time as _t2
@@ -574,23 +608,29 @@ def get_dashboard_summary(request: Request, user: dict = Depends(get_current_use
     kpis = kpi_result.get("kpis", [])
     charts = kpi_result.get("charts", [])
 
-    # Generate recommendations based on what tables exist
+    # Generate recommendations based on what tables exist. Wording is
+    # humanized (see above): raw identifiers never reach the user.
+    def _qdesc2(name):
+        try:
+            return humanize(str(name or "").split(".")[-1])
+        except Exception:
+            return humanize(str(name or ""))
     recommendations = []
     fact_tables = [t for t in intel.tables if intel.is_fact_table(t)]
     dim_tables = [t for t in intel.tables if intel.is_dimension_table(t)]
 
     for tname in fact_tables[:3]:
-        tdesc = intel.tables[tname].get("description", tname)
+        tdesc = _qdesc2(intel.tables[tname].get("description", tname))
         measure = intel.find_best_measure(tname)
         dim = intel.find_best_dimension(tname)
         dt = intel.find_best_datetime(tname)
         if measure and dim:
-            recommendations.append(f"What are the top {dim} by {measure} in {tdesc}?")
+            recommendations.append(f"What are the top {_qdesc2(dim)} by {_qdesc2(measure)} in {tdesc}?")
         if measure and dt:
-            recommendations.append(f"How has {measure} changed over time in {tdesc}?")
+            recommendations.append(f"How has {_qdesc2(measure)} changed over time in {tdesc}?")
 
     for tname in dim_tables[:2]:
-        tdesc = intel.tables[tname].get("description", tname)
+        tdesc = _qdesc2(intel.tables[tname].get("description", tname))
         recommendations.append(f"Show all records in {tdesc}")
 
     return {
@@ -960,6 +1000,49 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                             _rollback(conn)
                             pass
 
+                # Entity counts stand alone (no measure needed): distinct
+                # countries, ratings, categories are first-class KPIs on
+                # text-heavy tables that have no summable number. Deduped
+                # by (column, agg) in the diversity pass below.
+                try:
+                    for tname in tables_ranked[:5]:
+                        if intel.tables[tname].get("empty"):
+                            continue
+                        dim = intel.find_best_dimension(tname)
+                        if not dim:
+                            continue
+                        try:
+                            erow = conn.execute(text(
+                                f"SELECT COUNT(DISTINCT {_safe_name(dim, dialect)}) "
+                                f"FROM {_safe_name(tname, dialect)}"
+                            )).fetchone()
+                            if not (erow and erow[0]):
+                                continue
+                            ecount = int(erow[0])
+                            nrow = conn.execute(text(
+                                f"SELECT COUNT(*) FROM {_safe_name(tname, dialect)}")).fetchone()
+                            total_n = float(nrow[0]) if nrow and nrow[0] else 0.0
+                            if not (2 <= ecount <= max(10, total_n)
+                                    and ecount < 0.98 * (total_n or 1.0)):
+                                continue
+                            _dt0 = intel.find_best_datetime(tname)
+                            _td0 = intel.tables[tname].get("description", tname)
+                            eprof = {"n": total_n or 1.0, "nn": total_n or 1.0,
+                                     "distinct": float(ecount), "sum": None,
+                                     "avg": None, "min": 0, "max": 1}
+                            score, reason = _score_kpi("entity", dim, eprof, bool(_dt0), False)
+                            kpi_candidates.append({
+                                "kind": "entity", "table": tname, "column": dim,
+                                "agg": "DISTINCT", "value": float(ecount),
+                                "score": score, "reason": reason,
+                                "is_currency": False, "date_col": _dt0, "tdesc": _td0,
+                            })
+                        except Exception:
+                            _rollback(conn)
+                            continue
+                except Exception:
+                    pass
+
                 # Retail-aware candidates from real execution (single-table
                 # safe): sales total/avg (with spark), store count, date
                 # range, holiday lift. Scored via the same _score_kpi and
@@ -1143,41 +1226,60 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         continue
                     dt_col = intel.find_best_datetime(tname)
                     measure = intel.find_best_measure(tname)
-                    if not dt_col or not measure:
+                    if not dt_col:
                         continue
-                    if measure not in intel.get_numeric_cols(tname):
-                        continue
-                    try:
-                        # Real-SQL profile for variation scoring.
-                        _mref = _measure_expr(intel, tname, measure, dialect)
-                        srow = conn.execute(text(
-                            f"SELECT MIN({_safe_name(dt_col, dialect)}), "
-                            f"MAX({_safe_name(dt_col, dialect)}), "
-                            f"SUM({_mref}), "
-                            f"AVG({_mref}), "
-                            f"MIN({_mref}), "
-                            f"MAX({_mref}) "
-                            f"FROM {_safe_name(tname, dialect)} "
-                            f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL"
-                        )).fetchone()
-                        if not srow or srow[0] is None:
+                    if measure and measure in intel.get_numeric_cols(tname):
+                        try:
+                            # Real-SQL profile for variation scoring.
+                            _mref = _measure_expr(intel, tname, measure, dialect)
+                            srow = conn.execute(text(
+                                f"SELECT MIN({_safe_name(dt_col, dialect)}), "
+                                f"MAX({_safe_name(dt_col, dialect)}), "
+                                f"SUM({_mref}), "
+                                f"AVG({_mref}), "
+                                f"MIN({_mref}), "
+                                f"MAX({_mref}) "
+                                f"FROM {_safe_name(tname, dialect)} "
+                                f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL"
+                            )).fetchone()
+                            if not srow or srow[0] is None:
+                                continue
+                            # Grain-aware series from real SQL; handles non-ISO
+                            # date text via a raw-pair Python bucketing fallback.
+                            grain, chart_data = _fetch_time_series(
+                                conn, tname, dt_col, measure, dialect, limit=30, intel=intel)
+                            if len(chart_data) >= 2:
+                                var = _variation(srow[3], srow[4], srow[5])
+                                chart_candidates.append({
+                                    "kind": "time", "table": tname, "column": measure,
+                                    "score": _chart_score(len(chart_data), var),
+                                    "grain": grain or "month", "data": chart_data,
+                                    "reason": (f"{len(chart_data)} {grain or 'month'} periods with "
+                                               f"{'strong' if var > 0.5 else 'moderate' if var > 0.15 else 'low'} variation."),
+                                })
+                        except Exception:
+                            _rollback(conn)
                             continue
-                        # Grain-aware series from real SQL; handles non-ISO
-                        # date text via a raw-pair Python bucketing fallback.
-                        grain, chart_data = _fetch_time_series(
-                            conn, tname, dt_col, measure, dialect, limit=30, intel=intel)
-                        if len(chart_data) >= 2:
-                            var = _variation(srow[3], srow[4], srow[5])
-                            chart_candidates.append({
-                                "kind": "time", "table": tname, "column": measure,
-                                "score": _chart_score(len(chart_data), var),
-                                "grain": grain or "month", "data": chart_data,
-                                "reason": (f"{len(chart_data)} {grain or 'month'} periods with "
-                                           f"{'strong' if var > 0.5 else 'moderate' if var > 0.15 else 'low'} variation."),
-                            })
-                    except Exception:
-                        _rollback(conn)
-                        continue
+                    else:
+                        # No summable measure (catalogs, logs, text-heavy
+                        # tables): a row-count volume trend is still a
+                        # truthful time chart ("Records added over time").
+                        try:
+                            grain, chart_data = _fetch_count_series(
+                                conn, tname, dt_col, dialect, limit=30, intel=intel)
+                            if len(chart_data) >= 2:
+                                _vals = [c["value"] for c in chart_data]
+                                _avg = sum(_vals) / len(_vals)
+                                var = _variation(_avg, min(_vals), max(_vals))
+                                chart_candidates.append({
+                                    "kind": "time", "table": tname, "column": "Records",
+                                    "score": _chart_score(len(chart_data), var),
+                                    "grain": grain or "month", "data": chart_data,
+                                    "reason": (f"{len(chart_data)} {grain or 'month'} periods of record volume."),
+                                })
+                        except Exception:
+                            _rollback(conn)
+                            continue
 
                 if True:
                     for tname in tables_list[:14]:
@@ -1200,8 +1302,12 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                         # Rank candidate dims by cardinality first (cheap): prefer
                         # compact breakdowns (Region, Category) over near-unique
                         # columns (IDs, dates). One data query for the winner.
+                        # Up to 10 text columns are probed so genuinely useful
+                        # breakdowns later in column order (ratings, genres)
+                        # are reached on wide text-heavy tables — the probe is
+                        # one cheap COUNT per column, winners capped at 2.
                         ranked_dims: list[tuple] = []
-                        for dim in dim_candidates[:4]:
+                        for dim in dim_candidates[:10]:
                             try:
                                 crow = conn.execute(text(
                                     f"SELECT COUNT(*) AS n, COUNT(DISTINCT {_safe_name(dim, dialect)}) AS d "
@@ -1590,6 +1696,11 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
         "quality": {"score": max(0, quality_score), "issues": quality_issues[:10]},
         "recommendations": recommendations[:6],
     }
+    # JSON-safety boundary (generic): statistical detectors can emit
+    # NaN/Infinity (0/0, log(0)) on unseen data shapes, which crashes JSON
+    # serialization into a 500 ("couldn't load this analysis"). Sanitize
+    # recursively so the endpoint never fails on payload encoding.
+    config = _sanitize_json_floats(config)
     try:
         _DASH_CONFIG_CACHE[_cache_key] = (_time.monotonic(), config)
     except Exception:

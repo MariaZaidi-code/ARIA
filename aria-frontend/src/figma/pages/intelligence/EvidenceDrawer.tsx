@@ -141,18 +141,18 @@ export default function EvidenceDrawer({
               transition={{ duration: 0.2 }}
             />
             <motion.aside
-              className="absolute right-0 top-0 h-full w-full max-w-md bg-white shadow-2xl flex flex-col"
+              className="absolute right-0 top-0 h-full w-full max-w-md bg-card shadow-2xl flex flex-col"
               initial={{ x: 48, opacity: 0 }}
               animate={{ x: 0, opacity: 1 }}
               exit={{ x: 48, opacity: 0 }}
               transition={{ duration: 0.28, ease: "easeOut" }}
             >
-              <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-slate-100">
+              <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-border">
                 <div>
-                  <h3 className="text-[15px] font-semibold text-[#0F2440] tracking-tight">
+                  <h3 className="text-[15px] font-semibold text-foreground tracking-tight">
                     Full Evidence
                   </h3>
-                  <p className="text-[11.5px] text-slate-500 mt-0.5">
+                  <p className="text-[11.5px] text-muted-foreground mt-0.5">
                     {ctx.trendTitle}
                     {ctx.trendSub ? ` · ${ctx.trendSub}` : ""}
                   </p>
@@ -160,7 +160,7 @@ export default function EvidenceDrawer({
                 <div className="flex items-center gap-1.5 flex-shrink-0">
                   <button
                     onClick={copySummary}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11.5px] font-semibold text-blue-700 border border-blue-200 hover:bg-blue-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11.5px] font-semibold text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/25 hover:bg-blue-50 dark:hover:bg-blue-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                     aria-label="Copy evidence summary"
                     title="Copy a plain-text summary of this analysis"
                   >
@@ -169,7 +169,7 @@ export default function EvidenceDrawer({
                   <button
                     ref={closeRef}
                     onClick={onClose}
-                    className="inline-flex items-center justify-center w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                    className="inline-flex items-center justify-center w-8 h-8 rounded-lg hover:bg-secondary text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                     aria-label="Close evidence"
                   >
                     <X size={16} />
@@ -177,13 +177,13 @@ export default function EvidenceDrawer({
                 </div>
               </div>
               {copied && (
-                <p className="px-5 pt-2 text-[11px] text-emerald-700" role="status">
+                <p className="px-5 pt-2 text-[11px] text-emerald-700 dark:text-emerald-400" role="status">
                   Summary copied to clipboard.
                 </p>
               )}
               <div className="flex-1 overflow-y-auto px-5 py-4 space-y-5">
                 <section>
-                  <h4 className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide">
+                  <h4 className="text-[12px] font-semibold text-muted-foreground uppercase tracking-wide">
                     Evidence Quality
                   </h4>
                   {v ? (
@@ -195,32 +195,32 @@ export default function EvidenceDrawer({
                       }}
                     >
                       {v.passed ? (
-                        <Check size={15} className="text-emerald-600 flex-shrink-0 mt-px" />
+                        <Check size={15} className="text-emerald-600 dark:text-emerald-400 flex-shrink-0 mt-px" />
                       ) : (
-                        <AlertTriangle size={15} className="text-rose-600 flex-shrink-0 mt-px" />
+                        <AlertTriangle size={15} className="text-rose-600 dark:text-rose-400 flex-shrink-0 mt-px" />
                       )}
                       <div>
-                        <p className="font-semibold text-[#0F2440]">
+                        <p className="font-semibold text-foreground">
                           {v.passed ? "Verified — all checks passed" : "Needs attention"}
                         </p>
-                        {checks.length > 0 && <p className="text-slate-500 mt-0.5">{checks.join(" · ")}</p>}
+                        {checks.length > 0 && <p className="text-muted-foreground mt-0.5">{checks.join(" · ")}</p>}
                       </div>
                     </div>
                   ) : (
-                    <p className="mt-2 text-[12.5px] text-slate-500">
+                    <p className="mt-2 text-[12.5px] text-muted-foreground">
                       No validation record on this result.
                     </p>
                   )}
                 </section>
                 <section>
-                  <h4 className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide">
+                  <h4 className="text-[12px] font-semibold text-muted-foreground uppercase tracking-wide">
                     Analysis Details
                   </h4>
-                  <dl className="mt-2 divide-y divide-slate-100 rounded-xl border border-slate-100">
+                  <dl className="mt-2 divide-y divide-border rounded-xl border border-border">
                     {detailRows.map(([k, val]) => (
                       <div key={k} className="flex items-center justify-between gap-3 px-3 py-2">
-                        <dt className="text-[12px] text-slate-500">{k}</dt>
-                        <dd className="text-[12.5px] font-medium text-[#0F2440] text-right truncate max-w-[60%]">
+                        <dt className="text-[12px] text-muted-foreground">{k}</dt>
+                        <dd className="text-[12.5px] font-medium text-foreground text-right truncate max-w-[60%]">
                           {val}
                         </dd>
                       </div>
@@ -228,7 +228,7 @@ export default function EvidenceDrawer({
                   </dl>
                 </section>
                 <section>
-                  <h4 className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide">
+                  <h4 className="text-[12px] font-semibold text-muted-foreground uppercase tracking-wide">
                     Observations
                   </h4>
                   {ctx.obsBullets.length > 0 ? (
@@ -236,7 +236,7 @@ export default function EvidenceDrawer({
                       {ctx.obsBullets.map((b, i) => (
                         <li
                           key={i}
-                          className="flex items-start gap-1.5 text-[12.5px] text-slate-600 leading-relaxed"
+                          className="flex items-start gap-1.5 text-[12.5px] text-secondary-foreground leading-relaxed"
                         >
                           <span className="w-1.5 h-1.5 rounded-full bg-blue-600 flex-shrink-0 mt-1.5" />
                           {b}
@@ -244,13 +244,13 @@ export default function EvidenceDrawer({
                       ))}
                     </ul>
                   ) : (
-                    <p className="mt-2 text-[12.5px] text-slate-500">
+                    <p className="mt-2 text-[12.5px] text-muted-foreground">
                       {ctx.obsSummary || "No observations recorded."}
                     </p>
                   )}
                 </section>
                 <section>
-                  <h4 className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide">
+                  <h4 className="text-[12px] font-semibold text-muted-foreground uppercase tracking-wide">
                     Limitations
                   </h4>
                   {limits.length > 0 ? (
@@ -258,21 +258,21 @@ export default function EvidenceDrawer({
                       {limits.map((l, i) => (
                         <li
                           key={i}
-                          className="flex items-start gap-1.5 text-[12.5px] text-slate-600 leading-relaxed"
+                          className="flex items-start gap-1.5 text-[12.5px] text-secondary-foreground leading-relaxed"
                         >
-                          <AlertTriangle size={13} className="text-amber-500 flex-shrink-0 mt-px" />
+                          <AlertTriangle size={13} className="text-amber-500 dark:text-amber-400 flex-shrink-0 mt-px" />
                           {l}
                         </li>
                       ))}
                     </ul>
                   ) : (
-                    <p className="mt-2 text-[12.5px] text-slate-500">
+                    <p className="mt-2 text-[12.5px] text-muted-foreground">
                       No known limitations for this analysis.
                     </p>
                   )}
                 </section>
                 <section>
-                  <h4 className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide">
+                  <h4 className="text-[12px] font-semibold text-muted-foreground uppercase tracking-wide">
                     Top Segments
                   </h4>
                   {ctx.rows.length > 0 ? (
@@ -282,12 +282,12 @@ export default function EvidenceDrawer({
                         return (
                           <li
                             key={i}
-                            className="flex items-center justify-between gap-2 text-[12.5px] px-3 py-1.5 rounded-lg bg-slate-50"
+                            className="flex items-center justify-between gap-2 text-[12.5px] px-3 py-1.5 rounded-lg bg-secondary"
                           >
-                            <span className="font-medium text-[#0F2440] truncate">
+                            <span className="font-medium text-foreground truncate">
                               {strOf(r?.category || r?.label || r?.name || `Row ${i + 1}`)}
                             </span>
-                            <span className="tabular-nums text-slate-600">
+                            <span className="tabular-nums text-secondary-foreground">
                               {cur === null ? "—" : fmtMetric(cur, ctx.metric)}
                             </span>
                           </li>
@@ -295,7 +295,7 @@ export default function EvidenceDrawer({
                       })}
                     </ul>
                   ) : (
-                    <p className="mt-2 text-[12.5px] text-slate-500">No segment rows in this result.</p>
+                    <p className="mt-2 text-[12.5px] text-muted-foreground">No segment rows in this result.</p>
                   )}
                 </section>
               </div>

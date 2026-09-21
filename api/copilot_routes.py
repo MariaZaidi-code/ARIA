@@ -375,15 +375,18 @@ async def copilot_endpoint(body: CopilotRequest, user: dict = Depends(get_curren
             linked=_linked_context(session),
         )
         # pipeline.ask is blocking (SQL + LLM I/O); offload so the event
-        # loop stays responsive under concurrent requests.
-        result = await asyncio.to_thread(pipeline.ask, body.question)
+        # loop stays responsive under concurrent requests. Page/chart
+        # context travels with the question so deictic asks ("what is this
+        # chart showing?") resolve against the visible page.
+        result = await asyncio.to_thread(
+            pipeline.ask, body.question, body.context or None)
     except Exception as exc:
         from core.errors import sanitize_error as _san
         log.exception("Copilot pipeline failed")
         return {
             "ok": False,
             "answer": ("I hit an internal error while analysing that question. "
-                       "Please try again or rephrase it."),
+                       "Please try again with a specific table, measure, or period."),
             "error": _san(exc)[:300],
         }
 

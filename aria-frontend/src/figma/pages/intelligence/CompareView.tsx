@@ -225,12 +225,12 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
     <div>
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
-          <h3 className="text-[15px] font-semibold text-[#0F2440] tracking-tight">Compare saved analyses</h3>
-          <p className="text-[11.5px] text-slate-500 mt-0.5">Pick two saved analyses to compare side-by-side.</p>
+          <h3 className="text-[15px] font-semibold text-foreground tracking-tight">Compare saved analyses</h3>
+          <p className="text-[11.5px] text-muted-foreground mt-0.5">Pick two saved analyses to compare side-by-side.</p>
         </div>
         <button
           onClick={onClose}
-          className="inline-flex items-center justify-center w-8 h-8 rounded-lg hover:bg-slate-100 text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+          className="inline-flex items-center justify-center w-8 h-8 rounded-lg hover:bg-secondary text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
           aria-label="Close compare view"
         >
           <X size={16} />
@@ -246,7 +246,7 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
           <EmptyState
             title="Not enough saved analyses yet."
             body="Save at least two analyses from Explore (use Save Analysis on any result) — then pick two here to compare side-by-side."
-            action={<button onClick={onClose} className="text-xs font-semibold text-blue-700 hover:underline">Back to Explore</button>}
+            action={<button onClick={onClose} className="text-xs font-semibold text-blue-700 dark:text-blue-400 hover:underline">Back to Explore</button>}
           />
         </div>
       )}
@@ -254,7 +254,7 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
       {!loading && !error && items.length >= 2 && (
         <>
           <div className="mt-3 flex items-center justify-between gap-2 flex-wrap">
-            <p className="text-[11.5px] text-slate-500" role="status">
+            <p className="text-[11.5px] text-muted-foreground" role="status">
               {selected.length === 2
                 ? "Two selected — remove one to pick another."
                 : `Select ${2 - selected.length} more to compare.`}
@@ -262,13 +262,13 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
             {selected.length > 0 && (
               <button
                 onClick={() => setSelected([])}
-                className="text-[11.5px] font-semibold text-blue-700 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
+                className="text-[11.5px] font-semibold text-blue-700 dark:text-blue-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
               >
                 Clear selection
               </button>
             )}
           </div>
-          <div className="mt-2 max-h-56 overflow-y-auto divide-y divide-slate-100 border border-slate-200 rounded-xl" role="group" aria-label="Saved analyses picker">
+          <div className="mt-2 max-h-56 overflow-y-auto divide-y divide-border border border-border rounded-xl" role="group" aria-label="Saved analyses picker">
             {items.map((a: any) => {
               const id = strOf(a?.id);
               const checked = selected.includes(id);
@@ -280,17 +280,17 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
                   disabled={!id || disabled}
                   role="checkbox"
                   aria-checked={checked}
-                  className={`w-full text-left px-3 py-2 flex items-center gap-2.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500 ${checked ? "bg-blue-50/70" : "hover:bg-slate-50"} ${disabled ? "opacity-50" : ""}`}
+                  className={`w-full text-left px-3 py-2 flex items-center gap-2.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500 ${checked ? "bg-blue-50/70 dark:bg-blue-500/10" : "hover:bg-secondary"} ${disabled ? "opacity-50" : ""}`}
                 >
                   <span
-                    className={`inline-flex items-center justify-center w-[18px] h-[18px] rounded border flex-shrink-0 ${checked ? "bg-blue-700 border-blue-700 text-white" : "border-slate-300 text-transparent"}`}
+                    className={`inline-flex items-center justify-center w-[18px] h-[18px] rounded border flex-shrink-0 ${checked ? "bg-blue-700 border-blue-700 text-white" : "border-border text-transparent"}`}
                     aria-hidden
                   >
                     <Check size={12} />
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="block text-[12.5px] font-medium text-[#0F2440] truncate">{titleOf(a)}</span>
-                    <span className="block text-[11px] text-slate-400 truncate">
+                    <span className="block text-[12.5px] font-medium text-foreground truncate">{titleOf(a)}</span>
+                    <span className="block text-[11px] text-muted-foreground truncate">
                       {[humanize(a?.metric), a?.breakdown ? humanize(a.breakdown) : "", dateOf(a)].filter(Boolean).join(" · ")}
                     </span>
                   </span>
@@ -300,7 +300,7 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
           </div>
 
           {selected.length < 2 && (
-            <p className="mt-3 text-[12px] text-slate-400">Select two analyses above to compare their totals, trends, breakdowns, and observations.</p>
+            <p className="mt-3 text-[12px] text-muted-foreground">Select two analyses above to compare their totals, trends, breakdowns, and observations.</p>
           )}
           {selected.length === 2 && resolving && (
             <div className="mt-3"><LoadingPanel label="Loading both analyses — using stored results, recomputing live where needed…" /></div>
@@ -311,7 +311,7 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
               {pair.some((p) => p?.error) && (
                 <div className="space-y-2">
                   {pair.filter((p) => p?.error).map((p: Loaded | null, i: number) => (
-                    <p key={i} className="text-[12px] text-rose-600 bg-rose-50 border border-rose-100 rounded-xl px-3 py-2" role="alert">
+                    <p key={i} className="text-[12px] text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-500/10 border border-rose-100 dark:border-rose-500/25 rounded-xl px-3 py-2" role="alert">
                       {titleOf(p!.item)}: {p!.error}
                     </p>
                   ))}
@@ -320,15 +320,15 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
 
               {overlay.length > 0 && (
                 <Card className="p-4">
-                  <h4 className="text-[13px] font-semibold text-[#0F2440]">Trend comparison · current series</h4>
-                  <p className="text-[11px] text-slate-400">Both current series aligned by point order.</p>
+                  <h4 className="text-[13px] font-semibold text-foreground">Trend comparison · current series</h4>
+                  <p className="text-[11px] text-muted-foreground">Both current series aligned by point order.</p>
                   <div className="h-[220px] mt-2">
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={overlay} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" vertical={false} />
-                        <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#9CA3AF" }} axisLine={false} tickLine={false} minTickGap={24} />
-                        <YAxis tick={{ fontSize: 11, fill: "#9CA3AF" }} axisLine={false} tickLine={false} width={52} />
-                        <Tooltip />
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                        <XAxis dataKey="label" tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} minTickGap={24} />
+                        <YAxis tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={52} />
+                        <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8, fontSize: 12 }} />
                         <Legend wrapperStyle={{ fontSize: 11 }} />
                         <Line type="monotone" dataKey="a" name={nameA} stroke="#2F6FAD" strokeWidth={2.5} dot={false} connectNulls />
                         <Line type="monotone" dataKey="b" name={nameB} stroke="#7C3AED" strokeWidth={2.5} dot={false} connectNulls />
@@ -352,31 +352,31 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
                   const summary = summaryOf(r, p.item);
                   return (
                     <Card key={selected[i]} className="p-4">
-                      <p className="text-[13.5px] font-semibold text-[#0F2440] leading-snug">{titleOf(p.item)}</p>
-                      <p className="text-[11px] text-slate-400 mt-0.5">
+                      <p className="text-[13.5px] font-semibold text-foreground leading-snug">{titleOf(p.item)}</p>
+                      <p className="text-[11px] text-muted-foreground mt-0.5">
                         {[humanize(p.item?.metric), p.item?.breakdown ? `by ${humanize(p.item.breakdown)}` : "", dateOf(p.item)].filter(Boolean).join(" · ")}
                       </p>
                       <p className="mt-1.5">
-                        <span className={`inline-flex items-center text-[10.5px] font-semibold px-2 py-0.5 rounded-full border ${p.live ? "bg-amber-50 text-amber-700 border-amber-200" : "bg-blue-50 text-blue-700 border-blue-100"}`}>
+                        <span className={`inline-flex items-center text-[10.5px] font-semibold px-2 py-0.5 rounded-full border ${p.live ? "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" : "bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border-blue-100 dark:border-blue-500/20"}`}>
                           {p.live ? "Recomputed live from saved parameters" : "Stored result"}
                         </span>
                       </p>
 
                       <div className="mt-2 grid grid-cols-3 gap-2 text-center">
-                        <div className="rounded-xl bg-slate-50 border border-slate-100 px-2 py-2">
-                          <p className="text-[10px] font-medium text-slate-400">Current</p>
-                          <p className="text-[14px] font-bold text-[#0F2440] tabular-nums">{total === null ? "—" : fmtMetric(total, metricName)}</p>
+                        <div className="rounded-xl bg-secondary border border-border px-2 py-2">
+                          <p className="text-[10px] font-medium text-muted-foreground">Current</p>
+                          <p className="text-[14px] font-bold text-foreground tabular-nums">{total === null ? "—" : fmtMetric(total, metricName)}</p>
                         </div>
-                        <div className="rounded-xl bg-slate-50 border border-slate-100 px-2 py-2">
-                          <p className="text-[10px] font-medium text-slate-400">Previous</p>
-                          <p className="text-[14px] font-bold text-[#0F2440] tabular-nums">{prevTotal === null ? "—" : fmtMetric(prevTotal, metricName)}</p>
+                        <div className="rounded-xl bg-secondary border border-border px-2 py-2">
+                          <p className="text-[10px] font-medium text-muted-foreground">Previous</p>
+                          <p className="text-[14px] font-bold text-foreground tabular-nums">{prevTotal === null ? "—" : fmtMetric(prevTotal, metricName)}</p>
                         </div>
-                        <div className="rounded-xl bg-slate-50 border border-slate-100 px-2 py-2">
-                          <p className="text-[10px] font-medium text-slate-400">Change</p>
-                          <p className={`text-[14px] font-bold tabular-nums ${pct === null ? "text-slate-400" : pct >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                        <div className="rounded-xl bg-secondary border border-border px-2 py-2">
+                          <p className="text-[10px] font-medium text-muted-foreground">Change</p>
+                          <p className={`text-[14px] font-bold tabular-nums ${pct === null ? "text-muted-foreground" : pct >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                             {pct === null ? "—" : fmtPctBiz(pct)}
                           </p>
-                          {chg !== null && <p className="text-[10px] text-slate-400 tabular-nums">{fmtMetric(chg, metricName)}</p>}
+                          {chg !== null && <p className="text-[10px] text-muted-foreground tabular-nums">{fmtMetric(chg, metricName)}</p>}
                         </div>
                       </div>
 
@@ -384,26 +384,26 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
                         <div className="h-[160px] mt-2">
                           <ResponsiveContainer width="100%" height="100%">
                             <LineChart data={pts} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                              <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" vertical={false} />
-                              <XAxis dataKey="label" tick={{ fontSize: 10, fill: "#9CA3AF" }} axisLine={false} tickLine={false} minTickGap={28} />
-                              <YAxis tick={{ fontSize: 10, fill: "#9CA3AF" }} axisLine={false} tickLine={false} width={48} />
-                              <Tooltip formatter={(v: any) => fmtMetric(numOf(v), metricName)} />
+                              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                              <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} minTickGap={28} />
+                              <YAxis tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={48} />
+                              <Tooltip formatter={(v: any) => fmtMetric(numOf(v), metricName)} contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8, fontSize: 12 }} />
                               <Line type="monotone" dataKey="current" name="Current" stroke={i === 0 ? "#2F6FAD" : "#7C3AED"} strokeWidth={2} dot={false} />
                               <Line type="monotone" dataKey="previous" name="Previous" stroke="#B9D0E8" strokeWidth={1.5} strokeDasharray="5 4" dot={false} connectNulls />
                             </LineChart>
                           </ResponsiveContainer>
                         </div>
                       ) : (
-                        <p className="text-[11.5px] text-slate-400 mt-2">No trend points in this result.</p>
+                        <p className="text-[11.5px] text-muted-foreground mt-2">No trend points in this result.</p>
                       )}
 
-                      <h5 className="mt-2 text-[12px] font-semibold text-[#0F2440]">
+                      <h5 className="mt-2 text-[12px] font-semibold text-foreground">
                         Top segments{strOf(r?.breakdown || p.item?.breakdown) ? ` · ${titleCase(strOf(r.breakdown || p.item.breakdown))}` : ""}
                       </h5>
                       {top.length > 0 ? (
                         <table className="w-full text-[11.5px] mt-1">
                           <thead>
-                            <tr className="text-left text-slate-400 border-b border-slate-100">
+                            <tr className="text-left text-muted-foreground border-b border-border">
                               <th scope="col" className="py-1 pr-2 font-medium">Segment</th>
                               <th scope="col" className="py-1 pr-2 font-medium text-right">Current</th>
                               <th scope="col" className="py-1 font-medium text-right">% Change</th>
@@ -414,12 +414,12 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
                               const cur = numOf(row?.current ?? row?.current_value ?? row?.value);
                               const pp = numOf(row?.change_pct ?? row?.pct_change ?? row?.pct ?? row?.percent_change);
                               return (
-                                <tr key={j} className="border-b border-slate-50 last:border-0">
-                                  <td className="py-1 pr-2 font-medium text-[#0F2440] truncate max-w-[140px]">
+                                <tr key={j} className="border-b border-border last:border-0">
+                                  <td className="py-1 pr-2 font-medium text-foreground truncate max-w-[140px]">
                                     {strOf(row?.category || row?.label || row?.name || `Row ${j + 1}`)}
                                   </td>
                                   <td className="py-1 pr-2 text-right tabular-nums">{cur === null ? "—" : fmtMetric(cur, metricName)}</td>
-                                  <td className={`py-1 text-right tabular-nums font-medium ${pp === null ? "text-slate-400" : pp >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                                  <td className={`py-1 text-right tabular-nums font-medium ${pp === null ? "text-muted-foreground" : pp >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                                     {pp === null ? "—" : fmtPctBiz(pp)}
                                   </td>
                                 </tr>
@@ -428,11 +428,11 @@ export default function CompareView({ onClose }: { onClose: () => void }) {
                           </tbody>
                         </table>
                       ) : (
-                        <p className="text-[11.5px] text-slate-400 mt-1">No breakdown rows in this result.</p>
+                        <p className="text-[11.5px] text-muted-foreground mt-1">No breakdown rows in this result.</p>
                       )}
 
-                      <h5 className="mt-2 text-[12px] font-semibold text-[#0F2440]">Observation</h5>
-                      <p className="text-[11.5px] text-slate-600 leading-relaxed mt-0.5">
+                      <h5 className="mt-2 text-[12px] font-semibold text-foreground">Observation</h5>
+                      <p className="text-[11.5px] text-secondary-foreground leading-relaxed mt-0.5">
                         {summary || "No observation was stored for this analysis."}
                       </p>
                     </Card>

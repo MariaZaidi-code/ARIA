@@ -418,11 +418,16 @@ _SALES_HINTS = ("weekly_sales", "sales", "revenue", "turnover", "amount",
 # Flexible parse order matters: day-first before month-first so DMY sources
 # (e.g. Walmart "05-02-2010" = 5 Feb 2010, proven by "26-10-2012") bucket
 # correctly, while ISO values still parse via the fast path below.
+# Month-name forms are unambiguous in any position (catalog exports like
+# "June 7, 2019" or "7 June 2019").
 _DATE_PARSE_FORMATS = (
     "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d",
     "%d-%m-%Y %H:%M:%S", "%d-%m-%Y", "%d/%m/%Y",
     "%m-%d-%Y", "%m/%d/%Y", "%d-%m-%y", "%m-%d-%y",
     "%Y-%m", "%Y%m%d",
+    "%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y",
+    "%d %B %Y", "%d %b %Y", "%d %B, %Y", "%d %b, %Y",
+    "%Y.%m.%d", "%d.%m.%Y", "%m.%d.%Y",
 )
 
 _MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -646,6 +651,48 @@ def _fetch_time_series(conn, tname: str, dt_col: str, measure: str,
             return "month", chart_data
     except DB_ERRORS as exc:
         logger.debug("time-series fallback skipped for %s: %s", tname, exc)
+        _rollback(conn)
+    return None, []
+
+
+def _fetch_count_series(conn, tname: str, dt_col: str, dialect: str,
+                        limit: int = 30, intel=None) -> tuple[str | None, list]:
+    """Row-count trend per month from real data (no summable measure needed).
+
+    Text-heavy tables (catalogs, logs) often have a real date axis but no
+    SUM-able number; counting rows per month still yields a truthful volume
+    trend ("Titles added over time"). Dialect-agnostic: fetches raw date
+    values with bounded real SQL and buckets months in Python — the same
+    contract as the _fetch_time_series text fallback. Never invents values.
+    """
+    if intel is not None:
+        try:
+            _validate_schema_ident(intel, tname, dt_col)
+        except ValueError:
+            return None, []
+    limit = _bound_limit(limit)
+    try:
+        result = conn.execute(
+            text(
+                f"SELECT {_safe_name(dt_col, dialect)} AS d "
+                f"FROM {_safe_name(tname, dialect)} "
+                f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
+                f"LIMIT :fallback_limit"
+            ),
+            {"fallback_limit": _SERIES_FALLBACK_MAX},
+        )
+        buckets: dict[str, int] = {}
+        for (d,) in result.fetchall():
+            m = _parse_date_to_month(d)
+            if not m:
+                continue
+            buckets[m] = buckets.get(m, 0) + 1
+        if len(buckets) >= 2:
+            chart_data = [{"period": k, "value": float(buckets[k])}
+                          for k in sorted(buckets)][-limit:]
+            return "month", chart_data
+    except DB_ERRORS as exc:
+        logger.debug("count-series skipped for %s: %s", tname, exc)
         _rollback(conn)
     return None, []
 

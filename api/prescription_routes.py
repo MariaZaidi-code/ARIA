@@ -379,6 +379,41 @@ def prescription_analyze(req: AnalyzeRequest, request: Request,
             return {"ok": False, "success": False, "code": "INVALID_METRIC",
                     "detail": "Choose a target metric first — ARIA won't guess what to improve.",
                     "recoverable": True}
+
+        def _canon_requested(value, candidates):
+            """Resolve a UI-supplied name to its canonical schema spelling.
+
+            Exact match first, then case-insensitive, then humanized-form
+            match ("Gross Revenue" -> "gross_revenue"). Generic — no names.
+            Returns None when nothing matches.
+            """
+            s = str(value or "").strip()
+            if not s:
+                return None
+            if s in candidates:
+                return s
+            low = s.lower()
+            for c in candidates:
+                if str(c).lower() == low:
+                    return c
+            norm = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in low).strip("_")
+            for c in candidates:
+                if str(c).lower() == norm:
+                    return c
+            return None
+
+        try:
+            _all_numeric: list[str] = []
+            for _t in tables:
+                try:
+                    _all_numeric.extend(intel.get_numeric_cols(_t) or [])
+                except Exception:
+                    pass
+            _canon_metric = _canon_requested(metric, _all_numeric)
+            if _canon_metric:
+                metric = _canon_metric
+        except Exception:
+            pass
         # Locate the metric's table (schema-discovered, never assumed).
         table = req.table
         if table not in tables:
@@ -391,6 +426,23 @@ def prescription_analyze(req: AnalyzeRequest, request: Request,
             return {"ok": False, "success": False, "code": "INVALID_METRIC",
                     "detail": f"ARIA couldn't find a measurable '{metric}' in this data.",
                     "recoverable": True}
+        if driver:
+            try:
+                _drv_cands: list[str] = []
+                try:
+                    _drv_cands.extend(intel.get_col_names(table) or [])
+                except Exception:
+                    pass
+                for _t in tables:
+                    try:
+                        _drv_cands.extend(intel.get_col_names(_t) or [])
+                    except Exception:
+                        pass
+                _canon_drv = _canon_requested(driver, _drv_cands)
+                if _canon_drv:
+                    driver = _canon_drv
+            except Exception:
+                pass
         seg = None
         if req.segment and req.segment.field:
             seg = {"field": req.segment.field, "value": req.segment.value}

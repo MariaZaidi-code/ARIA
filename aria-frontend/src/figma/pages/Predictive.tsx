@@ -120,8 +120,18 @@ export function buildForecastStory(args: {
   return { story: `${s1}${s2}${s3}`, signal };
 }
 
+function labelsParseAsDates(rows: any[]): boolean {
+  if (!rows || rows.length === 0) return false;
+  // Every plotted label must look like a backend date (YYYY-MM or YYYY-MM-DD).
+  // Anything else (period names, buckets, free text) locks regrouping.
+  return rows.every((r: any) => /^\d{4}-\d{2}(?:-\d{2})?$/.test(String(r?.label || "").slice(0, 10)));
+}
+
 function rebin(rows: any[], tab: PeriodTab) {
   if (tab === "Monthly") return rows;
+  // Regroup only when labels parse as dates; otherwise return rows untouched
+  // so Quarterly/Yearly can never invent buckets from free-text labels.
+  if (!labelsParseAsDates(rows)) return rows;
   const groups = new Map<string, any>();
   for (const r of rows) {
     const mk = monthKey(r.label);
@@ -294,6 +304,12 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   const [scenario, setScenario] = useState<any>(null);
   const [scenarioLoading, setScenarioLoading] = useState(false);
   const [scenarioError, setScenarioError] = useState("");
+  // Request outcome: idle = no result yet, ok = plottable forecast,
+  // unforecastable = backend answered ok:false (tailored empty card).
+  const [forecastStatus, setForecastStatus] = useState<"idle" | "ok" | "unforecastable">("idle");
+  // Single auto-fetch guard: one ref gates both auto-run effects so StrictMode
+  // double-invoke and competing effects never fire two initial requests.
+  const autoFetchRef = useRef<string>("");
   /* So-consider actions: top prescriptions for the forecast target, fetched
      once per forecast from the existing engine. Honest omission on refusal. */
   const [rxItems, setRxItems] = useState<any[]>([]);
@@ -360,7 +376,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
 
   useEffect(() => {
     if (connectionStatus === "connected") loadEligibility();
-    else { setElig(null); setForecast(null); setError(""); }
+    else { setElig(null); setForecast(null); setError(""); setForecastStatus("idle"); autoFetchRef.current = ""; }
   }, [connectionStatus, loadEligibility]);
   // Also re-fetch when DB name changes (user switched databases without disconnecting).
   const prevDbRef = useRef(dbName);
@@ -369,7 +385,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       prevDbRef.current = dbName;
       forecastAbort.current?.abort();
       setElig(null); setForecast(null); setError(""); setScenario(null);
-      setEligError(""); setLoading(false);
+      setEligError(""); setLoading(false); setForecastStatus("idle"); autoFetchRef.current = "";
       setSelectedTarget(""); setSelectedTable(""); setSelectedTime("");
       setFilters([]); setSchemaCols([]); setRxItems([]); rxFor.current = "";
       if (connectionStatus === "connected") loadEligibility();
@@ -488,6 +504,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       setLoadStage(2);
       if (data.ok && data.forecast) {
         setForecast(data.forecast);
+        setForecastStatus("ok");
         setForecastInfo(data.info || null);
         setSelection(data.selection || null);
         setRevealKey((k) => k + 1);
@@ -515,9 +532,18 @@ export default function Predictive({ insightResult = null, goalResult = null, co
             setError(f.reason || "Couldn't build a reliable forecast from this data. Try a different number above.");
           }
         }
+      } else if (data && data.ok === false) {
+        // Genuinely unforecastable: backend refused with reason + suggestion.
+        // Track status so the tailored empty card renders (forecast stays null).
+        setForecast(null);
+        setForecastStatus("unforecastable");
+        setForecastInfo(data.info || null);
+        setSelection(data.selection || null);
+        setError(data.reason || data.detail || "This selection can't be forecast from the available history.");
       } else {
         setError(data.detail || "Couldn't build a forecast. Try a different number above.");
         setForecast(null);
+        setForecastStatus("idle");
       }
     } catch (e: any) {
       if (e?.name === "AbortError" || ctrl.signal.aborted) return; // superseded — not an error state
@@ -526,6 +552,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
         ? "ARIA couldn't reach the server. Check that the backend is running, then retry."
         : (e.message || "Couldn't build a forecast. Check your connection and try again."));
       setForecast(null);
+      setForecastStatus("idle");
     } finally {
       // Only the latest request clears loading (an aborted older one must
       // not flicker the spinner off while its replacement is in flight).
@@ -592,21 +619,28 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     setCtxApplied(true);
     // Never force re-analysis: preselect only. Auto-fetch only when there
     // is no usable forecast yet; an existing result stays untouched.
+    // Single auto-fetch ref gates this path so StrictMode + the default
+    // auto-run below never fire two initial requests for the same target.
     if (metric) {
       const empty = !forecast || (!Array.isArray((forecast as any)?.forecast) && !Array.isArray((forecast as any)?.points)
         && !Array.isArray((forecast as any)?.historical) && !Array.isArray((forecast as any)?.history))
         || (((forecast as any)?.forecast || (forecast as any)?.points || []).length === 0
           && ((forecast as any)?.historical || (forecast as any)?.history || []).length === 0);
       if (empty && !hasInsightPredictions) {
-        const timer = setTimeout(() => fetchForecast(metric, timeDim, hz, flt), 300);
-        return () => clearTimeout(timer);
+        const key = `ctx:${table.table}|${metric}|${timeDim}|${hz}`;
+        if (autoFetchRef.current !== key) {
+          autoFetchRef.current = key;
+          const timer = setTimeout(() => fetchForecast(metric, timeDim, hz, flt), 300);
+          return () => clearTimeout(timer);
+        }
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionStatus, elig, ctxApplied]);
 
   // Auto-run once eligibility + a valid default exist (skipped when a
-  // cross-link context is driving the first run).
+  // cross-link context is driving the first run). Shares the same single
+  // auto-fetch ref so only one initial request ever fires.
   useEffect(() => {
     if (connectionStatus !== "connected" || !elig?.eligible || !selectedTarget) return;
     if (pendingCtx && !ctxApplied) return;
@@ -615,6 +649,9 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       || ((forecast?.forecast || forecast?.points || []).length === 0
         && (forecast?.historical || forecast?.history || []).length === 0);
     if (!hasInsightPredictions && empty) {
+      const key = `auto:${selectedTable}|${selectedTarget}|${selectedTime}`;
+      if (autoFetchRef.current === key) return;
+      autoFetchRef.current = key;
       const timer = setTimeout(() => fetchForecast(), 500);
       return () => clearTimeout(timer);
     }
@@ -629,6 +666,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     setFilters([]);
     setWin(null);
     setForecast(null);
+    setForecastStatus("idle");
+    autoFetchRef.current = "";
     setError("");
     setTimeout(() => fetchForecast(rec.measure, rec.time_dim, horizon, []), 50);
   };
@@ -637,21 +676,46 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   // Accept the data contract (historical/forecast) or the legacy shape
   // (history/points). Either way every plotted timestamp comes from the
   // backend — entries without a backend date are dropped, never indexed.
-  const rawHistorical: any[] = Array.isArray((predictions as any)?.historical)
-    ? (predictions as any).historical
-    : (Array.isArray(predictions?.history) ? predictions.history : []);
-  const rawFuture: any[] = Array.isArray((predictions as any)?.forecast)
-    ? (predictions as any).forecast
-    : (Array.isArray((predictions as any)?.forecast_series) ? (predictions as any).forecast_series
-      : (Array.isArray(predictions?.points) ? predictions.points : []));
+  // Memoized so chartRows below has stable inputs (single memoized source).
+  const rawHistorical: any[] = useMemo(() => {
+    if (Array.isArray((predictions as any)?.historical)) return (predictions as any).historical;
+    if (Array.isArray(predictions?.history)) return predictions.history;
+    return [];
+  }, [predictions]);
+  const rawFuture: any[] = useMemo(() => {
+    if (Array.isArray((predictions as any)?.forecast)) return (predictions as any).forecast;
+    if (Array.isArray((predictions as any)?.forecast_series)) return (predictions as any).forecast_series;
+    if (Array.isArray(predictions?.points)) return predictions.points;
+    return [];
+  }, [predictions]);
   const hasPredictions = predictions && (
     predictions.valid || rawFuture.length > 0 || rawHistorical.length > 0);
   const targetName = plainName(
     selection?.measure || (predictions as any)?.target || predictions?.column || selectedTarget);
   const timeName = plainName(selection?.time_dim || selectedTime);
-  const accuracy = predictions?.accuracy_pct ?? null;
+  // Backend accuracy lives in two shapes: accuracy_pct (number) or
+  // accuracy: { pct, summary }. Support both verbatim.
+  const accuracy: number | null = (() => {
+    const a = (predictions as any)?.accuracy_pct;
+    if (a !== null && a !== undefined && !isNaN(Number(a))) return Number(a);
+    const b = (predictions as any)?.accuracy?.pct;
+    if (b !== null && b !== undefined && !isNaN(Number(b))) return Number(b);
+    return null;
+  })();
+  const backendReliability: string | null = (predictions as any)?.reliability ?? null;
+  const backendValid: boolean | null = typeof (predictions as any)?.valid === "boolean" ? (predictions as any).valid : null;
+  const forecastStage: string | null = (predictions as any)?.forecast_stage ?? null;
+  // Counts come from the backend total, never from a request-side row count.
+  // The chart shows at most the last 24 backend periods; the label below the
+  // chart states the full total.
+  const nObs: number = (() => {
+    const n = Number((predictions as any)?.n_obs);
+    if (Number.isFinite(n) && n > 0) return Math.round(n);
+    return 0;
+  })();
   const contractMetrics: any = (predictions as any)?.metrics || null;
   const validation: any = (predictions as any)?.validation || null;
+  const backendDrivers: any[] = Array.isArray((predictions as any)?.drivers) ? (predictions as any).drivers : [];
   const modelName: string | null = (predictions as any)?.model || predictions?.method || null;
   const frequency: string | null = (predictions as any)?.frequency || null;
   const selectionStatement: string | null = (predictions as any)?.selection_statement || null;
@@ -713,32 +777,28 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     // invent or drop the series — fall back to raw rows if it empties them.
     // Forecast points are never plotted as history: actual stays null on
     // future rows and forecast stays null on history rows, before and after.
+    // Zero-width intervals are never widened here — backend values stay
+    // untouched; the uncertain marker below carries the meaning.
     const base = rebinned.length > 0 ? rebinned : rows;
-    // Display-only minimum band: a zero-width interval (perfect fit) must
-    // never render as certainty — widen slightly so the likely range stays
-    // visible. Backend values are untouched; the uncertainty note carries
-    // the meaning.
-    const withBand = base.map((r: any) => {
-      if (r.lower95 !== null && r.lower95 !== undefined
-        && r.upper95 !== null && r.upper95 !== undefined
-        && r.forecast !== null && r.forecast !== undefined
-        && Number(r.lower95) === Number(r.upper95)) {
-        const v = Number(r.forecast);
-        const eps = Math.max(Math.abs(v) * 0.02, 0.01);
-        return {
-          ...r,
-          lower95: Math.round((v - eps) * 100) / 100,
-          upper95: Math.round((v + eps) * 100) / 100,
-        };
-      }
-      return r;
-    });
-    return withBand.map((r: any) => ({ ...r, short: r.short || shortLabel(r.label) }));
+    return base.map((r: any) => ({ ...r, short: r.short || shortLabel(r.label) }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rawHistorical, rawFuture, tab, rxItems]);
 
-  // Any new series resets the zoom/range window — stale indices must never
+  // Stable forecast identity for the zoom window: a new forecast resets the
+  // window, tab switches and plain re-renders never do.
+  const forecastId = useMemo(() => {
+    const parts = [
+      selection?.measure || targetName || "",
+      selection?.table || selectedTable || "",
+      selection?.time_dim || timeName || "",
+      String(nObs || rawHistorical.length || 0),
+      String(rawFuture.length || 0),
+    ];
+    return parts.join("|");
+  }, [selection, targetName, selectedTable, timeName, nObs, rawHistorical.length, rawFuture.length]);
+  // Any new forecast resets the zoom/range window — stale indices must never
   // window the wrong data.
-  useEffect(() => { setWin(null); }, [chartRows.length, tab, targetName]);
+  useEffect(() => { setWin(null); }, [forecastId]);
 
   // Cross-link date hint: jump the range window to the first backend
   // timestamp containing the hinted date, once rows exist.
@@ -754,9 +814,10 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     [chartRows, win],
   );
 
-  // Per-point lookup for tooltip + popup: value + change vs previous row.
+  // Per-point lookup for tooltip + popup: value + change vs previous row,
+  // plus index/total so boundary points label themselves.
   const rowsByLabel = useMemo(() => {
-    const map: Record<string, { pct: number | null; prevLabel: string | null }> = {};
+    const map: Record<string, { pct: number | null; prevLabel: string | null; idx: number }> = {};
     chartRows.forEach((r: any, i: number) => {
       const v = r.actual !== null && r.actual !== undefined ? Number(r.actual)
         : (r.forecast !== null && r.forecast !== undefined ? Number(r.forecast) : null);
@@ -771,7 +832,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
           break;
         }
       }
-      map[r.label] = { pct, prevLabel };
+      map[r.label] = { pct, prevLabel, idx: i };
     });
     return map;
   }, [chartRows]);
@@ -788,14 +849,22 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   const projectedTotal = fwdVals.reduce((a, b) => a + b, 0);
   const avgActual = historyVals.length ? historyVals.reduce((a, b) => a + b, 0) / historyVals.length : null;
   const pctChange = predictions?.projected_pct_change ?? null;
-  // History size comes from the plotted backend series, never from a
-  // request-side row count.
-  const historyCount = historyVals.length || forecastInfo?.rows_analyzed || 0;
+  // Counts come from the backend total, never from a request-side row count.
+  // The plotted history is capped at the last 24 backend periods; the full
+  // total below drives the preliminary flag and the "Showing last …" label.
+  const historyCount = nObs > 0 ? nObs : (historyVals.length || forecastInfo?.rows_analyzed || 0);
+  const plottedHistory = rawHistorical.length;
+  const historyLabel = nObs > plottedHistory && plottedHistory > 0
+    ? `Showing last ${plottedHistory} of ${nObs} periods`
+    : (historyCount > 0 ? `${historyCount} past ${historyCount === 1 ? "period" : "periods"}` : "");
 
   const sumKey = (k: string) => fwdPts.reduce((a, p) => {
     const v = k === "upper95" ? futHigh(p) : k === "lower95" ? futLow(p) : (p as any)?.[k];
     return a + (Number(v) || 0);
   }, 0);
+  // Likely-range cards derived from the backend range (upper/central/lower).
+  // Monthly is authoritative; regrouped Quarterly/Yearly buckets sum the
+  // backend bounds so they are marked approximate in the UI.
   const scenarios = useMemo(() => {
     if (!fwdPts.length || lastActual === null) return null;
     const base = (avgActual !== null ? avgActual * Math.max(1, fwdVals.length) : Math.abs(Number(lastActual)) * Math.max(1, fwdVals.length)) || 1;
@@ -804,9 +873,9 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       return { label, total, tone, note, sub, pct, ofTarget: base ? (total / base) * 100 : 100 };
     };
     return [
-      mk("Best Case", sumKey("upper95") || projectedTotal, "good", "Upper edge of the expected range", "If momentum holds"),
-      mk("Commit", projectedTotal, "base", "Central projection", "Based on recent trend"),
-      mk("Worst Case", sumKey("lower95") || projectedTotal, "bad", "Lower edge of the expected range", "If momentum slows"),
+      mk("Likely range — upper", sumKey("upper95") || projectedTotal, "good", "Upper edge of the expected range", "If momentum holds"),
+      mk("Central projection", projectedTotal, "base", "Central projection", "Based on recent trend"),
+      mk("Likely range — lower", sumKey("lower95") || projectedTotal, "bad", "Lower edge of the expected range", "If momentum slows"),
     ];
   }, [fwdPts, lastActual, avgActual, projectedTotal, fwdVals.length]);
   const scenMax = scenarios ? Math.max(...scenarios.map((s) => s.total), 1) : 1;
@@ -832,27 +901,53 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     });
   }, [hasPredictions, scenarios, targetName, fwdVals.length, accuracy, momDelta]);
 
-  // ---- Confidence (backend evidence only): High ≥85, Moderate ≥70,
-  // Limited otherwise. Expands to n_obs, validation metrics, coverage,
-  // model and horizon — every figure from the forecast payload. ----
-  const confidenceLevel: "High" | "Moderate" | "Limited" =
-    accuracy !== null && accuracy >= 85 ? "High" : accuracy !== null && accuracy >= 70 ? "Moderate" : "Limited";
+  // Preliminary comes from the backend total: the backend marks fewer than
+  // 50 observations preliminary, mirrored here via forecast_stage + n_obs.
+  const isPreliminary = !!hasPredictions && (forecastStage === "preliminary" || (historyCount > 0 && historyCount < 50));
+  // Unforecastable: backend answered ok:false (tracked status), so the
+  // tailored empty card renders instead of the generic error.
+  const isUnforecastable = forecastStatus === "unforecastable";
+
+  // ---- Confidence shows backend reliability/valid verbatim. High only when
+  // the backend says so AND valid is true AND not preliminary AND backtested
+  // accuracy is at least 85. ----
+  const confidenceLevel: "High" | "Moderate" | "Limited" = (() => {
+    const rel = String(backendReliability || "").toLowerCase();
+    let base: "High" | "Moderate" | "Limited";
+    if (rel === "high" || rel === "moderate" || rel === "limited") {
+      base = rel === "high" ? "High" : rel === "moderate" ? "Moderate" : "Limited";
+    } else {
+      base = accuracy !== null && accuracy >= 85 ? "High" : accuracy !== null && accuracy >= 70 ? "Moderate" : "Limited";
+    }
+    if (base === "High" && !(backendValid === true && !isPreliminary && accuracy !== null && accuracy >= 85)) {
+      base = "Moderate";
+      if (backendValid === false || accuracy === null || accuracy < 70) base = "Limited";
+    }
+    return base;
+  })();
   const coverage = validation ? {
     origins: validation.walk_forward_origins ?? null,
     evaluated: validation.walk_forward_evaluated ?? null,
     zeroSkipped: validation.zero_actuals_skipped ?? null,
   } : null;
 
-  // ---- "Why ARIA expects this": backend explanation fields only. The
-  // forecast contract carries NO drivers[] array (see
-  // api/predictive_routes.py + prediction/agent.py), so per-driver
-  // attribution is never invented — the signals below are the full
-  // backend explanation, each labelled with its source field. ----
+  // ---- "Why ARIA expects this": backend explanation fields + backend
+  // drivers[] rendered verbatim (name + evidence). Nothing invented. ----
   const whyItems: { title: string; body: string; source: string }[] = useMemo(() => {
     if (!hasPredictions) return [];
     const items: { title: string; body: string; source: string }[] = [];
     if (selectionStatement) items.push({ title: "Model selection", body: selectionStatement, source: "selection_statement" });
     if (modelName && modelName !== "none") items.push({ title: "Approach", body: `Projected with ${modelName}, the approach that held up best against past actuals.`, source: "model" });
+    for (const d of backendDrivers) {
+      const name = String(d?.name || "").trim();
+      if (!name) continue;
+      const ev = String(d?.evidence || "").trim();
+      const mv = d?.metric_value ?? d?.value ?? null;
+      const body = ev
+        ? (mv !== null && mv !== undefined && String(mv).trim() !== "" ? `${ev} (value: ${mv})` : ev)
+        : (mv !== null && mv !== undefined ? `Observed value: ${mv}.` : "Observed in your history.");
+      items.push({ title: name, body, source: "drivers" });
+    }
     if (pctChange !== null && pctChange !== undefined) items.push({
       title: "Expected move",
       body: `The final projected point sits ${Math.abs(pctChange).toFixed(1)}% ${pctChange >= 0 ? "above" : "below"} the last actual value.`,
@@ -868,15 +963,12 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     if (validation?.reason) items.push({ title: "Validation", body: validation.reason, source: "validation.reason" });
     if (frequency) items.push({ title: "Time base", body: `History was aggregated per ${frequency === "MS" ? "month" : frequency === "W" ? "week" : frequency === "D" ? "day" : frequency}.`, source: "frequency" });
     return items;
-  }, [hasPredictions, selectionStatement, modelName, pctChange, momDelta, validation, frequency]);
+  }, [hasPredictions, selectionStatement, modelName, backendDrivers, pctChange, momDelta, validation, frequency]);
   const topSignal = forecastStory.signal || (whyItems[0] ? `${whyItems[0].title}: ${whyItems[0].body}` : "");
 
   const horizonWarning = historyPoints !== null && horizon > historyPoints
     ? `Heads up: ${horizon} periods ahead from only ${historyPoints} past points — treat the far end as directional.`
     : null;
-  const isPreliminary = hasPredictions && historyCount > 0 && historyCount < 50;
-  // Unforecastable: nothing plottable came back (invalid + no points).
-  const isUnforecastable = !!forecast && !hasPredictions;
 
   // ---- Zoom / pan / range: one index window over the backend rows. ----
   const zoomDepth = win ? (win.e - win.s + 1) / Math.max(1, chartRows.length) : 1;
@@ -928,13 +1020,43 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   };
   const rangeFrom = win ? chartRows[Math.max(0, win.s)]?.label || "" : "";
   const rangeTo = win ? chartRows[Math.min(chartRows.length - 1, win.e)]?.label || "" : "";
+  // Regrouping is only offered when every plotted label parses as a date.
+  // Monthly stays authoritative; Quarterly/Yearly are approximate sums.
+  const canRebin = useMemo(() => {
+    if (chartRows.length === 0) return true;
+    return labelsParseAsDates(chartRows);
+  }, [chartRows]);
+  // Zero-width intervals are never widened — flag for the uncertain marker.
+  const hasZeroWidth = useMemo(() => {
+    return chartRows.some((r: any) =>
+      r.forecast !== null && r.forecast !== undefined
+      && r.lower95 !== null && r.lower95 !== undefined
+      && r.upper95 !== null && r.upper95 !== undefined
+      && Number(r.lower95) === Number(r.upper95));
+  }, [chartRows]);
+  // Lock regroup tabs when labels don't parse as dates.
+  useEffect(() => {
+    if (!canRebin && tab !== "Monthly") setTab("Monthly");
+  }, [canRebin, tab]);
 
   const exportCsv = () => {
-    if (viewRows.length === 0) return;
+    if (chartRows.length === 0) return;
+    // Full series export (not just the zoomed view) with provenance header.
+    const prov: string[] = [
+      `# metric,${String(targetName || "").replace(/,/g, ";")}`,
+      `# dataset,${String(selectedTable || "").replace(/,/g, ";")}`,
+      `# time field,${String(timeName || "").replace(/,/g, ";")}`,
+      `# generated,${new Date().toISOString()}`,
+      `# model,${String(modelName || "").replace(/,/g, ";")}`,
+      `# observations,${historyCount}`,
+      `# horizon,${fwdVals.length}`,
+      `# reliability,${String(backendReliability || "").replace(/,/g, ";")}`,
+      `# valid,${backendValid === null ? "" : String(backendValid)}`,
+    ];
     const header = "date,actual,forecast,lower95,upper95";
-    const lines = viewRows.map((r: any) =>
+    const lines = chartRows.map((r: any) =>
       [r.label, r.actual ?? "", r.forecast ?? "", r.lower95 ?? "", r.upper95 ?? ""].join(","));
-    const blob = new Blob([[header, ...lines].join("\n")], { type: "text/csv;charset=utf-8" });
+    const blob = new Blob([[...prov, header, ...lines].join("\n")], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -947,8 +1069,15 @@ export default function Predictive({ insightResult = null, goalResult = null, co
 
   const openPoint = (row: any) => {
     if (!row) return;
-    const info = rowsByLabel[row.label] || { pct: null, prevLabel: null };
-    setPointSel({ ...row, pct: info.pct, prevLabel: info.prevLabel });
+    const info = rowsByLabel[row.label] || { pct: null, prevLabel: null, idx: -1 };
+    const idx = typeof (info as any).idx === "number" ? (info as any).idx : chartRows.findIndex((r: any) => r.label === row.label);
+    const total = chartRows.length;
+    const isFirst = idx === 0;
+    const isLast = idx === total - 1;
+    const kind = row.forecast !== null && row.forecast !== undefined
+      ? (row.actual !== null && row.actual !== undefined ? "history + forecast" : "forecast")
+      : "history";
+    setPointSel({ ...row, pct: info.pct, prevLabel: info.prevLabel, idx, total, isFirst, isLast, kind });
   };
 
   if (connectionStatus !== "connected") {
@@ -978,17 +1107,27 @@ export default function Predictive({ insightResult = null, goalResult = null, co
           <h2 className="text-xl font-bold text-foreground tracking-tight">Forecast</h2>
           <p className="text-sm text-muted-foreground mt-0.5">See where your business is heading.</p>
         </div>
-        <div className="flex bg-secondary border border-border rounded-xl p-0.5 text-xs font-medium" role="group" aria-label="Granularity">
-          {(["Monthly", "Quarterly", "Yearly"] as PeriodTab[]).map((p) => (
-            <button
-              key={p}
-              onClick={() => setTab(p)}
-              aria-pressed={tab === p}
-              className={`px-3 py-1.5 rounded-lg transition-all duration-200 ${tab === p ? "bg-card text-foreground shadow-sm border border-border/60" : "text-muted-foreground hover:text-foreground border border-transparent"}`}
-            >
-              {p}
-            </button>
-          ))}
+        <div className="flex flex-col items-end gap-1">
+          <div className="flex bg-secondary border border-border rounded-xl p-0.5 text-xs font-medium" role="group" aria-label="Granularity">
+            {(["Monthly", "Quarterly", "Yearly"] as PeriodTab[]).map((p) => {
+              const locked = p !== "Monthly" && !canRebin;
+              const approx = p !== "Monthly";
+              return (
+                <button
+                  key={p}
+                  onClick={() => { if (!locked) setTab(p); }}
+                  aria-pressed={tab === p}
+                  disabled={locked}
+                  title={p === "Monthly" ? "Monthly is authoritative" : locked ? "Regrouping needs date labels — showing monthly" : "Approximate regrouping of monthly history"}
+                  aria-label={p === "Monthly" ? "Monthly, authoritative" : `${p}, approximate regrouping`}
+                  className={`px-3 py-1.5 rounded-lg transition-all duration-200 ${tab === p ? "bg-card text-foreground shadow-sm border border-border/60" : "text-muted-foreground hover:text-foreground border border-transparent"} disabled:opacity-40`}
+                >
+                  {p}{approx ? " ~approx" : ""}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[10px] text-muted-foreground">Monthly is authoritative; regrouped views are approximate.</p>
         </div>
       </div>
 
@@ -1048,7 +1187,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                     setSelectedTarget((owner.measures || [])[0] || "");
                     setSelectedTime((owner.time_dims || [])[0]?.column || "");
                   }
-                  setFilters([]); setWin(null); setForecast(null); setError("");
+                  setFilters([]); setWin(null); setForecast(null); setForecastStatus("idle"); setError("");
                 }}
                 className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none cursor-pointer"
               >
@@ -1063,7 +1202,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 value={selectedTarget}
                 onChange={(e) => {
                   setSelectedTarget(e.target.value);
-                  setForecast(null); setError("");
+                  setForecast(null); setForecastStatus("idle"); setError("");
                 }}
                 className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none cursor-pointer"
               >
@@ -1077,14 +1216,29 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               <p className="text-xs font-medium text-muted-foreground">Date field</p>
               <select
                 value={selectedTime}
-                onChange={(e) => { setSelectedTime(e.target.value); setForecast(null); setError(""); }}
+                onChange={(e) => { setSelectedTime(e.target.value); setForecast(null); setForecastStatus("idle"); setError(""); }}
                 className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none cursor-pointer"
               >
                 {activeTimes.length === 0 && <option value="">Auto-detect…</option>}
                 {activeTimes.map((d: any) => (
-                  <option key={d.column} value={d.column}>{d.column}{d.kind === "text" ? " (text)" : ""}</option>
+                  <option key={d.column} value={d.column}>{d.column}{d.kind === "text" ? " (text)" : ""} · {d.distinct ?? "?"} points</option>
                 ))}
               </select>
+              {selectedTime && (
+                <p className="text-[10px] text-muted-foreground">
+                  {(() => {
+                    const td = activeTimes.find((d: any) => d.column === selectedTime);
+                    const pts = td?.distinct ?? historyPoints ?? null;
+                    const grain = td?.kind === "text" ? "text dates grouped as listed" : frequency === "MS" ? "monthly history" : frequency === "W" ? "weekly history" : frequency === "D" ? "daily history" : "history in listed order";
+                    return `${grain}${pts !== null ? ` · ${pts} time points` : ""}. Needs at least 5 periods.`;
+                  })()}
+                </p>
+              )}
+              <p className="text-[10px] leading-relaxed">
+                {(historyPoints ?? 0) >= 5
+                  ? <span className="text-positive font-semibold">✓ Ready: {(historyPoints ?? 0)} periods (needs at least 5).</span>
+                  : <span className="text-warning font-semibold">Needs at least 5 periods — currently {historyPoints ?? 0}. Pick a date field with more history.</span>}
+              </p>
             </div>
             <div className="space-y-1.5">
               <p className="text-xs font-medium text-muted-foreground">Forecast horizon (periods)</p>
@@ -1162,8 +1316,14 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                     onChange={(e) => setFilterVal(e.target.value)}
                     placeholder="value, e.g. Berlin"
                     aria-label="Filter value"
+                    list="predictive-filter-values"
                     className="flex-1 min-w-0 bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none"
                   />
+                  <datalist id="predictive-filter-values">
+                    {filters.map((f) => (
+                      <option key={`sug-${f.column}-${f.value}`} value={f.value}>{f.column}</option>
+                    ))}
+                  </datalist>
                   <button
                     onClick={() => {
                       if (!filterCol || !filterVal.trim()) return;
@@ -1276,16 +1436,17 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                     {fmtNum(projectedTotal)} total
                   </span>
                   <div className="flex items-center gap-1" role="group" aria-label="Zoom and pan">
-                    <button onClick={() => pan(-1)} disabled={chartRows.length < 3 || !win} title="Pan back" className="text-[11px] font-bold px-2 py-1 rounded-lg bg-secondary text-foreground border border-border disabled:opacity-40">‹</button>
-                    <button onClick={zoomOut} disabled={chartRows.length < 3 || !win} title="Zoom out" className="text-[11px] font-bold px-2 py-1 rounded-lg bg-secondary text-foreground border border-border disabled:opacity-40">−</button>
-                    <button onClick={zoomIn} disabled={chartRows.length < 3} title="Zoom in" className="text-[11px] font-bold px-2 py-1 rounded-lg bg-secondary text-foreground border border-border disabled:opacity-40">+</button>
-                    <button onClick={() => pan(1)} disabled={chartRows.length < 3 || !win} title="Pan forward" className="text-[11px] font-bold px-2 py-1 rounded-lg bg-secondary text-foreground border border-border disabled:opacity-40">›</button>
-                    <button onClick={resetView} disabled={!win} title="Reset view" className="text-[11px] font-medium px-2 py-1 rounded-lg bg-secondary text-foreground border border-border disabled:opacity-40">Reset</button>
+                    <button onClick={() => pan(-1)} disabled={chartRows.length < 3 || !win} title="Pan back" aria-label="Pan back" className="text-[11px] font-bold px-2 py-1 rounded-lg bg-secondary text-foreground border border-border disabled:opacity-40">‹</button>
+                    <button onClick={zoomOut} disabled={chartRows.length < 3 || !win} title="Zoom out" aria-label="Zoom out" className="text-[11px] font-bold px-2 py-1 rounded-lg bg-secondary text-foreground border border-border disabled:opacity-40">−</button>
+                    <button onClick={zoomIn} disabled={chartRows.length < 3} title="Zoom in" aria-label="Zoom in" className="text-[11px] font-bold px-2 py-1 rounded-lg bg-secondary text-foreground border border-border disabled:opacity-40">+</button>
+                    <button onClick={() => pan(1)} disabled={chartRows.length < 3 || !win} title="Pan forward" aria-label="Pan forward" className="text-[11px] font-bold px-2 py-1 rounded-lg bg-secondary text-foreground border border-border disabled:opacity-40">›</button>
+                    <button onClick={resetView} disabled={!win} title="Reset view" aria-label="Reset zoom" className="text-[11px] font-medium px-2 py-1 rounded-lg bg-secondary text-foreground border border-border disabled:opacity-40">Reset</button>
                   </div>
                   <button
                     onClick={exportCsv}
-                    disabled={viewRows.length === 0}
-                    title="Download the plotted rows as CSV"
+                    disabled={chartRows.length === 0}
+                    title="Download the full series as CSV with source details"
+                    aria-label="Export full forecast series as CSV"
                     className="text-[11px] font-medium px-2.5 py-1 rounded-lg bg-secondary hover:bg-secondary/70 text-foreground transition-colors border border-border disabled:opacity-50"
                   >
                     Export CSV
@@ -1299,7 +1460,10 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                   </button>
                 </div>
               </div>
-              {win && (
+              {historyLabel && (
+                <p className="text-[11px] text-muted-foreground mb-1">{historyLabel}{tab !== "Monthly" ? " · regrouped view is approximate, Monthly is authoritative" : ""}</p>
+              )}
+              {win && viewRows.length > 0 && (
                 <p className="text-[11px] text-muted-foreground mb-1">
                   Showing {fullLabel(viewRows[0]?.label)} – {fullLabel(viewRows[viewRows.length - 1]?.label)} ({Math.round(zoomDepth * 100)}% of {chartRows.length} points). <button onClick={resetView} className="text-primary hover:underline font-medium">Show all</button>
                 </p>
@@ -1363,18 +1527,17 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 <p className="text-sm text-muted-foreground py-8 text-center">Chart couldn't be drawn from this result — the numbers above still apply.</p>
               )}
               </ChartFrame>
-              {/* Uncertainty + regrouping honesty: a perfect-fit zero-width
-                  band is never rendered as certainty; rebinned Quarterly/
-                  Yearly bounds are marked approximate. Backend fields are
-                  optional — these render only when present. */}
-              {((predictions as any)?.uncertainty_note || (Array.isArray(rawFuture) && rawFuture.length > 0 && rawFuture.every((p: any) => {
-                const lo = futLow(p), hi = futHigh(p);
-                return lo !== null && hi !== null && Number(lo) === Number(hi);
-              }))) && (
-                <p className="mt-2 text-[11px] text-warning leading-relaxed">Very low observed error — treat as uncertain, not guaranteed.</p>
+              {/* Uncertainty + regrouping honesty: backend values are never
+                  widened — a zero-width band shows an uncertain marker.
+                  Regrouped Quarterly/Yearly bounds are marked approximate. */}
+              {(uncertaintyNote || hasZeroWidth) && (
+                <p className="mt-2 text-[11px] text-warning leading-relaxed">
+                  {uncertaintyNote || "Very low observed spread — treat as uncertain, not guaranteed."}
+                  {hasZeroWidth ? " (marked uncertain: range has no width)" : ""}
+                </p>
               )}
-              {((predictions as any)?.interval_method === "summed_bounds_approx" && tab !== "Monthly") && (
-                <p className="mt-1 text-[11px] text-muted-foreground leading-relaxed">Approximate range from regrouping — see Technical details.</p>
+              {tab !== "Monthly" && (
+                <p className="mt-1 text-[11px] text-muted-foreground leading-relaxed">Approximate range from regrouping — Monthly is authoritative. See Technical details.</p>
               )}
             </div>
 
@@ -1383,13 +1546,13 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               <button
                 onClick={() => setShowWhy((v) => !v)}
                 aria-expanded={showWhy}
-                className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold text-blue-700 border border-blue-200 rounded-full px-3 py-1.5 hover:bg-blue-50 transition-colors"
+                className="inline-flex items-center gap-1.5 text-[11.5px] font-semibold text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/25 rounded-full px-3 py-1.5 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-colors"
                 aria-label="Show why ARIA expects this"
               >
                 Why?
               </button>
               {whyItems.length > 0 && (
-                <span className="text-[11px] text-slate-500">{whyItems.length} reason{whyItems.length === 1 ? "" : "s"} from your data</span>
+                <span className="text-[11px] text-muted-foreground">{whyItems.length} reason{whyItems.length === 1 ? "" : "s"} from your data</span>
               )}
             </div>
             {showWhy && (
@@ -1413,12 +1576,16 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                   <p className="text-xs text-muted-foreground leading-relaxed">The backend did not return an explanation for this forecast.</p>
                 )}
                 <p className="text-[10px] text-muted-foreground/70 leading-relaxed pt-1">
-                  The forecast service does not return per-driver attribution (no drivers[] in the backend contract), so no driver breakdown is shown rather than an invented one.
+                  Driver notes above come straight from the backend explanation; anything missing was not returned, never filled in.
                 </p>
               </div>
             )}
 
             {scenarios && (
+              <>
+                {tab !== "Monthly" && (
+                  <p className="text-[11px] text-muted-foreground">Regrouped {tab.toLowerCase()} totals are approximate — Monthly is authoritative.</p>
+                )}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 {scenarios.map((s) => (
                   <div key={s.label} className="bg-card border border-border rounded-xl p-4 space-y-2">
@@ -1455,10 +1622,55 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                         </p>
                       ))}
                     </div>
+                    {tab !== "Monthly" && (
+                      <p className="text-[10px] text-muted-foreground">Approximate — regrouped view.</p>
+                    )}
                   </div>
                 ))}
               </div>
+              </>
             )}
+
+            {/* What-if estimate: wired to the real scenario endpoint. */}
+            <div className="bg-card border border-border rounded-xl p-4 space-y-2">
+              <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">What-if estimate</p>
+              <p className="text-xs text-muted-foreground leading-relaxed">See what a change to {targetName || "this number"} could look like. Arithmetic estimate from your history, not a forecast.</p>
+              <div className="flex items-center gap-2 flex-wrap">
+                <label className="text-xs text-muted-foreground" htmlFor="predictive-scenario-pct">Change (%)</label>
+                <input
+                  id="predictive-scenario-pct"
+                  type="number" min={-95} max={95} step={1}
+                  value={scenarioPct}
+                  onChange={(e) => setScenarioPct(Number(e.target.value) || 0)}
+                  aria-label="What-if change percent"
+                  className="w-20 bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none"
+                />
+                <button
+                  onClick={runScenario}
+                  disabled={scenarioLoading || !selectedTarget}
+                  aria-label="Run what-if estimate"
+                  className="text-xs font-semibold px-4 py-2 rounded-lg bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                >
+                  {scenarioLoading ? "Working…" : "Run estimate"}
+                </button>
+              </div>
+              {scenarioError && <p className="text-xs text-negative">{scenarioError}</p>}
+              {scenario && scenario.ok && (
+                <div className="space-y-1 text-xs">
+                  <div className="flex justify-between"><span className="text-muted-foreground">Starting level</span><span className="font-bold text-foreground">{fmtNum(scenario.baseline)}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">With change</span><span className="font-bold text-foreground">{fmtNum(scenario.scenario_value)} ({Number(scenario.pct_change) >= 0 ? "+" : ""}{scenario.pct_change}%)</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Difference</span><span className="font-bold text-foreground">{fmtNum(scenario.delta)}</span></div>
+                  <p className="text-[11px] text-muted-foreground">Based on the last {scenario.periods_used ?? 3} periods of {scenario.column || targetName}.</p>
+                  {Array.isArray(scenario.assumptions) && scenario.assumptions.length > 0 && (
+                    <ul className="space-y-0.5 pt-1">
+                      {scenario.assumptions.map((a: string, i: number) => (
+                        <li key={i} className="text-[11px] text-muted-foreground">· {a}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+            </div>
 
             {forecastStory.story && (
               <div className="bg-card border border-border rounded-xl p-4 space-y-1.5">
@@ -1473,7 +1685,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                   const fwd = (fwdVals || []).map((v: any) => Number(v)).filter((v: number) => Number.isFinite(v));
                   if (fwd.length >= 2 && fwd.every((v: number) => v === fwd[0])) {
                     return (
-                      <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-2 leading-relaxed">
+                      <p className="text-[11px] text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/25 rounded-lg px-2.5 py-2 leading-relaxed">
                         Flat projection — recent history shows no stable trend, so ARIA holds the last level
                         {modelName && modelName !== "none" ? ` (${modelName})` : ""} rather than inventing movement.
                       </p>
@@ -1487,10 +1699,10 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                   const acc = accuracy;
                   const ok = (predictions as any)?.valid !== false;
                   const verdict = !ok || (acc !== null && acc < 70)
-                    ? { t: "Direction only — don't plan on precise numbers.", c: "text-amber-700 border-amber-200 bg-amber-50" }
+                    ? { t: "Direction only — don't plan on precise numbers.", c: "text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25 bg-amber-50 dark:bg-amber-500/10" }
                     : acc !== null && acc >= 80
-                      ? { t: "Plan on this — backtesting supports the outlook.", c: "text-emerald-700 border-emerald-200 bg-emerald-50" }
-                      : { t: "Working estimate — plan with margin.", c: "text-blue-700 border-blue-200 bg-blue-50" };
+                      ? { t: "Plan on this — backtesting supports the outlook.", c: "text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25 bg-emerald-50 dark:bg-emerald-500/10" }
+                      : { t: "Working estimate — plan with margin.", c: "text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/25 bg-blue-50 dark:bg-blue-500/10" };
                   return (
                     <p className={`text-xs font-semibold rounded-lg border px-2.5 py-2 ${verdict.c}`}>
                       {verdict.t}{acc !== null ? ` Backtested accuracy ${acc.toFixed(0)}%.` : ""}
@@ -1508,9 +1720,6 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                     {p?.display?.why_summary && <p className="text-xs text-muted-foreground leading-relaxed mt-0.5">{String(p.display.why_summary)}</p>}
                   </div>
                 ))}
-                <button onClick={() => { window.location.hash = "#/intelligence?tab=prescriptions"; }} className="text-xs font-semibold text-primary hover:underline" aria-label="Open prescriptions">
-                  Open full prescriptions →
-                </button>
               </div>
             )}
           </div>
@@ -1546,7 +1755,10 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               </p>
               {confidenceOpen && (
                 <div className="pt-1 space-y-1.5 text-xs border-t border-border mt-2">
-                  <div className="flex justify-between pt-2"><span className="text-muted-foreground">Historical observations (n_obs)</span><span className="font-bold text-foreground">{historyCount}</span></div>
+                  <div className="flex justify-between pt-2"><span className="text-muted-foreground">Historical observations</span><span className="font-bold text-foreground">{historyCount}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Backend reliability</span><span className="font-bold text-foreground">{backendReliability ?? "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Backend valid</span><span className="font-bold text-foreground">{backendValid === null ? "—" : String(backendValid)}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Stage</span><span className="font-bold text-foreground">{forecastStage ?? "—"}</span></div>
                   <div className="flex justify-between"><span className="text-muted-foreground">Backtest accuracy</span><span className="font-bold text-foreground">{accuracy !== null ? `${accuracy.toFixed(1)}%` : "—"}</span></div>
                   <div className="flex justify-between"><span className="text-muted-foreground">MAE</span><span className="font-bold text-foreground">{contractMetrics?.mae ?? "—"}</span></div>
                   <div className="flex justify-between"><span className="text-muted-foreground">RMSE</span><span className="font-bold text-foreground">{contractMetrics?.rmse ?? "—"}</span></div>
@@ -1586,7 +1798,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                   {f.pill && (
                     <span
                       className="text-[10px] font-bold px-1.5 py-0.5 rounded"
-                      style={f.good ? { background: "rgba(5,150,105,0.12)", color: "#059669" } : { background: "rgba(239,68,68,0.12)", color: "#EF4444" }}
+                      style={f.good ? { background: "rgba(5,150,105,0.12)", color: "var(--positive)" } : { background: "rgba(239,68,68,0.12)", color: "var(--negative)" }}
                     >
                       {f.pill}
                     </span>
@@ -1645,7 +1857,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       )}
 
 
-      {/* Click-point detail popup: backend row + derived prior-period change. */}
+      {/* Click-point detail popup: backend row + prior-period change + boundary labels. */}
       {pointSel && (
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label="Forecast point detail">
           <div className="bg-card border border-border rounded-xl p-5 w-full max-w-sm space-y-2">
@@ -1653,6 +1865,13 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               <p className="text-sm font-bold text-foreground">{fullLabel(pointSel.label)}</p>
               <button onClick={() => setPointSel(null)} className="text-xs px-2.5 py-1.5 rounded-lg border border-border text-foreground hover:border-primary/50" aria-label="Close point detail">Close ×</button>
             </div>
+            {typeof pointSel.idx === "number" && typeof pointSel.total === "number" && pointSel.total > 0 && (
+              <p className="text-[11px] text-muted-foreground">
+                Point {(pointSel.idx ?? 0) + 1} of {pointSel.total}
+                {pointSel.isFirst ? " · first in view" : ""}{pointSel.isLast ? " · last in view" : ""}
+                {pointSel.kind ? ` · ${pointSel.kind}` : ""}
+              </p>
+            )}
             {pointSel.actual !== null && pointSel.actual !== undefined && (
               <p className="text-xs text-muted-foreground">Actual: <span className="text-foreground font-semibold">{fmtNum(pointSel.actual)}</span></p>
             )}

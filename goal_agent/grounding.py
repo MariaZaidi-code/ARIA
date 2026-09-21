@@ -389,7 +389,18 @@ class GroundingMixin:
     # ---- _is_measure_column (_is_measure_column) ----
 
     def _is_measure_column(self, table, col):
-        """True when a column is a numeric, non-key, non-FK measure candidate."""
+        """True when a column is a numeric, non-key, non-FK measure candidate.
+
+        Calendar-year columns (release_year, model_year) are never measures:
+        years label a timeline (usable as dimensions/trends) but SUM/AVG
+        over them is meaningless on any schema.
+        """
+        try:
+            from core.semantic import is_year_like as _is_year_like
+            if _is_year_like(col):
+                return False
+        except Exception:
+            pass
         info = self.tables.get(table, {})
         pk = set(info.get("primary_key", []) or [])
         fk_cols = {fk.get("column") for fk in info.get("foreign_keys", [])}

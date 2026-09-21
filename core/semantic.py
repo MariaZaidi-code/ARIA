@@ -40,6 +40,27 @@ _PCT_HINTS = ("pct", "percent", "rate", "ratio")
 _GEO_HINTS = ("city", "country", "region", "state", "zip", "postal", "lat", "lon", "lng", "address")
 
 
+def is_year_like(name: str) -> bool:
+    """True for calendar-year columns (release_year, model_year, year).
+
+    Years are labels on a timeline, not summable measures: SUM/AVG over
+    them produces nonsense (total 17,746,905 "years"). Generic, name-only
+    so every measure gate (dashboard, forecast eligibility, prescriptions,
+    goal grounding) shares one rule. Year columns remain fully usable as
+    dimensions and trend axes — only SUM/AVG candidacy is removed.
+    """
+    low = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name or "")).lower()
+    low_nosep = re.sub(r"[^a-z0-9]+", "", low)
+    if low in ("year", "years", "yr", "yrs"):
+        return True
+    if low.endswith(("_year", "_years")):
+        return True
+    # Separator-less variants (fiscalyear, releaseyear).
+    if low_nosep.endswith("year") and len(low_nosep) > 4:
+        return True
+    return False
+
+
 def is_valid_identifier(name: str, max_len: int = 64) -> bool:
     """Conservative identifier check for table/column names from user input."""
     return bool(name) and len(name) <= max_len and bool(IDENT_RE.match(name))

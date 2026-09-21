@@ -16,11 +16,11 @@ interface TimeRangeSelectorProps {
 export function TimeRangeSelector({ options, value, onChange, className = "" }: TimeRangeSelectorProps) {
   return (
     <div
-      className={`inline-flex items-center gap-0.5 p-0.5 rounded-xl bg-slate-100/80 border border-slate-200/60 ${className}`}
+      className={`inline-flex items-center gap-0.5 p-0.5 rounded-xl bg-secondary/80 border border-border/60 ${className}`}
       role="radiogroup"
       aria-label="Time range"
     >
-      <CalendarDays size={12} className="text-slate-400 ml-1.5 mr-0.5 flex-shrink-0 pointer-events-none" />
+      <CalendarDays size={12} className="text-muted-foreground ml-1.5 mr-0.5 flex-shrink-0 pointer-events-none" />
       {options.map((opt) => {
         const active = opt.key === value;
         return (
@@ -33,8 +33,8 @@ export function TimeRangeSelector({ options, value, onChange, className = "" }: 
               relative px-2.5 py-1 text-[11px] font-medium rounded-lg
               transition-all duration-200 ease-out
               ${active
-                ? "bg-white text-[#0F2440] shadow-sm border border-slate-200/80"
-                : "text-slate-400 hover:text-slate-600 border border-transparent"
+                ? "bg-card text-foreground shadow-sm border border-border/80"
+                : "text-muted-foreground hover:text-secondary-foreground border border-transparent"
               }
             `}
           >

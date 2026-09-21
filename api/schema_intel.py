@@ -336,15 +336,19 @@ class SchemaIntelligence:
 
         Excludes binary/blob/bytea/image/photo/picture columns by type AND
         by name (a photo/thumbnail/counter column is never a measure, even
-        when its declared type looks numeric), plus PK/FK/identifier keys.
+        when its declared type looks numeric), plus PK/FK/identifier keys,
+        plus calendar-year columns (release_year: SUM of years is nonsense;
+        years stay usable as dimensions and trend axes).
         """
+        from core.semantic import is_year_like as _is_year_like
         col_types = self._col_types.get(table, {})
         return [c for c in self.get_numeric_cols(table)
                 if c not in set(self.get_pk(table))
                 and c not in set(fk[0] for fk in self.get_fks(table))
                 and not _is_id_like(c)
                 and not _is_binary_like_name(c)
-                and not _is_binary_like_type(col_types.get(c, ""))]
+                and not _is_binary_like_type(col_types.get(c, ""))
+                and not _is_year_like(c)]
 
     def find_best_measure(self, table: str):
         """Pick the most analytically useful numeric column (prefer amounts over IDs).

@@ -135,17 +135,116 @@ function typeLabel(type: string): string {
 }
 
 /* ---- Semantic business labels: never leak raw snake_case / SQL internals
-   to the UI. humanize("total_amt") -> "Total amt" via schema-friendly words. ---- */
+   to the UI. humanize("total_amt") -> "Total amt" via schema-friendly words.
+   Table-qualified refs ("orders.total_amt") resolve to the column label. ---- */
 function humanize(v: unknown): string {
-  const s = String(v ?? "").trim();
+  const raw = String(v ?? "").trim();
+  if (!raw) return "";
+  const s = raw.includes(".") ? raw.slice(raw.lastIndexOf(".") + 1) : raw;
   if (!s) return "";
   const spaced = s.replace(/[_-]+/g, " ").replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/\s+/g, " ").trim();
   if (/^[A-Z0-9_()%. ]+$/.test(s) && s.length <= 8) return s.replace(/_/g, " ");
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
+/* ---- Plain business language: backend prose can carry detector jargon
+   (correlation, p-value, slope, variance, std, z-score, confidence
+   interval, statistical terms, table.column). Rewrite to what happened /
+   why it matters / what to do next. Business numbers ($, %, counts) are
+   preserved; math words/numbers are removed or reworded. Charts, tooltips,
+   drill-downs and API calls are untouched — only wording changes. ---- */
+function containsBannedTerms(s: string): boolean {
+  const t = s || "";
+  if (/[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*/.test(t)) return true;
+  if (/[A-Za-z0-9]+_[A-Za-z0-9]+/.test(t)) return true;
+  return /correl\w*|\bp[\s-]?values?|\bslopes?|\bvariance?s?|\bcovariance?s?|\bstd\b|\bstandard\s+deviations?|\bz[\s-]?scores?|\bconfidence\s+intervals?|\bstatistic\w*|\bregressions?|\bR\^2\b|\bR-squared\b|\bOLS\b|\bIQR\b|\bANOVA\b|\bchi[\s-]?squared?|\bintercepts?|\bcoefficients?/i.test(t);
+}
+
+function plainBusiness(v: unknown): string {
+  if (typeof v !== "string") return "";
+  let s = v.trim();
+  if (!s) return "";
+  // table.column -> column label ("orders.total_amt" -> "Total amt").
+  s = s.replace(/([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)/g, (_m, _t, col) => humanize(col));
+  // snake_case tokens -> human labels.
+  s = s.replace(/\b[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+\b/g, (m) => humanize(m));
+  // Statistical assignments -> plain words or removed (no math in prose).
+  s = s.replace(/\bn\s*=\s*(\d+)\b/gi, "based on $1 observations");
+  s = s.replace(/\b(r|p|slope|std|var|z)\s*=\s*-?\d+(\.\d+)?\b/gi, "");
+  s = s.replace(/\bCV\s*=\s*[\d.]+\b/gi, "wide spread");
+  s = s.replace(/\bSkew\s*=\s*[-\d.]+\b/gi, "lopsided spread");
+  // Phrase-level rewrites first (natural verbs, not single-word swaps).
+  s = s.replace(/\bcorrelates?\s+with\b/gi, "is linked to");
+  s = s.replace(/\bcorrelated\s+with\b/gi, "linked to");
+  s = s.replace(/\bnormal\s+distributions?\b/gi, "usual range");
+  s = s.replace(/\bstatistically\s+significant\b/gi, "meaningful");
+  // Word-level rewrites: math term -> business term.
+  s = s.replace(/\bcorrelations?\b/gi, "link");
+  s = s.replace(/\bcorrel\w*\b/gi, "link");
+  s = s.replace(/\bp[\s-]?values?\b/gi, "reliability check");
+  s = s.replace(/\bslopes?\b/gi, "trend");
+  s = s.replace(/\bcovariance?s?\b/gi, "joint movement");
+  s = s.replace(/\bvariance?s?\b/gi, "spread");
+  s = s.replace(/\bstd\.?\s*dev\w*/gi, "typical spread");
+  s = s.replace(/\bstandard\s+deviations?\b/gi, "typical spread");
+  s = s.replace(/\bstd\b\.?/gi, "typical spread");
+  s = s.replace(/\bz[\s-]?scores?\b/gi, "unusual reading");
+  s = s.replace(/\bconfidence\s+intervals?\b/gi, "expected range");
+  s = s.replace(/\bstatistically\b/gi, "reliably");
+  s = s.replace(/\bstatistical\b/gi, "data-based");
+  s = s.replace(/\bstatistic\w*\b/gi, "evidence");
+  s = s.replace(/\bregressions?\b/gi, "trend analysis");
+  s = s.replace(/\bR\^2\b|\bR-squared\b/gi, "pattern strength");
+  s = s.replace(/\bOLS\b/g, "trend analysis");
+  s = s.replace(/\bIQR\b/gi, "usual range");
+  s = s.replace(/\bANOVA\b/gi, "comparison");
+  s = s.replace(/\bchi[\s-]?squared?\b/gi, "comparison");
+  s = s.replace(/\bintercepts?\b/gi, "starting level");
+  s = s.replace(/\bcoefficients?\b/gi, "link");
+  s = s.replace(/\bdistributions?\b/gi, "spread");
+  // Cleanup artifacts left by removed numbers.
+  s = s.replace(/\s*,\s*,\s*/g, ", ");
+  s = s.replace(/\(\s*,/g, "(").replace(/,\s*\)/g, ")");
+  s = s.replace(/\s+([.,;:!?])/g, "$1");
+  s = s.replace(/\s{2,}/g, " ").trim();
+  s = s.replace(/^[,;:\-–—\s]+/, "").trim();
+  return s;
+}
+
+/* Display helpers: title / description / magnitude in plain business words.
+   Data identical — only wording. Falls back to humanized raw when plain
+   would empty the string, so cards never render blank. */
+function displayTitle(ins: Insight): string {
+  const p = plainBusiness(ins.title);
+  if (p && !containsBannedTerms(p)) return p;
+  const h = humanize(ins.title);
+  if (h && !containsBannedTerms(h)) return h;
+  return "Finding";
+}
+
+function displayDescription(ins: Insight): string {
+  const p = plainBusiness(ins.description);
+  if (!p || containsBannedTerms(p)) return "";
+  return p;
+}
+
+function displayMagnitude(ins: Insight): string {
+  const p = plainBusiness(ins.magnitude);
+  if (!p || containsBannedTerms(p)) return "";
+  return p;
+}
+
+function displayImpact(ins: Insight): string {
+  const raw = ins.businessImpact?.explanation || "";
+  const p = plainBusiness(raw);
+  if (p && !containsBannedTerms(p) && !isRoboticText(p)) return p;
+  return "";
+}
+
 function shortMetric(metric: string): string {
-  return humanize((metric || "").split(" (")[0]);
+  const h = humanize((metric || "").split(" (")[0]);
+  const p = plainBusiness(h);
+  return p || h;
 }
 
 /* ---- Real timestamps only: detectedAt -> "Today, 09:18 AM" style. ---- */
@@ -185,21 +284,21 @@ function relTime(iso: string): string {
 function takeawayTone(text: string): { Icon: typeof Lightbulb; wrap: string } {
   const t = (text || "").toLowerCase();
   if (/(risk|declin|drop|fall|caution|watch|concern|threat|loss)/.test(t)) {
-    return { Icon: AlertTriangle, wrap: "bg-rose-50 text-rose-600" };
+    return { Icon: AlertTriangle, wrap: "bg-rose-50 dark:bg-rose-500/10 text-rose-600 dark:text-rose-400" };
   }
   if (/(growth|opportunit|increas|improv|gain|uplift|strong|record)/.test(t)) {
-    return { Icon: Lightbulb, wrap: "bg-emerald-50 text-emerald-600" };
+    return { Icon: Lightbulb, wrap: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" };
   }
-  return { Icon: Sparkles, wrap: "bg-blue-50 text-blue-600" };
+  return { Icon: Sparkles, wrap: "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400" };
 }
 
 /* ---- Trust (§12): confidence only from computed evidence ---- */
 function confidenceInfo(conf?: number): { label: string; dots: number; tone: string } {
   const c = typeof conf === "number" ? conf : -1;
-  if (c >= 75) return { label: "High confidence", dots: 3, tone: "text-emerald-600" };
-  if (c >= 50) return { label: "Moderate confidence", dots: 2, tone: "text-blue-600" };
-  if (c >= 30) return { label: "Limited evidence", dots: 1, tone: "text-slate-500" };
-  return { label: "Insufficient data", dots: 0, tone: "text-slate-400" };
+  if (c >= 75) return { label: "High confidence", dots: 3, tone: "text-emerald-600 dark:text-emerald-400" };
+  if (c >= 50) return { label: "Moderate confidence", dots: 2, tone: "text-blue-600 dark:text-blue-400" };
+  if (c >= 30) return { label: "Limited evidence", dots: 1, tone: "text-muted-foreground" };
+  return { label: "Insufficient data", dots: 0, tone: "text-muted-foreground" };
 }
 
 /* Short status-panel wording for confidence (Strong / Moderate / Limited). */
@@ -213,7 +312,7 @@ function confidenceShort(conf?: number): string {
 
 function evidenceQualityOf(ins: Insight): string {
   const raw = ins.evidenceQuality ?? (ins.evidence as unknown as Record<string, unknown> | undefined)?.quality;
-  if (typeof raw === "string" && raw.trim()) return humanize(raw);
+  if (typeof raw === "string" && raw.trim()) return plainBusiness(humanize(raw)) || humanize(raw);
   if (typeof raw === "number" && !isNaN(raw)) return confidenceShort(raw);
   return "Not reported";
 }
@@ -224,7 +323,7 @@ function ConfidenceDots({ conf }: { conf?: number }) {
     <span className="inline-flex items-center gap-1.5" title={typeof conf === "number" ? `${info.label} (${conf}%)` : info.label}>
       <span className="flex items-center gap-0.5" aria-hidden>
         {[0, 1, 2].map((i) => (
-          <span key={i} className={`w-1.5 h-1.5 rounded-full ${i < info.dots ? "bg-emerald-500" : "bg-slate-200"}`} />
+          <span key={i} className={`w-1.5 h-1.5 rounded-full ${i < info.dots ? "bg-emerald-500" : "bg-border"}`} />
         ))}
       </span>
       <span className={`text-[10px] font-medium ${info.tone}`}>{info.label}</span>
@@ -296,20 +395,20 @@ function ChartCaption({ ins }: { ins: Insight }) {
   const [title, sub] = map[cat] || ["Evidence chart", "Hover any mark for its exact value."];
   return (
     <div className="mb-1.5">
-      <p className="text-[12px] font-semibold text-[#0F2440]">{title}</p>
-      <p className="text-[10px] text-slate-500">{sub}</p>
+      <p className="text-[12px] font-semibold text-foreground">{title}</p>
+      <p className="text-[10px] text-muted-foreground">{sub}</p>
     </div>
   );
 }
 
 /* Category pill meta — premium light tints, no orange anywhere. */
 const CAT_META: Record<Category, { label: string; Icon: typeof TrendingUp; pill: string; iconWrap: string }> = {
-  trends: { label: "Trend", Icon: TrendingUp, pill: "bg-violet-50 text-violet-700 border-violet-200", iconWrap: "bg-violet-50 text-violet-600" },
-  anomalies: { label: "Anomaly", Icon: AlertTriangle, pill: "bg-blue-50 text-blue-700 border-blue-200", iconWrap: "bg-blue-50 text-blue-600" },
+  trends: { label: "Trend", Icon: TrendingUp, pill: "bg-violet-50 dark:bg-violet-500/10 text-violet-700 dark:text-violet-400 border-violet-200 dark:border-violet-500/25", iconWrap: "bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400" },
+  anomalies: { label: "Anomaly", Icon: AlertTriangle, pill: "bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/25", iconWrap: "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400" },
   performance: { label: "Performance", Icon: BarChart3, pill: "bg-sky-50 text-sky-700 border-sky-200", iconWrap: "bg-sky-50 text-sky-600" },
-  relationships: { label: "Relationship", Icon: GitBranch, pill: "bg-indigo-50 text-indigo-700 border-indigo-200", iconWrap: "bg-indigo-50 text-indigo-600" },
-  opportunities: { label: "Opportunity", Icon: Lightbulb, pill: "bg-emerald-50 text-emerald-700 border-emerald-200", iconWrap: "bg-emerald-50 text-emerald-600" },
-  risks: { label: "Risk", Icon: Shield, pill: "bg-rose-50 text-rose-700 border-rose-200", iconWrap: "bg-rose-50 text-rose-600" },
+  relationships: { label: "Relationship", Icon: GitBranch, pill: "bg-indigo-50 dark:bg-indigo-500/10 text-indigo-700 dark:text-indigo-400 border-indigo-200 dark:border-indigo-500/25", iconWrap: "bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-400" },
+  opportunities: { label: "Opportunity", Icon: Lightbulb, pill: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25", iconWrap: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" },
+  risks: { label: "Risk", Icon: Shield, pill: "bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/25", iconWrap: "bg-rose-50 dark:bg-rose-500/10 text-rose-600 dark:text-rose-400" },
 };
 
 function CatPill({ ins }: { ins: Insight }) {
@@ -333,7 +432,7 @@ function InteractiveEvidenceChart({ ins, height = 260, onDrillDown }: { ins: Ins
   if (!ins.visualization?.data?.length || !spec) {
     const unsupported = ins.visualization?.unsupported === true;
     return (
-      <p className="text-xs text-slate-500">
+      <p className="text-xs text-muted-foreground">
         {unsupported
           ? "This chart type isn't supported for this data — supporting values below still describe the evidence."
           : "Chart unavailable for this insight — supporting values below still describe the evidence."}
@@ -344,7 +443,7 @@ function InteractiveEvidenceChart({ ins, height = 260, onDrillDown }: { ins: Ins
     return (
       <div>
         <InsightChart spec={spec} height={height} onDrillDown={onDrillDown} />
-        <p className="mt-1 text-[11px] text-slate-500">Limited history — treat the shape as indicative, not conclusive.</p>
+        <p className="mt-1 text-[11px] text-muted-foreground">Limited history — treat the shape as indicative, not conclusive.</p>
       </div>
     );
   }
@@ -378,15 +477,15 @@ function EvidenceDataTable({ ins }: { ins: Insight }) {
   };
   return (
     <details className="mt-2">
-      <summary className="cursor-pointer text-[11px] font-medium text-blue-600 hover:underline">
+      <summary className="cursor-pointer text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:underline">
         View data table
       </summary>
-      <div className="mt-1.5 overflow-x-auto rounded-lg border border-slate-200">
+      <div className="mt-1.5 overflow-x-auto rounded-lg border border-border">
         <table className="w-full text-[11px]">
           <thead>
-            <tr className="bg-slate-50">
+            <tr className="bg-secondary">
               {cols.map((c) => (
-                <th key={c} scope="col" className="px-2.5 py-1.5 text-left font-semibold text-[#0F2440]">
+                <th key={c} scope="col" className="px-2.5 py-1.5 text-left font-semibold text-foreground">
                   {humanize(c)}
                 </th>
               ))}
@@ -394,9 +493,9 @@ function EvidenceDataTable({ ins }: { ins: Insight }) {
           </thead>
           <tbody>
             {rows.map((r, i) => (
-              <tr key={i} className="border-t border-slate-100">
+              <tr key={i} className="border-t border-border">
                 {cols.map((c) => (
-                  <td key={c} className="px-2.5 py-1.5 text-slate-500">
+                  <td key={c} className="px-2.5 py-1.5 text-muted-foreground">
                     {cell(r[c])}
                   </td>
                 ))}
@@ -429,18 +528,21 @@ function writeCopilotContext(ins: Insight, question: string, segment?: string | 
 }
 
 /* ---- Normalize backend limitations (top-level or evidence-level) into
-   display lines. Renders only when the backend sent them — never invented. */
+   display lines. Reworded to plain business language; renders only when the
+   backend sent them — never invented. */
 function limitationLines(ins: Insight): string[] {
   const raw = ins.limitations ?? ins.evidence?.limitations;
   const list = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
   return list
     .filter((l): l is string => typeof l === "string" && l.trim().length > 0)
-    .map((l) => l.trim().slice(0, 200))
-    .filter((l) => !isRoboticText(l));
+    .map((l) => plainBusiness(l).slice(0, 200))
+    .filter((l) => l && !isRoboticText(l) && !containsBannedTerms(l));
 }
 
 /* ---- Robotic-fallback guard: sections hide when content is empty or
-   still carries raw schema / SQL / engine internals. Never shown. ---- */
+   still carries raw schema / SQL / engine internals or math jargon.
+   plainBusiness runs first so genuine findings show in business words;
+   anything still technical hides instead of leaking. Never shown. ---- */
 function isRoboticText(v: unknown): boolean {
   if (typeof v !== "string") return true;
   const s = v.trim();
@@ -450,33 +552,42 @@ function isRoboticText(v: unknown): boolean {
   // Raw SQL leaks are conventionally UPPERCASE; everyday words like "from"
   // must survive in conversational prose, so this match is case-sensitive.
   if (/\b(SELECT|FROM|WHERE|GROUP BY|ORDER BY|JOIN|SQL)\b/.test(s)) return true;
-  if (/\bp-?value\b|\bz-?score\b|\bR\^2\b|\bR-squared\b|\bOLS\b|\bIQR\b|\bCV\s*=\s*[\d.]|\bSkew\s*=/i.test(s)) return true;
+  if (/\bcorrel\w*|\bp[\s-]?values?|\bslopes?|\bvariance?s?|\bcovariance?s?|\bstd\b|\bstandard\s+deviations?|\bz[\s-]?scores?|\bconfidence\s+intervals?|\bstatistic\w*|\bregressions?|\bR\^2\b|\bR-squared\b|\bOLS\b|\bIQR\b|\bANOVA\b|\bchi[\s-]?squared?|\bCV\s*=\s*[\d.]|\bSkew\s*=/i.test(s)) return true;
   if (/\bFK\b|\bforeign key\b/i.test(s)) return true;
   if (/^Ranked \d+ .* by /i.test(s)) return true; // legacy robotic template
   return false;
 }
 
-/* Key takeaways: backend takeaways when provided; otherwise ONLY items the
-   backend actually sent (observations / supporting metrics) — never derived
-   numbers or invented claims. Robotic or empty lines are dropped so the
-   section hides instead of showing filler. */
+/* Key takeaways: backend takeaways when provided, reworded to plain business
+   language (what happened / why it matters / what to do next); otherwise ONLY
+   items the backend actually sent (observations / supporting metrics) — never
+   derived numbers or invented claims. Robotic, technical or empty lines are
+   dropped so the section hides instead of showing filler. */
 function takeawayLines(ins: Insight): string[] {
+  const clean = (t: string): string => plainBusiness(t).trim().slice(0, 240);
+  const keep = (t: string): boolean => {
+    if (!t || t.length < 4) return false;
+    if (isRoboticText(t) || containsBannedTerms(t)) return false;
+    return true;
+  };
   const direct = Array.isArray(ins.takeaways) ? ins.takeaways.filter((t): t is string => typeof t === "string" && t.trim().length > 0) : [];
-  if (direct.length) return direct.filter((t) => !isRoboticText(t)).slice(0, 4).map((t) => t.trim().slice(0, 240));
+  if (direct.length) return direct.map(clean).filter(keep).slice(0, 4);
   const obs = (ins.evidence?.observations || []).filter((o) => typeof o === "string" && o.trim());
   const sup = (ins.evidence?.supportingMetrics || []).filter((m) => typeof m === "string" && m.trim());
-  return [...obs, ...sup].filter((t) => !isRoboticText(t)).slice(0, 4).map((t) => t.trim().slice(0, 240));
+  return [...obs, ...sup].map(clean).filter(keep).slice(0, 4);
 }
 
-/* ARIA explains: prefer the backend's conversational `explains` prose.
-   Falls back to a short reading of title + first observation. Returns ""
-   when nothing meaningful exists so the section hides. */
+/* ARIA explains: prefer the backend's conversational `explains` prose,
+   reworded to plain business language. Returns "" when nothing meaningful
+   exists so the section hides. */
 function explainsTextOf(ins: Insight): string {
   const direct = typeof (ins as unknown as Record<string, unknown>).explains === "string"
     ? String((ins as unknown as Record<string, unknown>).explains).trim()
     : "";
-  if (direct && !isRoboticText(direct)) return direct.slice(0, 2000);
-  return "";
+  if (!direct) return "";
+  const plain = plainBusiness(direct).slice(0, 2000);
+  if (!plain || isRoboticText(plain) || containsBannedTerms(plain)) return "";
+  return plain;
 }
 
 /** Split explains text into paragraphs for rendering. */
@@ -501,19 +612,34 @@ function associatedFactorsOf(ins: Insight): string[] {
 }
 
 function recommendationTextOf(ins: Insight): string {
-  if (typeof ins.recommendation === "string" && ins.recommendation.trim() && !isRoboticText(ins.recommendation)) return ins.recommendation.trim().slice(0, 400);
+  const clean = (v: string): string => {
+    const p = plainBusiness(v).trim().slice(0, 400);
+    if (!p || isRoboticText(p) || containsBannedTerms(p)) return "";
+    return p;
+  };
+  if (typeof ins.recommendation === "string" && ins.recommendation.trim()) {
+    const c = clean(ins.recommendation);
+    if (c) return c;
+  }
   if (ins.recommendation && typeof ins.recommendation === "object") {
     const t = (ins.recommendation.text || ins.recommendation.title || "").trim();
-    if (t && !isRoboticText(t)) return t.slice(0, 400);
+    if (t) {
+      const c = clean(t);
+      if (c) return c;
+    }
   }
   const q = (ins.recommendedNextAnalysis?.question || "").trim();
-  if (q && !isRoboticText(q)) return q.slice(0, 400);
+  if (q) {
+    const c = clean(q);
+    if (c) return c;
+  }
   const det = ins.recommendation_detail;
   if (det?.title) {
     const bits = [det.title, ...(det.steps || []).slice(0, 1)];
     if (det.outcome) bits.push(`Expected: ${det.outcome}`);
     const joined = bits.join(" — ");
-    if (!isRoboticText(joined)) return joined.slice(0, 400);
+    const c = clean(joined);
+    if (c) return c;
   }
   return "";
 }
@@ -521,12 +647,139 @@ function recommendationTextOf(ins: Insight): string {
 function recommendationDetailOf(ins: Insight): { title: string; steps: string[]; outcome: string } | null {
   const det = ins.recommendation_detail;
   if (!det || typeof det !== "object") return null;
-  const title = typeof det.title === "string" ? det.title.trim() : "";
-  const steps = Array.isArray(det.steps) ? det.steps.filter((s): s is string => typeof s === "string" && s.trim().length > 0).map((s) => s.trim().slice(0, 300)) : [];
-  const outcome = typeof det.outcome === "string" ? det.outcome.trim().slice(0, 300) : "";
+  const clean = (v: string, cap: number): string => {
+    const p = plainBusiness(v).trim().slice(0, cap);
+    if (!p || isRoboticText(p) || containsBannedTerms(p)) return "";
+    return p;
+  };
+  const titleRaw = typeof det.title === "string" ? det.title.trim() : "";
+  const title = titleRaw ? clean(titleRaw, 300) : "";
+  const steps = Array.isArray(det.steps)
+    ? det.steps
+        .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+        .map((s) => clean(s, 300))
+        .filter((s) => s.length > 0)
+        .slice(0, 2)
+    : [];
+  const outcomeRaw = typeof det.outcome === "string" ? det.outcome.trim().slice(0, 300) : "";
+  const outcome = outcomeRaw ? clean(outcomeRaw, 300) : "";
   if (!title && !steps.length && !outcome) return null;
-  if (title && isRoboticText(title) && !steps.length) return null;
+  if (!title && !steps.length) return null;
   return { title, steps: steps.slice(0, 2), outcome };
+}
+
+/* ---- Helpfulness upgrades (wording/structure only — no data, chart or
+   API changes). Every helper reads only fields the backend already sent
+   and returns "" when data is missing so callers render nothing. All
+   copy uses plain everyday words. ---- */
+function isFiniteNum(v: unknown): v is number {
+  return typeof v === "number" && isFinite(v);
+}
+
+/* Plain attention label for severity codes — never shows raw high/medium/low. */
+function severityPlain(sev: string): string {
+  const s = (sev || "").toLowerCase().trim();
+  if (s === "high") return "Needs attention now";
+  if (s === "medium") return "Worth a look";
+  if (s === "low") return "For your information";
+  return "";
+}
+
+/* Humanized monitoring range — plain words only, "" when missing/technical. */
+function expectedRangePlain(ins: Insight): string {
+  const raw = ins.monitoring?.expectedRange;
+  if (typeof raw !== "string" || !raw.trim()) return "";
+  const p = plainBusiness(raw).trim().slice(0, 160);
+  if (!p || isRoboticText(p) || containsBannedTerms(p)) return "";
+  return p;
+}
+
+/* 1) Decision sentence: what changed + by how much + what to do,
+   all from the insight's own numbers and recommendation. */
+function decisionSentenceOf(ins: Insight): string {
+  const metricLabel = shortMetric(ins.metric || "");
+  const titleLabel = displayTitle(ins);
+  const what = metricLabel || titleLabel || "";
+  if (!what) return "";
+  let how = displayMagnitude(ins).trim();
+  const cp = ins.evidence?.changePercent;
+  if (!how && isFiniteNum(cp) && cp !== 0) {
+    const dir = cp > 0 ? "up" : "down";
+    how = `${dir} ${Math.abs(cp)}%`;
+  }
+  const base = ins.evidence?.baseline;
+  const cur = ins.evidence?.currentValue;
+  if (!how && isFiniteNum(base) && isFiniteNum(cur)) {
+    how = `from ${fmtMoney(base)} to ${fmtMoney(cur)}`;
+  }
+  if (!how) return "";
+  const det = recommendationDetailOf(ins);
+  const action = (det?.title || det?.steps?.[0] || recommendationTextOf(ins) || "").trim().slice(0, 160);
+  if (!action) return "";
+  const periodRaw = (ins.affectedPeriod || "").trim().slice(0, 60);
+  const periodPlain = periodRaw ? (plainBusiness(periodRaw) || periodRaw) : "";
+  if (containsBannedTerms(periodPlain) || isRoboticText(periodPlain)) return "";
+  const sentence = periodPlain
+    ? `${what} changed ${how} in ${periodPlain} — ${action}`
+    : `${what} changed ${how} — ${action}`;
+  if (!sentence || isRoboticText(sentence) || containsBannedTerms(sentence)) return "";
+  return sentence.slice(0, 320);
+}
+
+/* 2) Anomaly baseline from monitoring band + evidence fields. */
+function anomalyBaselineOf(ins: Insight): string {
+  const t = (ins.type || "").toLowerCase();
+  if (!t.includes("anomal") && !t.includes("outlier")) return "";
+  const usual = expectedRangePlain(ins)
+    || (isFiniteNum(ins.evidence?.baseline) ? fmtMoney(ins.evidence.baseline) : "");
+  const thisTime = isFiniteNum(ins.evidence?.currentValue) ? fmtMoney(ins.evidence.currentValue) : "";
+  if (!usual || !thisTime || usual === "—" || thisTime === "—") return "";
+  const started = fmtWhen(ins.detectedAt || "") || (ins.affectedPeriod || "").trim().slice(0, 60);
+  const lasted = isFiniteNum(ins.evidence?.sampleSize) && (ins.evidence?.sampleSize as number) > 0
+    ? `${ins.evidence?.sampleSize} periods`
+    : "";
+  let tail = "";
+  if (started && lasted) tail = ` (started ${started}, lasted ${lasted})`;
+  else if (started) tail = ` (started ${started})`;
+  else if (lasted) tail = ` (lasted ${lasted})`;
+  const sentence = `Usually ${usual}, this time ${thisTime}${tail}`;
+  if (isRoboticText(sentence) || containsBannedTerms(sentence)) return "";
+  return sentence.slice(0, 320);
+}
+
+/* 3) At-stake estimate: affected records x typical value, in plain words. */
+function atStakeOf(ins: Insight): string {
+  const records = ins.evidence?.sampleSize;
+  const typical = isFiniteNum(ins.evidence?.baseline)
+    ? ins.evidence?.baseline as number
+    : isFiniteNum(ins.evidence?.currentValue)
+      ? ins.evidence?.currentValue as number
+      : isFiniteNum(ins.metricValue)
+        ? ins.metricValue as number
+        : null;
+  if (!isFiniteNum(records) || (records as number) < 1 || typical === null || !isFinite(typical)) return "";
+  const total = (records as number) * (typical as number);
+  if (!isFinite(total) || total <= 0) return "";
+  return `About ${Math.round(records as number).toLocaleString()} records at roughly ${fmtMoney(typical)} each — about ${fmtMoney(total)} at stake.`;
+}
+
+/* 4) One plain "why shown" clause per evidence row. */
+function whyShownFor(kind: string): string {
+  const k = (kind || "").toLowerCase();
+  if (k.includes("observ")) return "shown because it is what actually happened.";
+  if (k.includes("compar")) return "shown to put the change in context.";
+  if (k.includes("scope") || k.includes("segment")) return "shown to say where this applies.";
+  if (k.includes("quality") || k.includes("strength")) return "shown to say how much proof sits behind this.";
+  if (k.includes("support") || k.includes("metric")) return "shown because it backs up the change.";
+  return "shown because it supports this finding.";
+}
+
+/* Shared drill context — same localStorage pattern Dashboard uses
+   (localStorage `aria_dashboard_drill`), then the caller navigates. */
+function storeDrillContextLocal(ctx: Record<string, unknown>): void {
+  try {
+    localStorage.setItem("aria_dashboard_drill", JSON.stringify({ at: Date.now(), ...ctx }));
+  } catch { /* private mode: navigation still works */ }
 }
 
 /* ============================ Main page ============================ */
@@ -567,6 +820,8 @@ export default function Insights({
   const [sessionInfo, setSessionInfo] = useState<{ dbName: string; sourceType: string }>({ dbName: "", sourceType: "" });
   // data-aware drill-down context (e.g. click a bar to focus a segment).
   const [drill, setDrill] = useState<{ insightId: string; label: string; value: number | string | null } | null>(null);
+  // 5) Owner + review-by per recommended steps — local state only, never sent.
+  const [ownerById, setOwnerById] = useState<Record<string, { owner: string; reviewBy: string }>>({});
   const abortRef = useRef<AbortController | null>(null);
 
   const fetchInsights = useCallback(async () => {
@@ -801,6 +1056,23 @@ export default function Insights({
     else askCopilot(ins, `Forecast ${shortMetric(ins.metric) || "this metric"} over the next periods given: ${ins.description}`);
   };
 
+  /* 7) Cross-links per insight — all reuse existing handoff mechanisms:
+     dashboard via the drill-context pattern (localStorage
+     `aria_dashboard_drill`), forecast via the existing forecast prefill. */
+  const openDashboard = (ins: Insight) => {
+    persistHandoff(ins);
+    const dims = ins.recommendedNextAnalysis?.dimensions || [];
+    storeDrillContextLocal({
+      kind: "insight",
+      insight_id: ins.id,
+      ...(ins.metric ? { metric: ins.metric } : {}),
+      ...(dims[0] ? { dimension: dims[0], breakdown: dims[0] } : {}),
+      ...(ins.affectedPeriod ? { period: ins.affectedPeriod } : {}),
+      ...(ins.source?.tables?.[0] ? { dataset: ins.source.tables[0], table: ins.source.tables[0] } : {}),
+    });
+    if (setPage) setPage("dashboard");
+  };
+
   const toggleSave = async (ins: Insight) => {
     const isSaved = savedIds.includes(ins.id);
     try {
@@ -818,9 +1090,9 @@ export default function Insights({
   };
 
   const handleShare = async (ins: Insight) => {
-    const text = `${ins.title}\n\n${ins.description}\n\nMetric: ${shortMetric(ins.metric) || "—"}\nConfidence: ${typeof ins.confidence === "number" ? `${ins.confidence}%` : "not reported"}`;
+    const text = `${displayTitle(ins)}\n\n${displayDescription(ins)}\n\nMetric: ${shortMetric(ins.metric) || "—"}\nConfidence: ${typeof ins.confidence === "number" ? `${ins.confidence}%` : "not reported"}`;
     try {
-      if (navigator.share) await navigator.share({ title: ins.title, text });
+      if (navigator.share) await navigator.share({ title: displayTitle(ins), text });
       else await navigator.clipboard.writeText(text);
     } catch { /* dismissed */ }
   };
@@ -848,15 +1120,15 @@ export default function Insights({
   /* ------------------------- Failure / empty states ------------------------- */
   if (connectionStatus !== "connected") {
     return (
-      <div className="min-h-full bg-white text-[#0F2440]">
+      <div className="min-h-full bg-card text-foreground">
         <div className="p-6 max-w-screen-xl mx-auto">
-          <p className="text-[11px] font-bold tracking-[0.14em] text-blue-600">ARIA INSIGHTS</p>
+          <p className="text-[11px] font-bold tracking-[0.14em] text-blue-600 dark:text-blue-400">ARIA INSIGHTS</p>
           <h2 className="text-xl font-semibold tracking-tight">Insights</h2>
-          <p className="text-sm text-slate-500 mt-0.5">ARIA automatically finds meaningful patterns in your connected data.</p>
-          <div className="mt-8 text-center py-12 bg-white border border-slate-200 rounded-2xl shadow-sm">
-            <Database size={22} className="mx-auto text-slate-400 mb-3" />
+          <p className="text-sm text-muted-foreground mt-0.5">ARIA automatically finds meaningful patterns in your connected data.</p>
+          <div className="mt-8 text-center py-12 bg-card border border-border rounded-2xl shadow-sm">
+            <Database size={22} className="mx-auto text-muted-foreground mb-3" />
             <p className="text-sm font-medium">No data source connected</p>
-            <p className="text-xs text-slate-500 mt-1">Connect PostgreSQL, MySQL, or upload a CSV to let ARIA investigate your data.</p>
+            <p className="text-xs text-muted-foreground mt-1">Connect PostgreSQL, MySQL, or upload a CSV to let ARIA investigate your data.</p>
           </div>
         </div>
       </div>
@@ -865,39 +1137,39 @@ export default function Insights({
 
   if (loading) {
     return (
-      <div className="min-h-full bg-white text-[#0F2440]" aria-busy="true">
+      <div className="min-h-full bg-card text-foreground" aria-busy="true">
         <div className="p-6 max-w-screen-xl mx-auto">
           <p className="sr-only">Analyzing your data — loading insights…</p>
-          <div className="rounded-2xl border border-slate-200 bg-gradient-to-br from-blue-50 via-white to-indigo-50 p-6 animate-pulse" aria-hidden>
-            <div className="h-3 w-24 rounded bg-slate-200" />
-            <div className="mt-3 h-6 w-2/3 rounded bg-slate-200" />
-            <div className="mt-2 h-4 w-1/2 rounded bg-slate-100" />
+          <div className="rounded-2xl border border-border bg-gradient-to-br from-blue-50 dark:from-blue-500/10 via-card to-indigo-50 dark:to-indigo-500/10 p-6 animate-pulse" aria-hidden>
+            <div className="h-3 w-24 rounded bg-border" />
+            <div className="mt-3 h-6 w-2/3 rounded bg-border" />
+            <div className="mt-2 h-4 w-1/2 rounded bg-secondary" />
             <div className="mt-4 flex gap-2">
-              <div className="h-7 w-20 rounded-full bg-slate-200" />
-              <div className="h-7 w-20 rounded-full bg-slate-100" />
-              <div className="h-7 w-24 rounded-full bg-slate-100" />
+              <div className="h-7 w-20 rounded-full bg-border" />
+              <div className="h-7 w-20 rounded-full bg-secondary" />
+              <div className="h-7 w-24 rounded-full bg-secondary" />
             </div>
           </div>
           <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4" aria-hidden>
             {[0, 1, 2, 3, 4, 5].map((i) => (
-              <div key={i} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm animate-pulse">
+              <div key={i} className="rounded-2xl border border-border bg-card p-4 shadow-sm animate-pulse">
                 <div className="flex items-center gap-2">
-                  <div className="w-6 h-6 rounded-full bg-slate-200" />
-                  <div className="h-3 w-20 rounded-full bg-slate-200" />
+                  <div className="w-6 h-6 rounded-full bg-border" />
+                  <div className="h-3 w-20 rounded-full bg-border" />
                 </div>
-                <div className="mt-3 h-4 w-3/4 rounded bg-slate-200" />
-                <div className="mt-2 h-3 w-full rounded bg-slate-100" />
-                <div className="mt-2 h-3 w-5/6 rounded bg-slate-100" />
-                <div className="mt-3 h-28 rounded-xl bg-slate-100" />
+                <div className="mt-3 h-4 w-3/4 rounded bg-border" />
+                <div className="mt-2 h-3 w-full rounded bg-secondary" />
+                <div className="mt-2 h-3 w-5/6 rounded bg-secondary" />
+                <div className="mt-3 h-28 rounded-xl bg-secondary" />
                 <div className="mt-3 flex items-center gap-2">
-                  <div className="h-3 w-24 rounded bg-slate-100" />
-                  <div className="ml-auto h-3 w-20 rounded bg-slate-200" />
+                  <div className="h-3 w-24 rounded bg-secondary" />
+                  <div className="ml-auto h-3 w-20 rounded bg-border" />
                 </div>
               </div>
             ))}
           </div>
           <div className="text-center py-6">
-            <button onClick={() => abortRef.current?.abort()} className="text-xs text-slate-400 hover:text-[#0F2440] underline">Cancel loading</button>
+            <button onClick={() => abortRef.current?.abort()} className="text-xs text-muted-foreground hover:text-foreground underline">Cancel loading</button>
           </div>
         </div>
       </div>
@@ -913,21 +1185,21 @@ export default function Insights({
       : errorKind === "analysis" ? "Analysis unavailable."
       : "";
     return (
-      <div className="min-h-full bg-white text-[#0F2440]">
+      <div className="min-h-full bg-card text-foreground">
         <div className="p-6 max-w-screen-xl mx-auto">
-          <p className="text-[11px] font-bold tracking-[0.14em] text-blue-600">ARIA INSIGHTS</p>
+          <p className="text-[11px] font-bold tracking-[0.14em] text-blue-600 dark:text-blue-400">ARIA INSIGHTS</p>
           <h2 className="text-xl font-semibold tracking-tight">Insights</h2>
-          <p className="text-sm text-slate-500 mt-0.5">ARIA automatically finds meaningful patterns in your connected data.</p>
-          <div className="mt-6 bg-white border border-slate-200 rounded-2xl p-5 flex gap-3 shadow-sm">
-            <AlertTriangle size={18} className="text-rose-500 flex-shrink-0 mt-0.5" />
+          <p className="text-sm text-muted-foreground mt-0.5">ARIA automatically finds meaningful patterns in your connected data.</p>
+          <div className="mt-6 bg-card border border-border rounded-2xl p-5 flex gap-3 shadow-sm">
+            <AlertTriangle size={18} className="text-rose-500 dark:text-rose-400 flex-shrink-0 mt-0.5" />
             <div>
               <p className="text-sm font-medium">ARIA couldn&apos;t generate insights for this dataset{kindLabel ? ` — ${kindLabel}` : ""}</p>
-              <p className="text-xs text-slate-500 mt-1">{msg}</p>
+              <p className="text-xs text-muted-foreground mt-1">{msg}</p>
               {errorRequestId && (
-                <p className="text-[11px] text-slate-400 mt-1 font-mono">Request ID: {errorRequestId}</p>
+                <p className="text-[11px] text-muted-foreground mt-1 font-mono">Request ID: {errorRequestId}</p>
               )}
-              <p className="text-xs text-slate-500 mt-1">ARIA needs a measurable metric with enough historical observations. Check for empty tables, missing date fields, or excessive nulls.</p>
-              <button onClick={fetchInsights} className="mt-2 text-xs text-blue-600 hover:underline">Try again</button>
+              <p className="text-xs text-muted-foreground mt-1">ARIA needs a measurable metric with enough historical observations. Check for empty tables, missing date fields, or excessive nulls.</p>
+              <button onClick={fetchInsights} className="mt-2 text-xs text-blue-600 dark:text-blue-400 hover:underline">Try again</button>
             </div>
           </div>
         </div>
@@ -937,23 +1209,23 @@ export default function Insights({
 
   if (!allInsights.length) {
     return (
-      <div className="min-h-full bg-white text-[#0F2440]">
+      <div className="min-h-full bg-card text-foreground">
         <div className="p-6 max-w-screen-xl mx-auto">
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-[11px] font-bold tracking-[0.14em] text-blue-600">ARIA INSIGHTS</p>
+              <p className="text-[11px] font-bold tracking-[0.14em] text-blue-600 dark:text-blue-400">ARIA INSIGHTS</p>
               <h2 className="text-xl font-semibold tracking-tight">What did ARIA learn today?</h2>
-              <p className="text-sm text-slate-500 mt-0.5">ARIA automatically finds meaningful patterns in your connected data.</p>
+              <p className="text-sm text-muted-foreground mt-0.5">ARIA automatically finds meaningful patterns in your connected data.</p>
             </div>
-            <button onClick={fetchInsights} className="p-2 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-[#0F2440] transition-colors" title="Refresh Analysis">
+            <button onClick={fetchInsights} className="p-2 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors" title="Refresh Analysis">
               <RefreshCw size={14} />
             </button>
           </div>
-          <div className="mt-8 text-center py-12 bg-white border border-slate-200 rounded-2xl shadow-sm">
-            <Sparkles size={22} className="mx-auto text-slate-400 mb-3" />
+          <div className="mt-8 text-center py-12 bg-card border border-border rounded-2xl shadow-sm">
+            <Sparkles size={22} className="mx-auto text-muted-foreground mb-3" />
             <p className="text-sm font-medium">ARIA hasn&apos;t identified any strong patterns yet.</p>
-            <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">Weak evidence is never promoted into a business claim. Try a broader question in AI Analytics.</p>
-            <button onClick={() => setPage?.("analytics")} className="mt-3 text-xs font-medium text-blue-600 hover:underline">
+            <p className="text-xs text-muted-foreground mt-1 max-w-md mx-auto">Weak evidence is never promoted into a business claim. Try a broader question in AI Analytics.</p>
+            <button onClick={() => setPage?.("analytics")} className="mt-3 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline">
               Is there anything unusual about this dataset?
             </button>
           </div>
@@ -974,7 +1246,7 @@ export default function Insights({
             key={id}
             onClick={() => { setActiveFilter(id); }}
             aria-pressed={on}
-            className={`text-[11px] font-semibold px-3.5 py-1.5 rounded-full border transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1 ${on ? "bg-blue-700 text-white border-blue-700 shadow-md ring-1 ring-blue-700/30" : "bg-white/80 text-slate-600 border-slate-200 hover:border-blue-300 hover:text-[#0F2440] hover:shadow-sm"}`}
+            className={`text-[11px] font-semibold px-3.5 py-1.5 rounded-full border transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1 ${on ? "bg-blue-700 text-white border-blue-700 shadow-md ring-1 ring-blue-700/30" : "bg-white/80 text-secondary-foreground border-border hover:border-blue-300 dark:hover:border-blue-500/25 hover:text-foreground hover:shadow-sm"}`}
           >
             {f.label}{id !== "all" ? ` · ${n}` : ""}
           </button>
@@ -985,24 +1257,24 @@ export default function Insights({
 
   const toolbar = (
     <div className="mt-4 flex items-center gap-2 flex-wrap">
-      <p className="text-[12px] text-slate-600 mr-1">
-        <span className="font-semibold text-[#0F2440]">{filtered.length} of {allInsights.length}</span> insights
+      <p className="text-[12px] text-secondary-foreground mr-1">
+        <span className="font-semibold text-foreground">{filtered.length} of {allInsights.length}</span> insights
         {criticalOnly ? " · critical only" : ""}
         {metricFilter !== "All" ? ` · ${humanize(metricFilter)}` : ""}
       </p>
       <button
         onClick={() => setCriticalOnly((v) => !v)}
         aria-pressed={criticalOnly}
-        className={`text-[11px] font-semibold px-2.5 py-1 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-400 ${criticalOnly ? "bg-rose-600 text-white border-rose-600 shadow-sm" : "bg-white text-slate-500 border-slate-200 hover:text-[#0F2440] hover:border-rose-200"}`}
+        className={`text-[11px] font-semibold px-2.5 py-1 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-400 ${criticalOnly ? "bg-rose-600 text-white border-rose-600 shadow-sm" : "bg-card text-muted-foreground border-border hover:text-foreground hover:border-rose-200 dark:hover:border-rose-500/25"}`}
       >
         Critical · {counts.critical}
       </button>
       <div className="ml-auto flex items-center gap-1.5 min-w-0">
-        <Filter size={12} className="text-slate-400 flex-shrink-0" />
-        <select value={metricFilter} onChange={(e) => setMetricFilter(e.target.value)} className="text-[11px] bg-white border border-slate-200 rounded-lg px-2 py-1.5 text-[#0F2440] max-w-[180px]" aria-label="Filter by metric">
+        <Filter size={12} className="text-muted-foreground flex-shrink-0" />
+        <select value={metricFilter} onChange={(e) => setMetricFilter(e.target.value)} className="text-[11px] bg-card border border-border rounded-lg px-2 py-1.5 text-foreground max-w-[180px]" aria-label="Filter by metric">
           {metrics.map((m) => <option key={m} value={m}>{m === "All" ? "All metrics" : humanize(m)}</option>)}
         </select>
-        <button onClick={fetchInsights} className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-[#0F2440] transition-colors" title="Refresh Analysis" aria-label="Refresh analysis">
+        <button onClick={fetchInsights} className="p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors" title="Refresh Analysis" aria-label="Refresh analysis">
           <RefreshCw size={13} />
         </button>
       </div>
@@ -1010,9 +1282,9 @@ export default function Insights({
   );
 
   const dataSourceCard = (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+    <div className="rounded-2xl border border-border bg-card p-4 shadow-sm">
       <div className="flex items-center gap-2">
-        <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-blue-50 text-blue-600">
+        <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400">
           <Database size={15} />
         </span>
         <p className="text-[12px] font-semibold flex items-center gap-1.5">
@@ -1020,82 +1292,82 @@ export default function Insights({
           {displayDbName ? "Data Connected" : "Connected source"}
         </p>
       </div>
-      <button onClick={() => setPage?.("data")} className="mt-3 w-full text-left rounded-xl hover:bg-slate-50 p-2 -m-1 transition-colors" title="Open data center">
+      <button onClick={() => setPage?.("data")} className="mt-3 w-full text-left rounded-xl hover:bg-secondary p-2 -m-1 transition-colors" title="Open data center">
         <p className="text-[13px] font-semibold truncate">{displayDbName || selected?.source?.tables?.[0] || "Connected source"}</p>
-        {displaySourceType && <p className="text-[11px] text-slate-500">{humanize(displaySourceType)}</p>}
+        {displaySourceType && <p className="text-[11px] text-muted-foreground">{humanize(displaySourceType)}</p>}
       </button>
-      <div className="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500">
+      <div className="mt-2 pt-2 border-t border-border flex items-center justify-between text-[11px] text-muted-foreground">
         <span>Last analyzed</span>
-        <span className="font-medium text-slate-600" title={fetchedAt ? fmtWhen(fetchedAt) : undefined}>{fetchedAt ? relTime(fetchedAt) : "—"}</span>
+        <span className="font-medium text-secondary-foreground" title={fetchedAt ? fmtWhen(fetchedAt) : undefined}>{fetchedAt ? relTime(fetchedAt) : "—"}</span>
       </div>
       {samplingNote && (
-        <p className="mt-1.5 text-[10.5px] text-slate-400" title="Large datasets are analyzed on a bounded sample; conclusions are statistical, not row-exact.">{samplingNote} · sample-based</p>
+        <p className="mt-1.5 text-[10.5px] text-muted-foreground" title="Large datasets are analyzed on a bounded sample; conclusions are indicative, not row-exact.">{samplingNote} · sample-based</p>
       )}
-      <button onClick={() => setPage?.("data")} className="mt-1.5 text-[11px] font-semibold text-blue-600 hover:underline inline-flex items-center gap-1">
+      <button onClick={() => setPage?.("data")} className="mt-1.5 text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1">
         View data center <ChevronRight size={12} />
       </button>
     </div>
   );
 
   const recentCard = (
-    <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
-      <div className="flex items-center gap-4 px-4 pt-3 text-[12px] font-semibold border-b border-slate-100">
+    <div className="rounded-2xl border border-border bg-card shadow-sm overflow-hidden">
+      <div className="flex items-center gap-4 px-4 pt-3 text-[12px] font-semibold border-b border-border">
         {(["recent", "saved"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setRecentTab(t)}
-            className={`pb-2.5 -mb-px border-b-2 transition-colors ${recentTab === t ? "border-blue-600 text-[#0F2440]" : "border-transparent text-slate-400 hover:text-slate-600"}`}
+            className={`pb-2.5 -mb-px border-b-2 transition-colors ${recentTab === t ? "border-blue-600 text-foreground" : "border-transparent text-muted-foreground hover:text-secondary-foreground"}`}
           >
             {t === "recent" ? "Recent Insights" : `Saved${savedIds.length ? ` · ${savedIds.length}` : ""}`}
           </button>
         ))}
       </div>
-      <div className="divide-y divide-slate-100">
+      <div className="divide-y divide-border">
         {recentItems.length === 0 && (
-          <p className="px-4 py-5 text-[11px] text-slate-400">{recentTab === "saved" ? "No saved insights yet — tap the bookmark on any insight." : "No insights under the current filters."}</p>
+          <p className="px-4 py-5 text-[11px] text-muted-foreground">{recentTab === "saved" ? "No saved insights yet — tap the bookmark on any insight." : "No insights under the current filters."}</p>
         )}
         {recentItems.map((ins) => {
           const meta = CAT_META[primaryCategory(ins.type)];
           const Icon = meta.Icon;
           return (
-            <button key={ins.id} onClick={() => openInsight(ins.id)} className="w-full text-left px-4 py-2.5 flex items-center gap-2.5 hover:bg-blue-50/50 transition-colors group">
+            <button key={ins.id} onClick={() => openInsight(ins.id)} className="w-full text-left px-4 py-2.5 flex items-center gap-2.5 hover:bg-blue-50/50 dark:hover:bg-blue-500/10 transition-colors group">
               <span className={`inline-flex items-center justify-center w-7 h-7 rounded-full flex-shrink-0 ${meta.iconWrap}`}>
                 <Icon size={13} />
               </span>
               <span className="min-w-0 flex-1">
-                <span className="block text-[12px] font-medium text-[#0F2440] leading-snug line-clamp-2 group-hover:text-blue-700">{ins.title}</span>
-                <span className="block text-[10px] text-slate-400 mt-0.5">{fmtWhen(ins.detectedAt)}</span>
+                <span className="block text-[12px] font-medium text-foreground leading-snug line-clamp-2 group-hover:text-blue-700 dark:group-hover:text-blue-400">{displayTitle(ins)}</span>
+                <span className="block text-[10px] text-muted-foreground mt-0.5">{fmtWhen(ins.detectedAt)}</span>
               </span>
-              <ChevronRight size={13} className="text-slate-300 group-hover:text-blue-500 flex-shrink-0" />
+              <ChevronRight size={13} className="text-slate-300 dark:text-muted-foreground group-hover:text-blue-500 dark:group-hover:text-blue-400 flex-shrink-0" />
             </button>
           );
         })}
       </div>
-      <button onClick={() => { setActiveFilter("all"); setMetricFilter("All"); setCriticalOnly(false); setRecentTab("recent"); }} className="w-full text-left px-4 py-2.5 text-[11px] font-semibold text-blue-600 hover:underline">
+      <button onClick={() => { setActiveFilter("all"); setMetricFilter("All"); setCriticalOnly(false); setRecentTab("recent"); }} className="w-full text-left px-4 py-2.5 text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline">
         View all insights →
       </button>
     </div>
   );
 
   const askBar = (
-    <div className="rounded-2xl border border-blue-100 bg-gradient-to-r from-blue-50/80 to-indigo-50/80 p-4 flex flex-col sm:flex-row sm:items-center gap-3">
+    <div className="rounded-2xl border border-blue-100 dark:border-blue-500/20 bg-gradient-to-r from-blue-50/80 dark:from-blue-500/10 to-indigo-50/80 dark:to-indigo-500/10 p-4 flex flex-col sm:flex-row sm:items-center gap-3">
       <div className="flex items-center gap-3 min-w-0 sm:w-64 flex-shrink-0">
-        <span className="inline-flex items-center justify-center w-10 h-10 rounded-full bg-blue-100 text-blue-700 flex-shrink-0">
+        <span className="inline-flex items-center justify-center w-10 h-10 rounded-full bg-blue-100 dark:bg-blue-500/15 text-blue-700 dark:text-blue-400 flex-shrink-0">
           <Sparkles size={16} />
         </span>
         <span className="min-w-0">
           <span className="block text-[13px] font-semibold">Ask ARIA Anything</span>
-          <span className="block text-[11px] text-slate-500 leading-snug">Get deeper insights, ask follow-up questions, or explore your data in natural language.</span>
+          <span className="block text-[11px] text-muted-foreground leading-snug">Get deeper insights, ask follow-up questions, or explore your data in natural language.</span>
         </span>
       </div>
-      <div className="flex items-center gap-2 flex-1 min-w-0 bg-white border border-slate-200 rounded-xl pl-3 pr-1.5 py-1.5 shadow-sm focus-within:border-blue-400">
-        <MessageSquare size={14} className="text-slate-400 flex-shrink-0" />
+      <div className="flex items-center gap-2 flex-1 min-w-0 bg-card border border-border rounded-xl pl-3 pr-1.5 py-1.5 shadow-sm focus-within:border-blue-400">
+        <MessageSquare size={14} className="text-muted-foreground flex-shrink-0" />
         <input
           value={askText}
           onChange={(e) => setAskText(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") submitAskBar(); }}
           placeholder="Ask a question about your data…"
-          className="flex-1 min-w-0 bg-transparent text-[12px] text-[#0F2440] placeholder:text-slate-400 outline-none"
+          className="flex-1 min-w-0 bg-transparent text-[12px] text-foreground placeholder:text-muted-foreground outline-none"
           aria-label="Ask ARIA anything"
         />
         <button onClick={submitAskBar} disabled={!askText.trim()} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 transition-colors flex-shrink-0" title="Ask Copilot" aria-label="Send question">
@@ -1121,6 +1393,15 @@ export default function Insights({
     const monitorAvailable = selected.monitoring?.available === true;
     const lims = limitationLines(selected);
     const meta = CAT_META[primaryCategory(selected.type)];
+    // Helpfulness derivations — each guards on its own data, "" hides.
+    const decisionSentence = decisionSentenceOf(selected);
+    const anomalyBaseline = anomalyBaselineOf(selected);
+    const atStake = atStakeOf(selected);
+    const attentionLabel = severityPlain(selected.severity);
+    const rangePlain = expectedRangePlain(selected);
+    const ownerState = ownerById[selected.id] || { owner: "", reviewBy: "" };
+    const canSeeDashboard = Boolean((selected.metric || "").trim() || selected.source?.tables?.length);
+    const canForecast = Boolean((selected.metric || "").trim());
 
     const tabs: { id: string; label: string }[] = [
       { id: "changed", label: "What Changed" },
@@ -1134,20 +1415,20 @@ export default function Insights({
     const tabId = tabs.some((t) => t.id === activeTab) ? activeTab : "changed";
 
     return (
-      <div className="min-h-full bg-white text-[#0F2440] overflow-x-hidden overflow-x-clip scroll-smooth">
+      <div className="min-h-full bg-card text-foreground overflow-x-hidden overflow-x-clip scroll-smooth">
         <div className="p-4 md:p-6 max-w-[1400px] mx-auto min-w-0 max-w-full">
           {/* Breadcrumb + back */}
           <div className="flex items-center gap-2 text-[12px] flex-wrap">
-            <button onClick={() => setSelectedId(null)} className="inline-flex items-center gap-1.5 font-semibold text-blue-600 hover:text-blue-800 transition-colors" aria-label="Back to insights">
+            <button onClick={() => setSelectedId(null)} className="inline-flex items-center gap-1.5 font-semibold text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 transition-colors" aria-label="Back to insights">
               <ArrowLeft size={13} /> Insights
             </button>
-            <span className="text-slate-300">›</span>
-            <span className="text-slate-500 truncate max-w-[60vw]">{selected.title}</span>
+            <span className="text-slate-300 dark:text-muted-foreground">›</span>
+            <span className="text-muted-foreground truncate max-w-[60vw]">{displayTitle(selected)}</span>
             <span className="ml-auto flex items-center gap-1">
-              <button onClick={() => toggleSave(selected)} className={`p-1.5 rounded-lg transition-colors ${savedIds.includes(selected.id) ? "text-blue-600" : "text-slate-400 hover:text-[#0F2440]"} hover:bg-slate-100`} title={savedIds.includes(selected.id) ? "Unsave insight" : "Save insight"} aria-label="Save insight">
+              <button onClick={() => toggleSave(selected)} className={`p-1.5 rounded-lg transition-colors ${savedIds.includes(selected.id) ? "text-blue-600 dark:text-blue-400" : "text-muted-foreground hover:text-foreground"} hover:bg-secondary`} title={savedIds.includes(selected.id) ? "Unsave insight" : "Save insight"} aria-label="Save insight">
                 <Bookmark size={15} fill={savedIds.includes(selected.id) ? "currentColor" : "none"} />
               </button>
-              <button onClick={() => handleShare(selected)} className="p-1.5 rounded-lg text-slate-400 hover:text-[#0F2440] hover:bg-slate-100 transition-colors" title="Share" aria-label="Share insight">
+              <button onClick={() => handleShare(selected)} className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors" title="Share" aria-label="Share insight">
                 <Share2 size={15} />
               </button>
             </span>
@@ -1155,9 +1436,9 @@ export default function Insights({
 
           <div className="mt-3 grid grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)] gap-4 items-start">
             {/* Left: compact insight list */}
-            <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
-              <div className="px-4 pt-4 pb-3 border-b border-slate-100">
-                <p className="text-[11px] font-bold tracking-[0.14em] text-blue-600">ARIA INSIGHTS</p>
+            <div className="rounded-2xl border border-border bg-card shadow-sm overflow-hidden">
+              <div className="px-4 pt-4 pb-3 border-b border-border">
+                <p className="text-[11px] font-bold tracking-[0.14em] text-blue-600 dark:text-blue-400">ARIA INSIGHTS</p>
                 <p className="text-[15px] font-semibold leading-snug mt-1">What did ARIA learn today?</p>
                 <div className="mt-2.5 flex items-center gap-1.5 flex-wrap">
                   {HERO_PILLS.map((id) => (
@@ -1165,29 +1446,29 @@ export default function Insights({
                       key={id}
                       onClick={() => setActiveFilter(id)}
                       aria-pressed={activeFilter === id}
-                      className={`text-[10px] font-semibold px-2.5 py-1 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${activeFilter === id ? "bg-blue-700 text-white border-blue-700 shadow-sm" : "bg-white text-slate-500 border-slate-200 hover:text-[#0F2440] hover:border-blue-300"}`}
+                      className={`text-[10px] font-semibold px-2.5 py-1 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${activeFilter === id ? "bg-blue-700 text-white border-blue-700 shadow-sm" : "bg-card text-muted-foreground border-border hover:text-foreground hover:border-blue-300 dark:hover:border-blue-500/25"}`}
                     >
                       {FILTERS.find((x) => x.id === id)!.label}
                     </button>
                   ))}
                 </div>
               </div>
-              <div className="divide-y divide-slate-100 max-h-[70vh] overflow-y-auto">
+              <div className="divide-y divide-border max-h-[70vh] overflow-y-auto">
                 {filtered.map((ins) => {
                   const m = CAT_META[primaryCategory(ins.type)];
                   const Icon = m.Icon;
                   const on = ins.id === selected.id;
                   return (
-                    <button key={ins.id} onClick={() => openInsight(ins.id)} className={`w-full text-left px-4 py-3 transition-colors ${on ? "bg-blue-50/70 border-l-2 border-l-blue-600" : "hover:bg-slate-50 border-l-2 border-l-transparent"}`}>
+                    <button key={ins.id} onClick={() => openInsight(ins.id)} className={`w-full text-left px-4 py-3 transition-colors ${on ? "bg-blue-50/70 dark:bg-blue-500/10 border-l-2 border-l-blue-600" : "hover:bg-secondary border-l-2 border-l-transparent"}`}>
                       <span className="flex items-center gap-2">
                         <span className={`inline-flex items-center justify-center w-6 h-6 rounded-full flex-shrink-0 ${m.iconWrap}`}>
                           <Icon size={12} />
                         </span>
                         <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${m.pill}`}>{m.label}</span>
                       </span>
-                      <span className="block mt-1.5 text-[12px] font-semibold leading-snug">{ins.title}</span>
-                      <span className="block mt-0.5 text-[11px] text-slate-500 leading-snug line-clamp-2">{ins.description}</span>
-                      <span className="mt-1.5 flex items-center gap-1 text-[10px] text-slate-400">
+                      <span className="block mt-1.5 text-[12px] font-semibold leading-snug">{displayTitle(ins)}</span>
+                      <span className="block mt-0.5 text-[11px] text-muted-foreground leading-snug line-clamp-2">{displayDescription(ins)}</span>
+                      <span className="mt-1.5 flex items-center gap-1 text-[10px] text-muted-foreground">
                         <Clock size={10} /> {fmtWhen(ins.detectedAt)}
                         <ChevronRight size={11} className="ml-auto" />
                       </span>
@@ -1195,28 +1476,37 @@ export default function Insights({
                   );
                 })}
                 {filtered.length === 0 && (
-                  <p className="px-4 py-6 text-[11px] text-slate-400">No insights match these filters.</p>
+                  <p className="px-4 py-6 text-[11px] text-muted-foreground">No insights match these filters.</p>
                 )}
               </div>
             </div>
 
             {/* Right: explain panel */}
-            <article key={selected.id} className="min-w-0 max-w-full rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden overflow-x-clip">
+            <article key={selected.id} className="min-w-0 max-w-full rounded-2xl border border-border bg-card shadow-sm overflow-hidden overflow-x-clip">
               {/* Hero */}
-              <div className="px-5 md:px-6 pt-6 pb-5 border-b border-slate-100 bg-gradient-to-br from-blue-50/60 via-white to-indigo-50/40">
+              <div className="px-5 md:px-6 pt-6 pb-5 border-b border-border bg-gradient-to-br from-blue-50/60 dark:from-blue-500/10 via-card to-indigo-50/40 dark:to-indigo-500/10">
                 <div className="flex flex-col md:flex-row gap-4 md:gap-5">
                   <div className="min-w-0 flex-1 max-w-full">
                     <CatPill ins={selected} />
-                    <h1 className="mt-2.5 text-[22px] md:text-[24px] font-semibold leading-[1.2] tracking-tight text-balance break-words">{selected.title}</h1>
-                    <p className="mt-2 text-[13px] md:text-[14px] text-slate-600 leading-relaxed break-words">{selected.description}</p>
+                    <h1 className="mt-2.5 text-[22px] md:text-[24px] font-semibold leading-[1.2] tracking-tight text-balance break-words">{displayTitle(selected)}</h1>
+                    <p className="mt-2 text-[13px] md:text-[14px] text-secondary-foreground leading-relaxed break-words">{displayDescription(selected)}</p>
+                    {decisionSentence ? (
+                      <p className="mt-2.5 rounded-xl border border-blue-100 dark:border-blue-500/20 bg-blue-50/60 dark:bg-blue-500/10 px-3 py-2 text-[12.5px] font-medium leading-relaxed text-foreground">{decisionSentence}</p>
+                    ) : null}
+                    {anomalyBaseline ? (
+                      <p className="mt-1.5 text-[11.5px] text-secondary-foreground leading-relaxed">{anomalyBaseline}</p>
+                    ) : null}
                     <div className="mt-2.5"><ConfidenceDots conf={selected.confidence} /></div>
                   </div>
                   {/* Status panel — real fields only, semantic labels */}
-                  <dl className="flex-shrink-0 md:w-56 rounded-xl border border-slate-200 bg-white p-3.5 grid grid-cols-2 md:grid-cols-1 gap-x-4 gap-y-2.5 text-[11px] shadow-sm">
-                    <div className="flex md:justify-between gap-2"><dt className="text-slate-400">Confidence</dt><dd className="font-semibold ml-auto">{confidenceShort(selected.confidence)}</dd></div>
-                    <div className="flex md:justify-between gap-2"><dt className="text-slate-400">Evidence Quality</dt><dd className="font-semibold ml-auto">{evidenceQualityOf(selected)}</dd></div>
-                    <div className="flex md:justify-between gap-2"><dt className="text-slate-400">Period</dt><dd className="font-semibold ml-auto text-right">{selected.affectedPeriod || "—"}</dd></div>
-                    <div className="flex md:justify-between gap-2"><dt className="text-slate-400">Affected Segment</dt><dd className="font-semibold ml-auto text-right">{affectedSegment ? humanize(affectedSegment) : "—"}</dd></div>
+                  <dl className="flex-shrink-0 md:w-56 rounded-xl border border-border bg-card p-3.5 grid grid-cols-2 md:grid-cols-1 gap-x-4 gap-y-2.5 text-[11px] shadow-sm">
+                    <div className="flex md:justify-between gap-2"><dt className="text-muted-foreground">Confidence</dt><dd className="font-semibold ml-auto">{confidenceShort(selected.confidence)}</dd></div>
+                    <div className="flex md:justify-between gap-2"><dt className="text-muted-foreground">Evidence Quality</dt><dd className="font-semibold ml-auto">{evidenceQualityOf(selected)}</dd></div>
+                    {attentionLabel ? (
+                      <div className="flex md:justify-between gap-2"><dt className="text-muted-foreground">Attention</dt><dd className="font-semibold ml-auto text-right">{attentionLabel}</dd></div>
+                    ) : null}
+                    <div className="flex md:justify-between gap-2"><dt className="text-muted-foreground">Period</dt><dd className="font-semibold ml-auto text-right">{selected.affectedPeriod || "—"}</dd></div>
+                    <div className="flex md:justify-between gap-2"><dt className="text-muted-foreground">Affected Segment</dt><dd className="font-semibold ml-auto text-right">{affectedSegment ? plainBusiness(humanize(affectedSegment)) || humanize(affectedSegment) : "—"}</dd></div>
                   </dl>
                 </div>
               </div>
@@ -1224,28 +1514,28 @@ export default function Insights({
               <div className="px-5 py-4 space-y-4 min-w-0 max-w-full overflow-x-clip">
                 {/* Main visual + takeaways — stacks on mobile, side-by-side on xl */}
                 <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_260px] gap-4 items-start min-w-0 max-w-full">
-                  <div className="min-w-0 max-w-full overflow-hidden rounded-xl border border-slate-200 bg-white p-4">
+                  <div className="min-w-0 max-w-full overflow-hidden rounded-xl border border-border bg-card p-4">
                     <div className="flex items-center gap-2">
                       <span className={`inline-flex items-center justify-center w-7 h-7 rounded-lg ${meta.iconWrap}`}>
                         <meta.Icon size={14} />
                       </span>
-                      <p className="text-[13px] font-semibold truncate">{selected.visualization?.title || `${shortMetric(selected.metric) || "Evidence"} vs ${humanize(selected.affectedPeriod) || "baseline"}`}</p>
+                      <p className="text-[13px] font-semibold truncate">{plainBusiness(selected.visualization?.title) || selected.visualization?.title || `${shortMetric(selected.metric) || "Evidence"} vs ${humanize(selected.affectedPeriod) || "baseline"}`}</p>
                     </div>
                     <div className="mt-2 min-w-0">
                       <ChartCaption ins={selected} />
                       {drill && drill.insightId === selected.id && (
-                        <div className="mb-2 flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1.5 text-[11px]">
+                        <div className="mb-2 flex items-center gap-2 rounded-lg border border-blue-200 dark:border-blue-500/25 bg-blue-50 dark:bg-blue-500/10 px-2.5 py-1.5 text-[11px]">
                           <span>
                             Context: <span className="font-semibold">{drill.label}</span>
                             {typeof drill.value === "number" ? ` · ${fmtMoney(drill.value)}` : ""}
                           </span>
                           <button
                             onClick={() => askCopilot(selected, `Break down "${drill.label}" further: trend and top contributors within this segment for ${shortMetric(selected.metric) || "this metric"}.`, drill.label)}
-                            className="ml-auto font-medium text-blue-600 hover:underline"
+                            className="ml-auto font-medium text-blue-600 dark:text-blue-400 hover:underline"
                           >
                             Investigate {drill.label}
                           </button>
-                          <button onClick={() => setDrill(null)} className="text-slate-400 hover:text-[#0F2440]" title="Clear drill-down" aria-label="Clear drill-down">
+                          <button onClick={() => setDrill(null)} className="text-muted-foreground hover:text-foreground" title="Clear drill-down" aria-label="Clear drill-down">
                             <XCircle size={13} />
                           </button>
                         </div>
@@ -1255,18 +1545,18 @@ export default function Insights({
                         height={300}
                         onDrillDown={(sel) => setDrill({ insightId: selected.id, label: sel.label, value: sel.value })}
                       />
-                      <p className="mt-1.5 text-[10px] text-slate-400">Tip: hover for exact values · drag the mini-map to zoom a time range · click legend entries to toggle series · click a mark to drill down.</p>
+                      <p className="mt-1.5 text-[10px] text-muted-foreground">Tip: hover for exact values · drag the mini-map to zoom a time range · click legend entries to toggle series · click a mark to drill down.</p>
                     </div>
                   </div>
 
                   {/* Key Takeaways — only items the backend actually sent */}
-                  <aside className="rounded-xl border border-slate-200 bg-white p-4 min-w-0 max-w-full">
+                  <aside className="rounded-xl border border-border bg-card p-4 min-w-0 max-w-full">
                     <p className="text-[13px] font-semibold flex items-center gap-1.5">
-                      <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-blue-50 text-blue-600"><TrendingUp size={12} /></span>
+                      <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400"><TrendingUp size={12} /></span>
                       Key Takeaways
                     </p>
                     {takeaways.length === 0 && (
-                      <p className="mt-2 text-[11px] text-slate-400">No additional takeaways reported for this insight.</p>
+                      <p className="mt-2 text-[11px] text-muted-foreground">No additional takeaways reported for this insight.</p>
                     )}
                     <ul className="mt-2 space-y-3">
                       {takeaways.map((t, i) => {
@@ -1277,7 +1567,7 @@ export default function Insights({
                             <span className={`inline-flex items-center justify-center w-6 h-6 rounded-full flex-shrink-0 ${tone.wrap}`}>
                               <ToneIcon size={12} />
                             </span>
-                            <span className="text-slate-600 break-words min-w-0">{t}</span>
+                            <span className="text-secondary-foreground break-words min-w-0">{t}</span>
                           </li>
                         );
                       })}
@@ -1289,14 +1579,14 @@ export default function Insights({
                     when present; hidden entirely when empty or robotic.
                     Renders multi-paragraph explanations when available. */}
                 {explains && explainsParas.length > 0 ? (
-                  <div className="rounded-xl border border-blue-100 bg-blue-50/40 p-4">
-                    <p className="text-[13px] font-semibold flex items-center gap-1.5 text-[#0F2440]">
+                  <div className="rounded-xl border border-blue-100 dark:border-blue-500/20 bg-blue-50/40 dark:bg-blue-500/10 p-4">
+                    <p className="text-[13px] font-semibold flex items-center gap-1.5 text-foreground">
                       <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-blue-600 text-white"><Sparkles size={12} /></span>
                       ARIA explains
                     </p>
                     <div className="mt-2 space-y-2">
                       {explainsParas.map((para, i) => (
-                        <p key={i} className="text-[12.5px] text-slate-700 leading-relaxed">
+                        <p key={i} className="text-[12.5px] text-secondary-foreground leading-relaxed">
                           {para}
                         </p>
                       ))}
@@ -1305,7 +1595,7 @@ export default function Insights({
                 ) : null}
 
                 {/* Tabs — sticky, smooth-scroll aware, no horizontal page overflow */}
-                <div className="sticky top-0 z-10 -mx-5 px-5 bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/85 border-b border-slate-200 flex gap-4 overflow-x-auto scroll-smooth" role="tablist" aria-label="Insight explanation sections">
+                <div className="sticky top-0 z-10 -mx-5 px-5 bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/85 border-b border-border flex gap-4 overflow-x-auto scroll-smooth" role="tablist" aria-label="Insight explanation sections">
                   {tabs.map((t) => (
                     <button
                       key={t.id}
@@ -1317,7 +1607,7 @@ export default function Insights({
                           document.getElementById("insight-tab-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
                         });
                       }}
-                      className={`pb-2 pt-2.5 text-[12px] font-semibold whitespace-nowrap border-b-2 -mb-px transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded-t ${tabId === t.id ? "border-blue-600 text-blue-700" : "border-transparent text-slate-400 hover:text-slate-600"}`}
+                      className={`pb-2 pt-2.5 text-[12px] font-semibold whitespace-nowrap border-b-2 -mb-px transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded-t ${tabId === t.id ? "border-blue-600 text-blue-700 dark:text-blue-400" : "border-transparent text-muted-foreground hover:text-secondary-foreground"}`}
                     >
                       {t.label}
                     </button>
@@ -1327,44 +1617,50 @@ export default function Insights({
 
                 {tabId === "changed" && (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <div className="rounded-xl border border-slate-200 p-4 bg-gradient-to-br from-blue-50/60 to-white">
-                      <p className="text-[11px] font-semibold text-slate-500 flex items-center gap-1.5"><TrendingUp size={12} className="text-blue-600" /> Change in {shortMetric(selected.metric) || "metric"}</p>
-                      {selected.magnitude ? (
-                        <p className={`mt-1 text-[26px] font-bold ${selChange === null || selChange === undefined ? "text-[#0F2440]" : selChange >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{selected.magnitude}</p>
+                    <div className="rounded-xl border border-border p-4 bg-gradient-to-br from-blue-50/60 dark:from-blue-500/10 to-card">
+                      <p className="text-[11px] font-semibold text-muted-foreground flex items-center gap-1.5"><TrendingUp size={12} className="text-blue-600 dark:text-blue-400" /> Change in {shortMetric(selected.metric) || "metric"}</p>
+                      {displayMagnitude(selected) ? (
+                        <p className={`mt-1 text-[26px] font-bold ${selChange === null || selChange === undefined ? "text-foreground" : selChange >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>{displayMagnitude(selected)}</p>
                       ) : (
-                        <p className="mt-1 text-[13px] text-slate-400">Change not quantified by the backend.</p>
+                        <p className="mt-1 text-[13px] text-muted-foreground">Change not quantified by the backend.</p>
                       )}
-                      {selected.affectedPeriod && <p className="text-[11px] text-slate-500">vs. {selected.affectedPeriod}</p>}
+                      {selected.affectedPeriod && <p className="text-[11px] text-muted-foreground">vs. {selected.affectedPeriod}</p>}
                       {(selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined) ||
                       (selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined) ? (
-                        <p className="mt-2 text-[11px] text-slate-600">
-                          {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && <>Baseline <span className="font-semibold text-[#0F2440]">{fmtMoney(selected.evidence.baseline)}</span></>}
+                        <p className="mt-2 text-[11px] text-secondary-foreground">
+                          {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && <>Baseline <span className="font-semibold text-foreground">{fmtMoney(selected.evidence.baseline)}</span></>}
                           {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && " → "}
-                          {selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && <>Current <span className="font-semibold text-[#0F2440]">{fmtMoney(selected.evidence.currentValue)}</span></>}
+                          {selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && <>Current <span className="font-semibold text-foreground">{fmtMoney(selected.evidence.currentValue)}</span></>}
                         </p>
                       ) : null}
                     </div>
-                    <div className="rounded-xl border border-slate-200 p-4">
-                      <p className="text-[11px] font-semibold text-slate-500 flex items-center gap-1.5"><Lightbulb size={12} className="text-indigo-500" /> Why It Matters</p>
-                      <p className="mt-1.5 text-[12px] text-slate-600 leading-relaxed">
-                        {impact?.explanation || "The available evidence does not yet support a business interpretation — no causal claim is made."}
+                    <div className="rounded-xl border border-border p-4">
+                      <p className="text-[11px] font-semibold text-muted-foreground flex items-center gap-1.5"><Lightbulb size={12} className="text-indigo-500 dark:text-indigo-400" /> Why It Matters</p>
+                      <p className="mt-1.5 text-[12px] text-secondary-foreground leading-relaxed">
+                        {displayImpact(selected) || "The available evidence does not yet support a business interpretation — no causal claim is made."}
                       </p>
+                      {atStake ? (
+                        <p className="mt-1.5 text-[11px] text-secondary-foreground leading-relaxed">{atStake}</p>
+                      ) : null}
                     </div>
                   </div>
                 )}
 
                 {tabId === "why" && (
-                  <div className="rounded-xl border border-slate-200 p-4 max-w-3xl">
+                  <div className="rounded-xl border border-border p-4 max-w-3xl">
                     <p className="text-[12px] font-semibold">Why It Matters</p>
-                    <p className="mt-1.5 text-[13px] text-slate-600 leading-relaxed">
-                      {impact?.explanation || "The available evidence does not yet support a business interpretation — no causal claim is made."}
+                    <p className="mt-1.5 text-[13px] text-secondary-foreground leading-relaxed">
+                      {displayImpact(selected) || "The available evidence does not yet support a business interpretation — no causal claim is made."}
                     </p>
-                    {!impact?.explanation && (
-                      <p className="mt-1 text-[11px] text-slate-400">Interpretation appears only when the underlying evidence supports it.</p>
+                    {atStake ? (
+                      <p className="mt-1.5 text-[12px] text-secondary-foreground leading-relaxed">{atStake}</p>
+                    ) : null}
+                    {!displayImpact(selected) && (
+                      <p className="mt-1 text-[11px] text-muted-foreground">Interpretation appears only when the underlying evidence supports it.</p>
                     )}
                     {impact?.value !== undefined && impact.value !== null && impact.direction !== "neutral" && impact.explanation && (
-                      <p className="mt-2 text-xs text-slate-500">
-                        Estimated impact: <span className={`font-semibold ${impact.direction === "positive" ? "text-emerald-600" : impact.direction === "negative" ? "text-rose-600" : "text-[#0F2440]"}`}>{fmtMoney(Math.abs(impact.value))}</span>
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        Estimated impact: <span className={`font-semibold ${impact.direction === "positive" ? "text-emerald-600 dark:text-emerald-400" : impact.direction === "negative" ? "text-rose-600 dark:text-rose-400" : "text-foreground"}`}>{fmtMoney(Math.abs(impact.value))}</span>
                       </p>
                     )}
                   </div>
@@ -1374,40 +1670,45 @@ export default function Insights({
                   <div className="space-y-3 min-w-0 max-w-full">
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
                       {selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && (
-                        <div className="rounded-lg border border-slate-200 border-l-4 border-l-blue-600 px-2.5 py-2 bg-white"><p className="text-slate-400">Current</p><p className="font-semibold break-words">{fmtMoney(selected.evidence.currentValue)}</p></div>
+                        <div className="rounded-lg border border-border border-l-4 border-l-blue-600 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Current</p><p className="font-semibold break-words">{fmtMoney(selected.evidence.currentValue)}</p></div>
                       )}
                       {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && (
-                        <div className="rounded-lg border border-slate-200 border-l-4 border-l-indigo-500 px-2.5 py-2 bg-white"><p className="text-slate-400">Baseline</p><p className="font-semibold break-words">{fmtMoney(selected.evidence.baseline)}</p></div>
+                        <div className="rounded-lg border border-border border-l-4 border-l-indigo-500 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Baseline</p><p className="font-semibold break-words">{fmtMoney(selected.evidence.baseline)}</p></div>
                       )}
                       {selected.evidence?.sampleSize !== null && selected.evidence?.sampleSize !== undefined && (
-                        <div className="rounded-lg border border-slate-200 border-l-4 border-l-blue-600 px-2.5 py-2 bg-white"><p className="text-slate-400">Sample</p><p className="font-semibold break-words">{selected.evidence.sampleSize} periods</p></div>
+                        <div className="rounded-lg border border-border border-l-4 border-l-blue-600 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Sample</p><p className="font-semibold break-words">{selected.evidence.sampleSize} periods</p></div>
                       )}
-                      <div className="rounded-lg border border-slate-200 border-l-4 border-l-indigo-500 px-2.5 py-2 bg-white"><p className="text-slate-400">Strength</p><p className="font-semibold break-words">{typeof selected.confidence === "number" ? `${selected.confidence}%` : "—"}</p></div>
+                      <div className="rounded-lg border border-border border-l-4 border-l-indigo-500 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Strength</p><p className="font-semibold break-words">{typeof selected.confidence === "number" ? `${selected.confidence}%` : "—"}</p></div>
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
                       {[
-                        { k: "Observed", v: selected.evidence?.observations?.[0] },
-                        { k: "Comparison", v: selected.affectedPeriod || selected.evidence?.supportingMetrics?.[0] },
-                        { k: "Scope", v: affectedSegment ? humanize(affectedSegment) : undefined },
+                        { k: "Observed", v: selected.evidence?.observations?.[0] ? plainBusiness(selected.evidence.observations[0]) || undefined : undefined },
+                        { k: "Comparison", v: selected.affectedPeriod ? plainBusiness(selected.affectedPeriod) || selected.affectedPeriod : (selected.evidence?.supportingMetrics?.[0] ? plainBusiness(selected.evidence.supportingMetrics[0]) || undefined : undefined) },
+                        { k: "Scope", v: affectedSegment ? plainBusiness(humanize(affectedSegment)) || humanize(affectedSegment) : undefined },
                         { k: "Evidence Quality", v: evidenceQualityOf(selected) === "Not reported" ? undefined : evidenceQualityOf(selected) },
                       ].filter((b) => b.v).map((b) => (
-                        <div key={b.k} className="rounded-xl border border-slate-200 border-l-4 border-l-blue-600 p-3 bg-white min-w-0">
-                          <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">{b.k}</p>
-                          <p className="mt-1 text-[11px] text-slate-600 leading-snug line-clamp-3 break-words">{b.v}</p>
+                        <div key={b.k} className="rounded-xl border border-border border-l-4 border-l-blue-600 p-3 bg-card min-w-0">
+                          <p className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">{b.k}</p>
+                          <p className="mt-1 text-[11px] text-secondary-foreground leading-snug line-clamp-3 break-words">{b.v}</p>
+                          <p className="mt-1 text-[10px] text-muted-foreground leading-snug">Why shown: {whyShownFor(b.k)}</p>
                         </div>
                       ))}
                     </div>
                     {!!selected.evidence?.supportingMetrics?.length && (
                       <ul className="space-y-1">
-                        {selected.evidence.supportingMetrics.slice(0, 4).map((m, i) => (
-                          <li key={i} className="text-xs"><span className="text-slate-400">• </span>{m}</li>
-                        ))}
+                        {selected.evidence.supportingMetrics.slice(0, 4).map((m, i) => {
+                          const text = plainBusiness(m) || humanize(m);
+                          if (!text) return null;
+                          return (
+                            <li key={i} className="text-xs"><span className="text-muted-foreground">• </span>{text} <span className="text-muted-foreground">— {whyShownFor("supporting")}</span></li>
+                          );
+                        })}
                       </ul>
                     )}
                     {lims.length > 0 && (
-                      <div className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2" role="note" aria-label="Limitations">
-                        <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">Limitations</p>
-                        <p className="mt-0.5 text-[11px] text-slate-500 leading-relaxed">{lims[0]}</p>
+                      <div className="rounded-lg border border-border bg-secondary px-2.5 py-2" role="note" aria-label="Limitations">
+                        <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wide">Limitations</p>
+                        <p className="mt-0.5 text-[11px] text-muted-foreground leading-relaxed">{lims[0]}</p>
                       </div>
                     )}
                     <EvidenceDataTable ins={selected} />
@@ -1415,90 +1716,126 @@ export default function Insights({
                 )}
 
                 {tabId === "factors" && (
-                  <div className="rounded-xl border border-slate-200 p-4 max-w-3xl">
+                  <div className="rounded-xl border border-border p-4 max-w-3xl">
                     <p className="text-[12px] font-semibold">Associated Factors</p>
-                    <p className="text-[11px] text-slate-400 mt-0.5">Shown only because the analysis independently supports them.</p>
+                    <p className="text-[11px] text-muted-foreground mt-0.5">Shown only because the analysis independently supports them.</p>
                     <ul className="mt-2 space-y-1.5">
                       {factors.map((f, i) => (
-                        <li key={i} className="text-[12px] text-slate-600"><span className="text-blue-500">• </span><span className="font-medium text-[#0F2440]">{humanize(f)}</span></li>
+                        <li key={i} className="text-[12px] text-secondary-foreground"><span className="text-blue-500 dark:text-blue-400">• </span><span className="font-medium text-foreground">{plainBusiness(humanize(f)) || humanize(f)}</span></li>
                       ))}
                     </ul>
                   </div>
                 )}
 
                 {tabId === "reco" && (recoDetail || recoText) && (
-                  <div className="rounded-xl border border-blue-100 bg-blue-50/50 p-4 max-w-3xl">
+                  <div className="rounded-xl border border-blue-100 dark:border-blue-500/20 bg-blue-50/50 dark:bg-blue-500/10 p-4 max-w-3xl">
                     <p className="text-[12px] font-semibold">What ARIA recommends</p>
                     {recoDetail ? (
                       <div className="mt-1">
                         {recoDetail.title && (
-                          <p className="text-[13px] font-semibold text-[#0F2440] leading-relaxed">{recoDetail.title}</p>
+                          <p className="text-[13px] font-semibold text-foreground leading-relaxed">{recoDetail.title}</p>
                         )}
                         {recoDetail.steps.length > 0 && (
                           <ul className="mt-2 space-y-1.5">
                             {recoDetail.steps.map((s, i) => (
-                              <li key={i} className="text-[12.5px] text-slate-700 leading-relaxed">
-                                <span className="font-semibold text-blue-700">{i + 1}. </span>{s}
+                              <li key={i} className="text-[12.5px] text-secondary-foreground leading-relaxed">
+                                <span className="font-semibold text-blue-700 dark:text-blue-400">{i + 1}. </span>{s}
                               </li>
                             ))}
                           </ul>
                         )}
                         {recoDetail.outcome && (
-                          <p className="mt-2 text-[12px] text-slate-600 leading-relaxed">
-                            <span className="font-semibold text-[#0F2440]">Expected outcome: </span>{recoDetail.outcome}
+                          <p className="mt-2 text-[12px] text-secondary-foreground leading-relaxed">
+                            <span className="font-semibold text-foreground">Expected outcome: </span>{recoDetail.outcome}
                           </p>
                         )}
                       </div>
                     ) : (
-                      <p className="mt-1 text-[13px] text-[#0F2440] leading-relaxed">{recoText}</p>
+                      <p className="mt-1 text-[13px] text-foreground leading-relaxed">{recoText}</p>
                     )}
+                    <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2 border-t border-blue-100 dark:border-blue-500/20 pt-3">
+                      <label className="block text-[11px]">
+                        <span className="text-muted-foreground font-medium">Owner</span>
+                        <input
+                          value={ownerState.owner}
+                          onChange={(e) => setOwnerById((p) => ({ ...p, [selected.id]: { owner: e.target.value.slice(0, 80), reviewBy: ownerState.reviewBy } }))}
+                          placeholder="Name who will act"
+                          className="mt-1 w-full rounded-lg border border-border bg-card px-2.5 py-1.5 text-[12px] text-foreground outline-none focus:border-blue-400"
+                          aria-label="Recommendation owner"
+                        />
+                      </label>
+                      <label className="block text-[11px]">
+                        <span className="text-muted-foreground font-medium">Review by</span>
+                        <input
+                          value={ownerState.reviewBy}
+                          onChange={(e) => setOwnerById((p) => ({ ...p, [selected.id]: { owner: ownerState.owner, reviewBy: e.target.value.slice(0, 80) } }))}
+                          placeholder="Date to check back"
+                          className="mt-1 w-full rounded-lg border border-border bg-card px-2.5 py-1.5 text-[12px] text-foreground outline-none focus:border-blue-400"
+                          aria-label="Recommendation review-by date"
+                        />
+                      </label>
+                    </div>
                   </div>
                 )}
 
                 {tabId === "whatif" && (
-                  <div className="rounded-xl border border-slate-200 p-4 max-w-3xl">
+                  <div className="rounded-xl border border-border p-4 max-w-3xl">
                     <p className="text-[12px] font-semibold">What If</p>
                     {scenarioAvailable ? (
-                      <p className="mt-1 text-[12px] text-slate-600">{selected.scenario?.label || "Scenario modeling is available for this insight — ask ARIA to model a change."}</p>
+                      <p className="mt-1 text-[12px] text-secondary-foreground">{plainBusiness(selected.scenario?.label) || selected.scenario?.label || "Scenario modeling is available for this insight — ask ARIA to model a change."}</p>
                     ) : (
-                      <p className="mt-1 text-[12px] text-slate-400">Scenario modeling isn&apos;t available for this insight yet.</p>
+                      <p className="mt-1 text-[12px] text-muted-foreground">Scenario modeling isn&apos;t available for this insight yet.</p>
                     )}
                   </div>
                 )}
 
                 {tabId === "monitor" && (
-                  <div className="rounded-xl border border-slate-200 p-4 max-w-3xl">
+                  <div className="rounded-xl border border-border p-4 max-w-3xl">
                     <p className="text-[12px] font-semibold">Watch this</p>
                     {monitorAvailable ? (
                       <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
-                        {selected.monitoring?.metric && <div className="rounded-lg border border-slate-200 px-2.5 py-2"><p className="text-slate-400">Metric</p><p className="font-semibold">{humanize(selected.monitoring.metric)}</p></div>}
-                        {selected.monitoring?.expectedRange && <div className="rounded-lg border border-slate-200 px-2.5 py-2"><p className="text-slate-400">Expected range</p><p className="font-semibold">{selected.monitoring.expectedRange}</p></div>}
-                        {selected.monitoring?.nextReview && <div className="rounded-lg border border-slate-200 px-2.5 py-2"><p className="text-slate-400">Next review</p><p className="font-semibold">{selected.monitoring.nextReview}</p></div>}
+                        {selected.monitoring?.metric && <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Metric</p><p className="font-semibold">{plainBusiness(humanize(selected.monitoring.metric)) || humanize(selected.monitoring.metric)}</p></div>}
+                        {rangePlain ? <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Usual range</p><p className="font-semibold">{rangePlain}</p></div> : null}
+                        {selected.monitoring?.nextReview && <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Next review</p><p className="font-semibold">{selected.monitoring.nextReview}</p></div>}
                       </div>
                     ) : (
-                      <p className="mt-1 text-[12px] text-slate-400">Monitoring isn&apos;t configured for this insight yet.</p>
+                      <p className="mt-1 text-[12px] text-muted-foreground">Monitoring isn&apos;t configured for this insight yet.</p>
                     )}
                   </div>
                 )}
 
                 {/* Actions */}
-                <div className="rounded-xl border border-blue-100 bg-blue-50/40 p-3.5">
+                <div className="rounded-xl border border-blue-100 dark:border-blue-500/20 bg-blue-50/40 dark:bg-blue-500/10 p-3.5">
                   <p className="text-[12px] font-semibold">Investigate this insight</p>
-                  <p className="text-[11px] text-slate-500">Explore the drivers, forecast the impact, or hand it to a decision.</p>
+                  <p className="text-[11px] text-muted-foreground">Explore the drivers, forecast the impact, or hand it to a decision.</p>
                   <div className="mt-2.5 flex flex-wrap gap-1.5">
                     <button onClick={() => openHypothesis(selected)} className="inline-flex items-center gap-1 text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors">
                       <FlaskConical size={12} /> Investigate
                     </button>
-                    <button onClick={() => askCopilot(selected, selected.recommendedNextAnalysis?.question || selected.description, drill && drill.insightId === selected.id ? drill.label : undefined)} className="inline-flex items-center gap-1 text-[11px] font-semibold px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:border-blue-400 transition-colors">
+                    <button onClick={() => askCopilot(selected, selected.recommendedNextAnalysis?.question || selected.description, drill && drill.insightId === selected.id ? drill.label : undefined)} className="inline-flex items-center gap-1 text-[11px] font-semibold px-3 py-1.5 rounded-lg border border-border bg-card hover:border-blue-400 transition-colors">
                       <MessageSquare size={12} /> Ask ARIA
                     </button>
-                    <button onClick={() => toggleSave(selected)} className="inline-flex items-center gap-1 text-[11px] font-semibold px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:border-blue-400 transition-colors">
+                    <button onClick={() => toggleSave(selected)} className="inline-flex items-center gap-1 text-[11px] font-semibold px-3 py-1.5 rounded-lg border border-border bg-card hover:border-blue-400 transition-colors">
                       <Bookmark size={12} fill={savedIds.includes(selected.id) ? "currentColor" : "none"} /> {savedIds.includes(selected.id) ? "Saved" : "Save"}
                     </button>
-                    <button onClick={() => openForecast(selected)} className="inline-flex items-center gap-1 text-[11px] font-semibold px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:border-blue-400 transition-colors">
+                    <button onClick={() => openForecast(selected)} className="inline-flex items-center gap-1 text-[11px] font-semibold px-3 py-1.5 rounded-lg border border-border bg-card hover:border-blue-400 transition-colors">
                       <TrendingUp size={12} /> Forecast
                     </button>
                   </div>
+                  {(canSeeDashboard || canForecast) ? (
+                    <div className="mt-2.5 flex flex-wrap gap-1.5 border-t border-blue-100 dark:border-blue-500/20 pt-2.5">
+                      {canSeeDashboard ? (
+                        <button onClick={() => openDashboard(selected)} className="inline-flex items-center gap-1 text-[11px] font-semibold px-3 py-1.5 rounded-lg border border-border bg-card hover:border-blue-400 transition-colors">
+                          See on dashboard
+                        </button>
+                      ) : null}
+                      {canForecast ? (
+                        <button onClick={() => openForecast(selected)} className="inline-flex items-center gap-1 text-[11px] font-semibold px-3 py-1.5 rounded-lg border border-border bg-card hover:border-blue-400 transition-colors">
+                          Forecast this
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
 
                 {/* Prev / Next */}
@@ -1506,18 +1843,18 @@ export default function Insights({
                   <button
                     onClick={() => { const i = filtered.findIndex((x) => x.id === selected.id); if (i > 0) openInsight(filtered[i - 1].id); }}
                     disabled={filtered.findIndex((x) => x.id === selected.id) <= 0}
-                    className="text-[11px] text-slate-400 hover:text-[#0F2440] disabled:opacity-40 inline-flex items-center gap-1">
+                    className="text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-40 inline-flex items-center gap-1">
                     ← Previous finding
                   </button>
                   <button
                     onClick={() => askCopilot(selected, `What is driving ${shortMetric(selected.metric) || "this metric"}? Break down ${selected.magnitude || "the change"} by the top contributing dimensions${selected.affectedPeriod ? ` in ${selected.affectedPeriod}` : ""}.`, drill && drill.insightId === selected.id ? drill.label : undefined)}
-                    className="text-[11px] text-blue-600 hover:underline inline-flex items-center gap-1">
+                    className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1">
                     See What&apos;s Driving This <ChevronRight size={12} />
                   </button>
                   <button
                     onClick={() => { const i = filtered.findIndex((x) => x.id === selected.id); if (i < filtered.length - 1) openInsight(filtered[i + 1].id); }}
                     disabled={filtered.findIndex((x) => x.id === selected.id) >= filtered.length - 1}
-                    className="text-[11px] text-slate-400 hover:text-[#0F2440] disabled:opacity-40 inline-flex items-center gap-1">
+                    className="text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-40 inline-flex items-center gap-1">
                     Next finding →
                   </button>
                 </div>
@@ -1531,20 +1868,20 @@ export default function Insights({
 
   /* ============================ LIST VIEW ============================ */
   return (
-    <div className="min-h-full bg-white text-[#0F2440] overflow-x-hidden">
+    <div className="min-h-full bg-card text-foreground overflow-x-hidden">
       <style>{`@keyframes insightCardIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}.insight-card-in{animation:insightCardIn .45s ease both}`}</style>
       <div className="p-4 md:p-6 max-w-[1400px] mx-auto">
         <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_300px] gap-5 items-start">
           {/* Main column */}
           <div className="min-w-0 space-y-5">
             {/* Hero banner */}
-            <section className="relative overflow-hidden rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50 via-[#F4F7FF] to-indigo-100 px-6 py-7 md:px-8 md:py-9">
-              <div className="absolute -right-16 -top-24 w-72 h-72 rounded-full bg-indigo-200/40 blur-2xl pointer-events-none" aria-hidden />
-              <div className="absolute right-10 bottom-0 w-56 h-32 rounded-t-full bg-blue-200/30 blur-xl pointer-events-none" aria-hidden />
+            <section className="relative overflow-hidden rounded-2xl border border-blue-100 dark:border-blue-500/20 bg-gradient-to-br from-blue-50 dark:from-blue-500/10 via-card to-indigo-100 dark:to-indigo-500/10 px-6 py-7 md:px-8 md:py-9">
+              <div className="absolute -right-16 -top-24 w-72 h-72 rounded-full bg-indigo-200/40 dark:bg-indigo-500/15 blur-2xl pointer-events-none" aria-hidden />
+              <div className="absolute right-10 bottom-0 w-56 h-32 rounded-t-full bg-blue-200/30 dark:bg-blue-500/15 blur-xl pointer-events-none" aria-hidden />
               <div className="relative min-w-0 max-w-full">
-                <p className="text-[11px] font-bold tracking-[0.18em] text-blue-700">ARIA INSIGHTS</p>
-                <h1 className="mt-2 text-[26px] md:text-[30px] font-semibold tracking-tight leading-[1.12] text-balance text-[#0B1F3A]">What did ARIA learn today?</h1>
-                <p className="mt-2 text-[13px] md:text-[14px] text-slate-600 leading-relaxed max-w-2xl">
+                <p className="text-[11px] font-bold tracking-[0.18em] text-blue-700 dark:text-blue-400">ARIA INSIGHTS</p>
+                <h1 className="mt-2 text-[26px] md:text-[30px] font-semibold tracking-tight leading-[1.12] text-balance text-foreground">What did ARIA learn today?</h1>
+                <p className="mt-2 text-[13px] md:text-[14px] text-secondary-foreground leading-relaxed max-w-2xl">
                   Here are the key patterns, trends and opportunities found in your data. Explore deeper, ask questions, or see what might happen next.
                 </p>
                 {heroPills}
@@ -1555,15 +1892,15 @@ export default function Insights({
             {/* Key Insights */}
             <section className="min-w-0">
               <div className="flex items-center gap-2">
-                <Sparkles size={15} className="text-blue-600" />
+                <Sparkles size={15} className="text-blue-600 dark:text-blue-400" />
                 <h2 className="text-[15px] font-semibold tracking-tight">Key Insights</h2>
-                <button onClick={() => { setActiveFilter("all"); setMetricFilter("All"); setCriticalOnly(false); }} className="ml-auto text-[11px] font-semibold text-blue-600 hover:underline">View all →</button>
+                <button onClick={() => { setActiveFilter("all"); setMetricFilter("All"); setCriticalOnly(false); }} className="ml-auto text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline">View all →</button>
               </div>
               {filtered.length === 0 ? (
-                <div className="mt-3 text-center py-14 px-6 bg-white border border-dashed border-slate-300 rounded-2xl shadow-sm max-w-full">
-                  <Filter size={20} className="mx-auto text-slate-300 mb-3" />
+                <div className="mt-3 text-center py-14 px-6 bg-card border border-dashed border-border rounded-2xl shadow-sm max-w-full">
+                  <Filter size={20} className="mx-auto text-slate-300 dark:text-muted-foreground mb-3" />
                   <p className="text-sm font-semibold">No insights match these filters</p>
-                  <p className="mt-1 text-xs text-slate-500">Try a different category, metric, or clear everything to see the full set.</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Try a different category, metric, or clear everything to see the full set.</p>
                   <button onClick={() => { setActiveFilter("all"); setMetricFilter("All"); setCriticalOnly(false); }} className="mt-3 inline-flex items-center gap-1 text-xs font-semibold px-3.5 py-1.5 rounded-full bg-blue-600 text-white hover:bg-blue-700 transition-colors">Clear filters</button>
                 </div>
               ) : (
@@ -1573,24 +1910,24 @@ export default function Insights({
                     return (
                       <article
                         key={ins.id}
-                        className="insight-card-in min-w-0 max-w-full rounded-2xl border border-slate-200 bg-white p-4 shadow-sm hover:shadow-lg hover:border-blue-200 hover:-translate-y-0.5 transition-all duration-200 flex flex-col"
+                        className="insight-card-in min-w-0 max-w-full rounded-2xl border border-border bg-card p-4 shadow-sm hover:shadow-lg hover:border-blue-200 dark:hover:border-blue-500/25 hover:-translate-y-0.5 transition-all duration-200 flex flex-col"
                         style={{ borderTop: `3px solid ${severityAccent(ins.severity)}`, animationDelay: `${Math.min(idx, 6) * 60}ms` }}
                       >
                         <div className="flex items-center gap-2">
                           <CatPill ins={ins} />
-                          <button onClick={() => toggleSave(ins)} className={`ml-auto p-1.5 rounded-lg transition-colors ${isSaved ? "text-blue-600" : "text-slate-300 hover:text-slate-500"} hover:bg-slate-100`} title={isSaved ? "Unsave insight" : "Save insight"} aria-label="Save insight">
+                          <button onClick={() => toggleSave(ins)} className={`ml-auto p-1.5 rounded-lg transition-colors ${isSaved ? "text-blue-600 dark:text-blue-400" : "text-slate-300 dark:text-muted-foreground hover:text-muted-foreground"} hover:bg-secondary`} title={isSaved ? "Unsave insight" : "Save insight"} aria-label="Save insight">
                             <Bookmark size={14} fill={isSaved ? "currentColor" : "none"} />
                           </button>
                         </div>
-                        <h3 className="mt-2 text-[14px] font-semibold leading-snug tracking-tight break-words">{ins.title}</h3>
-                        <p className="mt-1 text-[12px] text-slate-500 leading-relaxed line-clamp-3 break-words">{ins.description}</p>
-                        <div className="mt-2 min-w-0 max-w-full overflow-hidden rounded-xl border border-slate-100 bg-slate-50/50 px-1">
+                        <h3 className="mt-2 text-[14px] font-semibold leading-snug tracking-tight break-words">{displayTitle(ins)}</h3>
+                        <p className="mt-1 text-[12px] text-muted-foreground leading-relaxed line-clamp-3 break-words">{displayDescription(ins)}</p>
+                        <div className="mt-2 min-w-0 max-w-full overflow-hidden rounded-xl border border-border bg-secondary/50 px-1">
                           <MiniInsightChart ins={ins} />
                         </div>
-                        <div className="mt-auto pt-3 flex items-center gap-1.5 text-[11px] text-slate-400">
+                        <div className="mt-auto pt-3 flex items-center gap-1.5 text-[11px] text-muted-foreground">
                           <Clock size={11} className="flex-shrink-0" />
                           <span className="truncate">{fmtWhen(ins.detectedAt)}</span>
-                          <button onClick={() => openInsight(ins.id)} className="ml-auto flex-shrink-0 inline-flex items-center gap-1 font-semibold text-blue-600 hover:text-blue-800 hover:underline">
+                          <button onClick={() => openInsight(ins.id)} className="ml-auto flex-shrink-0 inline-flex items-center gap-1 font-semibold text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 hover:underline">
                             View details <ChevronRight size={12} />
                           </button>
                         </div>

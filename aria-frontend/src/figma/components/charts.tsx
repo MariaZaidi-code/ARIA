@@ -182,9 +182,9 @@ export function BizTooltip({
       className="rounded-lg border border-border px-3 py-2 shadow-md"
       style={{ background: "var(--card)" }}
     >
-      {(periodLabel || label) && (
+      {(periodLabel || label || (payload[0] as any)?.name) && (
         <p className="text-[11px] font-bold text-foreground mb-1">
-          {fmtPeriod(periodLabel ?? String(label ?? ""))}
+          {fmtPeriod(periodLabel ?? String(label ?? (payload[0] as any)?.name ?? ""))}
         </p>
       )}
       {payload.filter((p: any) => {
@@ -473,8 +473,8 @@ export function InsightChart({
         <ResponsiveContainer width="100%" height={h}>
           <ScatterChart>
             <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-            <XAxis dataKey="__x" name={spec.x || ""} tick={{ fontSize: 11 }} axisLine={false} tickLine={false} />
-            <YAxis dataKey="__y" name={spec.y || ""} tick={{ fontSize: 11 }} axisLine={false} tickLine={false} width={56} />
+            <XAxis dataKey="__x" name={spec.x || ""} tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} />
+            <YAxis dataKey="__y" name={spec.y || ""} tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={56} />
             <Tooltip content={<BizTooltip />} cursor={{ strokeDasharray: "3 3" }} />
             <Scatter data={pts} fill="#2F6FAD" fillOpacity={0.65} onClick={(d: any) => handlePick(d?.payload || d)}>
               {pts.map((pt: any, i: number) => (
@@ -546,8 +546,8 @@ export function InsightChart({
       <ResponsiveContainer width="100%" height={h}>
         <Chart data={spec.data} onClick={(st: any) => { if (st?.activePayload?.[0]?.payload) handlePick(st.activePayload[0].payload); }}>
           <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
-          <XAxis dataKey={spec.x as string} tick={{ fontSize: 11 }} axisLine={false} tickLine={false} minTickGap={24} />
-          <YAxis tick={{ fontSize: 11 }} axisLine={false} tickLine={false} width={56} />
+          <XAxis dataKey={spec.x as string} tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={56} />
           <Tooltip content={<BizTooltip />} />
           <Legend wrapperStyle={{ fontSize: 11 }} onClick={(e: any) => { const v = e?.value; if (typeof v === "string" && legendItems.includes(v)) toggle(v); }} />
           {seriesKeys.map((s, i) =>

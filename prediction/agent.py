@@ -85,8 +85,12 @@ ANALYZE_SUGGESTION = "Ask ARIA to analyze this dataset instead."
 
 
 def _numeric_cols(df):
-    """Numeric columns, including numeric-looking string columns (e.g. a Postgres
-    NUMERIC value serialised as text by JSON)."""
+    """Numeric columns, including locale-formatted numeric strings.
+
+    Uses locale-aware parsing ("1,234.56" vs "1.234,56", "%", currency)
+    so formatted measures are recognised; the parse ratio (>=0.8) gates
+    inclusion. Pure numeric dtypes always qualify.
+    """
     cols = []
     for c in df.columns:
         if pd.api.types.is_numeric_dtype(df[c]):
@@ -95,8 +99,11 @@ def _numeric_cols(df):
         sample = df[c].dropna()
         if not len(sample):
             continue
-        coerced = pd.to_numeric(sample, errors="coerce")
-        if coerced.notna().sum() / len(sample) >= 0.8:
+        try:
+            _, ratio = _coerce_locale_series(sample)
+        except Exception:
+            continue
+        if ratio >= 0.8:
             cols.append(c)
     return cols
 
@@ -116,20 +123,225 @@ def _datetime_cols(df):
 
 
 def _infer_period(dates):
-    """Choose the aggregation period from the median gap between dates."""
-    series = pd.Series(pd.to_datetime(pd.unique(pd.to_datetime(dates, errors="coerce")))).sort_values().dropna()
-    gaps = series.diff().dropna().dt.days
-    if len(gaps) == 0:
+    """Choose the aggregation grain from the median timestamp delta.
+
+    Supports hourly (h) / daily (D) / weekly (W) / monthly (MS) /
+    quarterly (Q) / yearly (YS). The median delta drives the grain and a
+    coverage sanity check coarsens a grain that is too fine for the
+    observed span (fixes yearly/quarterly/hourly series mislabeled
+    monthly). Returns a pandas Grouper-compatible code.
+    """
+    try:
+        uniq = pd.Series(
+            pd.unique(pd.to_datetime(dates, errors="coerce"))
+        ).sort_values().dropna()
+    except Exception:
+        return "MS"
+    if len(uniq) < 2:
         return "D"
-    med = float(gaps.median())
-    if med <= 2:
+    try:
+        gaps_h = (uniq.diff().dropna().dt.total_seconds() / 3600.0).astype(float)
+        gaps_h = gaps_h[np.isfinite(gaps_h)]
+    except Exception:
+        return "MS"
+    if len(gaps_h) == 0:
         return "D"
-    if med <= 10:
-        return "W"
-    return "MS"
+    try:
+        med_h = float(gaps_h.median())
+    except Exception:
+        return "MS"
+    if not math.isfinite(med_h) or med_h < 0:
+        return "MS"
+    med_d = med_h / 24.0
+    if med_h <= 3.0:
+        grain = "h"
+    elif med_d <= 2.0:
+        grain = "D"
+    elif med_d <= 10.0:
+        grain = "W"
+    elif med_d <= 45.0:
+        grain = "MS"
+    elif med_d <= 120.0:
+        grain = "Q"
+    elif med_d <= 270.0:
+        # ~half-yearly spacings still aggregate cleanly at quarterly grain.
+        grain = "Q"
+    else:
+        grain = "YS"
+    # Sanity: a grain implying far more periods than observed points is
+    # too fine (e.g. two close transactions in a yearly series). Coarsen
+    # until the observed coverage is plausible.
+    try:
+        _NOMINAL_D = {"h": 1.0 / 24.0, "D": 1.0, "W": 7.0, "MS": 30.44,
+                      "Q": 91.31, "YS": 365.25}
+        _ORDER = ["h", "D", "W", "MS", "Q", "YS"]
+        span_d = float((uniq.iloc[-1] - uniq.iloc[0]).total_seconds() / 86400.0)
+        n_uniq = int(len(uniq))
+        if span_d > 0 and n_uniq >= 2:
+            idx = _ORDER.index(grain)
+            for cand in _ORDER[idx:]:
+                nominal = _NOMINAL_D[cand]
+                implied = span_d / nominal + 1.0
+                coverage = (n_uniq / implied) if implied > 0 else 1.0
+                if coverage >= 0.25 or cand == "YS":
+                    grain = cand
+                    break
+    except Exception:
+        pass
+    return grain
 
 
-_PERIOD_NAMES = {"D": "daily", "W": "weekly", "MS": "monthly"}
+_PERIOD_NAMES = {"D": "daily", "W": "weekly", "MS": "monthly",
+                 "Q": "quarterly", "YS": "yearly", "h": "hourly"}
+_PERIOD_GROUPER = {"D": "D", "W": "W", "MS": "MS", "Q": "QS",
+                   "YS": "YS", "h": "h"}
+# Pandas Period aliases for gap detection (None where Period is unusable).
+_PERIOD_FREQ = {"MS": "M", "D": "D", "W": "W", "Q": "Q", "YS": "Y", "h": "h"}
+_NOMINAL_DAYS = {"h": 1.0 / 24.0, "D": 1.0, "W": 7.0, "MS": 30.44,
+                 "Q": 91.31, "YS": 365.25}
+
+
+def _parse_locale_value(raw):
+    """Parse one locale-formatted number (thousands/decimal/percent/currency).
+
+    Handles "1,234.56" vs "1.234,56", thin spaces/apostrophes as
+    thousands separators, and trailing "%". Returns float or None.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float, np.integer, np.floating)):
+        try:
+            f = float(raw)
+            return f if math.isfinite(f) else None
+        except Exception:
+            return None
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "none", "null", "-", "--", "n/a", "na", "#n/a"):
+        return None
+    is_pct = s.endswith("%")
+    if is_pct:
+        s = s[:-1].strip()
+    # Strip currency/scale symbols but keep digits, signs, separators.
+    s = s.replace("$", "").replace("€", "").replace("£", "").replace("¥", "").strip()
+    s = s.replace("\u00a0", " ").replace("\u202f", " ")
+    s = s.replace(" ", "").replace("'", "").replace("’", "")
+    if not s:
+        return None
+    try:
+        if "." in s and "," in s:
+            # Rightmost separator is the decimal mark.
+            if s.rfind(".") > s.rfind(","):
+                s = s.replace(",", "")
+            else:
+                s = s.replace(".", "").replace(",", ".")
+        elif "," in s:
+            # Only commas: thousands ("1,234") vs decimal ("12,5").
+            import re as _re
+            if _re.fullmatch(r"-?\d{1,3}(,\d{3})+(\.\d+)?", s):
+                s = s.replace(",", "")
+            elif _re.fullmatch(r"-?\d+,\d{1,2}", s):
+                s = s.replace(",", ".")
+            elif s.count(",") == 1:
+                head, tail = s.split(",")
+                if len(tail) == 3 and head and head.lstrip("-+").isdigit():
+                    s = head + tail  # thousands
+                else:
+                    s = head + "." + tail
+            else:
+                s = s.replace(",", "")
+        f = float(s)
+        return f if math.isfinite(f) else None
+    except Exception:
+        return None
+
+
+def _coerce_locale_series(values):
+    """Coerce a column with locale-aware parsing. Returns (float Series, ratio)."""
+    try:
+        s = pd.Series(list(values))
+    except Exception:
+        return pd.Series(dtype=float), 0.0
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce").astype(float), 1.0
+    parsed = [_parse_locale_value(v) if pd.notna(v) else None for v in s.tolist()]
+    out = pd.Series(parsed, dtype=float)
+    try:
+        denom = int(s.notna().sum()) or 0
+        ratio = float(out.notna().sum() / denom) if denom else 0.0
+    except Exception:
+        ratio = 0.0
+    return out, round(ratio, 4)
+
+
+_GAUGE_LAST_HINTS = ("balance", "stock", "inventory", "level", "position",
+                     "headcount", "occupancy")
+_GAUGE_AVG_HINTS = ("price", "rate", "ratio", "pct", "percent", "temp",
+                    "score", "rating", "index", "avg", "average", "close",
+                    "closing", "open", "unit_cost", "unitcost")
+
+
+def _infer_aggregation(numeric_col, df=None):
+    """Additive-flow vs gauge inference for time-grain aggregation.
+
+    Flow measures (sales, amounts, counts, quantities) SUM across
+    timestamps; gauge measures (prices, rates, balances, levels) must
+    never SUM — they average (AVG) or take the last observation (LAST).
+    Returns (pandas_agg, method_label, reason).
+    """
+    low = str(numeric_col or "").lower().strip()
+    for hint in _GAUGE_LAST_HINTS:
+        if hint in low:
+            return ("last",
+                    "last",
+                    f"column '{numeric_col}' looks like a gauge/level "
+                    f"(hint '{hint}') — aggregating duplicate timestamps by "
+                    f"LAST observation, not SUM")
+    for hint in _GAUGE_AVG_HINTS:
+        if hint in low:
+            return ("mean",
+                    "avg",
+                    f"column '{numeric_col}' looks like a gauge/rate "
+                    f"(hint '{hint}') — aggregating duplicate timestamps by "
+                    f"AVERAGE, not SUM")
+    return ("sum",
+            "sum",
+            f"column '{numeric_col}' looks additive — aggregating duplicate "
+            f"timestamps by SUM")
+
+
+def _headline_pct_change(points, values, season_period=None):
+    """Headline change vs a trailing baseline average (not last-actual).
+
+    Baseline = mean of the last min(n, max(3, season)) periods. Returns
+    (pct_or_None, baseline_or_None, suppressed_bool). Suppressed when the
+    baseline is near-zero (a pct would explode) — callers must render no
+    headline pct in that case.
+    """
+    try:
+        pts = np.asarray(points, dtype=float)
+        v = np.asarray(values, dtype=float)
+        v = v[np.isfinite(v)]
+        pts = pts[np.isfinite(pts)]
+        if len(v) == 0 or len(pts) == 0:
+            return None, None, True
+        try:
+            window = max(3, int(season_period)) if season_period else 4
+        except Exception:
+            window = 4
+        window = max(1, min(int(len(v)), int(window)))
+        baseline = float(np.mean(v[-window:]))
+        try:
+            scale = max(1.0, abs(float(np.mean(np.abs(v)))))
+        except Exception:
+            scale = 1.0
+        if not math.isfinite(baseline) or abs(baseline) < 1e-6 * scale:
+            return None, (round(baseline, 2) if math.isfinite(baseline) else None), True
+        pct = round(float(pts[-1] - baseline) / abs(baseline) * 100.0, 2)
+        return pct, round(baseline, 2), False
+    except Exception:
+        return None, None, True
 
 # Column names that indicate a natural period/ordinal axis for forecasting even
 # without a datetime column (e.g. "sales by year", "churn per month").
@@ -155,6 +367,12 @@ def _suggest_horizon(frequency_label, n_obs):
         return min(12, max(4, n // 4))
     if frequency_label == "monthly":
         return min(12, max(3, n // 4))
+    if frequency_label == "quarterly":
+        return min(8, max(2, n // 4))
+    if frequency_label == "yearly":
+        return min(5, max(2, n // 4))
+    if frequency_label == "hourly":
+        return min(48, max(12, n // 4))
     return min(12, max(3, n // 4))
 
 
@@ -197,8 +415,19 @@ def _forecast_labels(last_label, steps, period_code):
         "D": pd.Timedelta(days=1),
         "W": pd.Timedelta(weeks=1),
         "MS": pd.DateOffset(months=1),
-    }[period_code]
-    return [(last_ts + k * step).strftime("%Y-%m-%d") for k in range(1, steps + 1)]
+        "Q": pd.DateOffset(months=3),
+        "YS": pd.DateOffset(years=1),
+        "h": pd.Timedelta(hours=1),
+    }.get(period_code, pd.DateOffset(months=1))
+    out = []
+    for k in range(1, max(1, int(steps or 1)) + 1):
+        try:
+            ts = last_ts + k * step
+            out.append(pd.Timestamp(ts).strftime(
+                "%Y-%m-%d %H:%M" if period_code == "h" else "%Y-%m-%d"))
+        except Exception:
+            out.append(f"t+{k}")
+    return out
 
 
 def _series_varies(vals) -> bool:
@@ -307,6 +536,165 @@ def _substitute_flat_winner(values, season_period, model_spec, sel_meta,
         return model_spec, sel_meta, sel_metrics, None
 
 
+def _wave_period(values, season_period, period_code):
+    """Generic period for the trend+seasonal safety net (no hardcoded tables).
+
+    Prefers the validated ``season_period``; otherwise falls back to the
+    frequency grain (daily->7, weekly->4, monthly->12 need only ONE full
+    season) and finally to the strongest autocorrelation lag in
+    2..min(12, n//2). Returns None only when history is too short to
+    estimate any periodicity.
+    """
+    try:
+        if season_period and int(season_period) >= 2:
+            return int(season_period)
+    except Exception:
+        pass
+    try:
+        n = int(len(values))
+    except Exception:
+        return None
+    if period_code == "MS" and n >= 12:
+        return 12
+    if period_code == "D" and n >= 7:
+        return 7
+    if period_code == "W" and n >= 4:
+        return 4
+    if period_code == "Q" and n >= 8:
+        return 4
+    if period_code == "h" and n >= 48:
+        return 24
+    if period_code == "YS":
+        return None
+    if n >= 5:
+        try:
+            hi = min(12, n // 2)
+            best_lag, best_ac = 0, 0.0
+            for lag in range(2, hi + 1):
+                ac = _lag_autocorr(values, lag)
+                if abs(ac) > abs(best_ac):
+                    best_lag, best_ac = lag, ac
+            if best_lag:
+                return int(best_lag)
+        except Exception:
+            pass
+    return None
+
+
+def _trend_seasonal_projection(values, steps, wave_period):
+    """Generic trend + seasonal/periodic projection from actual history.
+
+    - Trend slope: drift (first->last) when history is shorter than two full
+      seasons (OLS is phase-biased with a single cycle), else least-squares.
+      The level is always anchored to the last actual so the projection is
+      continuous with history.
+    - Seasonality: mean detrended residual per phase (zero-mean ripple), so
+      future steps carry the observed periodic shape. Linear history yields
+      ~zero ripple (straight trend preserved); wavy history yields waves.
+    Returns (forecast ndarray, ripple_amplitude, slope).
+    """
+    v = np.asarray(values, dtype=float)
+    n = int(len(v))
+    steps = max(1, int(steps or 1))
+    try:
+        t = np.arange(n, dtype=float)
+        ols = float(np.polyfit(t, v, 1)[0]) if n >= 2 else 0.0
+    except Exception:
+        ols = 0.0
+    try:
+        drift = float((v[-1] - v[0]) / (n - 1)) if n > 1 else 0.0
+    except Exception:
+        drift = 0.0
+    if wave_period and n < 2 * int(wave_period):
+        slope = drift
+    else:
+        slope = ols
+    if not math.isfinite(slope):
+        slope = 0.0
+    p = max(2, int(wave_period)) if wave_period else 0
+    if not p:
+        return v[-1] + slope * np.arange(1, steps + 1, dtype=float), 0.0, slope
+    try:
+        resid = v - slope * t
+        s = np.zeros(p)
+        for ph in range(p):
+            idx = [k for k in range(n) if k % p == ph]
+            s[ph] = float(np.mean([resid[k] for k in idx])) if idx else 0.0
+        ripple = s - float(np.mean(s))
+        amp = float(np.max(ripple) - np.min(ripple))
+        last_ph = (n - 1) % p
+        out = np.empty(steps)
+        for i in range(steps):
+            fut = (n + i) % p
+            out[i] = float(v[-1] + slope * (i + 1) + (ripple[fut] - ripple[last_ph]))
+        return out, amp, slope
+    except Exception:
+        return v[-1] + slope * np.arange(1, steps + 1, dtype=float), 0.0, slope
+
+
+def _ensure_wavy_forecast(values, points, season_period, period_code):
+    """Guarantee a non-flat, wave-carrying projection on varying history.
+
+    Replaces a flat level (or a straight line that suppresses clear observed
+    seasonality) with the generic trend+seasonal projection above — derived
+    only from the actual history, never invented. Returns (points, note).
+    """
+    try:
+        v = np.asarray(values, dtype=float)
+        pts = np.asarray(points, dtype=float)
+        if len(pts) < 2 or not _history_varies(v):
+            return points, None
+        wp = _wave_period(v, season_period, period_code)
+        if not wp:
+            return points, None
+        proj, amp, slope = _trend_seasonal_projection(v, len(pts), wp)
+        if not _forecast_varies(proj):
+            return points, None
+        try:
+            scale = max(1.0, abs(float(np.mean(np.abs(v[np.isfinite(v)])))))
+        except Exception:
+            scale = 1.0
+        std_vals = float(np.std(v)) if len(v) > 1 else 0.0
+        std_pts = float(np.std(pts)) if len(pts) > 1 else 0.0
+        flat = not _forecast_varies(pts)
+        thresh = max(1e-6 * scale, 0.15 * std_vals)
+        seasonal = bool(amp > thresh)
+        if flat or (seasonal and std_pts < 0.7 * std_vals):
+            note = (
+                f"level/straight projection carried no seasonal shape on varying "
+                f"history; using generic trend+seasonal projection (period {wp}, "
+                f"slope {slope:+.4f}/period, seasonal amplitude {amp:.2f}) from "
+                f"observed history."
+            )
+            return proj, note
+        return points, None
+    except Exception:
+        log.debug("wave guard failed", exc_info=True)
+        return points, None
+
+
+def _widening_sigmas(sigma, steps, values):
+    """Per-horizon band scales that strictly widen: sigma*sqrt(h).
+
+    Floored at 0.5% of the series scale so a perfect in-sample fit still
+    yields an honest widening band instead of a zero-width line.
+    """
+    try:
+        v = np.asarray(values, dtype=float)
+        v = v[np.isfinite(v)]
+        scale = max(1.0, abs(float(np.mean(np.abs(v))))) if len(v) else 1.0
+    except Exception:
+        scale = 1.0
+    try:
+        base = float(sigma)
+    except Exception:
+        base = 0.0
+    if not math.isfinite(base) or base < 0:
+        base = 0.0
+    eff = max(base, 0.005 * scale)
+    return [eff * math.sqrt(i + 1) for i in range(max(1, int(steps or 1)))]
+
+
 class PredictionAgent:
     def __init__(self, horizon=6, min_points=5, valid_threshold=70.0,
                  confidence_threshold=50, auto_horizon=True):
@@ -348,12 +736,13 @@ class PredictionAgent:
             out.update({"ok": False, "missing_field": "numeric_target",
                         "suggestion": ANALYZE_SUGGESTION})
             return out
-        # Coerce numeric-looking string columns to real numbers so downstream
-        # aggregation and models compute correctly.
+        # Coerce locale-formatted string columns so downstream aggregation
+        # and models compute correctly (parse ratios disclosed per series).
         for c in numeric_cols:
             if c in df.columns and not pd.api.types.is_numeric_dtype(df[c]):
                 try:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                    _coerced_c, _ = _coerce_locale_series(df[c])
+                    df[c] = _coerced_c.values
                 except Exception:
                     pass
 
@@ -386,7 +775,12 @@ class PredictionAgent:
                 measure_cols[-1],  # measures usually come after id columns in SELECT order
             )
         if numeric_col not in df.columns:
-            out = self._empty(f"numeric column '{numeric_col}' not found", "no_data")
+            _avail = ", ".join([str(c) for c in list(df.columns)[:8]])
+            out = self._empty(
+                f"numeric column '{numeric_col}' not found "
+                f"(available columns: {_avail or 'none'}). "
+                f"Specify one of the available numeric measures as the "
+                f"forecast target.", "no_data")
             out.update({"ok": False, "missing_field": "numeric_target",
                         "suggestion": ANALYZE_SUGGESTION})
             return out
@@ -416,9 +810,12 @@ class PredictionAgent:
         # and are handled gracefully instead of being forced through a fake axis.
         seq_col = self._sequence_col(df)
         if seq_col is None:
+            _avail = ", ".join([str(c) for c in list(df.columns)[:8]])
             out = self._empty(
                 "no time dimension - a forecast is not applicable to this aggregate "
-                f"question (forecast target '{numeric_col}').",
+                f"question (forecast target '{numeric_col}'; available columns: "
+                f"{_avail or 'none'}). Provide a date/timestamp column or a "
+                f"period axis (year, month, week, quarter, period) to forecast over.",
                 "not_applicable",
             )
             out.update({"ok": False, "missing_field": "date",
@@ -427,7 +824,8 @@ class PredictionAgent:
             return out
 
         seq = df[seq_col]
-        raw_vals = pd.to_numeric(df[numeric_col], errors="coerce").astype(float)
+        _raw_coerced, _seq_parse_ratio = _coerce_locale_series(df[numeric_col])
+        raw_vals = _raw_coerced.astype(float)
         n_missing_vals = int(raw_vals.isna().sum())
         values = raw_vals.values
         mask = pd.notna(values)
@@ -446,15 +844,20 @@ class PredictionAgent:
             "duplicate_timestamps_merged": seq_dups,
             "missing_periods": 0,
             "missing_periods_interpolated": 0,
+            "missing_periods_masked": 0,
             "missing_periods_filled": 0,
+            "gap_method": "ordinal_sequence_no_gaps",
             "median_delta_days": None,
             "frequency": "sequence",
             "n_obs_raw": int(len(df)),
             "n_obs": int(len(values)),
             "missing_values": n_missing_vals,
+            "parse_ratio": round(float(_seq_parse_ratio), 4),
             "aggregation_level": "ordinal_sequence_no_date_aggregation",
             "aggregation_method": "none",
             "irregular_intervals": False,
+            "tz_normalized": False,
+            "tz_note": "no datetime axis — no timezone normalization",
         }
         return self._build(values, labels, numeric_col, "sequence", None, horizon, None,
                            diagnostics=diagnostics,
@@ -479,6 +882,11 @@ class PredictionAgent:
             return 12
         if period_code == "W" and n >= 12:
             return 4
+        if period_code == "Q" and n >= 12:
+            return 4
+        if period_code == "h" and n >= 72:
+            return 24
+        # Yearly grain has no sub-year season to estimate.
         return None
 
     def _extra_feature_count(self, df, target_col, exclude=None):
@@ -499,11 +907,32 @@ class PredictionAgent:
         timestamps ("%Y-%m-%d"); the frontend must plot these verbatim and
         never invent dates.
         """
-        ts = pd.to_datetime(df[datetime_col], errors="coerce")
+        ts_raw = pd.to_datetime(df[datetime_col], errors="coerce")
+        # TZ normalization is disclosed, never silent: aware -> UTC naive.
+        tz_original, tz_normalized = None, False
         try:
-            if getattr(ts.dt, "tz", None) is not None:
-                ts = ts.dt.tz_convert("UTC").dt.tz_localize(None)
+            _tz = getattr(ts_raw.dt, "tz", None)
+            if _tz is not None:
+                tz_original = str(_tz)
+                ts = ts_raw.dt.tz_convert("UTC").dt.tz_localize(None)
+                tz_normalized = True
+            else:
+                # Mixed offsets without a uniform tz still normalize per-value.
+                try:
+                    _sample = pd.Series(pd.unique(ts_raw.dropna().astype(str))).head(3).tolist()
+                except Exception:
+                    _sample = []
+                if any(("+" in str(x) or str(x).rstrip().endswith("Z")
+                        or "GMT" in str(x)) for x in _sample):
+                    tz_normalized = True
+                    tz_original = "mixed offsets -> UTC"
+                ts = ts_raw
+                try:
+                    ts = ts.dt.tz_localize(None)
+                except Exception:
+                    pass
         except Exception:
+            ts = ts_raw
             try:
                 ts = ts.dt.tz_localize(None)
             except Exception:
@@ -517,10 +946,11 @@ class PredictionAgent:
         # Chronological order is enforced here; everything downstream
         # (grain inference, aggregation, labels) sees sorted time.
         temp = temp.sort_values("_ts").reset_index(drop=True)
-        # Target/measure: coerce once; non-numeric rows cannot be aggregated.
-        temp["_val"] = pd.to_numeric(temp[numeric_col], errors="coerce")
-        n_bad_value = int(temp["_val"].isna().sum())
-        temp = temp[temp["_val"].notna()]
+        # Target/measure: locale-aware coercion; parse_ratio is disclosed.
+        _coerced, _parse_ratio = _coerce_locale_series(temp[numeric_col])
+        temp["_val"] = _coerced.values
+        n_bad_value = int(pd.Series(temp["_val"]).isna().sum())
+        temp = temp[pd.notna(temp["_val"])]
         if len(temp) < 2:
             return None
         # Raw gap profile (before aggregation) drives the irregular-interval
@@ -537,69 +967,119 @@ class PredictionAgent:
             irregular = False
         # Time grain from the observed (unique) timestamps.
         period_code = _infer_period(temp["_ts"])
-        # Aggregate to the grain; duplicate timestamps are merged by sum and
-        # counted so the cleaning is auditable, never silent.
+        if period_code not in _PERIOD_GROUPER:
+            period_code = "MS"
+        group_freq = _PERIOD_GROUPER[period_code]
+        per_freq = _PERIOD_FREQ.get(period_code)
+        # Additive-vs-gauge aggregation inference (never SUM a gauge).
+        _agg_func, _agg_method, _agg_reason = _infer_aggregation(
+            numeric_col, temp)
         n_rows = len(temp)
         n_unique = int(temp["_ts"].nunique())
-        grouped = temp.groupby(pd.Grouper(key="_ts", freq=period_code))["_val"].sum()
-        duplicates_merged = max(0, n_rows - n_unique)
-        # Clean missing periods: compare the observed grain periods against
-        # the full min..max range. (pandas >= 2/3 zero-fills unobserved
-        # groupby bins, so gaps are detected from the timestamps, not NaNs.)
-        # Interior gaps of <= 2 consecutive periods are linearly interpolated;
-        # edges / long outages keep the aggregation zero and every gap is
-        # reported in diagnostics — never silently invented.
-        _PER_FREQ = {"MS": "M", "D": "D", "W": "W"}
         try:
-            observed = set(temp["_ts"].dt.to_period(_PER_FREQ[period_code]))
-            full = pd.period_range(temp["_ts"].min(), temp["_ts"].max(),
-                                   freq=_PER_FREQ[period_code])
-            missing = [p for p in full if p not in observed]
+            grouped = temp.groupby(
+                pd.Grouper(key="_ts", freq=group_freq))["_val"].agg(_agg_func)
         except Exception:
-            missing = []
+            grouped = temp.groupby(
+                pd.Grouper(key="_ts", freq=group_freq))["_val"].sum()
+            _agg_method = "sum"
+        duplicates_merged = max(0, n_rows - n_unique)
+        # Gap accounting from observed grain periods vs the full range.
+        try:
+            if per_freq:
+                observed = set(temp["_ts"].dt.to_period(per_freq))
+                full = pd.period_range(temp["_ts"].min(), temp["_ts"].max(),
+                                       freq=per_freq)
+                missing = [p for p in full if p not in observed]
+            else:
+                missing = []
+        except Exception:
+            observed, full, missing = set(), [], []
         missing_periods = len(missing)
-        grouped = grouped.reindex(
-            pd.date_range(grouped.index.min(), grouped.index.max(), freq=period_code))
-        grouped = grouped.fillna(0.0).astype(float)
-        n_interpolated = 0
+        # Never 0-fill for fitting: reindex keeps NaN for missing periods.
+        # Short interior runs (<=2) are linearly interpolated; longer runs
+        # are linearly bridged for continuity but MASKED (counted
+        # separately, disclosed, and excluded from honest error metrics
+        # where possible) — never filled with 0.
+        try:
+            full_idx = pd.date_range(grouped.index.min(), grouped.index.max(),
+                                     freq=group_freq)
+            grouped = grouped.reindex(full_idx)
+        except Exception:
+            pass
+        grouped = grouped.astype(float)
+        n_interpolated, n_masked = 0, 0
         if missing_periods:
-            asfreq_idx = pd.period_range(grouped.index.min(), grouped.index.max(),
-                                         freq=_PER_FREQ[period_code])
-            vals = grouped.copy()
-            n = min(len(asfreq_idx), len(vals))
-            if n < len(asfreq_idx) or n < len(vals):
-                log.warning("Period index length mismatch: asfreq=%d, vals=%d; using %d",
-                            len(asfreq_idx), len(vals), n)
-            vals.index = asfreq_idx[:n]
-            # runs of consecutive missing periods
-            run, prev = [], None
-            runs = []
-            for p in missing:
-                if prev is not None and p.ordinal == prev.ordinal + 1:
-                    run.append(p)
-                else:
-                    if run:
-                        runs.append(run)
-                    run = [p]
-                prev = p
-            if run:
-                runs.append(run)
-            for run in runs:
-                if len(run) > 2:
-                    continue
-                lo_pos = max(0, full.get_loc(run[0]) - 1)
-                hi_pos = min(len(full) - 1, full.get_loc(run[-1]) + 1)
-                if full[lo_pos] in observed and full[hi_pos] in observed:
-                    lo_v = float(vals.loc[full[lo_pos]])
-                    hi_v = float(vals.loc[full[hi_pos]])
-                    span = hi_pos - lo_pos
-                    for k, p in enumerate(run, start=1):
-                        vals.loc[p] = lo_v + (hi_v - lo_v) * (k / span)
-                        n_interpolated += 1
-            vals.index = grouped.index
-            grouped = vals.astype(float)
+            try:
+                asfreq_idx = pd.period_range(grouped.index.min(),
+                                             grouped.index.max(), freq=per_freq)
+                vals = grouped.copy()
+                n = min(len(asfreq_idx), len(vals))
+                vals.index = asfreq_idx[:n]
+                run, prev, runs = [], None, []
+                for p in missing:
+                    if prev is not None and p.ordinal == prev.ordinal + 1:
+                        run.append(p)
+                    else:
+                        if run:
+                            runs.append(run)
+                        run = [p]
+                    prev = p
+                if run:
+                    runs.append(run)
+                for run in runs:
+                    try:
+                        lo_pos = max(0, full.get_loc(run[0]) - 1)
+                        hi_pos = min(len(full) - 1, full.get_loc(run[-1]) + 1)
+                    except Exception:
+                        continue
+                    if full[lo_pos] in observed and full[hi_pos] in observed:
+                        try:
+                            lo_v = float(vals.loc[full[lo_pos]])
+                            hi_v = float(vals.loc[full[hi_pos]])
+                        except Exception:
+                            continue
+                        span = hi_pos - lo_pos
+                        for k, p in enumerate(run, start=1):
+                            try:
+                                vals.loc[p] = lo_v + (hi_v - lo_v) * (k / span)
+                            except Exception:
+                                continue
+                            if len(run) <= 2:
+                                n_interpolated += 1
+                            else:
+                                n_masked += 1
+                    else:
+                        n_masked += len(run)
+                vals.index = grouped.index
+                grouped = vals.astype(float)
+            except Exception:
+                log.debug("gap interpolation failed", exc_info=True)
+        # Any residual NaN (e.g. edge effects) is bridged linearly for model
+        # continuity and counted as masked — still never 0.
+        try:
+            if grouped.isna().any():
+                n_masked += int(grouped.isna().sum())
+                grouped = grouped.interpolate(method="linear", limit_direction="both")
+                if grouped.isna().any():
+                    grouped = grouped.ffill().bfill()
+        except Exception:
+            pass
         values = np.asarray(grouped.values, dtype=float)
-        labels = [pd.Timestamp(t).strftime("%Y-%m-%d") for t in grouped.index]
+        # Safety: no NaN/0-fill may reach the fitter.
+        try:
+            if np.isnan(values).any():
+                _fill = float(np.nanmedian(values)) if np.isfinite(
+                    np.nanmedian(values)) else 0.0
+                values = np.where(np.isnan(values), _fill, values)
+                n_masked += 1
+        except Exception:
+            pass
+        if period_code == "h":
+            labels = [pd.Timestamp(t).strftime("%Y-%m-%d %H:%M")
+                      for t in grouped.index]
+        else:
+            labels = [pd.Timestamp(t).strftime("%Y-%m-%d") for t in grouped.index]
         # Post-aggregation quality flags — info for validation, never silent.
         std = float(np.std(values)) if len(values) else 0.0
         mean = float(np.mean(values)) if len(values) else 0.0
@@ -608,9 +1088,11 @@ class PredictionAgent:
         near_constant = bool(not constant and len(values) >= 3 and math.isfinite(cv) and cv < 1e-3)
         outliers = self._outlier_count(values)
         if n_rows > len(values):
-            agg_level = f"transaction_rows_aggregated_to_{period_code}_by_sum"
+            agg_level = (f"transaction_rows_aggregated_to_{period_code}_"
+                         f"by_{_agg_method}")
         elif duplicates_merged:
-            agg_level = f"duplicate_timestamps_aggregated_to_{period_code}_by_sum"
+            agg_level = (f"duplicate_timestamps_aggregated_to_{period_code}_"
+                         f"by_{_agg_method}")
         else:
             agg_level = f"already_at_{period_code}_grain"
         diagnostics = {
@@ -618,17 +1100,26 @@ class PredictionAgent:
             "duplicate_timestamps_merged": duplicates_merged,
             "missing_periods": missing_periods,
             "missing_periods_interpolated": n_interpolated,
+            "missing_periods_masked": n_masked,
             "missing_periods_filled": missing_periods,
+            "gap_method": ("interpolate_short_runs_max2_then_mask_long "
+                           "(never 0-fill for fitting)"),
             "median_delta_days": round(median_delta, 2),
-            "frequency": _PERIOD_NAMES[period_code],
+            "frequency": _PERIOD_NAMES.get(period_code, period_code),
             "n_obs_raw": int(n_rows),
             "n_obs": int(len(values)),
             "missing_values": int(n_bad_time + n_bad_value),
+            "parse_ratio": round(float(_parse_ratio), 4),
             "outlier_count": outliers,
             "outlier_method": "IQR+zscore union, info only - values kept",
             "irregular_intervals": bool(irregular),
             "aggregation_level": agg_level,
-            "aggregation_method": "sum",
+            "aggregation_method": _agg_method,
+            "aggregation_reason": _agg_reason,
+            "tz_normalized": bool(tz_normalized),
+            "tz_original": tz_original,
+            "tz_note": ("timestamps normalized to UTC-naive"
+                        if tz_normalized else "no timezone normalization needed"),
             "constant": constant,
             "near_constant": near_constant,
             "temporal_variation": bool(not constant and len(values) >= 2),
@@ -770,7 +1261,10 @@ class PredictionAgent:
         if raw_df is None or target_col not in raw_df.columns:
             return None
         try:
-            totals = pd.to_numeric(raw_df[target_col], errors="coerce")
+            try:
+                totals, _ = _coerce_locale_series(raw_df[target_col])
+            except Exception:
+                totals = pd.to_numeric(raw_df[target_col], errors="coerce")
             grand = float(totals.sum())
             if not math.isfinite(grand) or abs(grand) < 1e-12:
                 return None
@@ -881,6 +1375,10 @@ class PredictionAgent:
         if season_period:
             _probe_steps = max(_probe_steps,
                                min(int(season_period), len(values)))
+        try:
+            _orig_winner = sel_meta.get("winner") or getattr(model_spec, "name", "none")
+        except Exception:
+            _orig_winner = "none"
         model_spec, sel_meta, sel_metrics, _sub_note = \
             _substitute_flat_winner(values, season_period, model_spec,
                                     sel_meta, sel_metrics, _probe_steps)
@@ -972,11 +1470,26 @@ class PredictionAgent:
                 except Exception:
                     log.debug("flat-line guard post-refit rebuild failed",
                               exc_info=True)
+        # Generic wave guard: a flat level or a straight line that suppresses
+        # clear observed seasonality still reads as "no forecast" on unseen
+        # databases. Replace it with a trend+seasonal projection derived only
+        # from the actual history (never invented wiggle). Disclosed below.
+        _wave_note = None
+        try:
+            _wavy, _wave_note = _ensure_wavy_forecast(
+                values, points, season_period, period_code)
+            if _wave_note is not None:
+                points = np.asarray(_wavy, dtype=float)
+                _sub_note = ((_sub_note + " ") if _sub_note else "") + _wave_note
+                log.info("wave guard: %s", _wave_note)
+        except Exception:
+            log.debug("wave guard failed", exc_info=True)
         last_actual = float(values[-1])
         accuracy = accuracy_from_mape(oos_mape)
-        projected_pct = (
-            round(float(points[-1] / last_actual * 100.0 - 100.0), 2) if last_actual else 0.0
-        )
+        # Headline change vs a trailing baseline average — never vs a
+        # near-zero last actual (which would explode to ±inf%).
+        projected_pct, _proj_baseline, _proj_suppressed = \
+            _headline_pct_change(points, values, season_period)
 
         # Validation gate: only forecasts whose backtested accuracy clears the
         # threshold are "valid". Poor/unknown accuracy -> not usable downstream.
@@ -1028,15 +1541,82 @@ class PredictionAgent:
         model_name = getattr(model, "name", "none")
         frequency = period_code or "sequence"
         fwd_labels = _forecast_labels(labels[-1], steps, period_code)
+        # Structured guard disclosure (additive): which projection replaced
+        # what and why. None when the validated winner stands unchanged.
+        try:
+            _final_name = getattr(model, "name", None) or sel_meta.get("winner") or model_name
+        except Exception:
+            _final_name = model_name
+        _wave_fired = bool(_wave_note)
+        _sub_fired = bool(_sub_note) and not _wave_fired
+        _adjusted_fired = bool(_sub_note or _wave_note)
+        if _wave_fired:
+            _adj_to = f"trend+seasonal projection ({_final_name} base)"
+        elif _sub_fired:
+            _adj_to = str(_final_name)
+        else:
+            _adj_to = str(_final_name)
+        forecast_adjusted = None
+        if _adjusted_fired:
+            forecast_adjusted = {
+                "from": str(_orig_winner),
+                "to": _adj_to,
+                "reason": str((_sub_note or "").strip()),
+            }
+        # Confidence bands widen with horizon: sigma_h = sigma_eff * sqrt(h).
+        # n>=30: empirical residual quantiles scale the bands (honest,
+        # distribution-free); n<30: gaussian sigma with an unreliable flag.
+        _sigmas = _widening_sigmas(sigma, steps, values)
+        _n_for_intervals = int(n_obs)
+        _use_empirical = bool(_n_for_intervals >= 30)
+        _q10 = _q90 = _q025 = _q975 = None
+        _hw80_emp = _hw95_emp = None
+        if _use_empirical:
+            try:
+                _r = np.asarray(resid, dtype=float)
+                _r = _r[np.isfinite(_r)]
+                if len(_r) >= 30:
+                    _q10, _q90 = float(np.quantile(_r, 0.10)), float(np.quantile(_r, 0.90))
+                    _q025, _q975 = float(np.quantile(_r, 0.025)), float(np.quantile(_r, 0.975))
+                    _hw80_emp, _hw95_emp = abs(_q90 - _q10) / 2.0, abs(_q975 - _q025) / 2.0
+                else:
+                    _use_empirical = False
+            except Exception:
+                _use_empirical = False
+        if _use_empirical:
+            interval_method = "empirical_residual_quantiles_sqrt_h"
+            interval_unreliable = False
+        else:
+            interval_method = "gaussian_sigma_sqrt_h"
+            interval_unreliable = True
+
+        def _band_hw(i, which):
+            import math as _m
+            _w = _m.sqrt(i + 1)
+            if _use_empirical and _hw80_emp is not None and _hw95_emp is not None:
+                base = _hw80_emp if which == 80 else _hw95_emp
+                try:
+                    _v = np.asarray(values, dtype=float)
+                    _scale = max(1.0, abs(float(np.mean(np.abs(_v[np.isfinite(_v)])))))
+                except Exception:
+                    _scale = 1.0
+                base = max(float(base), 0.005 * float(_scale))
+                return float(base) * _w
+            if which == 80:
+                return float(1.28 * _sigmas[i])
+            return float(1.96 * _sigmas[i])
+
         forecast_points = [
             {
                 "label": fwd_labels[i],
                 "value": round(float(points[i]), 2),
                 "forecast": round(float(points[i]), 2),
-                "lower80": round(float(points[i] - 1.28 * sigma), 2),
-                "upper80": round(float(points[i] + 1.28 * sigma), 2),
-                "lower95": round(float(points[i] - 1.96 * sigma), 2),
-                "upper95": round(float(points[i] + 1.96 * sigma), 2),
+                "lower80": round(float(points[i] - _band_hw(i, 80)), 2),
+                "upper80": round(float(points[i] + _band_hw(i, 80)), 2),
+                "lower95": round(float(points[i] - _band_hw(i, 95)), 2),
+                "upper95": round(float(points[i] + _band_hw(i, 95)), 2),
+                "interval_method": interval_method,
+                **({"interval_unreliable": True} if interval_unreliable else {}),
             }
             for i in range(steps)
         ]
@@ -1054,8 +1634,20 @@ class PredictionAgent:
             {
                 "date": fwd_labels[i],
                 "value": round(float(points[i]), 2),
-                "lower": round(float(points[i] - 1.96 * sigma), 2),
-                "upper": round(float(points[i] + 1.96 * sigma), 2),
+                "lower": round(float(points[i] - _band_hw(i, 95)), 2),
+                "upper": round(float(points[i] + _band_hw(i, 95)), 2),
+            }
+            for i in range(steps)
+        ]
+        confidence_interval = [
+            {
+                "date": fwd_labels[i],
+                "lower80": round(float(points[i] - _band_hw(i, 80)), 2),
+                "upper80": round(float(points[i] + _band_hw(i, 80)), 2),
+                "lower95": round(float(points[i] - _band_hw(i, 95)), 2),
+                "upper95": round(float(points[i] + _band_hw(i, 95)), 2),
+                "interval_method": interval_method,
+                **({"interval_unreliable": True} if interval_unreliable else {}),
             }
             for i in range(steps)
         ]
@@ -1080,10 +1672,38 @@ class PredictionAgent:
         selection_statement = sel_meta.get("statement") or (
             f"Selected {model_name} { _selection.HOLDOUT_STATEMENT}."
             if validated else "insufficient history for holdout validation")
+        try:
+            if _wave_note:
+                selection_statement = (selection_statement + " " + _wave_note).strip()
+        except Exception:
+            pass
         model_notes = dict(sel_meta)
-        model_notes.setdefault("sigma", round(float(sigma), 2))
+        try:
+            model_notes.setdefault("sigma", round(float(_sigmas[0]), 2))
+        except Exception:
+            model_notes.setdefault("sigma", round(float(sigma), 2))
         if diagnostics:
             model_notes.setdefault("series_diagnostics", diagnostics)
+        # Sparse / intermittent-demand hint (additive): high zero share
+        # means MAPE covers only non-zero periods — flag directionally.
+        try:
+            _zero_frac_hist = float(np.mean(np.asarray(values) == 0.0)) if len(values) else 0.0
+        except Exception:
+            _zero_frac_hist = 0.0
+        sparse_hint = None
+        if _zero_frac_hist >= 0.3 or zero_frac >= 0.3:
+            sparse_hint = (
+                f"sparse/intermittent demand: "
+                f"{round(_zero_frac_hist * 100.0, 1)}% zero periods in history "
+                f"({cov.get('zero_skipped', 0)}/{cov.get('origins', 0)} walk-forward "
+                f"origins excluded from MAPE) — treat the projection as "
+                f"directional, not precise."
+            )
+            if "reliability_note" in model_notes and model_notes["reliability_note"]:
+                model_notes["reliability_note"] = (
+                    str(model_notes["reliability_note"]) + " " + sparse_hint)
+            else:
+                model_notes["sparse_demand_note"] = sparse_hint
 
         # Perfect-fit honesty: a zero-width interval is observed error, not
         # certainty. The bands stay as computed; the note tells every
@@ -1126,18 +1746,26 @@ class PredictionAgent:
             "target_column": col,
             "frequency": frequency_label,
             "frequency_detection": {
-                "method": "median timestamp delta",
+                "method": "median timestamp delta + coverage sanity (h/D/W/MS/Q/YS)",
                 "median_delta_days": (diagnostics or {}).get("median_delta_days"),
                 "time_grain": (diagnostics or {}).get("time_grain"),
             },
             "n_obs_raw": (diagnostics or {}).get("n_obs_raw", n_obs),
             "n_obs": n_obs,
             "missing_periods": (diagnostics or {}).get("missing_periods", 0),
+            "missing_periods_interpolated": (diagnostics or {}).get(
+                "missing_periods_interpolated", 0),
+            "missing_periods_masked": (diagnostics or {}).get(
+                "missing_periods_masked", 0),
             "missing_periods_filled": (diagnostics or {}).get("missing_periods_filled", 0),
+            "gap_method": (diagnostics or {}).get("gap_method"),
             "missing_values": (diagnostics or {}).get("missing_values", 0),
+            "parse_ratio": (diagnostics or {}).get("parse_ratio", 1.0),
             "duplicate_timestamps_merged": (diagnostics or {}).get(
                 "duplicate_timestamps_merged", 0),
             "duplicate_aggregation": (diagnostics or {}).get("aggregation_method", "sum"),
+            "aggregation_method": (diagnostics or {}).get("aggregation_method", "sum"),
+            "aggregation_reason": (diagnostics or {}).get("aggregation_reason"),
             "constant": (diagnostics or {}).get("constant", False),
             "near_constant": (diagnostics or {}).get("near_constant", False),
             "temporal_variation": (diagnostics or {}).get("temporal_variation", True),
@@ -1146,6 +1774,9 @@ class PredictionAgent:
                 "outlier_method", "IQR+zscore union, info only - values kept"),
             "irregular_intervals": (diagnostics or {}).get("irregular_intervals", False),
             "aggregation_level": (diagnostics or {}).get("aggregation_level"),
+            "tz_normalized": (diagnostics or {}).get("tz_normalized", False),
+            "tz_note": (diagnostics or {}).get("tz_note"),
+            "sparse_demand_hint": sparse_hint,
         }
         if accuracy is not None:
             accuracy_summary = (
@@ -1174,7 +1805,17 @@ class PredictionAgent:
                         "used": steps, "frequency": frequency_label,
                         "capped": horizon_capped, "note": horizon_note},
             "confidence_threshold": conf_thresh,
-            "sigma": round(float(sigma), 2),
+            "sigma": round(float(_sigmas[0]), 2) if "_sigmas" in locals() else round(float(sigma), 2),
+            "interval_widening": "sqrt(h)",
+            "interval_method": interval_method,
+            "interval_unreliable": interval_unreliable,
+            "interval_quantiles": (
+                {"q10": round(_q10, 2), "q90": round(_q90, 2),
+                 "q2_5": round(_q025, 2), "q97_5": round(_q975, 2)}
+                if _use_empirical else None),
+            "forecast_adjusted": forecast_adjusted,
+            "projected_baseline": _proj_baseline,
+            "projected_pct_suppressed": bool(_proj_suppressed),
             "legacy_reliability_label": _legacy_reliability_label(accuracy),
         }
 
@@ -1200,7 +1841,13 @@ class PredictionAgent:
             "recommendation": PRELIMINARY_RECOMMENDATION if preliminary else None,
             "n_obs": n_obs,
             "uncertainty_note": uncertainty_note,
-            "interval_method": "pointwise",
+            "interval_method": interval_method,
+            "interval_unreliable": interval_unreliable,
+            "interval_quantiles": details.get("interval_quantiles"),
+            "forecast_adjusted": forecast_adjusted,
+            "projected_baseline": _proj_baseline,
+            "projected_pct_suppressed": bool(_proj_suppressed),
+            "sparse_demand_hint": sparse_hint,
             "validation": validation,
             "preparation": preparation,
             "model_notes": model_notes,
@@ -1213,16 +1860,7 @@ class PredictionAgent:
             # ---- data contract (Phase 12 / §16) ----
             "historical": historical,
             "forecast": forecast_series,
-            "confidence_interval": [
-                {
-                    "date": fwd_labels[i],
-                    "lower80": round(float(points[i] - 1.28 * sigma), 2),
-                    "upper80": round(float(points[i] + 1.28 * sigma), 2),
-                    "lower95": round(float(points[i] - 1.96 * sigma), 2),
-                    "upper95": round(float(points[i] + 1.96 * sigma), 2),
-                }
-                for i in range(steps)
-            ],
+            "confidence_interval": confidence_interval,
             "timestamps": [h["date"] for h in historical]
             + [f["date"] for f in forecast_series],
             "frequency": frequency,
@@ -1287,6 +1925,12 @@ class PredictionAgent:
             "valid": False,
             "uncertainty_note": None,
             "interval_method": None,
+            "interval_unreliable": True,
+            "interval_quantiles": None,
+            "forecast_adjusted": None,
+            "projected_baseline": None,
+            "projected_pct_suppressed": False,
+            "sparse_demand_hint": None,
             "validation": {
                 "method": None, "metric": "MAPE",
                 "accuracy_pct": None, "threshold_pct": self.valid_threshold,

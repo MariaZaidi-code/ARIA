@@ -386,7 +386,7 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
                                 });
                               } catch { /* best-effort; user can retry regardless */ }
                             }}
-                            className="mt-2 inline-flex items-center gap-1.5 text-[12px] font-semibold text-blue-700 border border-blue-200 rounded-lg px-3 py-1.5 hover:bg-blue-50"
+                            className="mt-2 inline-flex items-center gap-1.5 text-[12px] font-semibold text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/25 rounded-lg px-3 py-1.5 hover:bg-blue-50 dark:hover:bg-blue-500/10"
                           >
                             Switch to on-device AI and retry your question
                           </button>

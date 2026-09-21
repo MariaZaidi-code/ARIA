@@ -887,12 +887,18 @@ def _usable_measures(intel, table):
     fks = {f[0].lower() for f in intel.get_fks(table)}
     pks = {p.lower() for p in intel.get_pk(table)}
     join_keys = _join_key_cols(intel, table)
+    try:
+        from core.semantic import is_year_like as _is_year_like
+    except Exception:
+        _is_year_like = lambda c: False  # noqa: E731
     out = []
     for c in intel.get_numeric_cols(table):
         low = c.lower()
         if low in fks or low in pks or low in join_keys:
             continue
         if low.endswith(("_id", "_key", "_no", "_code")) or low in ("id", "key", "code"):
+            continue
+        if _is_year_like(c):
             continue
         role = classify_semantic_role(
             c, "numeric", is_pk=(low in pks), is_fk=(low in fks),
@@ -1521,6 +1527,10 @@ def _coverage_response(items, metric, table, m_h, priors, tested=None):
                 "diagnostics": {"dropped_invalid": dropped, "emitted": 0}}
     for i, c in enumerate(pres):
         c["rank"] = i + 1
+        # First-class honest prescription marker (additive): this card
+        # directs attention with plain wording and gated evidence — it is a
+        # real prescription, not a refusal side-path.
+        c["coverage"] = True
     top = pres[0]
     from core.semantic import humanize as _hh
     _top_ev = top.get("evidence", {}) if isinstance(top.get("evidence"), dict) else {}
@@ -1542,6 +1552,8 @@ def _coverage_response(items, metric, table, m_h, priors, tested=None):
     _viz = _groups_bar_viz(top, m_h)
     return {"ok": True, "success": True, "status": "completed",
             "analysis_id": f"rxa_{table}_{metric}_coverage",
+            "coverage": True,
+            "prescription_class": "attention",
             "metric": metric, "driver": _top_ev.get("driver"),
             "table": table, "driver_table": table, "join": None, "join_ref": None,
             "control": {"level": "investigation",
@@ -1556,6 +1568,50 @@ def _coverage_response(items, metric, table, m_h, priors, tested=None):
                         "priors_origin": (priors or {}).get("origin")},
             "story": story,
             "summary_plain": _plain_summary(m_h, _top_ev.get("driver") or m_h, None, top)}
+
+
+def _coverage_or_refusal(engine, dialect, intel, table, metric, m_h, priors,
+                         tested=None, reason="", evidence=None, review=None,
+                         review_basis=None, driver=None):
+    """Coverage fallback as a first-class honest prescription.
+
+    Tries the gated investigate / segment-focus / monitor candidates first
+    (each keeps its own evidence gates — share/gap/n and momentum/points —
+    plus an explicit honest note; thresholds are untouched). When at least
+    one candidate clears its gates, the coverage response below is returned
+    as a completed, plain-worded attention prescription instead of a bare
+    refusal. Only when nothing clears the gates does this fall back to the
+    honest no_prescription refusal. Additive: API shapes are unchanged apart
+    from the coverage flag carried by _coverage_response.
+    """
+    try:
+        inv = _investigate_cands(engine, dialect, intel, table, metric, m_h,
+                                 review=review, review_basis=review_basis)
+    except Exception:
+        inv = []
+    try:
+        seg = _segment_focus_cands(engine, dialect, intel, table, metric, m_h,
+                                   review=review, review_basis=review_basis)
+    except Exception:
+        seg = []
+    try:
+        mon = _monitor_cands(engine, dialect, intel, table, metric, m_h,
+                             review=review, review_basis=review_basis)
+    except Exception:
+        mon = []
+    if seg or mon or inv:
+        return _coverage_response(seg + mon + inv, metric, table,
+                                  m_h, priors, tested=tested)
+    out: dict = {"ok": True, "success": True, "status": "no_prescription",
+                 "reason": reason,
+                 "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
+                 "tested": [dict(t) for t in (tested or [])][:12],
+                 "metric": metric, "table": table}
+    if driver is not None:
+        out["driver"] = driver
+    if evidence is not None:
+        out["evidence"] = evidence
+    return out
 
 
 def _groups_bar_viz(top, m_h):
@@ -1676,8 +1732,27 @@ def _qi(name, dialect="postgresql"):
 
 def _fetch_joined(engine, dialect, mtable, mcol, otable, ocol, self_col, other_col,
                   limit=SAMPLE_LIMIT):
-    """Read-only joined driver/metric pairs across one declared edge."""
-    mt, ot = _qi(mtable, dialect), _qi(otable, dialect)
+    """Read-only joined driver/metric pairs across one declared edge.
+
+    Table names may be schema-qualified (sales.orders on multi-schema
+    databases): they are quoted per dot-segment ("sales"."orders") via
+    the shared _safe_name helper. Column references stay bare and use
+    the local _qi quoter.
+    """
+    try:
+        from api.schema_intel import _safe_name as _qn
+    except Exception:
+        _qn = None
+
+    def _qt(name):
+        try:
+            if _qn is not None:
+                return _qn(name, dialect)
+        except Exception:
+            pass
+        return _qi(name, dialect)
+
+    mt, ot = _qt(mtable), _qt(otable)
     return _exec(engine,
                  f"SELECT o.{_qi(ocol, dialect)}, m.{_qi(mcol, dialect)} "
                  f"FROM {mt} m JOIN {ot} o ON "
@@ -1877,16 +1952,18 @@ def _analyze_core(engine, dialect, intel, table, metric, driver=None,
             is_fk=(str(driver).lower() in _dfks),
             is_join_key=(str(driver).lower() in _dkeys))
         if _drole in NON_LEVER_ROLES:
-            return {"ok": True, "success": True, "status": "no_prescription",
-                    "reason": (f"{_disp(driver)} is a {_drole.lower().replace('_', ' ')} — ARIA keeps the "
-                               f"association with {_disp(metric)} as supporting evidence, but it cannot be "
-                               f"moved as an intervention. Association is evidence of association, not evidence "
-                               f"of an actionable driver."),
-                    "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
-                "tested": ([{"driver": driver, "verdict": "skipped",
-                             "note": f"{_disp(driver)} is a {_drole.lower().replace('_', ' ')} — categories and system fields cannot be adjusted as interventions."}]
-                           + [dict(t) for t in tested])[:12],
-                    "metric": metric, "driver": driver, "table": table}
+            from core.semantic import humanize as _hg0
+            _tested0 = ([{"driver": driver, "verdict": "skipped",
+                          "note": f"{_disp(driver)} is a {_drole.lower().replace('_', ' ')} — categories and system fields cannot be adjusted as interventions."}]
+                        + [dict(t) for t in tested])[:12]
+            return _coverage_or_refusal(
+                engine, dialect, intel, table, metric, _hg0(metric), priors,
+                tested=_tested0,
+                reason=(f"{_disp(driver)} is a {_drole.lower().replace('_', ' ')} — ARIA keeps the "
+                        f"association with {_disp(metric)} as supporting evidence, but it cannot be "
+                        f"moved as an intervention. Association is evidence of association, not evidence "
+                        f"of an actionable driver."),
+                review=review, review_basis=review_basis, driver=driver)
     neighbors = _edge_neighbors(intel, table)
     auto_note = None
     if driver == "length_of_stay":
@@ -1901,12 +1978,13 @@ def _analyze_core(engine, dialect, intel, table, metric, driver=None,
                          f"{_disp(metric)}.")
         f = fit_relationship(nights, ys)
         if not (f and abs(f["r"]) >= MIN_ABS_R and f["p_value"] < 0.05):
-            return {"ok": True, "success": True, "status": "no_prescription",
-                    "reason": (f"ARIA measured stay length against {_disp(metric)} but the link "
-                               f"is too weak to justify an intervention."),
-                    "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
-                "tested": [dict(t) for t in tested][:12],
-                    "metric": metric, "table": table}
+            from core.semantic import humanize as _hg0s
+            return _coverage_or_refusal(
+                engine, dialect, intel, table, metric, _hg0s(metric), priors,
+                tested=tested,
+                reason=(f"ARIA measured stay length against {_disp(metric)} but the link "
+                        f"is too weak to justify an intervention."),
+                review=review, review_basis=review_basis)
         best, best_fit, best_xy, best_join = "length_of_stay", f, (nights, ys), None
         cands = []
     elif driver:
@@ -2110,14 +2188,15 @@ _hg(metric), priors, tested=tested)
     # technical/system outcomes; this is the structural backstop.
     up_better, up_assump = improvement_up(metric)
     if up_better is None:
-        return {"ok": True, "success": True, "status": "no_prescription",
-                "reason": (f"ARIA cannot establish whether higher or lower values of {_disp(metric)} "
-                           f"are desirable ({up_assump}). Without a justified direction, no actionable "
-                           f"recommendation can be generated — the association stays supporting evidence only."),
-                "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
-                "tested": [dict(t) for t in tested][:12],
-                "metric": metric, "driver": driver_used, "table": table,
-                "evidence": {"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]}}
+        from core.semantic import humanize as _hg_dir
+        return _coverage_or_refusal(
+            engine, dialect, intel, table, metric, _hg_dir(metric), priors,
+            tested=tested,
+            reason=(f"ARIA cannot establish whether higher or lower values of {_disp(metric)} "
+                    f"are desirable ({up_assump}). Without a justified direction, no actionable "
+                    f"recommendation can be generated — the association stays supporting evidence only."),
+            evidence={"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]},
+            review=review, review_basis=review_basis, driver=driver_used)
     # Explicit fallback assumption (no recognized outcome semantics): the
     # recommendation is allowed for business-plausible metrics but carries
     # capped confidence — the assumption is recorded, never silent.
@@ -2162,13 +2241,13 @@ _hg2(metric), priors, tested=tested)
     _xmean = float(_xs.mean()) if len(_xs) else fit["x_mean"]
     _xstd = float(_xs.std()) if len(_xs) > 1 else 0.0
     if not _xmean or not _xstd:
-        return {"ok": True, "success": True, "status": "no_prescription",
-                "reason": (f"Cannot compute scenario: driver '{humanize(driver_used)}' "
-                           f"has zero mean or zero variance in the observed data."),
-                "alternatives": ["Investigate Driver", "Test Hypothesis", "Explore Data", "Ask ARIA"],
-                "tested": [dict(t) for t in tested][:12],
-                "metric": metric, "driver": driver_used, "table": table,
-                "evidence": {"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]}}
+        return _coverage_or_refusal(
+            engine, dialect, intel, table, metric, humanize(metric), priors,
+            tested=tested,
+            reason=(f"Cannot compute scenario: driver '{humanize(driver_used)}' "
+                    f"has zero mean or zero variance in the observed data."),
+            evidence={"r": fit["r"], "p_value": fit["p_value"], "n": fit["n"]},
+            review=review, review_basis=review_basis, driver=driver_used)
     _typical = abs(_xstd / _xmean * 100) if _xmean else 10.0
     _edge = ((fit["x_max"] - _xmean) / abs(_xmean) * 100) if move > 0 else ((_xmean - fit["x_min"]) / abs(_xmean) * 100)
     _edge = max(0.0, min(50.0, _edge if _edge == _edge else 0.0))  # NaN-safe
@@ -3733,7 +3812,21 @@ def _finalize_output(out: dict, *, engine=None, dialect=None, intel=None,
         except Exception:
             _tested = []
         for r in pres:
-            if isinstance(r, dict) and "display" not in r:
+            # Repair incomplete display contracts too, not just missing ones:
+            # a partial/{} display from an older path must gain every key
+            # the UI reads (title, action_text, outcome_text,
+            # confidence_label, why_summary, problem_text, why_text).
+            _needs_display = True
+            try:
+                _d = r.get("display") if isinstance(r, dict) else None
+                _needs_display = not (
+                    isinstance(_d, dict) and all(
+                        k in _d for k in ("title", "action_text", "outcome_text",
+                                         "confidence_label", "why_summary",
+                                         "problem_text", "why_text")))
+            except Exception:
+                _needs_display = True
+            if isinstance(r, dict) and _needs_display:
                 try:
                     _supporting = [s for s in pres if isinstance(s, dict) and s is not r]
                 except Exception:

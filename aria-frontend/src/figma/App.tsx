@@ -4,6 +4,7 @@ import "./index.css";
 import "../aria-enhance.css";
 import AppShell from "./components/AppShell";
 import ErrorBoundary from "./components/ErrorBoundary";
+import MiniAria from "./components/MiniAria";
 import Login from "./pages/Login";
 // Route pages are code-split: each hash route loads its own chunk on
 // first visit (vendor/charts/motion stay in shared manualChunks — see
@@ -708,6 +709,8 @@ export default function App() {
           }
         })())}</Suspense></div>
       </AppShell>
+      {/* Mini ARIA robot: every page except the Copilot page itself. */}
+      {page !== "copilot" && <MiniAria />}
       </ToastProvider>
     </ThemeContext.Provider>
   );

@@ -457,6 +457,254 @@ def compute_possible_drivers(engine: Any, dialect: str, table: str,
 
 
 # ---------------------------------------------------------------------------
+# Hypothesis builder (evidence-shaped, generic — no hardcoded names)
+# ---------------------------------------------------------------------------
+
+def _hyp_num(v: Any) -> float | None:
+    try:
+        f = float(v)
+        if f != f or f in (float("inf"), float("-inf")):
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+def _hyp_grade(sample_n: int, gap: float | None, top_conf: str) -> tuple[str, str]:
+    """Evidence grade from sample size + consistency, in plain words.
+
+    Never mentions r/p/slope or any statistician numbers — only everyday
+    words about how much was seen and how clear the gap is.
+    """
+    conf = str(top_conf or "").lower()
+    clear = (conf == "high" and gap is not None and gap >= 15) or (
+        gap is not None and gap >= 25
+    )
+    partly = (
+        conf in ("high", "medium")
+        and gap is not None
+        and gap >= 8
+    )
+    if sample_n >= 30 and clear:
+        return ("strong",
+                "Strong — seen across many observations with a clear gap "
+                "between the leader and the rest.")
+    if sample_n >= 30 and partly:
+        return ("mixed",
+                "Mixed — seen across many observations, but the gap is "
+                "modest so the lead could change with more data.")
+    if sample_n >= 10 and clear:
+        return ("mixed",
+                "Mixed — the gap looks clear, but it rests on a moderate "
+                "number of observations so treat it as a lead to check.")
+    if sample_n >= 10 and partly:
+        return ("mixed",
+                "Mixed — a middling number of observations with a modest "
+                "gap, worth checking further.")
+    if sample_n >= 10:
+        return ("weak",
+                "Weak — only a middling number of observations and no clear "
+                "gap, so this is an early hint at best.")
+    return ("weak",
+            "Weak — based on only a few observations, so treat this as a "
+            "question to explore, not an answer.")
+
+
+def build_hypothesis(
+    drivers: list[dict] | None,
+    metric_label: str | None = None,
+    metric_col: str | None = None,
+    period_label: str = "",
+    observation_count: int = 0,
+    dimensions: list[str] | None = None,
+) -> dict:
+    """Build an evidence-shaped hypothesis from real driver aggregates.
+
+    Returns a backward-compatible dict (``text``/``confidence``/``drivers``)
+    plus additive fields: ``evidence_grade``, ``evidence_reason``,
+    ``rivals`` ([{text}]), ``data_needed``, ``explore_handoff`` and
+    ``prescription_handoff``. Everything is derived from the passed
+    drivers/metric/period/counts — nothing is hardcoded to a domain, and
+    the prose never contains r/p/slope statistics.
+    """
+    metric = str(metric_label or metric_col or "the metric").strip() or "the metric"
+    period = str(period_label or "the selected period").strip() or "the selected period"
+    try:
+        n = int(observation_count or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n < 0:
+        n = 0
+    items = [d for d in (drivers or []) if isinstance(d, dict)]
+    tops = sorted(items, key=lambda d: _hyp_num(d.get("contribution_pct")) or 0,
+                  reverse=True)
+    driver_names = [str(d.get("driver") or "") for d in tops[:3] if d.get("driver")]
+
+    if not tops:
+        obs = f" across {n} observations" if n > 0 else ""
+        text = (
+            f"No single segment dominates {metric} in {period}{obs} — "
+            f"the data looks spread out. "
+            f"Treat any single-factor story as weak until more of the data "
+            f"is checked. This is a pattern in the data, "
+            f"not proof of what causes it."
+        )
+        grade, reason = _hyp_grade(n, None, "low")
+        noun = "breakdown" if not (dimensions or []) else str((dimensions or [])[0])
+        return {
+            "text": text,
+            "confidence": "low",
+            "drivers": [],
+            "evidence_grade": grade,
+            "evidence_reason": reason,
+            "rivals": [
+                {"text": (
+                    "One rival explanation is that the total is spread across "
+                    "many small segments, so no single one drives it."
+                )},
+                {"text": (
+                    "Another is a mix or timing effect not visible in this "
+                    f"breakdown — checked only against {noun}, so it stays open."
+                )},
+            ][:2],
+            "data_needed": (
+                "A finer breakdown, or a longer period with more observations, "
+                "would settle whether any single factor emerges."
+            ),
+            "explore_handoff": {
+                **({"metric": str(metric_col or metric)} if (metric_col or metric) else {}),
+                **({"breakdown": str((dimensions or [])[0])} if (dimensions or []) else {}),
+            },
+            "prescription_handoff": {
+                **({"metric": str(metric_col or metric)} if (metric_col or metric) else {}),
+            },
+        }
+
+    top = tops[0]
+    top_val = str(top.get("value") or "").strip() or "the leading segment"
+    top_dim = str(top.get("dimension") or (dimensions or [""])[0] if (dimensions or []) else (top.get("dimension") or "")).strip()
+    top_share = _hyp_num(top.get("contribution_pct"))
+    top_conf = str(top.get("confidence") or "low")
+    second = tops[1] if len(tops) > 1 else None
+    second_val = str((second or {}).get("value") or "").strip() if second else ""
+    second_share = _hyp_num((second or {}).get("contribution_pct")) if second else None
+    gap: float | None = None
+    if top_share is not None and second_share is not None:
+        gap = round(top_share - second_share, 1)
+
+    share_txt = f"about {round(top_share)}%" if top_share is not None else "a large portion"
+    obs_txt = f" across {n} observations" if n > 0 else ""
+    where = f" in {period}" if period else ""
+    seg_txt = f" ({top_dim})" if top_dim else ""
+
+    # Evidence-shaped sentences: shape chosen by evidence type.
+    if top_share is not None and (top_share >= 40 or (gap is not None and gap >= 20)):
+        gap_txt = f" — well ahead of the next largest at about {round(second_share)}%" \
+            if second and second_val and second_share is not None else ""
+        text = (
+            f"{top_val}{seg_txt} stands out in {metric}{where}: "
+            f"{share_txt} of the total{obs_txt}{gap_txt}. "
+            f"The size of the gap makes it the leading pattern to check. "
+            f"This is a pattern in the data, not proof of what causes it."
+        )
+    elif second and second_val and gap is not None and gap < 12 and (top_share or 0) >= 15:
+        text = (
+            f"{top_val}{seg_txt} leads {metric}{where} with {share_txt}, "
+            f"just ahead of {second_val} at about {round(second_share or 0)}%{obs_txt}. "
+            f"With the top two close, either could matter most on a rerun. "
+            f"This is a pattern in the data, not proof of what causes it."
+        )
+    else:
+        runner_txt = f" The next largest, {second_val}, is not far behind." \
+            if second and second_val else ""
+        text = (
+            f"{top_val}{seg_txt} holds {share_txt} of {metric}{where}{obs_txt}."
+            f"{runner_txt} "
+            f"The picture is suggestive rather than firm. "
+            f"This is a pattern in the data, not proof of what causes it."
+        )
+
+    grade, reason = _hyp_grade(n, gap, top_conf)
+
+    rivals: list[dict] = []
+    if second and second_val:
+        s_txt = f"about {round(second_share)}%" if second_share is not None else "a smaller portion"
+        rivals.append({"text": (
+            f"Another possibility is {second_val} at {s_txt} — checked against "
+            f"the same breakdown, it explains less on its own because its "
+            f"portion is smaller."
+        )})
+    else:
+        rivals.append({"text": (
+            "Another possibility is that the rest is spread across many small "
+            "segments, so the lead flatters a single name — checked only "
+            "against the top of the breakdown."
+        )})
+    if len(tops) > 2:
+        third = tops[2]
+        third_val = str(third.get("value") or "").strip()
+        if third_val:
+            third_share = _hyp_num(third.get("contribution_pct"))
+            t_txt = f"about {round(third_share)}%" if third_share is not None else "a smaller portion"
+            rivals.append({"text": (
+                f"A further rival is {third_val} at {t_txt} — smaller still, "
+                f"so it would need a different cut of the data to overtake."
+            )})
+    else:
+        rivals.append({"text": (
+            "A further rival is a mix or timing effect not visible in this "
+            "breakdown — nothing in this cut rules it out."
+        )})
+    rivals = rivals[:2]
+
+    if second and gap is not None and gap < 12:
+        data_needed = (
+            "Comparing another period, or breaking the numbers down over "
+            "time, would settle which segment holds the lead."
+        )
+    elif top_dim:
+        data_needed = (
+            f"Breaking down {top_val} further, or comparing another period, "
+            f"would settle whether the lead persists or fades."
+        )
+    else:
+        data_needed = (
+            "Comparing another period with more observations would settle "
+            "whether this pattern holds."
+        )
+
+    metric_ref = str(metric_col or metric)
+    dim_ref = str(top.get("dimension") or ((dimensions or [""])[0] if (dimensions or []) else ""))
+    explore_handoff: dict = {}
+    if metric_ref:
+        explore_handoff["metric"] = metric_ref
+    if dim_ref:
+        explore_handoff["breakdown"] = dim_ref
+    if top_val and top_val != "the leading segment":
+        explore_handoff["segment"] = top_val
+    prescription_handoff: dict = {}
+    if metric_ref:
+        prescription_handoff["metric"] = metric_ref
+    if dim_ref:
+        prescription_handoff["driver"] = dim_ref
+        prescription_handoff["segmentField"] = dim_ref
+    if top_val and top_val != "the leading segment":
+        prescription_handoff["segmentValue"] = top_val
+
+    return {
+        "text": text,
+        "confidence": top_conf,
+        "drivers": driver_names,
+        "evidence_grade": grade,
+        "evidence_reason": reason,
+        "rivals": rivals,
+        "data_needed": data_needed,
+        "explore_handoff": explore_handoff,
+        "prescription_handoff": prescription_handoff,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Follow-ups generated from the result (never generic)
 # ---------------------------------------------------------------------------
 
@@ -491,6 +739,27 @@ def build_followups(question: str, primary_intent: str, metric: str | None,
     dims = [d for d in (dimensions or [])
             if d and "(" not in str(d) and "*" not in str(d)
             and not _followup_is_id_like(str(d))]
+    # Natural-English wording (generic): humanize raw identifiers to bare
+    # lowercase words so follow-ups read like typed questions, never like
+    # schema paths (sales.totaldue -> "total due", never "sales.totaldue").
+    try:
+        from core.semantic import humanize as _hum
+
+        def _nl(v):
+            try:
+                return _hum(str(v or "").split(".")[-1]).lower().strip() or str(v or "")
+            except Exception:
+                return str(v or "")
+    except Exception:
+        def _nl(v):
+            return str(v or "")
+    m = _nl(m) if m != "the metric" else m
+    dims = [_nl(d) for d in dims]
+    try:
+        drivers = [{**t, "dimension": _nl(t.get("dimension")),
+                    "value": str(t.get("value"))} for t in (drivers or [])]
+    except Exception:
+        pass
     d0 = dims[0] if dims else "segment"
     d1 = dims[1] if len(dims) > 1 else None
     period = (period_label or "this period").strip()

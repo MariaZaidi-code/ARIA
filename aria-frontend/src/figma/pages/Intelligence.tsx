@@ -4,7 +4,7 @@ import {
   BarChart3, Lightbulb, Target, SlidersHorizontal, FileText, Play, RotateCcw,
   ChevronRight, ArrowLeft, RefreshCw, Database, Sparkles,
   Plus, Printer, Download, Share2,
-  CalendarDays, Save, Eye, Check, ClipboardList,
+  CalendarDays, Save, Eye, Check,
 } from "lucide-react";
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
@@ -18,35 +18,37 @@ import {
   SkeletonBlock, Field, selectCls, inputCls, btnPrimary, btnGhost,
 } from "./intelligence/cards";
 import ExploreTab from "./intelligence/ExploreTab";
-import PrescriptionsTab from "./intelligence/PrescriptionsTab";
+import PrescriptionsFeed from "./intelligence/PrescriptionsFeed";
 import { intelligenceApi, normalizeApiError, apiFetch } from "../../services/api";
 
 /* =====================================================================
-   ARIA Intelligence — Explore / Hypotheses / Goals / What-If /
-   Prescriptions / Reports.
+   ARIA Intelligence — Explore / Hypotheses / Goals / What-If / Reports.
    Single page with an icon tab bar (Explore, Hypotheses, Goals, What-If,
-   Prescriptions, Reports). Every number, label option, status and range comes from
+   Reports). Every number, label option, status and range comes from
    GET/POST /api/intelligence/* — the frontend formats and renders but
    never calculates truth (no confidence/priority/impact math in React).
    No values are hardcoded from design screenshots.
    ===================================================================== */
 
-export type IntelTab = "explore" | "hypotheses" | "goals" | "whatif" | "prescriptions" | "reports";
+export type IntelTab = "explore" | "hypotheses" | "goals" | "whatif" | "reports" | "prescriptions";
 
 const TABS: { id: IntelTab; label: string; Icon: typeof BarChart3 }[] = [
   { id: "explore", label: "Explore", Icon: BarChart3 },
   { id: "hypotheses", label: "Hypotheses", Icon: Lightbulb },
   { id: "goals", label: "Goals", Icon: Target },
+  { id: "prescriptions", label: "Prescriptions", Icon: Sparkles },
   { id: "whatif", label: "What-If", Icon: SlidersHorizontal },
-  { id: "prescriptions", label: "Prescriptions", Icon: ClipboardList },
   { id: "reports", label: "Reports", Icon: FileText },
 ];
 
 function tabFromHash(): IntelTab {
   try {
-    const m = /[?&]tab=([a-z]+)/.exec(window.location.hash || "");
+    const m = /[?&]tab=([a-z-]+)/.exec(window.location.hash || "");
     const t = (m?.[1] || "").toLowerCase();
-    if (t === "hypotheses" || t === "goals" || t === "whatif" || t === "what-if" || t === "prescriptions" || t === "reports" || t === "explore") {
+    if (t === "prescriptions" || t === "prescription" || t === "rx") {
+      return "prescriptions";
+    }
+    if (t === "hypotheses" || t === "goals" || t === "whatif" || t === "what-if" || t === "reports" || t === "explore") {
       return t === "what-if" ? "whatif" : (t as IntelTab);
     }
   } catch { /* ignore */ }
@@ -181,7 +183,7 @@ function duePlus90(): string {
    HYPOTHESES
    ===================================================================== */
 
-function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: (t: IntelTab) => void }) {
+function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: (t: IntelTab, extra?: Record<string, string>) => void }) {
   const [items, setItems] = useState<any[]>([]);
   const [total, setTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
@@ -335,6 +337,55 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
       : "Already in the report draft. Open Reports to generate.");
   };
 
+  /* ---- Test-this (Explore handoff) ----
+     Explore: sessionStorage `aria_explore_prefill` + the drill-context
+     pattern (localStorage `aria_dashboard_drill`), then goto explore.
+     All values are the live hypothesis fields — nothing hardcoded. */
+  const hypMetricOf = (h: any): string => {
+    const ctx = h?.context || h?.analysis_context || {};
+    return strOf(h?.metric || ctx?.metric || h?.metric_label || "");
+  };
+  const hypBreakdownOf = (h: any): string => {
+    const ctx = h?.context || h?.analysis_context || {};
+    return strOf(h?.dimension || ctx?.breakdown || ctx?.dimension || "");
+  };
+  const testThis = (h: any) => {
+    const metric = hypMetricOf(h);
+    const breakdown = hypBreakdownOf(h);
+    try {
+      if (metric || breakdown) {
+        sessionStorage.setItem("aria_explore_prefill", JSON.stringify({
+          ...(metric ? { metric } : {}),
+          ...(breakdown ? { breakdown } : {}),
+        }));
+      }
+    } catch { /* best-effort */ }
+    try {
+      localStorage.setItem("aria_dashboard_drill", JSON.stringify({
+        at: Date.now(), kind: "hypothesis",
+        ...(metric ? { metric } : {}),
+        ...(breakdown ? { dimension: breakdown, breakdown } : {}),
+      }));
+    } catch { /* best-effort */ }
+    onGoto("explore");
+  };
+  /* Plain-words grade for Intelligence hypotheses: prefer the backend
+     evidence_grade when present, otherwise map the existing strength
+     label (strong/moderate/weak) to everyday words. No statistics. */
+  const gradeOf = (h: any, factors: any[], evidenceCount: number): { label: string; reason: string; tone: string } => {
+    const g = strOf(h?.evidence_grade || "").toLowerCase();
+    const reason = strOf(h?.evidence_reason || "");
+    if (/strong/.test(g)) return { label: "Strong evidence", reason: reason || "Strong — the pattern is backed by comparatively strong supporting signs.", tone: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25" };
+    if (/mixed|moderate|medium/.test(g)) return { label: "Mixed evidence", reason: reason || "Mixed — there are supporting signs, but also reasons to keep checking.", tone: "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" };
+    if (/weak/.test(g)) return { label: "Weak evidence", reason: reason || "Weak — only early signs so far, treat this as a question to explore.", tone: "bg-secondary text-secondary-foreground border-border" };
+    const s = strOf(h?.evidence_strength || h?.strength || "").toLowerCase();
+    if (/strong/.test(s)) return { label: "Strong evidence", reason: "Strong — the supporting signs behind this pattern look comparatively strong.", tone: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25" };
+    if (/moderate|medium/.test(s)) return { label: "Mixed evidence", reason: "Mixed — some supporting signs, but the picture is not yet firm.", tone: "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" };
+    if (/weak|limited|early/.test(s)) return { label: "Weak evidence", reason: "Weak — only early signs so far, treat this as a question to explore.", tone: "bg-secondary text-secondary-foreground border-border" };
+    if (evidenceCount >= 5 && factors.length >= 2) return { label: "Mixed evidence", reason: "Mixed — several supporting points, but the picture is not yet firm.", tone: "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" };
+    return { label: "Weak evidence", reason: "Weak — only early signs so far, treat this as a question to explore.", tone: "bg-secondary text-secondary-foreground border-border" };
+  };
+
   if (selectedId) {
     const h = detail || {};
     const ctx = h?.context || h?.analysis_context || {};
@@ -352,8 +403,8 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
     ];
     return (
       <div className="space-y-4">
-        <div className="text-[11px] text-slate-400 flex items-center gap-1"><span>Intelligence</span><ChevronRight size={11} /><span className="text-slate-600 font-medium">Hypotheses</span></div>
-        <button onClick={() => { setSelectedId(null); setDetail(null); }} className="inline-flex items-center gap-1.5 text-[12.5px] font-semibold text-blue-700 hover:underline" aria-label="Back to hypotheses">
+        <div className="text-[11px] text-muted-foreground flex items-center gap-1"><span>Intelligence</span><ChevronRight size={11} /><span className="text-secondary-foreground font-medium">Hypotheses</span></div>
+        <button onClick={() => { setSelectedId(null); setDetail(null); }} className="inline-flex items-center gap-1.5 text-[12.5px] font-semibold text-blue-700 dark:text-blue-400 hover:underline" aria-label="Back to hypotheses">
           <ArrowLeft size={13} /> Hypotheses
         </button>
         {detailLoading && <LoadingPanel label="Loading hypothesis detail…" />}
@@ -385,14 +436,14 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                 <>
                   {topName ? (
                     <>
-                      <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">{verdictWord.toUpperCase()}</p>
-                      <h3 className="text-[17px] font-semibold text-[#0F2440] tracking-tight">{topName}: the main reason {metricLabel} {direction}</h3>
-                      <p className="text-[12px] text-slate-500 mt-0.5">{headerQ}</p>
+                      <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">{verdictWord.toUpperCase()}</p>
+                      <h3 className="text-[17px] font-semibold text-foreground tracking-tight">{topName}: the main reason {metricLabel} {direction}</h3>
+                      <p className="text-[12px] text-muted-foreground mt-0.5">{headerQ}</p>
                     </>
                   ) : (
                     <>
-                      <h3 className="text-[16px] font-semibold text-[#0F2440] tracking-tight">{headerQ}</h3>
-                      <p className="text-[12px] text-slate-500 -mt-3">Investigate potential factors behind the observed pattern.</p>
+                      <h3 className="text-[16px] font-semibold text-foreground tracking-tight">{headerQ}</h3>
+                      <p className="text-[12px] text-muted-foreground -mt-3">Investigate potential factors behind the observed pattern.</p>
                     </>
                   )}
                 </>
@@ -408,26 +459,32 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
               </button>
               <button
                 onClick={() => addHypToDraft(detail)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold text-blue-700 border border-blue-200 hover:bg-blue-50"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/25 hover:bg-blue-50 dark:hover:bg-blue-500/10"
                 aria-label="Add this hypothesis to the report draft">
                 <FileText size={13} /> Add to report draft
               </button>
+              <button
+                onClick={() => testThis(detail)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold text-blue-700 dark:text-blue-400 border border-border hover:border-blue-300 dark:hover:border-blue-500/25 hover:bg-blue-50/50 dark:hover:bg-blue-500/10"
+                aria-label="Test this hypothesis in Explore">
+                <Play size={13} /> Test this
+              </button>
             </div>
             {(trackMsg || draftMsg) && (
-              <p className={`text-[12px] ${trackMsg ? "text-rose-600" : "text-emerald-700"}`} role={trackMsg ? "alert" : "status"}>
+              <p className={`text-[12px] ${trackMsg ? "text-rose-600 dark:text-rose-400" : "text-emerald-700 dark:text-emerald-400"}`} role={trackMsg ? "alert" : "status"}>
                 {trackMsg || draftMsg}
               </p>
             )}
             <Card className="p-4 md:p-5">
               <div className="flex items-center justify-between gap-2 flex-wrap">
-                <h4 className="text-[13px] font-semibold text-[#0F2440]">Analysis Context</h4>
-                <button onClick={() => onGoto("explore")} className="text-[11px] font-semibold text-blue-700 hover:underline" aria-label="Edit context">Edit Context</button>
+                <h4 className="text-[13px] font-semibold text-foreground">Analysis Context</h4>
+                <button onClick={() => onGoto("explore")} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline" aria-label="Edit context">Edit Context</button>
               </div>
               <div className="mt-2 flex items-center gap-1.5 flex-wrap" aria-label="Analysis context">
                 {[["Metric", strOf(ctx?.metric || h?.metric_label || h?.metric || "—")], ["Time Period", strOf(ctx?.period || ctx?.time_period || h?.period || "All data")], ["Breakdown", strOf(ctx?.breakdown || ctx?.dimension || h?.dimension || "—")], ["Filters", (() => { const f = ctx?.filters; if (!f) return "—"; if (Array.isArray(f)) return f.map((x: any) => typeof x === "string" ? x : `${x?.column || ""} = ${x?.value || ""}`).join("; ") || "—"; return strOf(f); })()]].map(([k, v]) => (
-                  <span key={k} className="inline-flex items-center gap-1.5 text-[11.5px] bg-slate-50 border border-slate-200 rounded-full px-2.5 py-1">
-                    <span className="text-slate-400">{k}:</span>
-                    <span className="font-medium text-[#0F2440]">{v}</span>
+                  <span key={k} className="inline-flex items-center gap-1.5 text-[11.5px] bg-secondary border border-border rounded-full px-2.5 py-1">
+                    <span className="text-muted-foreground">{k}:</span>
+                    <span className="font-medium text-foreground">{v}</span>
                   </span>
                 ))}
               </div>
@@ -442,15 +499,15 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
               if (!meters.some(([, v]) => v > 0)) return null;
               return (
                 <Card className="p-4 md:p-5">
-                  <h4 className="text-[13px] font-semibold text-[#0F2440]">How complete is the evidence?</h4>
+                  <h4 className="text-[13px] font-semibold text-foreground">How complete is the evidence?</h4>
                   <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-3">
                     {meters.map(([label, v, max, hint]) => (
                       <div key={label} title={hint}>
                         <div className="flex items-center justify-between text-[11px]">
-                          <span className="text-slate-500">{label}</span>
-                          <span className="font-semibold text-[#0F2440] tabular-nums">{v}</span>
+                          <span className="text-muted-foreground">{label}</span>
+                          <span className="font-semibold text-foreground tabular-nums">{v}</span>
                         </div>
-                        <div className="mt-1 h-1.5 rounded-full bg-slate-100 overflow-hidden" role="progressbar" aria-valuenow={Math.min(100, Math.round((v / max) * 100))} aria-valuemin={0} aria-valuemax={100} aria-label={label}>
+                        <div className="mt-1 h-1.5 rounded-full bg-secondary overflow-hidden" role="progressbar" aria-valuenow={Math.min(100, Math.round((v / max) * 100))} aria-valuemin={0} aria-valuemax={100} aria-label={label}>
                           <div className="h-full rounded-full bg-gradient-to-r from-blue-600 to-indigo-400" style={{ width: `${Math.max(4, Math.min(100, (v / max) * 100))}%` }} />
                         </div>
                       </div>
@@ -459,10 +516,10 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                 </Card>
               );
             })()}
-            <div className="flex items-center gap-1 border-b border-slate-200" role="tablist" aria-label="Hypothesis detail">
+            <div className="flex items-center gap-1 border-b border-border" role="tablist" aria-label="Hypothesis detail">
               {detailTabs.map((t) => (
                 <button key={t.id} role="tab" aria-selected={detailTab === t.id} onClick={() => setDetailTab(t.id)}
-                  className={`px-3 py-2 text-[12.5px] font-medium border-b-2 -mb-px transition-colors ${detailTab === t.id ? "border-blue-700 text-[#0F2440]" : "border-transparent text-slate-400 hover:text-slate-600"}`}>
+                  className={`px-3 py-2 text-[12.5px] font-medium border-b-2 -mb-px transition-colors ${detailTab === t.id ? "border-blue-700 text-foreground" : "border-transparent text-muted-foreground hover:text-secondary-foreground"}`}>
                   {t.label}
                 </button>
               ))}
@@ -487,33 +544,77 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                 const story = `${s1}${s2}${s3}`;
                 const showStory = pattern || takeaways.length > 0;
                 return showStory ? (
-                  <Card className="p-4 md:p-5 border-blue-100 bg-blue-50/40">
-                    <h4 className="text-[13px] font-semibold text-[#0F2440] flex items-center gap-1.5"><Sparkles size={14} className="text-blue-700" /> ARIA explains, in plain words</h4>
-                    <p className="mt-2 text-[13px] text-slate-700 leading-relaxed">{story}</p>
+                  <Card className="p-4 md:p-5 border-blue-100 dark:border-blue-500/20 bg-blue-50/40 dark:bg-blue-500/10">
+                    <h4 className="text-[13px] font-semibold text-foreground flex items-center gap-1.5"><Sparkles size={14} className="text-blue-700 dark:text-blue-400" /> ARIA explains, in plain words</h4>
+                    <p className="mt-2 text-[13px] text-secondary-foreground leading-relaxed">{story}</p>
                   </Card>
                 ) : null;
+              })()}
+              {(() => {
+                const grade = gradeOf(h, factors, evidence.length);
+                const rivals: string[] = asList(h?.rivals)
+                  .map((r: any) => strOf(typeof r === "string" ? r : r?.text))
+                  .filter(Boolean)
+                  .slice(0, 2);
+                const fallbackRivals: string[] = [];
+                if (!rivals.length && factors.length > 1) {
+                  const r1 = factors[1];
+                  const r1Name = strOf(r1?.factor || r1?.name);
+                  if (r1Name) fallbackRivals.push(`Another possibility is ${r1Name} — checked against the same data, it explains less on its own because its supporting signs are weaker.`);
+                }
+                if (!rivals.length && !fallbackRivals.length && factors.length <= 1) {
+                  fallbackRivals.push("One rival explanation is that the pattern is spread across many small contributors, so no single one drives it.");
+                }
+                if (rivals.length + fallbackRivals.length < 2) {
+                  fallbackRivals.push("A further rival is a timing or mix effect not visible in this cut — nothing here rules it out.");
+                }
+                const allRivals = [...rivals, ...fallbackRivals].slice(0, 2);
+                const settle = strOf(h?.data_needed || h?.settle || "") || "Comparing another period, or breaking the numbers down over time, would settle whether this pattern holds.";
+                return (
+                  <Card className="p-4 md:p-5">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h4 className="text-[13px] font-semibold text-foreground">How strong is this, and what else could it be?</h4>
+                      <span className={`text-[10.5px] font-semibold px-2 py-0.5 rounded-full border ${grade.tone}`} title={grade.reason}>{grade.label}</span>
+                    </div>
+                    <p className="mt-1.5 text-[12px] text-secondary-foreground leading-relaxed">{grade.reason}</p>
+                    <p className="mt-2 text-[12px] font-semibold text-foreground">Other possibilities checked</p>
+                    <ul className="mt-1 space-y-1">
+                      {allRivals.map((r, i) => (
+                        <li key={i} className="text-[12px] text-secondary-foreground leading-relaxed">· {r}</li>
+                      ))}
+                    </ul>
+                    <p className="mt-2 text-[12px] text-muted-foreground leading-relaxed">
+                      <span className="font-semibold text-secondary-foreground">What would settle it: </span>{settle}
+                    </p>
+                    <div className="mt-2 pt-2 border-t border-border flex items-center gap-3 flex-wrap">
+                      <button onClick={() => testThis(detail)} className="inline-flex items-center gap-1 text-[11.5px] font-semibold text-blue-700 dark:text-blue-400 hover:underline" aria-label="Test this hypothesis in Explore">
+                        <Play size={12} /> Test this
+                      </button>
+                    </div>
+                  </Card>
+                );
               })()}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <Card className="p-4 md:p-5">
                   <div className="flex items-center justify-between gap-2">
-                    <h4 className="text-[13px] font-semibold text-[#0F2440]">Observed Pattern</h4>
+                    <h4 className="text-[13px] font-semibold text-foreground">Observed Pattern</h4>
                     {(() => { const v = strOf(h?.verdict || h?.status || ""); return v ? (
-                      <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${/support/i.test(v) && !/not support|unsupport/i.test(v) ? "bg-emerald-50 text-emerald-700 border-emerald-200" : /inconclus|needs|more data/i.test(v) ? "bg-amber-50 text-amber-700 border-amber-200" : /not support|refut/i.test(v) ? "bg-rose-50 text-rose-700 border-rose-200" : "bg-blue-50 text-blue-700 border-blue-100"}`}>{v}</span>
+                      <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${/support/i.test(v) && !/not support|unsupport/i.test(v) ? "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25" : /inconclus|needs|more data/i.test(v) ? "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" : /not support|refut/i.test(v) ? "bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/25" : "bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border-blue-100 dark:border-blue-500/20"}`}>{v}</span>
                     ) : null; })()}
                   </div>
                   {pattern ? (
                     <div className="mt-2">
-                      <p className="text-[13px] font-medium text-[#0F2440]">{strOf(pattern?.headline || pattern?.title || pattern?.summary || "")}</p>
+                      <p className="text-[13px] font-medium text-foreground">{strOf(pattern?.headline || pattern?.title || pattern?.summary || "")}</p>
                       {(numOf(pattern?.change_pct) !== null || strOf(pattern?.before_display || pattern?.after_display)) && (
-                        <div className="mt-2 rounded-xl bg-slate-50 border border-slate-100 px-3 py-2.5">
+                        <div className="mt-2 rounded-xl bg-secondary border border-border px-3 py-2.5">
                           {numOf(pattern?.change_pct) !== null && (
-                            <p className={`text-[15px] font-semibold tabular-nums ${(numOf(pattern.change_pct) as number) < 0 ? "text-rose-600" : "text-emerald-600"}`}>
+                            <p className={`text-[15px] font-semibold tabular-nums ${(numOf(pattern.change_pct) as number) < 0 ? "text-rose-600 dark:text-rose-400" : "text-emerald-600 dark:text-emerald-400"}`}>
                               {(numOf(pattern.change_pct) as number) > 0 ? "↑" : (numOf(pattern.change_pct) as number) < 0 ? "↓" : ""} {Math.abs(numOf(pattern.change_pct) as number)}%
                             </p>
                           )}
                           {(strOf(pattern?.before_display) || strOf(pattern?.after_display)) && (
-                            <p className="text-[12.5px] font-medium text-[#0F2440] tabular-nums mt-0.5">
-                              {strOf(pattern?.before_display || "—")} <span className="text-slate-400 font-normal">→</span> {strOf(pattern?.after_display || "—")}
+                            <p className="text-[12.5px] font-medium text-foreground tabular-nums mt-0.5">
+                              {strOf(pattern?.before_display || "—")} <span className="text-muted-foreground font-normal">→</span> {strOf(pattern?.after_display || "—")}
                             </p>
                           )}
                         </div>
@@ -528,9 +629,9 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                             <div className="h-32 mt-2" role="img" aria-label={`Before ${strOf(pattern?.before_display)} versus after ${strOf(pattern?.after_display)}`}>
                               <ResponsiveContainer width="100%" height="100%">
                                 <BarChart data={[{ label: "Before", value: bd as number }, { label: "After", value: ad as number }]} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                                  <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#9CA3AF" }} axisLine={false} tickLine={false} />
-                                  <YAxis tick={{ fontSize: 11, fill: "#9CA3AF" }} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => fmtMetric(v, strOf(ctx?.metric || h?.metric || ""))} />
-                                  <Tooltip formatter={(v: any) => [fmtMetric(numOf(v) ?? 0, strOf(ctx?.metric || h?.metric || "")), "Value"]} cursor={{ fill: "#EFF6FF" }} />
+                                  <XAxis dataKey="label" tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} />
+                                  <YAxis tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => fmtMetric(v, strOf(ctx?.metric || h?.metric || ""))} />
+                                  <Tooltip formatter={(v: any) => [fmtMetric(numOf(v) ?? 0, strOf(ctx?.metric || h?.metric || "")), "Value"]} cursor={{ fill: "var(--secondary)" }} contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8, fontSize: 12 }} />
                                   <Bar dataKey="value" radius={[6, 6, 0, 0]} isAnimationActive animationDuration={600}>
                                     <Cell fill="#B9D0E8" /><Cell fill="#2F6FAD" />
                                   </Bar>
@@ -542,9 +643,9 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                             <div className="h-28 mt-2" role="img" aria-label="Pattern over time">
                               <ResponsiveContainer width="100%" height="100%">
                                 <LineChart data={pts} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                                  <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" vertical={false} />
-                                  <XAxis dataKey="label" tick={{ fontSize: 10, fill: "#9CA3AF" }} axisLine={false} tickLine={false} minTickGap={20} />
-                                  <YAxis tick={{ fontSize: 10, fill: "#9CA3AF" }} axisLine={false} tickLine={false} width={48} tickFormatter={(v: number) => fmtMetric(v, strOf(ctx?.metric || h?.metric || ""))} />
+                                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                                  <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} minTickGap={20} />
+                                  <YAxis tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={48} tickFormatter={(v: number) => fmtMetric(v, strOf(ctx?.metric || h?.metric || ""))} />
                                   <Tooltip formatter={(v: any) => [fmtMetric(numOf(v) ?? 0, strOf(ctx?.metric || h?.metric || "")), "Value"]} labelFormatter={(l) => `Point ${l}`} />
                                   <Line type="monotone" dataKey="v" stroke="#4F46E5" strokeWidth={2} dot={false} isAnimationActive animationDuration={600} />
                                 </LineChart>
@@ -553,28 +654,28 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                           )}
                         </>);
                       })()}
-                      {strOf(pattern?.detail || pattern?.description) && <p className="text-[12px] text-slate-600 mt-2 leading-relaxed">{strOf(pattern.detail || pattern.description)}</p>}
+                      {strOf(pattern?.detail || pattern?.description) && <p className="text-[12px] text-secondary-foreground mt-2 leading-relaxed">{strOf(pattern.detail || pattern.description)}</p>}
                     </div>
-                  ) : <p className="text-[12px] text-slate-400 mt-2">No observed pattern was returned for this hypothesis.</p>}
+                  ) : <p className="text-[12px] text-muted-foreground mt-2">No observed pattern was returned for this hypothesis.</p>}
                 </Card>
                 <Card className="p-4 md:p-5">
-                  <h4 className="text-[13px] font-semibold text-[#0F2440]">Key Takeaways</h4>
+                  <h4 className="text-[13px] font-semibold text-foreground">Key Takeaways</h4>
                   {takeaways.length ? (
                     <ul className="mt-2 space-y-1.5">
                       {takeaways.map((t, i) => (
-                        <li key={i} className="flex items-start gap-1.5 text-[12px] text-slate-600 leading-relaxed">
-                          <Check size={13} className="text-emerald-600 flex-shrink-0 mt-0.5" />{t}
+                        <li key={i} className="flex items-start gap-1.5 text-[12px] text-secondary-foreground leading-relaxed">
+                          <Check size={13} className="text-emerald-600 dark:text-emerald-400 flex-shrink-0 mt-0.5" />{t}
                         </li>
                       ))}
                     </ul>
-                  ) : <p className="text-[12px] text-slate-400 mt-2">No takeaways were returned for this hypothesis.</p>}
+                  ) : <p className="text-[12px] text-muted-foreground mt-2">No takeaways were returned for this hypothesis.</p>}
                 </Card>
               </div>
               </>
             )}
             {detailTab === "factors" && (
               <Card className="p-4 md:p-5 overflow-hidden">
-                <h4 className="text-[13px] font-semibold text-[#0F2440]">Potential Associated Factors</h4>
+                <h4 className="text-[13px] font-semibold text-foreground">Potential Associated Factors</h4>
                 {(() => {
                   const dir = strOf(pattern?.direction || "").toLowerCase();
                   const pct = numOf(pattern?.change_pct);
@@ -593,11 +694,11 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                   const proPct = Math.round((pro / factors.length) * 100);
                   return (
                     <div className="mt-2" role="img" aria-label={`${pro} supporting vs ${con} contradicting factors`}>
-                      <div className="flex h-2 rounded-full overflow-hidden bg-slate-100">
+                      <div className="flex h-2 rounded-full overflow-hidden bg-secondary">
                         <div className="bg-emerald-500" style={{ width: `${proPct}%` }} />
                         <div className="bg-amber-400" style={{ width: `${100 - proPct}%` }} />
                       </div>
-                      <p className="mt-1 text-[11px] text-slate-500">{pro} supporting · {con} pointing the other way — the judgment below weighs both sides.</p>
+                      <p className="mt-1 text-[11px] text-muted-foreground">{pro} supporting · {con} pointing the other way — the judgment below weighs both sides.</p>
                     </div>
                   );
                 })()}
@@ -615,14 +716,14 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                   });
                   if (!contra.length) return null;
                   return (
-                    <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5" role="note" aria-label="Contradicting evidence">
-                      <p className="text-[12px] font-semibold text-amber-800">Worth a second look — {contra.length} factor{contra.length === 1 ? "" : "s"} point{contra.length === 1 ? "s" : ""} the other way:</p>
+                    <div className="mt-2 rounded-xl border border-amber-200 dark:border-amber-500/25 bg-amber-50 dark:bg-amber-500/10 px-3 py-2.5" role="note" aria-label="Contradicting evidence">
+                      <p className="text-[12px] font-semibold text-amber-800 dark:text-amber-400">Worth a second look — {contra.length} factor{contra.length === 1 ? "" : "s"} point{contra.length === 1 ? "s" : ""} the other way:</p>
                       <ul className="mt-1 space-y-0.5">
                         {contra.slice(0, 4).map((f: any, i: number) => (
-                          <li key={i} className="text-[12px] text-amber-800">• <span className="font-medium">{strOf(f?.factor || f?.name)}</span> — {strOf(f?.association || f?.relationship)}</li>
+                          <li key={i} className="text-[12px] text-amber-800 dark:text-amber-400">• <span className="font-medium">{strOf(f?.factor || f?.name)}</span> — {strOf(f?.association || f?.relationship)}</li>
                         ))}
                       </ul>
-                      <p className="mt-1 text-[11px] text-amber-700">Consider this before concluding — strong analysis weighs both sides.</p>
+                      <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-400">Consider this before concluding — strong analysis weighs both sides.</p>
                     </div>
                   );
                 })()}
@@ -630,7 +731,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                   <div className="mt-2 overflow-x-auto">
                     <table className="w-full text-[12px] min-w-[560px]">
                       <thead>
-                        <tr className="text-left text-slate-500 border-b border-slate-100">
+                        <tr className="text-left text-muted-foreground border-b border-border">
                           <th scope="col" className="py-2 pr-3 font-medium">Factor</th>
                           <th scope="col" className="py-2 pr-3 font-medium">Type</th>
                           <th scope="col" className="py-2 pr-3 font-medium">Association</th>
@@ -640,8 +741,8 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                       </thead>
                       <tbody>
                         {factors.map((f: any, i: number) => (
-                          <tr key={i} className="border-b border-slate-50 last:border-0">
-                            <td className="py-2 pr-3 font-medium text-[#0F2440]">
+                          <tr key={i} className="border-b border-border last:border-0">
+                            <td className="py-2 pr-3 font-medium text-foreground">
                               {strOf(f?.factor || f?.name || `Factor ${i + 1}`)}
                               {(() => {
                                 const assoc = strOf(f?.association || f?.relationship || "");
@@ -653,15 +754,15 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                                 if (!bits.length && assoc && assoc !== "—") bits.push(assoc.charAt(0).toLowerCase() + assoc.slice(1));
                                 if (!bits.length) return null;
                                 return (
-                                  <span className="block text-[11px] font-normal text-slate-500 mt-0.5 leading-relaxed">
+                                  <span className="block text-[11px] font-normal text-muted-foreground mt-0.5 leading-relaxed">
                                     Because it {bits.join(" and ")} — part of the explanation, not proof of cause.
                                   </span>
                                 );
                               })()}
                             </td>
-                            <td className="py-2 pr-3 text-slate-500">{humanize(strOf(f?.type || f?.kind || "—"))}</td>
-                            <td className="py-2 pr-3 text-slate-600">{strOf(f?.association || f?.relationship || "—")}</td>
-                            <td className="py-2 pr-3"><span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${/strong/i.test(strOf(f?.evidence_strength || f?.strength || "")) ? "bg-rose-50 text-rose-700 border-rose-200" : /moderate/i.test(strOf(f?.evidence_strength || f?.strength || "")) ? "bg-amber-50 text-amber-700 border-amber-200" : "bg-blue-50 text-blue-700 border-blue-100"}`}>{humanize(strOf(f?.evidence_strength || f?.strength || "—"))}</span></td>
+                            <td className="py-2 pr-3 text-muted-foreground">{humanize(strOf(f?.type || f?.kind || "—"))}</td>
+                            <td className="py-2 pr-3 text-secondary-foreground">{strOf(f?.association || f?.relationship || "—")}</td>
+                            <td className="py-2 pr-3"><span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${/strong/i.test(strOf(f?.evidence_strength || f?.strength || "")) ? "bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/25" : /moderate/i.test(strOf(f?.evidence_strength || f?.strength || "")) ? "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" : "bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border-blue-100 dark:border-blue-500/20"}`}>{humanize(strOf(f?.evidence_strength || f?.strength || "—"))}</span></td>
                             <td className="py-2 text-right">
                               <span className="inline-flex items-center gap-2 justify-end">
                                 <button
@@ -669,10 +770,18 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                                     try {
                                       sessionStorage.setItem("aria_explore_prefill", JSON.stringify({ metric: strOf(h?.metric || ctx?.metric || ""), breakdown: strOf(h?.dimension || ctx?.breakdown || "") }));
                                     } catch { /* best-effort */ }
+                                    try {
+                                      localStorage.setItem("aria_dashboard_drill", JSON.stringify({
+                                        at: Date.now(), kind: "hypothesis-factor",
+                                        metric: strOf(h?.metric || ctx?.metric || ""),
+                                        dimension: strOf(h?.dimension || ctx?.breakdown || ""),
+                                        segment: strOf(f?.factor || f?.name || ""),
+                                      }));
+                                    } catch { /* best-effort */ }
                                     onGoto("explore");
                                   }}
-                                  className="inline-flex items-center gap-1 text-[11.5px] font-medium text-blue-700 hover:underline" aria-label={`Explore factor ${strOf(f?.factor || f?.name)}`}>
-                                  <Eye size={12} /> View
+                                  className="inline-flex items-center gap-1 text-[11.5px] font-medium text-blue-700 dark:text-blue-400 hover:underline" aria-label={`Test factor ${strOf(f?.factor || f?.name)} in Explore`}>
+                                  <Eye size={12} /> Test
                                 </button>
                                 <button
                                   onClick={() => {
@@ -681,7 +790,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                                     } catch { /* best-effort */ }
                                     onGoto("whatif");
                                   }}
-                                  className="text-[11.5px] font-medium text-slate-500 hover:text-blue-700 hover:underline" aria-label={`Test scenario for ${strOf(f?.factor || f?.name)}`}>
+                                  className="text-[11.5px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline" aria-label={`Test scenario for ${strOf(f?.factor || f?.name)}`}>
                                   What-if
                                 </button>
                               </span>
@@ -690,41 +799,41 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                         ))}
                       </tbody>
                     </table>
-                    <p className="mt-2 text-[11px] text-slate-400">These factors are associated with the observed pattern. They do not necessarily establish causation.</p>
+                    <p className="mt-2 text-[11px] text-muted-foreground">These factors are associated with the observed pattern. They do not necessarily establish causation.</p>
                   </div>
                 ) : (
-                  <p className="text-[12px] text-slate-400 mt-2">No independently supported associated factors were found — weak or structural-only links are never promoted into factors.</p>
+                  <p className="text-[12px] text-muted-foreground mt-2">No independently supported associated factors were found — weak or structural-only links are never promoted into factors.</p>
                 )}
               </Card>
             )}
             {detailTab === "evidence" && (
               <Card className="p-4 md:p-5">
-                <h4 className="text-[13px] font-semibold text-[#0F2440]">Evidence</h4>
+                <h4 className="text-[13px] font-semibold text-foreground">Evidence</h4>
                 {evidence.length ? (
                   <ul className="mt-2 space-y-1.5">
-                    {evidence.map((e, i) => <li key={i} className="text-[12px] text-slate-600 leading-relaxed">· {e}</li>)}
+                    {evidence.map((e, i) => <li key={i} className="text-[12px] text-secondary-foreground leading-relaxed">· {e}</li>)}
                   </ul>
-                ) : <p className="text-[12px] text-slate-400 mt-2">No evidence points were returned for this hypothesis.</p>}
+                ) : <p className="text-[12px] text-muted-foreground mt-2">No evidence points were returned for this hypothesis.</p>}
               </Card>
             )}
             {detailTab === "related" && (
               <Card className="p-4 md:p-5">
-                <h4 className="text-[13px] font-semibold text-[#0F2440]">Related</h4>
+                <h4 className="text-[13px] font-semibold text-foreground">Related</h4>
                 {related.length ? (
-                  <div className="mt-2 divide-y divide-slate-100">
+                  <div className="mt-2 divide-y divide-border">
                     {related.map((r: any, i: number) => (
-                      <button key={i} onClick={() => { const id = strOf(r?.id); if (id) openDetail(id); }} className="w-full text-left py-2 hover:text-blue-700 text-[12.5px] font-medium text-[#0F2440]">
+                      <button key={i} onClick={() => { const id = strOf(r?.id); if (id) openDetail(id); }} className="w-full text-left py-2 hover:text-blue-700 dark:hover:text-blue-400 text-[12.5px] font-medium text-foreground">
                         {strOf(r?.title || r?.question || `Related ${i + 1}`)}
                       </button>
                     ))}
                   </div>
-                ) : <p className="text-[12px] text-slate-400 mt-2">No related analyses were returned.</p>}
+                ) : <p className="text-[12px] text-muted-foreground mt-2">No related analyses were returned.</p>}
               </Card>
             )}
             {nextSteps.length > 0 && (
               <Card className="p-4 md:p-5">
-                <h4 className="text-[13px] font-semibold text-[#0F2440]">Next Steps</h4>
-                <div className="mt-2 divide-y divide-slate-100">
+                <h4 className="text-[13px] font-semibold text-foreground">Next Steps</h4>
+                <div className="mt-2 divide-y divide-border">
                   {[
                     { label: "Explore this factor", sub: "Drill into the data", tab: "explore" as IntelTab },
                     { label: "Test a scenario", sub: "See what might happen", tab: "whatif" as IntelTab },
@@ -737,15 +846,15 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                         if (label === "Add to a report") addHypToDraft(detail);
                         onGoto(tab);
                       }}
-                      className="w-full text-left py-2 flex items-center gap-2 hover:text-blue-700 text-[12.5px] font-medium text-[#0F2440] group">
+                      className="w-full text-left py-2 flex items-center gap-2 hover:text-blue-700 dark:hover:text-blue-400 text-[12.5px] font-medium text-foreground group">
                       <span className="w-1.5 h-1.5 rounded-full bg-blue-600 flex-shrink-0" />
-                      <span className="flex-1">{label} <span className="block text-[11px] font-normal text-slate-400">{sub}</span></span>
-                      <ChevronRight size={13} className="text-slate-300 group-hover:text-blue-500 flex-shrink-0" />
+                      <span className="flex-1">{label} <span className="block text-[11px] font-normal text-muted-foreground">{sub}</span></span>
+                      <ChevronRight size={13} className="text-slate-300 dark:text-muted-foreground group-hover:text-blue-500 dark:group-hover:text-blue-400 flex-shrink-0" />
                     </button>
                   ))}
                 </div>
-                <ul className="mt-2 space-y-1.5 border-t border-slate-100 pt-2">
-                  {nextSteps.map((s, i) => <li key={i} className="text-[11.5px] text-slate-500 leading-relaxed">· {s}</li>)}
+                <ul className="mt-2 space-y-1.5 border-t border-border pt-2">
+                  {nextSteps.map((s, i) => <li key={i} className="text-[11.5px] text-muted-foreground leading-relaxed">· {s}</li>)}
                 </ul>
               </Card>
             )}
@@ -763,7 +872,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
             <label htmlFor="hyp-search" className="sr-only">Search hypotheses</label>
             <input id="hyp-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search hypotheses…" className={inputCls} aria-label="Search hypotheses" />
           </div>
-          <label className="text-[11px] text-slate-500 flex items-center gap-1.5">
+          <label className="text-[11px] text-muted-foreground flex items-center gap-1.5">
             Sort
             <select value={sort} onChange={(e) => { setSort(e.target.value); setPage(1); }} className={`${selectCls} !w-auto`} aria-label="Sort hypotheses">
               <option value="recent">Most recent</option>
@@ -783,46 +892,52 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
           icon={Lightbulb}
           title="No hypotheses found yet."
           body="ARIA promotes a hypothesis only when the observed pattern has enough supporting evidence. Try a broader search, or run an analysis in Explore first."
-          action={<button onClick={() => { setSearch(""); setPage(1); fetchList(); }} className="text-xs font-semibold text-blue-700 hover:underline">Clear search</button>}
+          action={<button onClick={() => { setSearch(""); setPage(1); fetchList(); }} className="text-xs font-semibold text-blue-700 dark:text-blue-400 hover:underline">Clear search</button>}
         />
       )}
       {!loading && !error && items.length > 0 && (
         <>
           {(trackMsg || draftMsg) && (
-            <p className={`text-[12px] ${trackMsg ? "text-rose-600" : "text-emerald-700"}`} role={trackMsg ? "alert" : "status"}>
+            <p className={`text-[12px] ${trackMsg ? "text-rose-600 dark:text-rose-400" : "text-emerald-700 dark:text-emerald-400"}`} role={trackMsg ? "alert" : "status"}>
               {trackMsg || draftMsg}
             </p>
           )}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {orderedItems.map((h: any) => (
-              <Card key={strOf(h?.id || h?.title)} className="p-4 hover:border-blue-200 hover:shadow-md transition-all">
-                <p className="text-[13px] font-semibold text-[#0F2440] leading-snug">{strOf(h?.title || h?.question || "Hypothesis")}</p>
-                <p className="text-[12px] text-slate-500 mt-1 line-clamp-2 leading-relaxed">{strOf(h?.summary || h?.observed_pattern?.headline || h?.description || "")}</p>
+              <Card key={strOf(h?.id || h?.title)} className="p-4 hover:border-blue-200 dark:hover:border-blue-500/25 hover:shadow-md transition-all">
+                <p className="text-[13px] font-semibold text-foreground leading-snug">{strOf(h?.title || h?.question || "Hypothesis")}</p>
+                <p className="text-[12px] text-muted-foreground mt-1 line-clamp-2 leading-relaxed">{strOf(h?.summary || h?.observed_pattern?.headline || h?.description || "")}</p>
                 <div className="mt-2 flex items-center gap-2 flex-wrap">
                   {strOf(h?.evidence_strength || h?.strength) && (
-                    <span className="text-[10.5px] font-semibold px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-100">{humanize(strOf(h.evidence_strength || h.strength))} evidence</span>
+                    <span className="text-[10.5px] font-semibold px-2 py-0.5 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-100 dark:border-blue-500/20">{humanize(strOf(h.evidence_strength || h.strength))} evidence</span>
                   )}
-                  {strOf(h?.status) && <span className="text-[10.5px] text-slate-500">{humanize(strOf(h.status))}</span>}
+                  {strOf(h?.status) && <span className="text-[10.5px] text-muted-foreground">{humanize(strOf(h.status))}</span>}
                   {sort === "severity" && severityOf(h) > 0 && (
-                    <span className="text-[10.5px] font-medium px-2 py-0.5 rounded-full bg-violet-50 text-violet-700 border border-violet-200" title="Ranked by size of move times evidence strength">{severityReason(h)}</span>
+                    <span className="text-[10.5px] font-medium px-2 py-0.5 rounded-full bg-violet-50 dark:bg-violet-500/10 text-violet-700 dark:text-violet-400 border border-violet-200 dark:border-violet-500/25" title="Ranked by size of move times evidence strength">{severityReason(h)}</span>
                   )}
-                  <button onClick={() => openDetail(strOf(h?.id))} disabled={!h?.id} className="ml-auto inline-flex items-center gap-1 text-[12px] font-semibold text-blue-700 hover:underline disabled:opacity-40" aria-label={`View hypothesis ${strOf(h?.title || "")}`}>
+                  <button onClick={() => openDetail(strOf(h?.id))} disabled={!h?.id} className="ml-auto inline-flex items-center gap-1 text-[12px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`View hypothesis ${strOf(h?.title || "")}`}>
                     <Eye size={12} /> View
                   </button>
                 </div>
-                <div className="mt-2 pt-2 border-t border-slate-100 flex items-center gap-3">
+                <div className="mt-2 pt-2 border-t border-border flex items-center gap-3 flex-wrap">
                   <button
                     onClick={() => trackAsGoal(h)}
                     disabled={trackingId !== null}
-                    className="inline-flex items-center gap-1 text-[11.5px] font-semibold text-violet-700 hover:underline disabled:opacity-40"
+                    className="inline-flex items-center gap-1 text-[11.5px] font-semibold text-violet-700 dark:text-violet-400 hover:underline disabled:opacity-40"
                     aria-label={`Track hypothesis as goal: ${strOf(h?.title || "")}`}>
                     <Target size={12} /> {trackingId === strOf(h?.id) ? "Creating…" : "Track as goal"}
                   </button>
                   <button
                     onClick={() => addHypToDraft(h)}
-                    className="inline-flex items-center gap-1 text-[11.5px] font-medium text-slate-500 hover:text-blue-700 hover:underline"
+                    className="inline-flex items-center gap-1 text-[11.5px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline"
                     aria-label={`Add hypothesis to report draft: ${strOf(h?.title || "")}`}>
                     <FileText size={12} /> Add to report
+                  </button>
+                  <button
+                    onClick={() => testThis(h)}
+                    className="inline-flex items-center gap-1 text-[11.5px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline"
+                    aria-label={`Test hypothesis in Explore: ${strOf(h?.title || "")}`}>
+                    <Play size={12} /> Test this
                   </button>
                 </div>
               </Card>
@@ -831,7 +946,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
           {pages !== null && pages > 1 && (
             <div className="flex items-center justify-center gap-2" role="navigation" aria-label="Hypotheses pages">
               <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1} className={btnGhost} aria-label="Previous page">← Prev</button>
-              <span className="text-[12px] text-slate-500">Page {page} of {pages}{total !== null ? ` · ${total} total` : ""}</span>
+              <span className="text-[12px] text-muted-foreground">Page {page} of {pages}{total !== null ? ` · ${total} total` : ""}</span>
               <button onClick={() => setPage((p) => Math.min(pages, p + 1))} disabled={page >= pages} className={btnGhost} aria-label="Next page">Next →</button>
             </div>
           )}
@@ -1003,10 +1118,10 @@ function GoalsTab({ meta }: { meta: any }) {
 
   const statusTone = (s: string) => {
     const t = s.toLowerCase();
-    if (/behind|at risk|off track/.test(t)) return "bg-rose-50 text-rose-700 border-rose-200";
-    if (/near|close|watch/.test(t)) return "bg-amber-50 text-amber-700 border-amber-200";
-    if (/on track|ahead|complete|achieved/.test(t)) return "bg-emerald-50 text-emerald-700 border-emerald-200";
-    return "bg-slate-50 text-slate-600 border-slate-200";
+    if (/behind|at risk|off track/.test(t)) return "bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/25";
+    if (/near|close|watch/.test(t)) return "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25";
+    if (/on track|ahead|complete|achieved/.test(t)) return "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25";
+    return "bg-secondary text-secondary-foreground border-border";
   };
 
   const filters: { id: GoalFilter; label: string }[] = [
@@ -1026,13 +1141,13 @@ function GoalsTab({ meta }: { meta: any }) {
   }
   return (
     <div className="space-y-4">
-      <div className="text-[11px] text-slate-400 flex items-center gap-1">
-        <span>Intelligence</span><ChevronRight size={11} /><span className="text-slate-600 font-medium">Goals</span>
+      <div className="text-[11px] text-muted-foreground flex items-center gap-1">
+        <span>Intelligence</span><ChevronRight size={11} /><span className="text-secondary-foreground font-medium">Goals</span>
       </div>
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
-          <h3 className="text-[16px] font-semibold text-[#0F2440] tracking-tight">Business Goals</h3>
-          <p className="text-[12px] text-slate-500">Track your targets and monitor progress.</p>
+          <h3 className="text-[16px] font-semibold text-foreground tracking-tight">Business Goals</h3>
+          <p className="text-[12px] text-muted-foreground">Track your targets and monitor progress.</p>
         </div>
         <div className="flex items-center gap-1.5">
           <button
@@ -1048,19 +1163,19 @@ function GoalsTab({ meta }: { meta: any }) {
         </div>
       </div>
       {toast && (
-        <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 flex items-start gap-2" role="status">
-          <Check size={14} className="text-emerald-600 flex-shrink-0 mt-0.5" />
-          <p className="text-[12px] text-emerald-800 flex-1">{toast}</p>
-          <button onClick={() => setToast(null)} className="text-[11px] font-semibold text-emerald-700 hover:underline" aria-label="Dismiss notification">Dismiss</button>
+        <div className="rounded-xl border border-emerald-200 dark:border-emerald-500/25 bg-emerald-50 dark:bg-emerald-500/10 px-3 py-2 flex items-start gap-2" role="status">
+          <Check size={14} className="text-emerald-600 dark:text-emerald-400 flex-shrink-0 mt-0.5" />
+          <p className="text-[12px] text-emerald-800 dark:text-emerald-400 flex-1">{toast}</p>
+          <button onClick={() => setToast(null)} className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-400 hover:underline" aria-label="Dismiss notification">Dismiss</button>
         </div>
       )}
       {refreshMsg && (
-        <p className="text-[12px] text-amber-700" role="alert">{refreshMsg}</p>
+        <p className="text-[12px] text-amber-700 dark:text-amber-400" role="alert">{refreshMsg}</p>
       )}
 
       {showForm && (
         <Card className="p-4 md:p-5">
-          <h4 className="text-[13px] font-semibold text-[#0F2440]">Set a new goal</h4>
+          <h4 className="text-[13px] font-semibold text-foreground">Set a new goal</h4>
           <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
             <Field label="Goal title" htmlFor="goal-title">
               <input id="goal-title" value={fTitle} onChange={(e) => setFTitle(e.target.value)} placeholder="e.g. Grow monthly revenue" className={inputCls} aria-label="Goal title" />
@@ -1078,7 +1193,7 @@ function GoalsTab({ meta }: { meta: any }) {
               <input id="goal-due" type="date" value={fDue} onChange={(e) => setFDue(e.target.value)} className={inputCls} aria-label="Due date" />
             </Field>
           </div>
-          {formError && <p className="mt-2 text-[12px] text-rose-600" role="alert">{formError}</p>}
+          {formError && <p className="mt-2 text-[12px] text-rose-600 dark:text-rose-400" role="alert">{formError}</p>}
           <div className="mt-3 flex items-center gap-2">
             <button onClick={createGoal} disabled={formBusy} className={btnPrimary} aria-label="Save goal">
               {formBusy ? "Saving…" : "Save Goal"}
@@ -1088,14 +1203,14 @@ function GoalsTab({ meta }: { meta: any }) {
         </Card>
       )}
 
-      <div className="flex items-center gap-1 border-b border-slate-200" role="tablist" aria-label="Goal status filter">
+      <div className="flex items-center gap-1 border-b border-border" role="tablist" aria-label="Goal status filter">
         {filters.map((f) => (
           <button key={f.id} role="tab" aria-selected={filter === f.id} onClick={() => setFilter(f.id)}
-            className={`px-3 py-2 text-[12.5px] font-medium border-b-2 -mb-px transition-colors ${filter === f.id ? "border-blue-700 text-[#0F2440]" : "border-transparent text-slate-400 hover:text-slate-600"}`}>
+            className={`px-3 py-2 text-[12.5px] font-medium border-b-2 -mb-px transition-colors ${filter === f.id ? "border-blue-700 text-foreground" : "border-transparent text-muted-foreground hover:text-secondary-foreground"}`}>
             {f.label}
           </button>
         ))}
-        <button onClick={fetchGoals} className="ml-auto p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-[#0F2440]" title="Refresh goals" aria-label="Refresh goals">
+        <button onClick={fetchGoals} className="ml-auto p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground" title="Refresh goals" aria-label="Refresh goals">
           <RefreshCw size={13} />
         </button>
       </div>
@@ -1107,7 +1222,7 @@ function GoalsTab({ meta }: { meta: any }) {
           icon={Target}
           title={filter === "all" ? "No goals yet." : `No ${filter} goals.`}
           body="Define a target, track progress, and let ARIA help you stay on track. Goals persist, so they survive a reload."
-          action={<button onClick={() => setShowForm(true)} className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-700 hover:underline"><Plus size={12} /> Set your first goal</button>}
+          action={<button onClick={() => setShowForm(true)} className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-700 dark:text-blue-400 hover:underline"><Plus size={12} /> Set your first goal</button>}
         />
       )}
       {!loading && !error && goals.length > 0 && (
@@ -1124,24 +1239,24 @@ function GoalsTab({ meta }: { meta: any }) {
             return (
               <Card key={id || strOf(g?.title)} className="p-4">
                 <div className="flex items-start gap-3 flex-wrap">
-                  <span className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-violet-50 text-violet-700 flex-shrink-0"><Target size={15} /></span>
+                  <span className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-violet-50 dark:bg-violet-500/10 text-violet-700 dark:text-violet-400 flex-shrink-0"><Target size={15} /></span>
                   <div className="min-w-0 flex-1">
-                    <p className="text-[13.5px] font-semibold text-[#0F2440]">{strOf(g?.title || g?.name || "Goal")}</p>
-                    <p className="text-[11px] text-slate-400 mt-0.5 flex items-center gap-1">
+                    <p className="text-[13.5px] font-semibold text-foreground">{strOf(g?.title || g?.name || "Goal")}</p>
+                    <p className="text-[11px] text-muted-foreground mt-0.5 flex items-center gap-1">
                       <CalendarDays size={11} /> {due ? `Due ${due}` : "No due date"}{strOf(g?.metric) ? ` · ${humanize(strOf(g.metric))}` : ""}
                     </p>
                     <div className="mt-2 flex items-center gap-4 flex-wrap text-[12px]">
-                      <span className="text-slate-500">Current <span className="font-semibold text-[#0F2440] tabular-nums">{cur === null ? "—" : fmtBiz(cur)}</span></span>
-                      <span className="text-slate-500">Target <span className="font-semibold text-[#0F2440] tabular-nums">{tgt === null ? "—" : fmtBiz(tgt)}</span></span>
+                      <span className="text-muted-foreground">Current <span className="font-semibold text-foreground tabular-nums">{cur === null ? "—" : fmtBiz(cur)}</span></span>
+                      <span className="text-muted-foreground">Target <span className="font-semibold text-foreground tabular-nums">{tgt === null ? "—" : fmtBiz(tgt)}</span></span>
                       {(delta !== null || deltaPct !== null) && (
-                        <span className={`font-semibold tabular-nums ${(delta ?? 0) >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                        <span className={`font-semibold tabular-nums ${(delta ?? 0) >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                           {delta !== null ? fmtBiz(delta) : ""}{deltaPct !== null ? ` (${fmtPctBiz(deltaPct)})` : ""}
                         </span>
                       )}
                     </div>
                     {prog !== null && (
                       <div className="mt-2 max-w-md">
-                        <div className="h-1.5 rounded-full bg-slate-100 overflow-hidden" role="progressbar" aria-valuenow={Math.round(prog)} aria-valuemin={0} aria-valuemax={100} aria-label={`Progress for ${strOf(g?.title)}`}>
+                        <div className="h-1.5 rounded-full bg-secondary overflow-hidden" role="progressbar" aria-valuenow={Math.round(prog)} aria-valuemin={0} aria-valuemax={100} aria-label={`Progress for ${strOf(g?.title)}`}>
                           <div className={`h-full rounded-full ${/behind|at risk|off track/i.test(status) ? "bg-gradient-to-r from-rose-500 to-rose-400" : /near|watch/i.test(status) ? "bg-gradient-to-r from-amber-500 to-amber-400" : "bg-gradient-to-r from-emerald-500 to-emerald-400"}`} style={{ width: `${Math.max(0, Math.min(100, prog))}%` }} />
                         </div>
                       </div>
@@ -1151,19 +1266,19 @@ function GoalsTab({ meta }: { meta: any }) {
                     {status && <span className={`text-[10.5px] font-semibold px-2 py-0.5 rounded-full border ${statusTone(status)}`}>{status}</span>}
                     {filter !== "completed" && (
                       <div className="flex items-center gap-1.5 flex-wrap justify-end">
-                        <button onClick={() => id && refreshOne(id)} disabled={!id || refreshingId === id} className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-700 hover:underline disabled:opacity-40" aria-label={`Refresh goal from live data: ${strOf(g?.title)}`}>
+                        <button onClick={() => id && refreshOne(id)} disabled={!id || refreshingId === id} className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Refresh goal from live data: ${strOf(g?.title)}`}>
                           <RefreshCw size={11} className={refreshingId === id ? "animate-spin" : ""} /> {refreshingId === id ? "…" : "Refresh"}
                         </button>
                         {filter !== "paused" && (
-                          <button onClick={() => id && setStatus(id, "paused")} disabled={!id || actingId === id} className="text-[11px] font-medium text-slate-500 hover:text-[#0F2440] disabled:opacity-40" aria-label={`Pause goal ${strOf(g?.title)}`}>Pause</button>
+                          <button onClick={() => id && setStatus(id, "paused")} disabled={!id || actingId === id} className="text-[11px] font-medium text-muted-foreground hover:text-foreground disabled:opacity-40" aria-label={`Pause goal ${strOf(g?.title)}`}>Pause</button>
                         )}
                         {(filter === "paused") && (
-                          <button onClick={() => id && setStatus(id, "active")} disabled={!id || actingId === id} className="text-[11px] font-medium text-blue-700 hover:underline disabled:opacity-40" aria-label={`Resume goal ${strOf(g?.title)}`}>Resume</button>
+                          <button onClick={() => id && setStatus(id, "active")} disabled={!id || actingId === id} className="text-[11px] font-medium text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Resume goal ${strOf(g?.title)}`}>Resume</button>
                         )}
-                        <button onClick={() => id && setStatus(id, "completed")} disabled={!id || actingId === id} className="text-[11px] font-medium text-emerald-700 hover:underline disabled:opacity-40" aria-label={`Complete goal ${strOf(g?.title)}`}>
+                        <button onClick={() => id && setStatus(id, "completed")} disabled={!id || actingId === id} className="text-[11px] font-medium text-emerald-700 dark:text-emerald-400 hover:underline disabled:opacity-40" aria-label={`Complete goal ${strOf(g?.title)}`}>
                           {actingId === id ? "…" : "Complete"}
                         </button>
-                        <button onClick={() => id && deleteGoal(id)} disabled={!id || actingId === id} className="text-[11px] font-medium text-rose-600 hover:underline disabled:opacity-40" aria-label={`Delete goal ${strOf(g?.title)}`}>Delete</button>
+                        <button onClick={() => id && deleteGoal(id)} disabled={!id || actingId === id} className="text-[11px] font-medium text-rose-600 dark:text-rose-400 hover:underline disabled:opacity-40" aria-label={`Delete goal ${strOf(g?.title)}`}>Delete</button>
                       </div>
                     )}
                   </div>
@@ -1172,10 +1287,10 @@ function GoalsTab({ meta }: { meta: any }) {
             );
           })}
           <Card className="p-4 flex items-center gap-3 flex-wrap border-dashed !border-2">
-            <span className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-blue-50 text-blue-700"><Target size={15} /></span>
+            <span className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400"><Target size={15} /></span>
             <div className="flex-1 min-w-40">
-              <p className="text-[13px] font-semibold text-[#0F2440]">Set a new goal</p>
-              <p className="text-[11px] text-slate-500">Define a target, track progress, and let ARIA help you stay on track.</p>
+              <p className="text-[13px] font-semibold text-foreground">Set a new goal</p>
+              <p className="text-[11px] text-muted-foreground">Define a target, track progress, and let ARIA help you stay on track.</p>
             </div>
             <button onClick={() => setShowForm(true)} className={btnPrimary} aria-label="Create another goal"><Plus size={13} /> Create Goal</button>
           </Card>
@@ -1422,19 +1537,19 @@ function WhatIfTab() {
     if (noSchema.isNoSchema) {
       return <NoDatasetPanel onRetry={loadMeta} hint={noSchema.hint} />;
     }
-    return <EmptyState icon={SlidersHorizontal} title="No scenario variables available." body="ARIA couldn't identify supported scenario variables for this dataset, so there is nothing meaningful to model yet." action={<button onClick={loadMeta} className="text-xs font-semibold text-blue-700 hover:underline">Retry</button>} />;
+    return <EmptyState icon={SlidersHorizontal} title="No scenario variables available." body="ARIA couldn't identify supported scenario variables for this dataset, so there is nothing meaningful to model yet." action={<button onClick={loadMeta} className="text-xs font-semibold text-blue-700 dark:text-blue-400 hover:underline">Retry</button>} />;
   }
 
   const resetScenario = () => { setResult(null); setError(""); setErrorId(""); setChangeValue(10); };
   return (
     <div className="space-y-4">
-      <div className="text-[11px] text-slate-400 flex items-center gap-1">
-        <span>Intelligence</span><ChevronRight size={11} /><span className="text-slate-600 font-medium">What-If</span>
+      <div className="text-[11px] text-muted-foreground flex items-center gap-1">
+        <span>Intelligence</span><ChevronRight size={11} /><span className="text-secondary-foreground font-medium">What-If</span>
       </div>
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
-          <h3 className="text-[16px] font-semibold text-[#0F2440] tracking-tight">What-If Scenario Analysis</h3>
-          <p className="text-[12px] text-slate-500">Explore how changes in key factors may impact your business.</p>
+          <h3 className="text-[16px] font-semibold text-foreground tracking-tight">What-If Scenario Analysis</h3>
+          <p className="text-[12px] text-muted-foreground">Explore how changes in key factors may impact your business.</p>
         </div>
         <div className="flex items-center gap-1.5">
           <button onClick={saveCurrentScenario} disabled={!result} className={btnGhost} aria-label="Save scenario">Save Scenario</button>
@@ -1443,7 +1558,7 @@ function WhatIfTab() {
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Card className="p-4 md:p-5">
-          <h3 className="text-[14px] font-semibold text-[#0F2440] tracking-tight">Scenario Setup</h3>
+          <h3 className="text-[14px] font-semibold text-foreground tracking-tight">Scenario Setup</h3>
           <div className="mt-3 space-y-3">
             <Field label="Variable to change" htmlFor="wi-var">
               <select id="wi-var" value={variable} onChange={(e) => setVariable(e.target.value)} className={selectCls} aria-label="Scenario variable">
@@ -1456,14 +1571,14 @@ function WhatIfTab() {
               </select>
             </Field>
             <div>
-              <label htmlFor="wi-value" className="block text-[11px] font-medium text-slate-500 mb-1">
+              <label htmlFor="wi-value" className="block text-[11px] font-medium text-muted-foreground mb-1">
                 Change Value{range ? ` (supported range ${range.min}% to ${range.max}%)` : ""}
               </label>
               {range ? (
                 <div className="flex items-center gap-3">
-                  <span className="text-[11px] text-slate-400 w-8 text-right tabular-nums">{range.min}%</span>
+                  <span className="text-[11px] text-muted-foreground w-8 text-right tabular-nums">{range.min}%</span>
                   <div className="relative flex-1 h-6 flex items-center">
-                    <div className="absolute inset-x-0 h-[3px] bg-slate-200 rounded-full" />
+                    <div className="absolute inset-x-0 h-[3px] bg-border rounded-full" />
                     <div
                       className="absolute h-[3px] bg-blue-500 rounded-full"
                       style={{
@@ -1478,35 +1593,35 @@ function WhatIfTab() {
                       aria-label="Change value slider"
                     />
                     <div
-                      className="absolute w-4 h-4 bg-white border-2 border-blue-600 rounded-full shadow-sm pointer-events-none z-20 transition-transform hover:scale-110"
+                      className="absolute w-4 h-4 bg-card border-2 border-blue-600 rounded-full shadow-sm pointer-events-none z-20 transition-transform hover:scale-110"
                       style={{
                         left: `calc(${((Math.max(range.min, Math.min(range.max, changeValue)) - range.min) / (range.max - range.min)) * 100}% - 8px)`,
                       }}
                     />
                   </div>
-                  <span className="text-[11px] text-slate-400 w-8 tabular-nums">{range.max}%</span>
-                  <span className="text-[13px] font-bold text-[#0F2440] tabular-nums w-14 text-right">{changeValue >= 0 ? "+" : ""}{changeValue}%</span>
+                  <span className="text-[11px] text-muted-foreground w-8 tabular-nums">{range.max}%</span>
+                  <span className="text-[13px] font-bold text-foreground tabular-nums w-14 text-right">{changeValue >= 0 ? "+" : ""}{changeValue}%</span>
                 </div>
               ) : (
                 <input id="wi-value" type="number" value={changeValue} onChange={(e) => setChangeValue(Number(e.target.value) || 0)} className={inputCls} aria-label="Change value" />
               )}
               {range && (changeValue < range.min || changeValue > range.max) && (
-                <p className="text-[11px] text-amber-600 mt-1">Outside the supported range — results may be less reliable.</p>
+                <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1">Outside the supported range — results may be less reliable.</p>
               )}
             </div>
             <fieldset>
-              <legend className="text-[11px] font-medium text-slate-500 mb-1.5">Apply to</legend>
+              <legend className="text-[11px] font-medium text-muted-foreground mb-1.5">Apply to</legend>
               <div className="space-y-1.5" role="radiogroup" aria-label="Apply scenario to">
                 {applyOptions.map((t) => (
-                  <label key={t} className="flex items-center gap-2 text-[12.5px] text-[#0F2440] cursor-pointer">
+                  <label key={t} className="flex items-center gap-2 text-[12.5px] text-foreground cursor-pointer">
                     <input type="radio" name="wi-apply" checked={applyTo === t} onChange={() => setApplyTo(t)} className="accent-blue-700" />
                     {humanize(t)}
                   </label>
                 ))}
               </div>
-              {segLoading && <p className="text-[11px] text-slate-400 mt-1">Loading live segments…</p>}
+              {segLoading && <p className="text-[11px] text-muted-foreground mt-1">Loading live segments…</p>}
               {!segLoading && segValues.length > 0 && (
-                <p className="text-[11px] text-slate-400 mt-1">Segments from your live data — breakdown of {humanize(variable)} by {humanize(segDim)}.</p>
+                <p className="text-[11px] text-muted-foreground mt-1">Segments from your live data — breakdown of {humanize(variable)} by {humanize(segDim)}.</p>
               )}
             </fieldset>
             <button onClick={runScenario} disabled={running || !variable} className={`${btnPrimary} w-full`} aria-label="Run scenario">
@@ -1524,29 +1639,29 @@ function WhatIfTab() {
           {!running && !error && result && (
             <>
               <Card className="p-4 md:p-5">
-                <h3 className="text-[14px] font-semibold text-[#0F2440] tracking-tight">Projected Impact</h3>
+                <h3 className="text-[14px] font-semibold text-foreground tracking-tight">Projected Impact</h3>
                 {impacts.length ? (
                   <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-2">
                     {impacts.map((k: any, i: number) => (
-                      <div key={i} className="rounded-xl border border-slate-200 p-3">
-                        <p className="text-[11px] text-slate-500">{strOf(k?.label || k?.metric || `Impact ${i + 1}`)}</p>
-                        <p className="text-[20px] font-semibold text-[#0F2440] tabular-nums mt-0.5">{k?.display || (numOf(k?.value) !== null ? fmtBiz(numOf(k.value)) : "—")}</p>
-                        {strOf(k?.delta || k?.change_note) && <p className="text-[11px] text-slate-500 mt-0.5">{strOf(k.delta || k.change_note)}</p>}
+                      <div key={i} className="rounded-xl border border-border p-3">
+                        <p className="text-[11px] text-muted-foreground">{strOf(k?.label || k?.metric || `Impact ${i + 1}`)}</p>
+                        <p className="text-[20px] font-semibold text-foreground tabular-nums mt-0.5">{k?.display || (numOf(k?.value) !== null ? fmtBiz(numOf(k.value)) : "—")}</p>
+                        {strOf(k?.delta || k?.change_note) && <p className="text-[11px] text-muted-foreground mt-0.5">{strOf(k.delta || k.change_note)}</p>}
                       </div>
                     ))}
                   </div>
-                ) : <p className="text-[12px] text-slate-400 mt-2">The backend returned no projected impact figures.</p>}
+                ) : <p className="text-[12px] text-muted-foreground mt-2">The backend returned no projected impact figures.</p>}
               </Card>
               <Card className="p-4 md:p-5">
-                <h3 className="text-[14px] font-semibold text-[#0F2440] tracking-tight">{compTitle}</h3>
+                <h3 className="text-[14px] font-semibold text-foreground tracking-tight">{compTitle}</h3>
                 {compSeries.length ? (
                   <div className="h-[220px] mt-2">
                     <ResponsiveContainer width="100%" height="100%">
                       <BarChart data={compSeries} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" vertical={false} />
-                        <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#9CA3AF" }} axisLine={false} tickLine={false} minTickGap={16} />
-                        <YAxis tick={{ fontSize: 11, fill: "#9CA3AF" }} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => fmtBiz(v)} />
-                        <Tooltip formatter={(v: any, name: any) => [fmtMetric(numOf(v), variable), humanize(String(name))]} />
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                        <XAxis dataKey="label" tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} minTickGap={16} />
+                        <YAxis tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => fmtBiz(v)} />
+                        <Tooltip formatter={(v: any, name: any) => [fmtMetric(numOf(v), variable), humanize(String(name))]} contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8, fontSize: 12 }} />
                         <Legend wrapperStyle={{ fontSize: 11 }} />
                         <Bar dataKey="baseline" name="Baseline" fill="#C7D6E8" radius={[4, 4, 0, 0]} />
                         <Bar dataKey="scenario" name={`Scenario (${changeValue >= 0 ? "+" : ""}${changeValue}%)`} fill="#4F46E5" radius={[4, 4, 0, 0]}>
@@ -1555,23 +1670,23 @@ function WhatIfTab() {
                       </BarChart>
                     </ResponsiveContainer>
                   </div>
-                ) : <p className="text-[12px] text-slate-400 mt-2">The backend returned no comparison series.</p>}
+                ) : <p className="text-[12px] text-muted-foreground mt-2">The backend returned no comparison series.</p>}
               </Card>
               {(summary || assumptions.length > 0) && (
                 <Card className="p-4 md:p-5">
-                  <h3 className="text-[14px] font-semibold text-[#0F2440] tracking-tight">Scenario Summary</h3>
-                  {summary && <p className="text-[12.5px] text-slate-700 leading-relaxed mt-2">{summary}</p>}
+                  <h3 className="text-[14px] font-semibold text-foreground tracking-tight">Scenario Summary</h3>
+                  {summary && <p className="text-[12.5px] text-secondary-foreground leading-relaxed mt-2">{summary}</p>}
                   {assumptions.length > 0 && (
                     <ul className="mt-2 space-y-1">
-                      {assumptions.map((a, i) => <li key={i} className="text-[11.5px] text-slate-500 leading-relaxed">· {a}</li>)}
+                      {assumptions.map((a, i) => <li key={i} className="text-[11.5px] text-muted-foreground leading-relaxed">· {a}</li>)}
                     </ul>
                   )}
-                  <p className="mt-2 text-[11px] text-slate-400">This is a scenario estimate based on your historical data. Actual results may vary.</p>
+                  <p className="mt-2 text-[11px] text-muted-foreground">This is a scenario estimate based on your historical data. Actual results may vary.</p>
                   <div className="mt-3 flex items-center gap-2">
-                    <button onClick={saveCurrentScenario} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12px] font-semibold text-blue-700 border border-blue-200 hover:bg-blue-50" aria-label="Save scenario">
+                    <button onClick={saveCurrentScenario} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12px] font-semibold text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/25 hover:bg-blue-50 dark:hover:bg-blue-500/10" aria-label="Save scenario">
                       <Save size={13} /> Save Scenario
                     </button>
-                    {saveMsg && <span className="text-[11.5px] text-slate-600" role="status">{saveMsg}</span>}
+                    {saveMsg && <span className="text-[11.5px] text-secondary-foreground" role="status">{saveMsg}</span>}
                   </div>
                 </Card>
               )}
@@ -1581,19 +1696,19 @@ function WhatIfTab() {
       </div>
 
       <Card className="p-4 md:p-5">
-        <CardHead title="Saved Scenarios" sub="Scenarios you kept for later." right={<button onClick={loadSaved} className="text-[11px] font-semibold text-blue-700 hover:underline">View all</button>} />
-        {savedError && <p className="mt-2 text-[12px] text-rose-600" role="alert">{savedError} <button onClick={loadSaved} className="font-semibold text-blue-700 hover:underline ml-1">Retry</button></p>}
+        <CardHead title="Saved Scenarios" sub="Scenarios you kept for later." right={<button onClick={loadSaved} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline">View all</button>} />
+        {savedError && <p className="mt-2 text-[12px] text-rose-600 dark:text-rose-400" role="alert">{savedError} <button onClick={loadSaved} className="font-semibold text-blue-700 dark:text-blue-400 hover:underline ml-1">Retry</button></p>}
         <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2">
-          {!savedError && saved.length === 0 && <p className="text-[12px] text-slate-400">No saved scenarios yet.</p>}
+          {!savedError && saved.length === 0 && <p className="text-[12px] text-muted-foreground">No saved scenarios yet.</p>}
           {saved.map((s: any, i: number) => (
-            <div key={strOf(s?.id || i)} className="rounded-xl border border-slate-200 p-3 flex items-center gap-2">
-              <SlidersHorizontal size={14} className="text-indigo-600 flex-shrink-0" />
+            <div key={strOf(s?.id || i)} className="rounded-xl border border-border p-3 flex items-center gap-2">
+              <SlidersHorizontal size={14} className="text-indigo-600 dark:text-indigo-400 flex-shrink-0" />
               <div className="min-w-0 flex-1">
-                <p className="text-[12.5px] font-medium text-[#0F2440] truncate">{strOf(s?.title || s?.name || `${humanize(strOf(s?.variable))} ${strOf(s?.change_value)}%`)}</p>
-                <p className="text-[11px] text-slate-400">{strOf(s?.created_at || "")}</p>
+                <p className="text-[12.5px] font-medium text-foreground truncate">{strOf(s?.title || s?.name || `${humanize(strOf(s?.variable))} ${strOf(s?.change_value)}%`)}</p>
+                <p className="text-[11px] text-muted-foreground">{strOf(s?.created_at || "")}</p>
               </div>
-              <button onClick={() => loadSavedScenario(s)} className="text-[11px] font-semibold text-blue-700 hover:underline" aria-label={`Reload scenario ${strOf(s?.title || "")}`}>Load</button>
-              {strOf(s?.id) && <button onClick={() => deleteSavedScenario(strOf(s.id))} className="text-[11px] font-medium text-slate-400 hover:text-rose-600" aria-label={`Delete scenario ${strOf(s?.title || "")}`}>Delete</button>}
+              <button onClick={() => loadSavedScenario(s)} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline" aria-label={`Reload scenario ${strOf(s?.title || "")}`}>Load</button>
+              {strOf(s?.id) && <button onClick={() => deleteSavedScenario(strOf(s.id))} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400" aria-label={`Delete scenario ${strOf(s?.title || "")}`}>Delete</button>}
             </div>
           ))}
         </div>
@@ -1817,13 +1932,13 @@ function ReportsTab({ meta }: { meta: any }) {
   const scrollPreview = () => { try { document.getElementById("intel-report-preview")?.scrollIntoView({ behavior: "smooth", block: "start" }); } catch {} };
   return (
     <div className="space-y-4">
-      <div className="text-[11px] text-slate-400 flex items-center gap-1">
-        <span>Intelligence</span><ChevronRight size={11} /><span className="text-slate-600 font-medium">Reports</span>
+      <div className="text-[11px] text-muted-foreground flex items-center gap-1">
+        <span>Intelligence</span><ChevronRight size={11} /><span className="text-secondary-foreground font-medium">Reports</span>
       </div>
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
-          <h3 className="text-[16px] font-semibold text-[#0F2440] tracking-tight">Report Builder</h3>
-          <p className="text-[12px] text-slate-500">Create professional reports from your analysis.</p>
+          <h3 className="text-[16px] font-semibold text-foreground tracking-tight">Report Builder</h3>
+          <p className="text-[12px] text-muted-foreground">Create professional reports from your analysis.</p>
         </div>
         <div className="flex items-center gap-1.5">
           <button onClick={scrollPreview} className={btnGhost} aria-label="Preview report"><Eye size={13} /> Preview</button>
@@ -1832,26 +1947,26 @@ function ReportsTab({ meta }: { meta: any }) {
       </div>
       {!hasDatasetRep && !tplLoading && <NoDatasetPanel hint={noSchemaRep.isNoSchema ? noSchemaRep.hint : undefined} />}
       {draftItems.length > 0 && (
-        <Card className="p-4 md:p-5 !border-blue-200 bg-blue-50/40">
+        <Card className="p-4 md:p-5 !border-blue-200 dark:border-blue-500/25 bg-blue-50/40 dark:bg-blue-500/10">
           <div className="flex items-center justify-between gap-2 flex-wrap">
-            <p className="text-[12.5px] font-semibold text-[#0F2440]">
+            <p className="text-[12.5px] font-semibold text-foreground">
               Draft includes {draftItems.length} item{draftItems.length === 1 ? "" : "s"} — added from Hypotheses. Generate includes them in the report sections.
             </p>
             <button
               onClick={() => { clearReportDraft(); setDraftItems([]); }}
-              className="text-[11.5px] font-semibold text-slate-500 hover:text-rose-600 hover:underline"
+              className="text-[11.5px] font-semibold text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 hover:underline"
               aria-label="Clear report draft">
               Clear draft
             </button>
           </div>
           <ul className="mt-2 space-y-1">
             {draftItems.map((d) => (
-              <li key={d.id || d.title} className="flex items-center gap-2 text-[12px] text-slate-600">
+              <li key={d.id || d.title} className="flex items-center gap-2 text-[12px] text-secondary-foreground">
                 <span className="w-1.5 h-1.5 rounded-full bg-blue-600 flex-shrink-0" />
                 <span className="flex-1 truncate">{d.title}</span>
                 <button
                   onClick={() => setDraftItems(removeFromReportDraft(d.id || d.title))}
-                  className="text-[11px] font-medium text-slate-400 hover:text-rose-600 hover:underline flex-shrink-0"
+                  className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 hover:underline flex-shrink-0"
                   aria-label={`Remove from draft: ${d.title}`}>
                   Remove
                 </button>
@@ -1862,7 +1977,7 @@ function ReportsTab({ meta }: { meta: any }) {
       )}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Card className="p-4 md:p-5">
-          <h3 className="text-[14px] font-semibold text-[#0F2440] tracking-tight">Report Details</h3>
+          <h3 className="text-[14px] font-semibold text-foreground tracking-tight">Report Details</h3>
           <div className="mt-3 space-y-3">
             <Field label="Report Name" htmlFor="rep-name">
               <input id="rep-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Q2 Business Review" className={inputCls} aria-label="Report name" />
@@ -1877,13 +1992,13 @@ function ReportsTab({ meta }: { meta: any }) {
               </select>
             </Field>
             <fieldset>
-              <legend className="text-[11px] font-medium text-slate-500 mb-1.5">Include Sections</legend>
+              <legend className="text-[11px] font-medium text-muted-foreground mb-1.5">Include Sections</legend>
               <div className="space-y-1.5">
                 {(activeTemplate && asList(activeTemplate?.sections).length
                   ? asList(activeTemplate.sections).map((s) => strOf(typeof s === "string" ? s : s?.name || s?.label)).filter(Boolean)
                   : [...new Set([...sections, ...FALLBACK_SECTIONS])].slice(0, 9)
                 ).map((s) => (
-                  <label key={s} className="flex items-center gap-2 text-[12.5px] text-[#0F2440] cursor-pointer">
+                  <label key={s} className="flex items-center gap-2 text-[12.5px] text-foreground cursor-pointer">
                     <input type="checkbox" checked={sections.includes(s)} onChange={() => toggleSection(s)} className="accent-blue-700" aria-label={`Include ${s}`} />
                     {s}
                   </label>
@@ -1895,49 +2010,49 @@ function ReportsTab({ meta }: { meta: any }) {
 
         <Card className="p-4 md:p-5">
           <div className="flex items-center justify-between gap-2">
-            <h3 className="text-[14px] font-semibold text-[#0F2440] tracking-tight">Report Preview</h3>
-            <span className="text-[11px] text-slate-400">{sections.length > 0 ? `1 / ${sections.length}` : "No sections"}</span>
+            <h3 className="text-[14px] font-semibold text-foreground tracking-tight">Report Preview</h3>
+            <span className="text-[11px] text-muted-foreground">{sections.length > 0 ? `1 / ${sections.length}` : "No sections"}</span>
           </div>
-          <div id="intel-report-preview" className="mt-3 rounded-xl border border-slate-200 bg-slate-50/60 p-5 min-h-64" aria-label="Report preview">
-            <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">ARIA</p>
-            <h4 className="text-[17px] font-semibold text-[#0F2440] tracking-tight mt-1">{name || "Business Review"}</h4>
-            <p className="text-[11px] text-slate-500 mt-0.5">Insight. Analysis. Action.</p>
-            {description && <p className="text-[12px] text-slate-600 mt-2 leading-relaxed">{description}</p>}
+          <div id="intel-report-preview" className="mt-3 rounded-xl border border-border bg-secondary/60 p-5 min-h-64" aria-label="Report preview">
+            <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">ARIA</p>
+            <h4 className="text-[17px] font-semibold text-foreground tracking-tight mt-1">{name || "Business Review"}</h4>
+            <p className="text-[11px] text-muted-foreground mt-0.5">Insight. Analysis. Action.</p>
+            {description && <p className="text-[12px] text-secondary-foreground mt-2 leading-relaxed">{description}</p>}
             <div className="mt-3 space-y-1.5">
-              {sections.length === 0 && <p className="text-[11px] text-slate-400">Select sections on the left to preview the outline.</p>}
+              {sections.length === 0 && <p className="text-[11px] text-muted-foreground">Select sections on the left to preview the outline.</p>}
               {sections.map((s) => (
-                <div key={s} className="flex items-center gap-2 text-[12px] text-slate-600">
+                <div key={s} className="flex items-center gap-2 text-[12px] text-secondary-foreground">
                   <span className="w-1.5 h-1.5 rounded-full bg-blue-600" />{s}
                 </div>
               ))}
             </div>
             {(pvAnalysis || pvHyps.length > 0 || pvGoals.length > 0 || pvScenarios.length > 0 || draftItems.length > 0) && (
-              <div className="mt-3 border-t border-slate-200 pt-3 space-y-2">
+              <div className="mt-3 border-t border-border pt-3 space-y-2">
                 {pvAnalysis && (
                   <div>
-                    <p className="text-[11px] font-semibold text-[#0F2440]">Latest analysis</p>
-                    <p className="text-[11.5px] text-slate-600 leading-relaxed">{strOf(pvAnalysis?.title || pvAnalysis?.name || "")}{strOf(pvAnalysis?.result_summary || pvAnalysis?.summary) ? ` — ${strOf(pvAnalysis.result_summary || pvAnalysis.summary).slice(0, 160)}` : ""}</p>
+                    <p className="text-[11px] font-semibold text-foreground">Latest analysis</p>
+                    <p className="text-[11.5px] text-secondary-foreground leading-relaxed">{strOf(pvAnalysis?.title || pvAnalysis?.name || "")}{strOf(pvAnalysis?.result_summary || pvAnalysis?.summary) ? ` — ${strOf(pvAnalysis.result_summary || pvAnalysis.summary).slice(0, 160)}` : ""}</p>
                   </div>
                 )}
                 {pvHyps.length > 0 && (
                   <div>
-                    <p className="text-[11px] font-semibold text-[#0F2440]">Hypotheses</p>
+                    <p className="text-[11px] font-semibold text-foreground">Hypotheses</p>
                     {pvHyps.map((x: any, i: number) => (
-                      <p key={i} className="text-[11.5px] text-slate-600 leading-relaxed">· {strOf(x?.title || x?.question || "")}</p>
+                      <p key={i} className="text-[11.5px] text-secondary-foreground leading-relaxed">· {strOf(x?.title || x?.question || "")}</p>
                     ))}
                   </div>
                 )}
                 {draftItems.length > 0 && (
                   <div>
-                    <p className="text-[11px] font-semibold text-[#0F2440]">Report draft ({draftItems.length})</p>
+                    <p className="text-[11px] font-semibold text-foreground">Report draft ({draftItems.length})</p>
                     {draftItems.slice(0, 5).map((d, i: number) => (
-                      <p key={i} className="text-[11.5px] text-slate-600 leading-relaxed">· {d.title}</p>
+                      <p key={i} className="text-[11.5px] text-secondary-foreground leading-relaxed">· {d.title}</p>
                     ))}
                   </div>
                 )}
                 {pvGoals.length > 0 && (
                   <div>
-                    <p className="text-[11px] font-semibold text-[#0F2440]">Goals</p>
+                    <p className="text-[11px] font-semibold text-foreground">Goals</p>
                     {pvGoals.map((g: any, i: number) => {
                       const cur = numOf(g?.current ?? g?.current_value);
                       const tgt = numOf(g?.target ?? g?.target_value);
@@ -1945,12 +2060,12 @@ function ReportsTab({ meta }: { meta: any }) {
                       const status = strOf(g?.status_label || g?.status || "");
                       return (
                         <div key={i} className="mt-1.5">
-                          <p className="text-[11.5px] text-slate-600 leading-relaxed">
+                          <p className="text-[11.5px] text-secondary-foreground leading-relaxed">
                             · {strOf(g?.title || g?.name || "Goal")} — {status}
                             {cur !== null && tgt !== null ? ` (${fmtBiz(cur)} / ${fmtBiz(tgt)}${pct !== null ? `, ${pct}%` : ""})` : ""}
                           </p>
                           {pct !== null && (
-                            <div className="h-1.5 rounded-full bg-slate-200/70 overflow-hidden max-w-52 mt-1" role="progressbar" aria-valuenow={Math.round(pct)} aria-valuemin={0} aria-valuemax={100} aria-label={`Progress for ${strOf(g?.title)}`}>
+                            <div className="h-1.5 rounded-full bg-border/70 overflow-hidden max-w-52 mt-1" role="progressbar" aria-valuenow={Math.round(pct)} aria-valuemin={0} aria-valuemax={100} aria-label={`Progress for ${strOf(g?.title)}`}>
                               <div className={`h-full rounded-full ${/behind|at risk|off track/i.test(status) ? "bg-rose-500" : /near|watch/i.test(status) ? "bg-amber-500" : "bg-emerald-500"}`} style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
                             </div>
                           )}
@@ -1961,9 +2076,9 @@ function ReportsTab({ meta }: { meta: any }) {
                 )}
                 {pvScenarios.length > 0 && (
                   <div>
-                    <p className="text-[11px] font-semibold text-[#0F2440]">What-if scenarios</p>
+                    <p className="text-[11px] font-semibold text-foreground">What-if scenarios</p>
                     {pvScenarios.map((s: any, i: number) => (
-                      <p key={i} className="text-[11.5px] text-slate-600 leading-relaxed">
+                      <p key={i} className="text-[11.5px] text-secondary-foreground leading-relaxed">
                         · {strOf(s?.title || s?.name || `${humanize(strOf(s?.variable))} scenario`)}{numOf(s?.change_value) !== null ? ` (${numOf(s.change_value)}%)` : ""}
                       </p>
                     ))}
@@ -1971,10 +2086,10 @@ function ReportsTab({ meta }: { meta: any }) {
                 )}
               </div>
             )}
-            <p className="mt-4 text-[10.5px] text-slate-400">Prepared {dateRange ? `for ${dateRange}` : "—"} · {activeTemplate ? humanize(strOf(activeTemplate?.name || templateId)) : "No template"}</p>
+            <p className="mt-4 text-[10.5px] text-muted-foreground">Prepared {dateRange ? `for ${dateRange}` : "—"} · {activeTemplate ? humanize(strOf(activeTemplate?.name || templateId)) : "No template"}</p>
           </div>
-          {genError && <p className="mt-2 text-[12px] text-rose-600" role="alert">{genError}</p>}
-          {genOk && <p className="mt-2 text-[12px] text-emerald-700" role="status">{genOk}</p>}
+          {genError && <p className="mt-2 text-[12px] text-rose-600 dark:text-rose-400" role="alert">{genError}</p>}
+          {genOk && <p className="mt-2 text-[12px] text-emerald-700 dark:text-emerald-400" role="status">{genOk}</p>}
           <button onClick={generatePdf} disabled={genBusy} className={`${btnPrimary} w-full mt-3`} aria-label="Generate PDF">
             <Printer size={13} /> {genBusy ? "Generating…" : "Generate PDF"}
           </button>
@@ -1985,17 +2100,17 @@ function ReportsTab({ meta }: { meta: any }) {
 
         <div className="space-y-4">
           <Card className="p-4 md:p-5">
-            <h3 className="text-[14px] font-semibold text-[#0F2440] tracking-tight">Template</h3>
+            <h3 className="text-[14px] font-semibold text-foreground tracking-tight">Template</h3>
             {tplLoading && <div className="skeleton h-9 rounded-lg mt-2" aria-hidden />}
-            {!tplLoading && tplError && <p className="text-[12px] text-rose-600 mt-2" role="alert">{tplError}</p>}
+            {!tplLoading && tplError && <p className="text-[12px] text-rose-600 dark:text-rose-400 mt-2" role="alert">{tplError}</p>}
             {!tplLoading && !tplError && (
               <div className="mt-2 space-y-1.5" role="radiogroup" aria-label="Report template">
                 {templates.length === 0 && (
                   <div className="mt-2 space-y-1.5">
                     {[["Professional", "Clean and modern"], ["Executive", "Focused on key insights"], ["Detailed", "Comprehensive analysis"]].map(([n, d]) => (
-                      <button key={n} onClick={() => { setTemplateId(n); }} className={`w-full text-left rounded-xl border p-2.5 transition-colors ${templateId === n ? "border-blue-500 bg-blue-50/60" : "border-slate-200 hover:border-slate-300"}`}>
-                        <span className="block text-[12.5px] font-semibold text-[#0F2440]">{n}</span>
-                        <span className="block text-[11px] text-slate-400 mt-0.5">{d}</span>
+                      <button key={n} onClick={() => { setTemplateId(n); }} className={`w-full text-left rounded-xl border p-2.5 transition-colors ${templateId === n ? "border-blue-500 bg-blue-50/60 dark:bg-blue-500/10" : "border-border hover:border-border"}`}>
+                        <span className="block text-[12.5px] font-semibold text-foreground">{n}</span>
+                        <span className="block text-[11px] text-muted-foreground mt-0.5">{d}</span>
                       </button>
                     ))}
                   </div>
@@ -2005,9 +2120,9 @@ function ReportsTab({ meta }: { meta: any }) {
                   const on = templateId === id;
                   return (
                     <button key={id} role="radio" aria-checked={on} onClick={() => pickTemplate(id)}
-                      className={`w-full text-left rounded-xl border p-2.5 transition-colors ${on ? "border-blue-500 bg-blue-50/60" : "border-slate-200 hover:border-slate-300"}`}>
-                      <span className="block text-[12.5px] font-semibold text-[#0F2440]">{strOf(t?.name || id)}</span>
-                      <span className="block text-[11px] text-slate-400 mt-0.5">{strOf(t?.description || "")}</span>
+                      className={`w-full text-left rounded-xl border p-2.5 transition-colors ${on ? "border-blue-500 bg-blue-50/60 dark:bg-blue-500/10" : "border-border hover:border-border"}`}>
+                      <span className="block text-[12.5px] font-semibold text-foreground">{strOf(t?.name || id)}</span>
+                      <span className="block text-[11px] text-muted-foreground mt-0.5">{strOf(t?.description || "")}</span>
                     </button>
                   );
                 })}
@@ -2015,7 +2130,7 @@ function ReportsTab({ meta }: { meta: any }) {
             )}
           </Card>
           <Card className="p-4 md:p-5">
-            <h3 className="text-[14px] font-semibold text-[#0F2440] tracking-tight">Report Actions</h3>
+            <h3 className="text-[14px] font-semibold text-foreground tracking-tight">Report Actions</h3>
             <div className="mt-2 space-y-1.5">
               {[
                 { k: "template" as const, label: "Save as Template", Icon: Save },
@@ -2023,30 +2138,30 @@ function ReportsTab({ meta }: { meta: any }) {
                 { k: "share" as const, label: "Share Report", Icon: Share2 },
                 { k: "ppt" as const, label: "Export to PowerPoint", Icon: Download },
               ].map(({ k, label, Icon }) => (
-                <button key={k} onClick={() => reportAction(k)} className="w-full flex items-center gap-2 text-left text-[12.5px] font-medium text-[#0F2440] hover:text-blue-700 rounded-lg px-2 py-1.5 hover:bg-blue-50/60 transition-colors" aria-label={label}>
-                  <Icon size={13} className="text-slate-400" />{label}
+                <button key={k} onClick={() => reportAction(k)} className="w-full flex items-center gap-2 text-left text-[12.5px] font-medium text-foreground hover:text-blue-700 dark:hover:text-blue-400 rounded-lg px-2 py-1.5 hover:bg-blue-50/60 dark:hover:bg-blue-500/10 transition-colors" aria-label={label}>
+                  <Icon size={13} className="text-muted-foreground" />{label}
                 </button>
               ))}
             </div>
-            {actMsg && <p className="mt-2 text-[11.5px] text-slate-600" role="status">{actMsg}</p>}
-            <p className="mt-2 text-[11px] text-slate-400">Reports use verified outputs from your analyses, insights, forecasts and goals.</p>
+            {actMsg && <p className="mt-2 text-[11.5px] text-secondary-foreground" role="status">{actMsg}</p>}
+            <p className="mt-2 text-[11px] text-muted-foreground">Reports use verified outputs from your analyses, insights, forecasts and goals.</p>
           </Card>
         </div>
       </div>
       <Card className="p-4 md:p-5">
-        <CardHead title="Generated Reports" sub="Every report you generate is kept here." right={repLoading ? <span className="text-[11px] text-slate-400">Loading…</span> : <button onClick={loadReports} className="text-[11px] font-semibold text-blue-700 hover:underline" aria-label="Refresh reports">Refresh</button>} />
-        {repError && <p className="mt-2 text-[12px] text-rose-600" role="alert">{repError} <button onClick={loadReports} className="font-semibold text-blue-700 hover:underline ml-1">Retry</button></p>}
+        <CardHead title="Generated Reports" sub="Every report you generate is kept here." right={repLoading ? <span className="text-[11px] text-muted-foreground">Loading…</span> : <button onClick={loadReports} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline" aria-label="Refresh reports">Refresh</button>} />
+        {repError && <p className="mt-2 text-[12px] text-rose-600 dark:text-rose-400" role="alert">{repError} <button onClick={loadReports} className="font-semibold text-blue-700 dark:text-blue-400 hover:underline ml-1">Retry</button></p>}
         <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2">
-          {!repError && reports.length === 0 && <p className="text-[12px] text-slate-400">No reports yet — fill the details and choose Generate PDF.</p>}
+          {!repError && reports.length === 0 && <p className="text-[12px] text-muted-foreground">No reports yet — fill the details and choose Generate PDF.</p>}
           {reports.map((r: any, i: number) => (
-            <div key={strOf(r?.id || i)} className="rounded-xl border border-slate-200 p-3 flex items-center gap-2">
-              <FileText size={14} className="text-blue-600 flex-shrink-0" />
+            <div key={strOf(r?.id || i)} className="rounded-xl border border-border p-3 flex items-center gap-2">
+              <FileText size={14} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
               <div className="min-w-0 flex-1">
-                <p className="text-[12.5px] font-medium text-[#0F2440] truncate">{strOf(r?.name || "Report")}</p>
-                <p className="text-[11px] text-slate-400">{strOf(r?.generated_at || r?.created_at || "")}{asList(r?.sections).length ? ` · ${asList(r.sections).length} sections` : ""}</p>
+                <p className="text-[12.5px] font-medium text-foreground truncate">{strOf(r?.name || "Report")}</p>
+                <p className="text-[11px] text-muted-foreground">{strOf(r?.generated_at || r?.created_at || "")}{asList(r?.sections).length ? ` · ${asList(r.sections).length} sections` : ""}</p>
               </div>
-              <button onClick={() => viewReport(strOf(r?.id))} disabled={!r?.id} className="text-[11px] font-semibold text-blue-700 hover:underline disabled:opacity-40" aria-label={`View report ${strOf(r?.name || "")}`}>View</button>
-              {strOf(r?.id) && <button onClick={() => deleteReport(strOf(r.id))} className="text-[11px] font-medium text-slate-400 hover:text-rose-600" aria-label={`Delete report ${strOf(r?.name || "")}`}>Delete</button>}
+              <button onClick={() => viewReport(strOf(r?.id))} disabled={!r?.id} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`View report ${strOf(r?.name || "")}`}>View</button>
+              {strOf(r?.id) && <button onClick={() => deleteReport(strOf(r.id))} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400" aria-label={`Delete report ${strOf(r?.name || "")}`}>Delete</button>}
             </div>
           ))}
         </div>
@@ -2093,11 +2208,28 @@ export default function Intelligence({
   }, []);
   useEffect(() => { if (connectionStatus === "connected") loadMeta(); else { setMeta(null); setMetaLoading(false); } }, [connectionStatus, loadMeta]);
 
-  const goto = (t: IntelTab) => {
+  /* Deep-link arrivals (Dashboard / bot link straight to a case):
+     #/intelligence?tab=prescriptions&rx=<id> switches tabs without reload. */
+  useEffect(() => {
+    const onHash = () => {
+      try {
+        const t = tabFromHash();
+        setTab((cur) => (cur === t ? cur : t));
+      } catch { /* ignore */ }
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  const goto = (t: IntelTab, extra?: Record<string, string | null | undefined>) => {
     setTab(t);
     try {
       const base = (window.location.hash || "#/intelligence").split("?")[0];
-      window.location.hash = `${base}?tab=${t}`;
+      const qs = Object.entries(extra || {})
+        .filter(([, v]) => v !== null && v !== undefined && String(v).trim() !== "")
+        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+        .join("&");
+      window.location.hash = qs ? `${base}?tab=${t}&${qs}` : `${base}?tab=${t}`;
     } catch { /* ignore */ }
   };
 
@@ -2126,15 +2258,15 @@ export default function Intelligence({
 
   if (connectionStatus !== "connected") {
     return (
-      <div className="min-h-full bg-white text-[#0F2440]">
+      <div className="min-h-full bg-card text-foreground">
         <div className="p-6 max-w-screen-xl mx-auto">
-          <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">ARIA INTELLIGENCE</p>
+          <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">ARIA INTELLIGENCE</p>
           <h2 className="text-xl font-semibold tracking-tight">ARIA Intelligence</h2>
-          <p className="text-sm text-slate-500 mt-0.5">Explore beyond the dashboard.</p>
-          <div className="mt-8 text-center py-12 bg-white border border-slate-200 rounded-2xl shadow-sm">
-            <Database size={22} className="mx-auto text-slate-400 mb-3" />
+          <p className="text-sm text-muted-foreground mt-0.5">Explore beyond the dashboard.</p>
+          <div className="mt-8 text-center py-12 bg-card border border-border rounded-2xl shadow-sm">
+            <Database size={22} className="mx-auto text-muted-foreground mb-3" />
             <p className="text-sm font-medium">No data source connected</p>
-            <p className="text-xs text-slate-500 mt-1">Connect PostgreSQL, MySQL, or upload a CSV to start analyzing with Intelligence.</p>
+            <p className="text-xs text-muted-foreground mt-1">Connect PostgreSQL, MySQL, or upload a CSV to start analyzing with Intelligence.</p>
           </div>
         </div>
       </div>
@@ -2142,29 +2274,29 @@ export default function Intelligence({
   }
 
   return (
-    <div className="min-h-full bg-white text-[#0F2440]">
+    <div className="min-h-full bg-card text-foreground">
       <div className="p-4 md:p-6 max-w-screen-xl mx-auto">
         {/* Header — gradient banner */}
-        <div className="relative overflow-hidden rounded-2xl border border-slate-200/80 bg-gradient-to-br from-blue-50 via-white to-indigo-50/60 px-5 py-5 md:px-6">
+        <div className="relative overflow-hidden rounded-2xl border border-border/80 bg-gradient-to-br from-blue-50 dark:from-blue-500/10 via-card to-indigo-50/60 dark:to-indigo-500/10 px-5 py-5 md:px-6">
           <div className="intel-hero-gradient" aria-hidden />
           <div className="intel-orb intel-orb-subtle-1" aria-hidden />
           <div className="intel-orb intel-orb-subtle-2" aria-hidden />
           <div className="intel-grid-overlay" aria-hidden />
           <div className="relative flex items-start justify-between gap-4 flex-wrap">
             <div className="min-w-0">
-              <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700">ARIA INTELLIGENCE</p>
+              <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">ARIA INTELLIGENCE</p>
               <h2 className="text-[22px] font-bold tracking-tight">ARIA Intelligence</h2>
               <p className="text-[14px] font-medium mt-0.5">Explore beyond the dashboard.</p>
-              <p className="text-[12px] text-slate-500 mt-0.5 max-w-xl">Investigate patterns, compare performance, test scenarios, and build business analysis from your connected data.</p>
+              <p className="text-[12px] text-muted-foreground mt-0.5 max-w-xl">Investigate patterns, compare performance, test scenarios, and build business analysis from your connected data.</p>
             </div>
-            <p className="hidden md:block text-[12px] text-slate-400 italic text-right leading-relaxed">
+            <p className="hidden md:block text-[12px] text-muted-foreground italic text-right leading-relaxed">
               &ldquo;Better questions.<br />Deeper understanding.<br />Stronger decisions.&rdquo;
             </p>
           </div>
         </div>
 
         {/* Tab bar */}
-        <div className="mt-4 flex items-center gap-1 border-b border-slate-200 overflow-x-auto" role="tablist" aria-label="Intelligence sections">
+        <div className="mt-4 flex items-center gap-1 border-b border-border overflow-x-auto" role="tablist" aria-label="Intelligence sections">
           {TABS.map(({ id, label, Icon }, i) => {
             const on = tab === id;
             return (
@@ -2178,7 +2310,7 @@ export default function Intelligence({
                 tabIndex={on ? 0 : -1}
                 onClick={() => goto(id)}
                 onKeyDown={(e) => onTabKey(e, i)}
-                className={`inline-flex items-center gap-1.5 px-3.5 py-2.5 text-[12.5px] font-medium border-b-2 -mb-px transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${on ? "border-blue-700 text-blue-800" : "border-transparent text-slate-400 hover:text-slate-600"}`}
+                className={`inline-flex items-center gap-1.5 px-3.5 py-2.5 text-[12.5px] font-medium border-b-2 -mb-px transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${on ? "border-blue-700 text-blue-800 dark:text-blue-300" : "border-transparent text-muted-foreground hover:text-secondary-foreground"}`}
               >
                 <Icon size={14} /> {label}
               </button>
@@ -2194,7 +2326,7 @@ export default function Intelligence({
             <Card><SkeletonBlock lines={2} /></Card>
           </div>
         )}
-        {!metaLoading && metaError && (tab === "explore" || tab === "goals" || tab === "whatif" || tab === "prescriptions" || tab === "reports") && !meta && (
+        {!metaLoading && metaError && (tab === "explore" || tab === "goals" || tab === "whatif" || tab === "reports") && !meta && (
           <div className="mt-4">
             <ErrorPanel message={metaError} requestId={metaId} onRetry={loadMeta} retryLabel="Reload options" />
           </div>
@@ -2213,8 +2345,8 @@ export default function Intelligence({
                 {tab === "explore" && <ExploreTab meta={meta || {}} onRunQuick={quickPrefill} onGoto={goto} onAsk={ask} />}
                 {tab === "hypotheses" && <HypothesesTab onAsk={ask} onGoto={goto} />}
                 {tab === "goals" && <GoalsTab meta={meta || {}} />}
+                {tab === "prescriptions" && <PrescriptionsFeed />}
                 {tab === "whatif" && <WhatIfTab />}
-                {tab === "prescriptions" && <PrescriptionsTab meta={meta || {}} onGoto={goto} onAsk={ask} />}
                 {tab === "reports" && <ReportsTab meta={meta || {}} />}
               </motion.div>
             </AnimatePresence>

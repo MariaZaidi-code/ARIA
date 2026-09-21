@@ -305,7 +305,7 @@ export default function Data({
               {schemaStatus === "success" ? "Schema ready" : schemaStatus === "running" ? "Loading schema..." : "Schema pending"}
             </span>
             {connHealth.tables_without_pk?.length > 0 && (
-              <span className="text-[10px] text-amber-600 flex items-center gap-1">
+              <span className="text-[10px] text-amber-600 dark:text-amber-400 flex items-center gap-1">
                 <AlertTriangle size={10} /> {connHealth.tables_without_pk.length} tables without PK
               </span>
             )}
@@ -535,7 +535,7 @@ export default function Data({
                       </span>
                     )}
                     {pkList.length === 0 && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-600 font-medium">No PK detected</span>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400 font-medium">No PK detected</span>
                     )}
                     {(tableRowCounts[selectedTable] ?? currentTable?.row_count) != null && (
                       <span className="text-[10px] text-muted-foreground">{tableRowCounts[selectedTable] ?? currentTable?.row_count} rows</span>
@@ -576,7 +576,7 @@ export default function Data({
                               {isPk ? <Key size={11} className="text-positive inline" /> : <Minus size={11} className="text-muted-foreground/30 inline" />}
                             </td>
                             <td className="px-2 py-2 text-center">
-                              {fkInfo ? <Link size={11} className="text-blue-500 inline" /> : <Minus size={11} className="text-muted-foreground/30 inline" />}
+                              {fkInfo ? <Link size={11} className="text-blue-500 dark:text-blue-400 inline" /> : <Minus size={11} className="text-muted-foreground/30 inline" />}
                             </td>
                             <td className="px-2 py-2 text-center text-[10px] text-muted-foreground">{col.nullable !== false ? "Yes" : "No"}</td>
                             <td className="px-2 py-2 text-center">
@@ -599,7 +599,7 @@ export default function Data({
                                 )}
                                 {!isPk && !fkInfo && (
                                   <button onClick={() => { setFkSourceTable(selectedTable); setFkSourceCol(colName); setShowFKModal(true); }}
-                                    className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-600 hover:bg-blue-500/20 transition-colors flex items-center gap-1">
+                                    className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-600 dark:text-blue-400 hover:bg-blue-500/20 transition-colors flex items-center gap-1">
                                     <Link size={9} /> Set FK
                                   </button>
                                 )}
@@ -634,7 +634,7 @@ export default function Data({
                           <div><span className="text-muted-foreground">Nulls:</span> <span className="text-foreground">{ns.nulls ?? 0} ({ns.null_pct?.toFixed(0) ?? 0}%)</span></div>
                           <div><span className="text-muted-foreground">Total:</span> <span className="text-foreground">{ns.total_rows ?? "?"}</span></div>
                           {col.is_primary_key && <div><span className="text-muted-foreground">Role:</span> <span className="text-foreground flex items-center gap-1"><Key size={10} className="text-positive" /> Primary Key</span></div>}
-                          {col.is_foreign_key && col.references && <div><span className="text-muted-foreground">Role:</span> <span className="text-foreground flex items-center gap-1"><Link size={10} className="text-blue-500" /> FK → {col.references.table}.{col.references.column}</span></div>}
+                          {col.is_foreign_key && col.references && <div><span className="text-muted-foreground">Role:</span> <span className="text-foreground flex items-center gap-1"><Link size={10} className="text-blue-500 dark:text-blue-400" /> FK → {col.references.table}.{col.references.column}</span></div>}
                           {col.distinct_count != null && <div><span className="text-muted-foreground">Distinct:</span> <span className="text-foreground">{col.distinct_count}</span></div>}
                           {col.min != null && <div><span className="text-muted-foreground">Min:</span> <span className="text-foreground">{col.min}</span></div>}
                           {col.max != null && <div><span className="text-muted-foreground">Max:</span> <span className="text-foreground">{col.max}</span></div>}
@@ -666,7 +666,7 @@ export default function Data({
                         const info = relFor(r.from, r.to);
                         return (
                           <div key={`inf-${i}`} className="flex items-center gap-2 text-[11px]">
-                            <GitBranch size={10} className="text-amber-500 flex-shrink-0" />
+                            <GitBranch size={10} className="text-amber-500 dark:text-amber-400 flex-shrink-0" />
                             <span className="font-mono text-foreground">{r.from}</span>
                             <span className="text-muted-foreground">→</span>
                             <span className="font-mono text-foreground">{r.to}</span>
@@ -814,11 +814,11 @@ export default function Data({
     const handleMouseUp = () => setDragging(false);
 
     const C = {
-      card: "#FFFFFF",
-      border: "#E2E8F0",
-      fg: "#0B0F1A",
-      muted: "#64748B",
-      secondary: "#F1F5F9",
+      card: "var(--card)",
+      border: "var(--border)",
+      fg: "var(--foreground)",
+      muted: "var(--muted-foreground)",
+      secondary: "var(--secondary)",
       primary: "#2F6FAD",
       positive: "#059669",
       amber: "#F59E0B",
@@ -826,7 +826,7 @@ export default function Data({
     };
 
     return (
-      <div className="fixed inset-0 z-50 bg-white flex flex-col animate-fade-in">
+      <div className="fixed inset-0 z-50 bg-card flex flex-col animate-fade-in">
         <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-card shrink-0">
           <div className="flex items-center gap-3">
             <button onClick={() => setShowERD(false)}
@@ -910,7 +910,7 @@ export default function Data({
                   {/* Shadow */}
                   <rect width={BOX_W} height={totalH} rx={8} y={2} fill="rgba(0,0,0,0.06)" />
                   {/* Body */}
-                  <rect width={BOX_W} height={totalH} rx={8} fill={isHighlighted ? "#E8F0FA" : C.card}
+                  <rect width={BOX_W} height={totalH} rx={8} fill={isHighlighted ? "var(--primary-light)" : C.card}
                     stroke={isHighlighted ? C.primary : C.border} strokeWidth={isHighlighted ? 1.5 : 1} />
                   {/* Header */}
                   <rect width={BOX_W} height={HEADER_H} rx={8} fill={C.secondary} />
@@ -1125,7 +1125,7 @@ export default function Data({
     const metrics = quality?.metrics || {};
     const overall = quality?.overall ?? 0;
 
-    const severityColor = (s: string) => s === "high" ? "text-negative bg-negative/10" : s === "medium" ? "text-amber-600 bg-amber-500/10" : "text-muted-foreground bg-secondary";
+    const severityColor = (s: string) => s === "high" ? "text-negative bg-negative/10" : s === "medium" ? "text-amber-600 dark:text-amber-400 bg-amber-500/10" : "text-muted-foreground bg-secondary";
 
     return (
       <div className="space-y-5">
@@ -1198,7 +1198,7 @@ export default function Data({
                     <span className="text-[9px] px-1.5 py-0.5 rounded bg-negative/10 text-negative font-medium">
                       {issues.filter((i: any) => i.severity === "high").length} high
                     </span>
-                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 font-medium">
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 font-medium">
                       {issues.filter((i: any) => i.severity === "medium").length} medium
                     </span>
                   </div>
@@ -1213,7 +1213,7 @@ export default function Data({
                     <div className="px-4 py-3 flex items-center justify-between">
                       <div className="flex items-center gap-3">
                         {issue.severity === "high" ? <AlertCircle size={14} className="text-negative flex-shrink-0" /> :
-                          issue.severity === "medium" ? <AlertTriangle size={14} className="text-amber-500 flex-shrink-0" /> :
+                          issue.severity === "medium" ? <AlertTriangle size={14} className="text-amber-500 dark:text-amber-400 flex-shrink-0" /> :
                             <Info size={14} className="text-muted-foreground flex-shrink-0" />}
                         <div>
                           <p className="text-xs font-medium text-foreground">
@@ -1318,8 +1318,8 @@ function Field({ label, id, type, value, onChange, placeholder, disabled, childr
 function MetricCard({ label, value, suffix = "", invert = false }: { label: string; value?: number; suffix?: string; invert?: boolean }) {
   const v = value ?? 0;
   const color = invert
-    ? (v <= 20 ? "text-positive" : v <= 50 ? "text-amber-600" : "text-negative")
-    : (v >= 80 ? "text-positive" : v >= 50 ? "text-amber-600" : "text-negative");
+    ? (v <= 20 ? "text-positive" : v <= 50 ? "text-amber-600 dark:text-amber-400" : "text-negative")
+    : (v >= 80 ? "text-positive" : v >= 50 ? "text-amber-600 dark:text-amber-400" : "text-negative");
   return (
     <div className="bg-secondary/50 rounded-lg px-3 py-2">
       <p className="text-[10px] text-muted-foreground">{label}</p>
