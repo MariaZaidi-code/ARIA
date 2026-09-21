@@ -101,6 +101,11 @@ jobs:
       run:
         working-directory: aria-frontend
     steps:
+      # Supply-chain hygiene (visibility-only pin): `uses:` tags below are
+      # intentionally kept as tags so CI resolution never breaks. To hard-pin,
+      # replace a tag with its commit SHA — lookup via:
+      #   gh api repos/actions/checkout/commits/v4 --jq .sha
+      #   gh api repos/actions/setup-node/commits/v4 --jq .sha
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -109,7 +114,11 @@ jobs:
           cache-dependency-path: aria-frontend/package-lock.json
       - name: Install dependencies
         run: npm ci
-      - name: Lint (JS/JSX; TS gated by typecheck until parser supports TS7)
+      - name: Audit dependencies (non-blocking visibility)
+        # Visibility-only: `|| true` keeps CI green on new advisories.
+        # Triage High/Critical hits locally via `npm run audit:high`.
+        run: npm audit --audit-level=high || true
+      - name: Lint (JS/JSX; TS visibility-only via lint:ts, gated by typecheck until parser supports TS7)
         run: npm run lint
       - name: Typecheck
         run: npm run typecheck

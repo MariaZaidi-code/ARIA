@@ -2082,7 +2082,15 @@ def ask_about_insight(insight_id: str, req: AskInsightRequest, request: Request,
         _t0 = time.time()
         log.info("insights ask start user=%s id=%s", user.get("user_id"), insight_id)
         try:
-            engine = create_engine(db_uri)
+            try:
+                from core.db import search_path_connect_args as _spa_ins
+                _sch_ins = [str(s).strip() for s in
+                            (session.get("schemas") or []) if str(s or "").strip()]
+                _ca_ins = _spa_ins(session.get("db_type", "postgresql"), _sch_ins)
+            except Exception:
+                _ca_ins = {}
+            engine = create_engine(db_uri, pool_pre_ping=True,
+                                   **({"connect_args": _ca_ins} if _ca_ins else {}))
             with engine.connect() as conn:
                 ins_engine = InsightsEngine(conn, mapping, llm=None)
                 all_insights = ins_engine.generate_all_insights(max_insights=20)
@@ -2128,6 +2136,7 @@ def ask_about_insight(insight_id: str, req: AskInsightRequest, request: Request,
             api_key=api_key,
             dialect=dialect,
             overrides=load_user_overrides(user["user_id"], session.get("db_name", "")),
+            schemas=session.get("schemas"),
         )
         result = agent.process_goal(question, output_path=str(output_path))
     except Exception as e:

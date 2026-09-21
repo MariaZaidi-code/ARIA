@@ -1024,9 +1024,10 @@ def _investigate_cands(engine, dialect, intel, table, metric, m_h,
             "id": f"rxinv_{table}_{metric}_{dim}",
             "rank": 0, "title": f"Investigate {d_h} performance for {m_h}: {top} vs {bottom}",
             "summary": (f"{m_h} differs across {d_h} ({top} averages {means[top]:,.1f} vs "
-                        f"{bottom} at {means[bottom]:,.1f}, a {gap * 100:+.1f}% gap, p={p:.3f}). "
-                        f"These groups are observed alongside the difference — association only, "
-                        f"so investigate the cause before acting."),
+                        f"{bottom} at {means[bottom]:,.1f}, a {gap * 100:+.1f}% gap, "
+                        f"seen across {n:,} rows). "
+                        f"These groups are observed alongside the difference, "
+                        f"so investigate what is linked before acting."),
             "action_type": "investigate", "scenario_label": "investigate",
             # hyp §13: a segment gap with no modeled intervention is an
             # Insight (a meaningful interpretation), never an Opportunity.
@@ -1061,7 +1062,6 @@ def _investigate_cands(engine, dialect, intel, table, metric, m_h,
             "limitations": [
                 f"Gap computed over {n} rows; smaller groups ({min(len(v) for v in groups.values())} rows) are noisier.",
                 "A gap shows where to look — it does not say what to change.",
-                "Historical data shows an association; it does not establish causality.",
             ],
             "recommended_next_analysis": {
                 "type": "hypothesis",
@@ -1132,9 +1132,10 @@ def _segment_focus_cands(engine, dialect, intel, table, metric, m_h,
             "title": f"Review {top} — {share_pct:g}% of {m_h}",
             "summary": (f"{top} accounts for {share_pct:g}% of observed {m_h.lower()} rows "
                         f"(averaging {means[top]:,.1f} vs a midpoint segment at "
-                        f"{means[median]:,.1f}, a {gap * 100:+.1f}% gap, n={n:,}). "
-                        f"This is observed concentration — association only, so review "
-                        f"what drives the segment before acting."),
+                        f"{means[median]:,.1f}, a {gap * 100:+.1f}% gap, "
+                        f"seen across {n:,} rows). "
+                        f"This is observed concentration, so review "
+                        f"what is linked before acting."),
             "action_type": "investigate", "scenario_label": "segment-focus",
             "decision_type": "insight",
             "confidence": conf, "risk": "low",
@@ -1175,7 +1176,6 @@ def _segment_focus_cands(engine, dialect, intel, table, metric, m_h,
                 f"Concentration computed over {n} rows; smaller groups "
                 f"({min(len(v) for v in groups.values())} rows) are noisier.",
                 "A concentration shows where to look — it does not say what to change.",
-                "Historical data shows an association; it does not establish causality.",
             ],
             "recommended_next_analysis": {
                 "type": "hypothesis",
@@ -1710,33 +1710,61 @@ def _segment_extreme(engine, dialect, table, dim, metric):
 def _dynamic_limitations(fit, scen, targeted, driver_h):
     """Limitations computed from THIS evidence — never boilerplate (§20).
 
-    Each entry names the actual numbers behind it, so two datasets never
-    get the same list unless their evidence matches.
+    Plain-language only: no r/p/|r|/Spearman/slope numbers and no
+    observed-range min-max here — those live in details.numbers/evidence
+    (analyst expander). The single association-not-proof disclaimer lives
+    in display.why_text, not repeated per sentence here.
     """
     lim = []
-    n = fit["n"]
+    try:
+        n = int(fit.get("n", 0))
+    except (TypeError, ValueError):
+        n = 0
     if n < 30:
         lim.append(f"Small sample: only {n} usable observations — treat every estimate as rough.")
     elif n < 100:
         lim.append(f"Modest sample of {n} observations — direction is informative, exact sizes less so.")
-    r = abs(fit["r"])
-    if r < 0.5:
-        lim.append(f"Relationship strength is moderate (r={fit['r']:+.2f}) — {driver_h} explains only part of the movement.")
-    if abs(fit["r"] - fit["spearman_r"]) > 0.25 or (fit["r"] > 0) != (fit["spearman_r"] > 0):
-        lim.append(f"Rank-based check disagrees (Pearson {fit['r']:+.2f} vs Spearman {fit['spearman_r']:+.2f}) — a few extreme rows may drive the result.")
-    if not scen["in_historical_range"]:
-        lim.append(f"This scenario pushes the driver to {scen['driver_value']:,.2f}, outside its observed range "
-                   f"({fit['x_min']:,.2f}–{fit['x_max']:,.2f}) — extrapolation, not interpolation.")
+    try:
+        _r = abs(float(fit.get("r", 0) or 0))
+    except (TypeError, ValueError):
+        _r = 0.0
+    if _r < 0.5:
+        lim.append(f"Relationship strength is moderate — {driver_h} explains only part of the movement.")
+    try:
+        _rr = float(fit.get("r", 0) or 0)
+        _rs = float(fit.get("spearman_r", 0) or 0)
+        _rank_bad = abs(_rr - _rs) > 0.25 or (_rr > 0) != (_rs > 0)
+    except (TypeError, ValueError):
+        _rank_bad = False
+    if _rank_bad:
+        lim.append("A rank-based check disagrees — a few unusual rows may drive the result.")
+    if not scen.get("in_historical_range"):
+        lim.append("This scenario moves the driver outside what was observed — treat it as extrapolation.")
     if targeted:
         lim.append(f"Targeted at '{targeted['value']}' ({targeted['field']}) — segment estimates rest on fewer rows than the full table.")
-    lim.append("Historical data shows an association; it does not establish "
-               "that changing this variable will directly cause the predicted result.")
     return lim
+
+
+def _strength_word(r) -> str:
+    """Plain strength word for user-visible text (Strong/Moderate).
+
+    Thresholds reuse the engine's own bars: |r| >= 0.7 is Strong,
+    anything clearing MIN_ABS_R is Moderate. No numbers are emitted.
+    """
+    try:
+        a = abs(float(r))
+    except (TypeError, ValueError):
+        return "Moderate"
+    return "Strong" if a >= 0.7 else "Moderate"
 
 
 def _plain_summary(m_h, d_h, fit, rec, join_phrase=None):
     """Plain-English summary of the whole analysis — a normal person reads
-    only this and understands what was tested, found, and recommended."""
+    only this and understands what was tested, found, and recommended.
+
+    Plain-language contract: no r=/p=/|r|/Spearman/slope numbers and no
+    observed-range min-max — those live in details.numbers/evidence only.
+    """
     if str(rec.get("action_type") or "").lower() == "monitor":
         ev = rec.get("evidence", {}) if isinstance(rec.get("evidence"), dict) else {}
         return (
@@ -1759,19 +1787,29 @@ def _plain_summary(m_h, d_h, fit, rec, join_phrase=None):
             f"Our recommendation: {rec['title']}. Start by finding what is "
             f"associated with the difference — a gap shows where to look, not what to change."
         )
-    direction = "go up together" if fit["slope"] > 0 else "move in opposite directions"
-    strength = ("strong" if abs(fit["r"]) >= 0.7 else "moderate" if abs(fit["r"]) >= 0.5 else "noticeable")
-    r_imp = rec["impact"]
+    try:
+        _slope = float((fit or {}).get("slope", 1) or 0)
+    except (TypeError, ValueError):
+        _slope = 1.0
+    direction = "go up together" if _slope > 0 else "move in opposite directions"
+    strength = _strength_word((fit or {}).get("r")).lower()
+    r_imp = rec["impact"] if isinstance(rec.get("impact"), dict) else {}
     m, d = m_h.lower(), d_h.lower()
+    try:
+        _n = int((fit or {}).get("n", 0) or 0)
+    except (TypeError, ValueError):
+        _n = 0
+    _conf_label = confidence_label_for(rec.get("confidence"))
     return (
-        f"We tested whether {d} is associated with {m}, using {fit['n']:,} rows of your data. "
-        f"The two {direction} ({strength} association, r={fit['r']:+.2f})"
+        f"We tested whether {d} is linked with {m}, using {_n:,} rows of your data. "
+        f"The two {direction} ({strength} link)"
         + (f", measured {join_phrase}" if join_phrase else "")
         + ". "
         f"Our recommendation: {rec['title']}: "
-        f"{m} would go from about {r_imp['baseline']:,.1f} to about {r_imp['scenario']:,.1f} "
-        f"({r_imp['rel_pct']:+.1f}%), within a range of {r_imp['range'][0]:,.1f} to {r_imp['range'][1]:,.1f}. "
-        f"Confidence is {rec['confidence']}, risk is {rec['risk']} — and this is an association in past data, not a promise of future results."
+        f"{m} would go from about {r_imp.get('baseline', '?'):,.1f} to about {r_imp.get('scenario', '?'):,.1f} "
+        f"({r_imp.get('rel_pct', 0.0):+.1f}%). "
+        f"Confidence is {_conf_label}, risk is {rec.get('risk')} — past patterns show "
+        f"an association, not proof the change would cause the result."
     )
 
 
@@ -1985,13 +2023,15 @@ def _analyze_core(engine, dialect, intel, table, metric, driver=None,
             if best_fit is None or abs(f["r"]) > abs(best_fit["r"]):
                 best, best_fit, best_xy, best_join = c, f, (xs, ys), join
         elif f:
+            # Plain-language diagnostic: no r=/p=/|r| in the user-visible
+            # note — raw stats stay in details.numbers/evidence only.
             _why = []
             if abs(f["r"]) < MIN_ABS_R:
-                _why.append(f"link strength |r|={abs(f['r']):.2f} is below the {MIN_ABS_R:.2f} bar")
+                _why.append("link strength below the bar")
             if f["p_value"] >= 0.05:
-                _why.append(f"not statistically solid (p={f['p_value']:.2f})")
+                _why.append("not statistically solid")
             tested.append({"driver": c, "n": f.get("n"),
-                           "r": round(float(f["r"]), 2), "verdict": "rejected",
+                           "verdict": "rejected",
                            "note": "; ".join(_why) + f" — measured on {f.get('n', 0)} rows."})
         else:
             tested.append({"driver": c, "verdict": "rejected",
@@ -2011,8 +2051,8 @@ def _analyze_core(engine, dialect, intel, table, metric, driver=None,
                       f"there are no other numbers in your data to test as drivers.")
         else:
             reason = (f"ARIA tested {', '.join(numeric_tested[:6])} against {_disp(metric)} "
-                      f"({fit_n_total} usable rows) but found no relationship strong enough "
-                      f"(need |r|≥0.30, p<0.05) to justify an intervention.")
+                      f"({fit_n_total} usable rows) but found no link strong enough "
+                      f"to justify an intervention.")
         from core.semantic import humanize as _hz
         inv = _investigate_cands(engine, dialect, intel, table, metric, _hz(metric),
                                  review=review, review_basis=review_basis)
@@ -2179,13 +2219,14 @@ _hg2(metric), priors, tested=tested)
         # first with "No supported actionable scenario" / no_prescription).
         title = (f"Test a {abs(pct):g}% {verb} in {d_h}"
                  + (f" for {targeted['value']}" if targeted and label == "recommended" else ""))
-        # Association is supporting evidence: the r/n observation stands,
-        # the direction basis is the validated one from improvement_up —
-        # never a generic "higher is better" assumption.
-        why = (f"{m_h} is associated with {d_h} (r={fit['r']:+.2f}, n={fit['n']:,}); "
+        # Association is supporting evidence: plain words only (no r/p/
+        # slope numbers — those live in details.numbers/evidence). The
+        # direction basis is the validated one from improvement_up.
+        why = (f"{m_h} is linked with {d_h} ({_strength_word(fit['r']).lower()} link, "
+               f"seen across {fit['n']:,} rows); "
                f"moving {d_h} {'up' if move > 0 else 'down'} is modeled to move the metric "
-               f"toward improvement ({up_assump}). "
-               f"An association in past data is not proof the change would produce the result.")
+               f"toward improvement. "
+               f"Past patterns show an association, not proof the change would cause the result.")
         _conf = ("moderate" if (fit["r"] > 0) != (fit["spearman_r"] > 0)
                  or abs(fit["r"] - fit["spearman_r"]) > 0.4 else
                  "high" if fit["p_value"] < 0.01 and fit["n"] >= 100 else
@@ -2242,8 +2283,7 @@ _hg2(metric), priors, tested=tested)
                                     "mean": round(fit["x_mean"], 4)},
                        "labels": {"baseline": "OBSERVED", "scenario": "SIMULATED"}},
             "assumptions": [up_assump,
-                            "Linear response estimated from historical data (slope "
-                            f"{fit['slope']:.4f});",
+                            "Linear response estimated from historical data;",
                             "All other factors held constant."],
             "limitations": _dynamic_limitations(fit, scen, targeted, d_h),
             "recommended_next_analysis": {
@@ -2307,10 +2347,11 @@ _hg2(metric), priors, tested=tested)
     for i, c in enumerate(pres):
         c["rank"] = i + 1
 
-    story = (f"{m_h} is associated with {d_h} (r={fit['r']:+.2f} over {fit['n']:,} observations"
+    story = (f"{m_h} is linked with {d_h} ({_strength_word(fit['r']).lower()} link, "
+             f"seen across {fit['n']:,} observations"
              + (f", measured {_join_phrase(join_used)}" if join_used else "")
-             + f"). A tested {verb} in {d_h} is the most evidence-backed driver available. "
-               f"An association in past data is not proof the change would produce the result.")
+             + f"). A tested {verb} in {d_h} is the most supported move available. "
+               f"Past patterns show an association, not proof the change would cause the result.")
     # Bounded evidence sample for the scatter chart (never the full dump).
     _sxs, _sys = best_xy or ([], [])
     _idx = sorted(set(int(i) for i in np.linspace(0, max(0, len(_sxs) - 1), min(len(_sxs), 200))))
@@ -2502,13 +2543,32 @@ def _doc_terms(text):
             if len(t) > 2 and t not in _DOC_STOPWORDS]
 
 
+def _sanitize_label(text, max_len=90):
+    """Neutralize untrusted document/question text for titles/labels.
+
+    Strips HTML/XML tags, control characters and collapses whitespace so a
+    malicious chunk section or filename cannot inject markup or directive
+    prose into a recommendation title. Purely generic — no dataset names.
+    """
+    import re as _re
+    s = str(text or "")
+    s = _re.sub(r"<[^>]*>", " ", s)
+    s = "".join(c if (c.isprintable() or c in ("…",)) else " " for c in s)
+    s = _re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_len:
+        return s[:max(0, max_len - 1)].rstrip() + "…"
+    return s
+
+
 def _doc_title(chunk):
     section = (chunk.get("section") or "").strip()
     if section:
-        return section[:90]
+        return _sanitize_label(section, 90) or "Untitled finding"
     text = " ".join(str(chunk.get("content") or "").split())
     head = text.split(". ")[0].strip()
-    return (head[:87] + "…") if len(head) > 90 else (head or "Untitled finding")
+    if len(head) > 90:
+        return _sanitize_label(head, 90) or "Untitled finding"
+    return _sanitize_label(head, 90) or "Untitled finding"
 
 
 def _analyze_document_core(chunks, question, doc_name):
@@ -2534,12 +2594,14 @@ def _analyze_document_core(chunks, question, doc_name):
     scored.sort(key=lambda t: t[0], reverse=True)
     top = [ch for _, ch in scored[:5]]
     if not top:
+        _doc_display_empty = _sanitize_label(doc_name, 120) or "this document"
         return {"ok": True, "success": True, "status": "no_prescription",
-                "reason": (f"No passage in {doc_name} speaks to this question. "
+                "reason": (f"No passage in {_doc_display_empty} speaks to this question. "
                            f"Try different wording or ask ARIA to summarize the document first."),
                 "alternatives": ["Ask ARIA", "Explore Data"],
                 "document": doc_name}
     recs = []
+    _doc_display = _sanitize_label(doc_name, 120) or "this document"
     for ch in top[:3]:
         text = " ".join(str(ch.get("content") or "").split())
         low = text.lower()
@@ -2560,7 +2622,7 @@ def _analyze_document_core(chunks, question, doc_name):
             "id": f"rxdoc_{ch.get('id', len(recs))}",
             "rank": len(recs) + 1,
             "title": title,
-            "summary": f"Passage from {doc_name}" + (f" (page {page})" if page else "") + " reads: “" + quote + "”",
+            "summary": f"Passage from {_doc_display}" + (f" (page {page})" if page else "") + " reads: “" + quote + "”",
             "action_type": "qualitative", "scenario_label": "qualitative",
             # hyp §13: a cited passage is a Finding (an observed pattern),
             # never an Opportunity — there is no measured lever behind it.
@@ -2585,12 +2647,12 @@ def _analyze_document_core(chunks, question, doc_name):
             "review_basis": "text evidence has no time series to pace reviews",
             "assumptions": ["Passages interpreted at face value."],
             "limitations": ["Text evidence only — no numbers were modeled.",
-                            f"Based on {len(top)} cited passage(s) from {doc_name}; the rest of the document may add context.",
+                            f"Based on {len(top)} cited passage(s) from {_doc_display}; the rest of the document may add context.",
                             "Association in prose is not proof of cause or size."],
             "recommended_next_analysis": {"type": "copilot",
                                           "label": "Ask ARIA to dig into this passage further."},
         })
-    story = (f"{doc_name} speaks to your question in {len(top)} passage(s). "
+    story = (f"{_doc_display} speaks to your question in {len(top)} passage(s). "
               f"These are qualitative leads with citations — confirm them with numbers before acting.")
     return {"ok": True, "success": True, "status": "completed",
             "analysis_id": f"rxd_{abs(hash(doc_name)) % 10**8}",
@@ -2599,7 +2661,7 @@ def _analyze_document_core(chunks, question, doc_name):
             "signals": {"supporting": 1, "priors_origin": "document"},
             "story": story,
             "summary_plain": (
-                f"We read {doc_name} for passages about your question and found "
+                f"We read {_doc_display} for passages about your question and found "
                 f"{len(top)} relevant one(s). The top lead is: {recs[0]['title']}. "
                 f"Each card quotes its source passage — these are leads to verify, not measured effects.")}
 
@@ -3067,20 +3129,436 @@ def _numbers_for(rec: dict) -> dict:
     return out
 
 
-def _details_for(rec: dict) -> dict:
-    """details:{evidence_pass, checks[], numbers{}, limitations[]}."""
+_ASSOCIATION_DISCLAIMER = ("Past patterns show an association, not proof "
+                             "that a change will cause the result.")
+
+_CONFIDENCE_MEANINGS = {
+    "High": "Strong support from past data — the pattern is stable.",
+    "Moderate": "Reasonable support but real uncertainty remains.",
+    "Early": "Early signal only — limited support, watch first.",
+}
+
+
+def _confidence_meaning_for(confidence) -> str:
+    """Plain meaning for the single High/Moderate/Early vocabulary."""
+    return _CONFIDENCE_MEANINGS.get(confidence_label_for(confidence), _CONFIDENCE_MEANINGS["Early"])
+
+
+def _what_would_raise_for(confidence) -> str:
+    """What would raise confidence — plain, actionable, generic."""
+    label = confidence_label_for(confidence)
+    if label == "High":
+        return "Fresh data confirming the pattern holds would keep this High."
+    if label == "Moderate":
+        return "More rows and a repeat period with the same pattern would raise this to High."
+    return "More rows, a stable repeat, and a tested driver would raise this above Early."
+
+
+def _problem_text_for(rec: dict) -> str:
+    """Plain-language Problem: what changed, by how much, segment/period.
+
+    No r/p/Spearman/slope numbers and no observed-range min-max — stats
+    live in details.numbers/evidence only.
+    """
+    rec = rec if isinstance(rec, dict) else {}
+    n = _rec_names(rec)
+    atype = str(rec.get("action_type") or "").lower()
+    label = str(rec.get("scenario_label") or "").lower()
+    imp = rec.get("impact") if isinstance(rec.get("impact"), dict) else {}
+    ev = n["ev"]
+
+    def _num(v):
+        try:
+            f = float(v)
+            return f if f == f else None
+        except (TypeError, ValueError):
+            return None
+
+    if atype == "scenario":
+        rel, base, scen = _num(imp.get("rel_pct")), _num(imp.get("baseline")), _num(imp.get("scenario"))
+        seg = ev.get("segment")
+        seg_txt = ""
+        if isinstance(seg, dict) and seg.get("value") is not None:
+            seg_txt = f" for {seg.get('value')}"
+        if rel is not None and base is not None and scen is not None:
+            hb, hs = _human_amount(base, n["metric"]), _human_amount(scen, n["metric"])
+            return (f"{n['M']} could shift {hs} vs {hb} now ({_fmt_pct_short(rel)}) "
+                    f"if {n['D']} is tested{seg_txt}.")
+        return f"{n['M']} is linked with {n['D']}{seg_txt} — testing a change there is the focus."
+    if label == "segment-focus":
+        top = n.get("top") or n["D"]
+        share = ev.get("share_pct")
+        try:
+            _share = float(share) if share is not None else None
+        except (TypeError, ValueError):
+            _share = None
+        if _share is not None:
+            return f"{top} holds about {_trim_num(_share, 0)}% of {n['M']} rows — the concentration to review."
+        return f"{top} holds the largest share of {n['M']} rows — the concentration to review."
+    if atype == "monitor":
+        mom = ev.get("momentum_pct")
+        pts = ev.get("n_points", ev.get("n"))
+        direction = str(ev.get("direction") or "").lower() or "shifting"
+        try:
+            _mom = float(mom) if mom is not None else None
+        except (TypeError, ValueError):
+            _mom = None
+        if _mom is not None:
+            pts_txt = f" over {int(pts)} periods" if pts else ""
+            return f"{n['M']} moved {direction} about {_trim_num(abs(_mom), 0)}%{pts_txt}."
+        return f"{n['M']} is moving {direction} — keep watching before deciding."
+    if atype == "investigate":
+        top, bottom = n.get("top"), n.get("bottom")
+        gap = ev.get("effect_gap_pct")
+        try:
+            _gap = float(gap) if gap is not None else None
+        except (TypeError, ValueError):
+            _gap = None
+        if top and bottom and _gap is not None:
+            return f"{top} vs {bottom} differ by about {_trim_num(abs(_gap), 0)}% on {n['M']}."
+        return f"{n['D']} shows the clearest gap for {n['M']}."
+    if atype == "qualitative":
+        return "A passage in your document speaks to the question — review it before acting."
+    return f"{n['D']} shows the clearest pattern for {n['M']}."
+
+
+def _why_text_for(rec: dict, tested=None, supporting=None) -> str:
+    """Plain-language Why: 2-3 bullets + one disclaimer (Problem→Why→Action).
+
+    Built from tested[] + segment-focus/monitor/investigate outputs passed
+    as inputs (not sibling cards):
+      1. strongest linked driver in words Strong/Moderate + row count,
+      2. corroborating segment/time evidence,
+      3. top rejected alternative.
+    No r/p/slope numbers.
+    """
+    rec = rec if isinstance(rec, dict) else {}
+    n = _rec_names(rec)
+    ev = n["ev"]
+    atype = str(rec.get("action_type") or "").lower()
+    tested = [t for t in (tested or []) if isinstance(t, dict)]
+    supporting = [s for s in (supporting or []) if isinstance(s, dict) and s is not rec]
+
+    def _rows():
+        for k in ("n", "n_points"):
+            try:
+                v = int(ev.get(k)) if ev.get(k) is not None else None
+                if v:
+                    return f"{v:,} rows"
+            except (TypeError, ValueError):
+                continue
+        return "your available rows"
+
+    bullets = []
+    # Bullet 1: strongest linked driver in words + row count.
+    if atype == "scenario":
+        r = ev.get("effect_r", ev.get("r"))
+        bullets.append(f"• {_strength_word(r)} link between {n['D']} and {n['M']} across {_rows()} — the strongest tested.")
+    elif str(rec.get("scenario_label") or "").lower() == "segment-focus":
+        top = n.get("top") or n["D"]
+        bullets.append(f"• {top} holds the largest share of {n['M']} rows ({_rows()}) — focus lands where it counts.")
+    elif atype == "monitor":
+        direction = str(ev.get("direction") or "").lower() or "shift"
+        bullets.append(f"• {n['M']} shows a clear {direction}ward movement across {_rows()} of ordered history.")
+    elif atype == "investigate":
+        top, bottom = n.get("top"), n.get("bottom")
+        if top and bottom:
+            bullets.append(f"• {top} stands out against {bottom} on {n['M']} across {_rows()} — the gap to probe.")
+        else:
+            bullets.append(f"• {n['D']} shows the clearest gap for {n['M']} across {_rows()}.")
+    else:
+        bullets.append(f"• Clearest pattern for {n['M']} involves {n['D']} across {_rows()}.")
+    # Bullet 2: corroborating segment/time evidence from supporting inputs.
+    corroborated = False
+    for s in supporting:
+        try:
+            sev = s.get("evidence") if isinstance(s.get("evidence"), dict) else {}
+            slabel = str(s.get("scenario_label") or "").lower()
+            satype = str(s.get("action_type") or "").lower()
+            if slabel == "segment-focus" and sev.get("top"):
+                bullets.append(f"• Corroboration: {sev.get('top')} also concentrates {n['M']} rows in a segment split.")
+                corroborated = True
+                break
+            if satype == "monitor" and sev.get("direction"):
+                bullets.append(f"• Corroboration: {n['M']} is also moving {str(sev.get('direction')).lower()} over time.")
+                corroborated = True
+                break
+            if satype == "investigate" and sev.get("top") and sev.get("bottom"):
+                bullets.append(f"• Corroboration: {sev.get('top')} vs {sev.get('bottom')} differ on {n['M']} too.")
+                corroborated = True
+                break
+        except Exception:
+            continue
+    if not corroborated:
+        groups = ev.get("groups") or []
+        if isinstance(groups, list) and len(groups) >= 2:
+            try:
+                bullets.append(f"• Corroboration: the split holds across {len(groups)} groups, not one outlier.")
+                corroborated = True
+            except Exception:
+                pass
+    if not corroborated:
+        bullets.append("• Corroboration: no second split cleared the bar — this lead stands alone for now.")
+    # Bullet 3: top rejected alternative from tested[].
+    rej = next((t for t in tested if str(t.get("verdict") or "").lower() in ("rejected", "skipped")), None)
+    if rej and rej.get("driver"):
+        try:
+            from core.semantic import humanize as _hh
+            _dn = _hh(rej.get("driver"))
+        except Exception:
+            _dn = str(rej.get("driver"))
+        bullets.append(f"• Ruled out: {_dn} did not clear the bar, so it is not recommended.")
+    else:
+        bullets.append("• Ruled out: other tested factors did not clear the bar.")
+    bullets = bullets[:3]
+    return "\n".join(bullets) + f"\n{_ASSOCIATION_DISCLAIMER}"
+
+
+def _table_sampling(engine, dialect, table) -> dict:
+    """Sampling provenance for LIMIT 5000 reads (additive details only)."""
+    try:
+        from api.schema_intel import _safe_name
+        from sqlalchemy import text as _t
+        with engine.connect() as conn:
+            _n = conn.execute(_t(f"SELECT COUNT(*) FROM {_safe_name(table, dialect)}")).scalar()
+        table_n = int(_n or 0)
+    except Exception:
+        return {}
+    if table_n > SAMPLE_LIMIT:
+        return {"sampled": True, "sample_n": int(SAMPLE_LIMIT), "table_n": table_n}
+    return {"sampled": False, "sample_n": table_n, "table_n": table_n}
+
+
+def validate_segment_value(engine, dialect, table, field, value, limit=100) -> dict:
+    """Validate segment.value against SELECT DISTINCT LIMIT 100 + suggestions.
+
+    Generic over any dimension (no hardcoded values). Returns
+    {ok, distinct[], suggestions[]} — suggestions are case-insensitive
+    substring matches, capped at 5.
+    """
+    try:
+        from api.schema_intel import _safe_name
+        rows = _exec(engine,
+                     f"SELECT DISTINCT {_safe_name(field, dialect)} "
+                     f"FROM {_safe_name(table, dialect)} "
+                     f"WHERE {_safe_name(field, dialect)} IS NOT NULL "
+                     f"LIMIT {int(limit)}")
+        distinct = [r[0] for r in rows]
+    except Exception:
+        return {"ok": True, "distinct": [], "suggestions": []}
+    try:
+        if value in distinct or str(value) in [str(d) for d in distinct]:
+            return {"ok": True, "distinct": [str(d) for d in distinct][:limit], "suggestions": []}
+    except Exception:
+        pass
+    needle = str(value or "").lower()
+    suggs = []
+    for d in distinct:
+        try:
+            s = str(d)
+            if needle and (needle in s.lower() or s.lower() in needle):
+                suggs.append(s)
+        except Exception:
+            continue
+        if len(suggs) >= 5:
+            break
+    if not suggs:
+        suggs = [str(d) for d in distinct[:5]]
+    return {"ok": False, "distinct": [str(d) for d in distinct][:limit], "suggestions": suggs}
+
+
+_DIRECTION_WORDS_DOWN = ("down", "declin", "drop", "fall", "fell", "shrink", "slip", "weaken", "worsen", "bleed")
+_DIRECTION_WORDS_UP = ("up", "increas", "grow", "growth", "rise", "risen", "rose", "improv", "rebound", "surge")
+
+
+def parse_question_intent(question, intel, table, engine=None, dialect=None) -> dict:
+    """Wire the dead `question` param to hypothesis ranking (generic).
+
+    Parses metric + segment + direction words from the live schema values
+    (no hardcoded category names): metric/driver names, dimension names,
+    and DISTINCT dimension values (LIMIT 100 each, bounded). Returns
+    {metric_hint, segment_field, segment_value, direction, ignored_reason}.
+    Steering (not filtering): the caller boosts matching cards; a question
+    with no schema match is documented as ignored, never silently applied.
+    """
+    q = str(question or "").strip()
+    if not q:
+        return {"metric_hint": None, "segment_field": None, "segment_value": None,
+                "direction": None, "ignored_reason": "empty question — ignored"}
+    low = q.lower()
+    direction = None
+    if any(w in low for w in _DIRECTION_WORDS_DOWN):
+        direction = "down"
+    elif any(w in low for w in _DIRECTION_WORDS_UP):
+        direction = "up"
+    metric_hint = None
+    try:
+        cands = list(intel.get_numeric_cols(table) or []) + list(_usable_measures(intel, table) or [])
+        for c in cands:
+            cl = str(c).lower()
+            toks = [t for t in _name_tokens(cl) if len(t) > 2]
+            if cl and cl in low:
+                metric_hint = c
+                break
+            if any(t in low for t in toks):
+                metric_hint = c
+                break
+    except Exception:
+        metric_hint = None
+    seg_field, seg_value = None, None
+    try:
+        dims = list(intel.find_all_dimensions(table) or [])[:4]
+    except Exception:
+        dims = []
+    # Dimension NAME match first (e.g. "by category").
+    for d in dims:
+        dl = str(d).lower()
+        toks = [t for t in _name_tokens(dl) if len(t) > 2]
+        if dl and dl in low or any(t in low for t in toks):
+            seg_field = d
+            break
+    # Dimension VALUE match from live DISTINCT values (generic, bounded).
+    if engine is not None and dialect is not None:
+        for d in dims:
+            try:
+                from api.schema_intel import _safe_name
+                rows = _exec(engine,
+                             f"SELECT DISTINCT {_safe_name(d, dialect)} "
+                             f"FROM {_safe_name(table, dialect)} "
+                             f"WHERE {_safe_name(d, dialect)} IS NOT NULL "
+                             f"LIMIT 100")
+                for r in rows:
+                    try:
+                        s = str(r[0])
+                    except Exception:
+                        continue
+                    if len(s) < 2:
+                        continue
+                    if s.lower() in low:
+                        seg_field, seg_value = d, s
+                        break
+                if seg_value:
+                    break
+            except Exception:
+                continue
+    if seg_field is None and seg_value is None and direction is None and metric_hint is None:
+        return {"metric_hint": None, "segment_field": None, "segment_value": None,
+                "direction": direction, "ignored_reason": "no schema match — ignored"}
+    return {"metric_hint": metric_hint, "segment_field": seg_field, "segment_value": seg_value,
+            "direction": direction, "ignored_reason": None}
+
+
+def _apply_question_intent(pres, intent) -> list:
+    """Steer ranking toward the asked segment (additive boost, never filter)."""
+    try:
+        intent = intent if isinstance(intent, dict) else {}
+        seg_val = str(intent.get("segment_value") or "").lower()
+        seg_field = str(intent.get("segment_field") or "").lower()
+        direction = str(intent.get("direction") or "").lower()
+        if not seg_val and not seg_field and not direction:
+            return pres
+        out = []
+        for r in (pres or []):
+            if not isinstance(r, dict):
+                out.append(r)
+                continue
+            try:
+                boost = 0.0
+                ev = r.get("evidence") if isinstance(r.get("evidence"), dict) else {}
+                hay = " ".join([str(ev.get("top") or ""), str(ev.get("bottom") or ""),
+                                str(ev.get("median") or ""), str(ev.get("driver") or ""),
+                                str((ev.get("segment") or {}).get("value") if isinstance(ev.get("segment"), dict) else ""),
+                                str(r.get("title") or "")]).lower()
+                if seg_val and seg_val in hay:
+                    boost += 5.0
+                elif seg_field and seg_field in hay:
+                    boost += 2.0
+                if direction and str(ev.get("direction") or "").lower() == direction:
+                    boost += 1.0
+                if boost:
+                    r = dict(r)
+                    try:
+                        r["score"] = round(float(r.get("score", 0) or 0) + boost, 1)
+                    except (TypeError, ValueError):
+                        pass
+                    _pr = dict(r.get("priority_score", {}) if isinstance(r.get("priority_score"), dict) else {})
+                    out.append(r)
+                else:
+                    out.append(r)
+            except Exception:
+                out.append(r)
+        # Re-sort within tiers so the asked segment surfaces first.
+        try:
+            return _rank_coverage(out)
+        except Exception:
+            return out
+    except Exception:
+        return pres
+
+
+def _details_for(rec: dict, sampling=None) -> dict:
+    """details:{evidence_pass, checks[], numbers{}, limitations[], +additive}.
+
+    Additive extension: confidence_label/meaning/what_would_raise_it,
+    score_breakdown/join_ref nesting, sampling provenance. Raw stats live
+    here (analyst expander), never required in user-visible text.
+    """
     rec = rec if isinstance(rec, dict) else {}
     lims = rec.get("limitations") if isinstance(rec.get("limitations"), list) else []
-    return {
+    det = {
         "evidence_pass": _evidence_pass_for(rec),
         "checks": _checks_for(rec),
         "numbers": _numbers_for(rec),
         "limitations": [str(x) for x in lims],
     }
+    try:
+        det["confidence_label"] = confidence_label_for(rec.get("confidence"))
+        det["confidence_meaning"] = _confidence_meaning_for(rec.get("confidence"))
+        det["what_would_raise_it"] = _what_would_raise_for(rec.get("confidence"))
+    except Exception:
+        pass
+    try:
+        if isinstance(rec.get("score_breakdown"), dict):
+            det["score_breakdown"] = dict(rec.get("score_breakdown"))
+    except Exception:
+        pass
+    try:
+        _jr = rec.get("join_ref", rec.get("join"))
+        if _jr is not None:
+            det["join_ref"] = _jr
+    except Exception:
+        pass
+    try:
+        # Sampling provenance: always disclose when known (LIMIT 5000 reads),
+        # not only when truncation kicks in. When sampled, note the ORDER BY
+        # bias: the deterministic ordered sample favors the sort head, so the
+        # tail of the distribution is under-represented.
+        if isinstance(sampling, dict) and sampling.get("sample_n") is not None:
+            det["sampled"] = bool(sampling.get("sampled"))
+            try:
+                det["sample_n"] = int(sampling.get("sample_n"))
+            except (TypeError, ValueError):
+                pass
+            try:
+                if sampling.get("table_n") is not None:
+                    det["table_n"] = int(sampling.get("table_n"))
+            except (TypeError, ValueError):
+                pass
+            if det.get("sampled") is True:
+                det["sample_note"] = ("Analysis used a bounded ordered sample "
+                                      "(first rows in sort order up to the row limit); "
+                                      "tail values may be under-represented.")
+    except Exception:
+        pass
+    return det
 
 
-def build_display(rec: dict) -> dict:
-    """display:{title, action_text, outcome_text, confidence_label, why_summary}."""
+def build_display(rec: dict, tested=None, supporting=None) -> dict:
+    """display:{title, action_text, outcome_text, confidence_label, why_summary, problem_text, why_text}.
+
+    Additive: problem_text/why_text are new; the five legacy keys are kept.
+    why_text is built from tested[] + segment/monitor/investigate inputs.
+    """
     rec = rec if isinstance(rec, dict) else {}
     return {
         "title": str(rec.get("title") or "Recommendation"),
@@ -3088,18 +3566,22 @@ def build_display(rec: dict) -> dict:
         "outcome_text": _outcome_text_for(rec),
         "confidence_label": confidence_label_for(rec.get("confidence")),
         "why_summary": _why_summary_for(rec),
+        "problem_text": _problem_text_for(rec),
+        "why_text": _why_text_for(rec, tested=tested, supporting=supporting),
     }
 
 
-def attach_display(rec: dict) -> dict:
+def attach_display(rec: dict, tested=None, supporting=None, sampling=None) -> dict:
     """Attach the display-safe contract to one prescription (additive)."""
     if not isinstance(rec, dict):
         return rec
     try:
-        rec["display"] = build_display(rec)
+        rec["display"] = build_display(rec, tested=tested, supporting=supporting)
         rec["why_summary"] = rec["display"]["why_summary"]
         rec["confidence_label"] = rec["display"]["confidence_label"]
-        rec["details"] = _details_for(rec)
+        rec["problem_text"] = rec["display"]["problem_text"]
+        rec["why_text"] = rec["display"]["why_text"]
+        rec["details"] = _details_for(rec, sampling=sampling)
         rec["evidence_pass"] = rec["details"]["evidence_pass"]
     except Exception:
         log.debug("attach_display failed", exc_info=True)
@@ -3201,19 +3683,62 @@ def build_refusal(out: dict, *, engine=None, dialect=None, intel=None,
 
 
 def _finalize_output(out: dict, *, engine=None, dialect=None, intel=None,
-                      table=None, metric=None, driver=None) -> dict:
+                      table=None, metric=None, driver=None, question=None) -> dict:
     """Attach display/details to prescriptions + refusal to refusals.
 
     Additive only: existing keys are never removed or renamed here — the
-    routes layer owns internal-key stripping.
+    routes layer owns internal-key stripping. WHY is built from tested[] +
+    segment-focus/monitor/investigate outputs passed as inputs; question
+    intent (when given) steers ranking and is documented in diagnostics.
     """
     if not isinstance(out, dict):
         return out
+    # Wire the `question` param (previously dead): parse metric/segment/
+    # direction generically from schema values; steer ranking or document
+    # the ignore. Additive: diagnostics.question_intent only.
+    try:
+        if question is not None and engine is not None and intel is not None and table:
+            _intent = parse_question_intent(question, intel, table, engine=engine, dialect=dialect)
+            try:
+                _diag = out.get("diagnostics")
+                if not isinstance(_diag, dict):
+                    out["diagnostics"] = _diag = {}
+                _diag["question_intent"] = _intent
+            except Exception:
+                pass
+            try:
+                _pres0 = out.get("prescriptions")
+                if isinstance(_pres0, list) and _pres0 and _intent.get("ignored_reason") is None:
+                    out["prescriptions"] = _apply_question_intent(_pres0, _intent)
+            except Exception:
+                pass
+    except Exception:
+        log.debug("question intent wiring failed", exc_info=True)
+    # Sampling provenance (LIMIT 5000) — one bounded COUNT per analyze.
+    # Always attached (sampled True/False) so callers can tell a full scan
+    # from a truncated ordered sample.
+    _sampling = {}
+    try:
+        if engine is not None and dialect is not None and table:
+            _sampling = _table_sampling(engine, dialect, table) or {}
+    except Exception:
+        _sampling = {}
     pres = out.get("prescriptions")
     if isinstance(pres, list):
+        # tested[] trail for WHY inputs (diagnostics.tested preferred).
+        _tested = []
+        try:
+            _diag2 = out.get("diagnostics") if isinstance(out.get("diagnostics"), dict) else {}
+            _tested = _diag2.get("tested", out.get("tested", [])) or []
+        except Exception:
+            _tested = []
         for r in pres:
             if isinstance(r, dict) and "display" not in r:
-                attach_display(r)
+                try:
+                    _supporting = [s for s in pres if isinstance(s, dict) and s is not r]
+                except Exception:
+                    _supporting = []
+                attach_display(r, tested=_tested, supporting=_supporting, sampling=_sampling or None)
     scens = out.get("scenarios")
     if isinstance(scens, list) and out.get("ok"):
         for s in scens:
@@ -3287,7 +3812,7 @@ def analyze(engine, dialect, intel, table, metric, driver=None,
     try:
         return _finalize_output(out, engine=engine, dialect=dialect,
                                 intel=intel, table=table, metric=metric,
-                                driver=driver)
+                                driver=driver, question=question)
     except Exception:
         log.debug("analyze display finalize failed", exc_info=True)
         return out

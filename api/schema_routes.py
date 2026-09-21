@@ -64,22 +64,33 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
     try:
         conn = schema_agent.get_connection(types.SimpleNamespace(**config))
         try:
-            # Dynamic schema resolution (any PostgreSQL DB, not DB-specific):
-            # - single-schema DBs (northwind): keep the configured schema when it
-            #   has tables; otherwise fall back to the schema with the most tables.
-            # - multi-schema DBs (AdventureWorks): map ALL populated schemas with
+            # Dynamic schema resolution (generic, no database names):
+            # - single-schema DBs: keep the configured schema when it has
+            #   tables; otherwise fall back to populated schemas.
+            # - multi-schema DBs: map ALL populated schemas with
             #   schema-qualified table names so goals can span schemas.
+            #   When the requested schema is empty, default to ALL populated
+            #   schemas (never to nothing).
             multi_schema = False
             if db_type == "postgresql":
                 try:
-                    mode = schema_agent.detect_schema_mode(conn)
+                    mode = schema_agent.detect_schema_mode(conn, requested=schema_filter)
                     multi_schema = mode["mode"] == "multi"
                     if multi_schema:
                         schema_filter = "*"
                     elif not schema_agent.schema_has_tables(conn, schema_filter):
-                        alt = schema_agent.find_schema_with_tables(conn)
-                        if alt and alt != schema_filter:
-                            schema_filter = alt
+                        try:
+                            _all = schema_agent.resolve_schemas_for_requested(
+                                conn, schema_filter)
+                        except Exception:
+                            _all = []
+                        if len(_all or []) > 1:
+                            multi_schema = True
+                            schema_filter = "*"
+                        else:
+                            alt = schema_agent.find_schema_with_tables(conn)
+                            if alt and alt != schema_filter:
+                                schema_filter = alt
                 except Exception:
                     pass
             # Item 5: seed drift detection from the previous run of this DB.

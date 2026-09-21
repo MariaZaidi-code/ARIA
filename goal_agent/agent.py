@@ -57,7 +57,8 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
     # ---- __init__ (__init__) ----
 
     def __init__(self, schema_json_path=None, db_uri=None,
-                 provider=None, api_key=None, dialect="postgresql", overrides=None):
+                  provider=None, api_key=None, dialect="postgresql", overrides=None,
+                 schemas=None):
         if schema_json_path:
             schema_file = Path(schema_json_path)
         else:
@@ -88,13 +89,20 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
         self._apply_user_overrides()
         self.dialect = dialect
         self.schema = (self.full_schema.get("schema") or "public").strip()
+        _ms = schemas or (self.full_schema.get("schemas") if isinstance(
+            self.full_schema, dict) else None) or []
+        self.schemas = [str(s).strip() for s in _ms if str(s or "").strip()]
         self.engine = self._build_engine(db_uri)
         if isinstance(provider, str):
             self.llm = create_provider(provider=provider, api_key=api_key)
         elif provider is not None:
             self.llm = provider
         else:
-            self.llm = create_provider()
+            logger.warning("GoalAgent created with provider=None – failing closed to prevent silent local fallback")
+            raise ValueError(
+                "GoalAgent requires an explicit provider. Pass the LLMProvider "
+                "object returned by require_data() or session['provider']."
+            )
         self.kpi_index = self._build_kpi_index()
         # Universal Data Intelligence Layer (n.txt 11/12): reuse the mapping's
         # contract when this extraction already carries it; otherwise derive
@@ -170,8 +178,16 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
         uri = db_uri
         if self.dialect == "postgresql":
             args: dict = {"connect_timeout": 10}
-            if self.schema and self.schema != "public":
-                args["options"] = f"-csearch_path={self.schema}"
+            try:
+                from core.db import search_path_connect_args as _spa
+                _schemas = list(getattr(self, "schemas", []) or [])
+                if (not _schemas or _schemas == ["public"]) and getattr(
+                        self, "schema", "") not in (None, "", "public"):
+                    _schemas = [self.schema]
+                args.update(_spa(self.dialect, _schemas))
+            except Exception:
+                if self.schema and self.schema != "public":
+                    args["options"] = f"-csearch_path={self.schema}"
             return create_engine(uri, connect_args=args, pool_pre_ping=True)
         if self.dialect == "mysql":
             return create_engine(uri, connect_args={"connect_timeout": 10}, pool_pre_ping=True)

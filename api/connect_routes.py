@@ -44,6 +44,46 @@ def _upload_limit_mb(name: str, default: int) -> int:
 MAX_UPLOAD_BYTES_CSV = _upload_limit_mb("ARIA_MAX_UPLOAD_CSV_MB", 512) * 1024 * 1024
 MAX_UPLOAD_BYTES_PDF = _upload_limit_mb("ARIA_MAX_UPLOAD_PDF_MB", 50) * 1024 * 1024
 
+# CSV formula-injection guard (server-side, non-mutating).
+# The 512 MB cap + 413 behavior above is intentionally unchanged (the env var
+# ARIA_MAX_UPLOAD_CSV_MB remains the single tunable; no lower default is
+# applied). Instead, preview paths flag cells that spreadsheet apps would
+# interpret as formulas so the UI can warn before export/open. Data is never
+# mutated — the response only adds an additive `formula_risk: bool` signal.
+_FORMULA_CELL_PREFIXES = ("=", "+", "-", "@")
+
+
+def _cell_is_formula_risk(value: object) -> bool:
+    """True when a cell looks like a spreadsheet formula (CSV injection).
+
+    Flags values whose first non-whitespace char is one of ``=,+,-,@``.
+    Used by preview responses only; never strips or rewrites data.
+    """
+    try:
+        s = str(value) if value is not None else ""
+    except Exception:
+        return False
+    s = s.lstrip()
+    return bool(s) and s[0] in _FORMULA_CELL_PREFIXES
+
+
+def _scan_formula_risk(rows: list[dict], limit: int = 200) -> bool:
+    """Scan preview rows for formula-risk cells (bounded, read-only).
+
+    Returns True when any cell in the first ``limit`` rows starts with a
+    formula prefix. Additive signal for `formula_risk` in preview payloads.
+    """
+    try:
+        for row in (rows or [])[: max(0, int(limit))]:
+            if not isinstance(row, dict):
+                continue
+            for v in row.values():
+                if _cell_is_formula_risk(v):
+                    return True
+    except Exception:
+        return False
+    return False
+
 
 def _spool_limited(upload_file, dest: Path, max_bytes: int, label: str) -> int:
     """Stream an upload to disk, aborting with 413 past max_bytes."""
@@ -451,10 +491,14 @@ class ConnectRequest(BaseModel):
 
 
 def _discover_table_schema(config, exclude="public"):
-    """Find the PostgreSQL schema that actually holds tables.
+    """Find populated schemas when the requested one is empty.
 
     Returns (mapping, schema_name); ({}, None) when nothing is found.
     Read-only introspection; used only when the requested schema is empty.
+    Generic multi-schema fallback (no schema names): when the requested
+    schema holds nothing but several other schemas hold tables, map ALL of
+    them so cross-schema databases never connect to nothing; a single
+    populated schema keeps the exact old single-schema path.
     """
     import logging as _logging
     _log = _logging.getLogger("aria.connect")
@@ -463,6 +507,21 @@ def _discover_table_schema(config, exclude="public"):
     except Exception:
         return {}, None
     try:
+        try:
+            _populated = schema_agent.list_schemas_with_tables(conn)
+        except Exception:
+            _populated = []
+        _populated = [s for s in (_populated or []) if s != exclude]
+        if len(_populated) > 1:
+            try:
+                mapping = schema_agent.build_schema_mapping_all(
+                    conn, db_type="postgresql")
+            except Exception:
+                mapping = {}
+            if mapping.get("tables"):
+                _log.info("Schema auto-discovery: using ALL populated schemas (%d tables).",
+                          len(mapping["tables"]))
+                return mapping, ",".join(_populated)
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT schema_name FROM information_schema.schemata "
@@ -527,6 +586,7 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     session["source_type"] = request.source_type
     # A fresh database connection replaces any previously linked source.
     session.pop("linked_db", None)
+    session.pop("schemas", None)  # stale schemas from a prior DB break search_path
     session["db"] = None
     session["db_type"] = db_type
     session["db_uri"] = None
@@ -631,15 +691,47 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
         try:
             db_type = session.get("db_type", "postgresql")
             schema_filter = config.get("db_schema", "public") if db_type == "postgresql" else config.get("db", "")
-            mapping = schema_agent.build_schema_mapping(conn, schema_filter, db_type=db_type)
-            conn.close()
+            # Multi-schema databases: extract EVERY populated schema so no
+            # table is invisible. Single-schema databases keep the exact old
+            # path. When the requested schema is empty, default to ALL
+            # populated schemas (generic fallback, no schema names).
+            _schemas: list = []
+            try:
+                if db_type == "postgresql":
+                    _mode = schema_agent.detect_schema_mode(conn, requested=schema_filter)
+                    _schemas = list(_mode.get("schemas") or [])
+                    if _mode.get("mode") == "multi" and len(_schemas) > 1:
+                        mapping = schema_agent.build_schema_mapping_all(
+                            conn, db_type=db_type, database_name=db_name)
+                        conn.close()
+                    else:
+                        _schemas = []
+                        mapping = schema_agent.build_schema_mapping(conn, schema_filter, db_type=db_type)
+                        conn.close()
+                else:
+                    mapping = schema_agent.build_schema_mapping(conn, schema_filter, db_type=db_type)
+                    conn.close()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise
+            try:
+                session["schemas"] = list(_schemas) if _schemas else [schema_filter] \
+                    if db_type == "postgresql" else []
+                if _schemas and len(_schemas) > 1:
+                    current_db_schema = ",".join(_schemas)
+            except Exception:
+                pass
             if not mapping.get("tables") and db_type == "postgresql":
                 # Requested schema is empty (e.g. tables live in a named
                 # schema like "hotel", not public): discover the schema that
                 # actually holds tables instead of connecting to nothing.
                 mapping, discovered = _discover_table_schema(config, exclude=schema_filter)
                 if discovered:
-                    session["db"]["db_schema"] = discovered
+                    session["db"]["db_schema"] = discovered.split(",")[0].strip() if "," in discovered else discovered
+                    session["schemas"] = [s.strip() for s in discovered.split(",") if s.strip()]
                     current_db_schema = discovered
             if mapping.get("tables"):
                 # Single-table rule: a 1-table Postgres/MySQL DB is shaped
@@ -665,7 +757,14 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
                 user_schema_dir = _upaths["schema_dir"]
                 safe_name_for_file = re.sub(r"[^a-zA-Z0-9_-]+", "_", db_name)[:64] or "db"
                 user_path = user_schema_dir / f"schema_mapping_{safe_name_for_file}_latest.json"
-                user_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+
+                def _json_safe(o):
+                    _conn_log.warning("schema mapping had non-JSON value of type %s; coerced",
+                                      type(o).__name__)
+                    return str(o)
+
+                user_path.write_text(json.dumps(mapping, indent=2, default=_json_safe),
+                                     encoding="utf-8")
                 session["schema_path"] = user_path
                 session["schema_status"] = "ok"
                 save_session(user["user_id"], session)
@@ -1249,7 +1348,7 @@ def disconnect_source(user: dict = Depends(require_writable)):
         "processed_path", "insights_path", "schema_status", "file_type",
         "document_id", "document_name", "document_type", "linked_db",
         "conversation_id", "conversation_history",
-        "pending_history_id",
+        "pending_history_id", "schemas", "db_type",
     ):
         session.pop(key, None)
     save_session(user["user_id"], session)

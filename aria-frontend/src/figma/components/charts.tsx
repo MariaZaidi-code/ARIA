@@ -187,7 +187,10 @@ export function BizTooltip({
           {fmtPeriod(periodLabel ?? String(label ?? ""))}
         </p>
       )}
-      {payload.map((p: any, i: number) => {
+      {payload.filter((p: any) => {
+        const k = String(p.dataKey ?? p.name ?? "").toLowerCase();
+        return k !== "bandlower" && k !== "bandupper" && k !== "expected";
+      }).map((p: any, i: number) => {
         const key = String(p.dataKey ?? p.name ?? "");
         const raw = p.value;
         const val =

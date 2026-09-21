@@ -682,15 +682,21 @@ def _table_schema(mapping: dict, table: str, conn=None, dialect: str = "sqlite",
     mapping = mapping or {}
     try:
         tinfo = (mapping.get("tables") or {}).get(str(table)) or {}
-        s = tinfo.get("schema")
-        if s is not None and str(s).strip():
-            return str(s).strip()
+        for _k in ("schema", "table_schema"):
+            s = tinfo.get(_k)
+            if s is not None and str(s).strip() and str(s).strip() != "*":
+                return str(s).strip()
+        # Qualified key without an entry field: the leading segment is the
+        # schema (sales.employee -> sales). Generic, no names.
+        _segs = [p for p in str(table or "").split(".") if p]
+        if len(_segs) > 1 and str(_segs[0]).strip() != "*":
+            return str(_segs[0]).strip()
     except Exception:
         pass
     try:
         for _k in ("schema", "db_schema"):
             s = mapping.get(_k)
-            if s is not None and str(s).strip():
+            if s is not None and str(s).strip() and str(s).strip() != "*":
                 return str(s).strip()
     except Exception:
         pass
@@ -727,7 +733,17 @@ def _table_schema(mapping: dict, table: str, conn=None, dialect: str = "sqlite",
 def _qtbl(table: str, schema: str | None = None, dialect: str = "sqlite") -> str:
     """Schema-qualified quoted table ref: ``"schema"."table"`` (postgres),
     ```schema`.`table``` (mysql), plain quoted ``"table"`` for sqlite or
-    when schema is public/none."""
+    when schema is public/none. Dotted table keys (sales.employee from
+    multi-schema mappings) split into segments — never one dotted name.
+    """
+    try:
+        _segs = [s for s in str(table or "").split(".") if s]
+        if len(_segs) > 1 and not (schema and str(schema).strip()):
+            table, schema = _segs[-1], _segs[0]
+        elif len(_segs) > 1:
+            table = _segs[-1]
+    except Exception:
+        pass
     if dialect == "mysql":
         def _q(n) -> str:
             return "`" + str(n).replace("`", "``") + "`"
@@ -3167,13 +3183,25 @@ def _compute_goal_status(goal: dict) -> None:
 # Analyses (saved explore results)
 # ---------------------------------------------------------------------------
 
+def _sanitize_saved_text(value, max_len=200):
+    """Neutralize saved titles echoed in list endpoints (tags/controls/cap)."""
+    s = "" if value is None else str(value)
+    s = re.sub(r"<[^>]*>", " ", s)
+    s = "".join(c if c.isprintable() else " " for c in s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_len:
+        s = s[:max(0, max_len - 1)].rstrip() + "…"
+    return s
+
+
 def save_analysis(user_id: int, dataset_id: str, data: dict) -> dict:
     data = data or {}
     metric = data.get("metric")
     breakdown = data.get("breakdown")
     ml = display_name(str(metric), "Analysis") if metric else "Analysis"
     bl = display_name(str(breakdown), "") if breakdown else ""
-    title = data.get("title") or data.get("name") or (f"{ml} by {bl}" if bl else ml)
+    title = _sanitize_saved_text(
+        data.get("title") or data.get("name") or (f"{ml} by {bl}" if bl else ml), 200)
     now = datetime.now(timezone.utc).isoformat()
     analysis = {
         "id": uuid.uuid4().hex[:12],
@@ -3225,8 +3253,8 @@ def save_scenario(user_id: int, dataset_id: str, data: dict) -> dict:
         "id": uuid.uuid4().hex[:12],
         "user_id": user_id,
         "dataset_id": dataset_id,
-        "title": data.get("title") or data.get("name") or f"{display_name(str(data.get('variable', 'Scenario')), 'Scenario')} scenario",
-        "name": data.get("name") or data.get("title"),
+        "title": _sanitize_saved_text(data.get("title") or data.get("name") or f"{display_name(str(data.get('variable', 'Scenario')), 'Scenario')} scenario", 200),
+        "name": _sanitize_saved_text(data.get("name") or data.get("title"), 200) or None,
         "variable": data.get("variable"),
         "change_value": data.get("change_value"),
         "change_type": data.get("change_type"),

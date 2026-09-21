@@ -5,6 +5,7 @@ RAG is an Insight Agent capability, not a fifth autonomous agent.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from collections import Counter
@@ -49,6 +50,10 @@ def _capability(user_id: str | int) -> InsightPDFRAG:
     except Exception:
         _session = {}
     _pname = (_session.get("provider_name") or "local")
+    if _pname == "local" and not _session.get("provider_name"):
+        logging.getLogger("aria.insight_rag").warning(
+            "provider_name missing from session – falling back to local"
+        )
     if _pname not in ("local", "cloud", "deepseek", "omniroute", "grok"):
         _pname = "deepseek"
     if _pname == "deepseek":

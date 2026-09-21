@@ -185,13 +185,21 @@ class SqlContractMixin:
             if on_start is None:
                 continue
             cond = sql[on_start:on_end]
-            # Quote-tolerant: ON conditions use quoted identifiers
-            # ("orders"."customer_id" = "customers"."id") from _qcol.
+            # Quote-tolerant: ON conditions use quoted identifiers, with an
+            # optional schema prefix ("sales"."order"."col" = ...) on
+            # multi-schema databases. Aliases resolve via _sql_alias_map.
+            _ref = (r"['\"`\[]?([A-Za-z_]\w*)['\"`\]]?"
+                    r"(?:\s*\.\s*['\"`\[]?([A-Za-z_]\w*)['\"`\]]?)?"
+                    r"\s*\.\s*['\"`\[]?(\w+)['\"`\]]?")
             for eq in re.finditer(
-                    r"['\"`\[]?([A-Za-z_]\w*)['\"`\]]?\s*\.\s*['\"`\[]?(\w+)['\"`\]]?"
-                    r"\s*=\s*['\"`\[]?([A-Za-z_]\w*)['\"`\]]?\s*\.\s*['\"`\[]?(\w+)['\"`\]]?",
-                    cond):
-                a, ca, b, cb = eq.groups()
+                    _ref + r"\s*=\s*" + _ref, cond):
+                s1, t1, c1, s2, t2, c2 = eq.groups()
+                a = f"{s1}.{t1}" if s1 and t1 and c1 else (t1 or s1)
+                ca = c1 if c1 else t1
+                b = f"{s2}.{t2}" if s2 and t2 and c2 else (t2 or s2)
+                cb = c2 if c2 else t2
+                if not a or not b or not ca or not cb:
+                    continue
                 joins.append({
                     "left_table": alias_map.get(a.lower(), a),
                     "left_column": ca,

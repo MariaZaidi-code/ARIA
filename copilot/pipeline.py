@@ -214,7 +214,11 @@ class CopilotPipeline:
         )
         self.index = build_schema_index(schema_mapping or {}, dialect=self.dialect)
         self.retriever = SchemaRetriever(self.index, embedder=embedder)
-        self.sql_engine = SqlEngine(db_uri, dialect=self.dialect)
+        try:
+            _schemas = list((schema_mapping or {}).get("schemas") or [])
+        except Exception:
+            _schemas = []
+        self.sql_engine = SqlEngine(db_uri, dialect=self.dialect, schemas=_schemas)
         self.mapping = schema_mapping or {}
         self._embedder = embedder
 
@@ -578,6 +582,114 @@ class CopilotPipeline:
             log.info("Grounded context unavailable (%s); raw context.", exc)
             return ctx, None
 
+    def _join_lines_for(self, tables) -> list[str]:
+        """Validated join edges touching the retrieved tables, prompt-ready.
+
+        Generic (mapping-driven, no table names): used to steer the repair
+        when SQL runs but returns zero rows on a question that should have
+        data — usually a wrong join the DB accepted (e.g. order_id on a
+        product key yields an empty set, not an error).
+        """
+        lines: list[str] = []
+        try:
+            wanted = {str(t).lower() for t in (tables or [])}
+            _all = []
+            for e in ((self.mapping or {}).get("relationship_edges") or []):
+                s, sc = e.get("source_table"), e.get("source_column")
+                t, tc = e.get("target_table"), e.get("target_column")
+                if not s or not t:
+                    continue
+                _all.append((str(s), str(sc), str(t), str(tc)))
+            # 1-hop expansion: the bridge table joining the wanted tables is
+            # often NOT itself retrieved (orderdetail bridges header/product),
+            # so include edges touching wanted tables' neighbors too.
+            _neighbors = set(wanted)
+            for s, _sc, t, _tc in _all:
+                if s.lower() in wanted:
+                    _neighbors.add(t.lower())
+                if t.lower() in wanted:
+                    _neighbors.add(s.lower())
+            def _rank(e):
+                s, _sc, t, _tc = e
+                _both = (s.lower() in wanted and t.lower() in wanted)
+                _one = (s.lower() in wanted or t.lower() in wanted)
+                _nbor = (s.lower() in _neighbors or t.lower() in _neighbors)
+                return (0 if _both else (1 if _one else (2 if _nbor else 3)))
+            # Composite FKs share one table pair across edges: merge into a
+            # single ANDed line so the model emits every condition (a
+            # partial join fans out and silently inflates aggregates).
+            _pairs: dict = {}
+            for s, sc, t, tc in sorted(_all, key=_rank):
+                if _rank((s, sc, t, tc)) > 2:
+                    continue
+                _pk = (str(s).lower(), str(t).lower())
+                _rk = (str(t).lower(), str(s).lower())
+                _key = _pk if _pk in _pairs or _rk not in _pairs else _rk
+                _pairs.setdefault(_key, []).append((s, sc, t, tc))
+                if len(_pairs) >= 60:
+                    break
+            seen = set()
+            for (_ps, _pt), _conds in _pairs.items():
+                _parts = []
+                for s, sc, t, tc in _conds:
+                    key = (str(s).lower(), str(sc).lower(), str(t).lower(), str(tc).lower())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    _parts.append(f"{s}.{sc} = {t}.{tc}")
+                if _parts:
+                    lines.append(" AND ".join(_parts))
+            # Completeness tail: ranked lines above cover the question's
+            # neighborhood; the bridge BFS + join check need EVERYTHING.
+            # Appended last so relevance ranking is preserved.
+            for s, sc, t, tc in _all:
+                try:
+                    key = (str(s).lower(), str(sc).lower(), str(t).lower(), str(tc).lower())
+                except Exception:
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                lines.append(f"{s}.{sc} = {t}.{tc}")
+        except Exception:
+            pass
+        return lines
+
+    def _repair_empty_result(self, resolved, view, ctx, result):
+        """One bounded re-generation when SQL runs but returns zero rows.
+
+        An empty set on an aggregate/ranking question almost always means a
+        wrong join (not wrong filters): steer the retry at the validated
+        relationships instead of letting the model repeat the same join.
+        Returns the new SqlResult (or the original when no retry applies).
+        """
+        try:
+            if not result or not result.ok or (result.rows or []):
+                return result
+            rels = self._join_lines_for(getattr(ctx, "tables", None) or [])
+            if not rels:
+                return result
+            from .sql_engine import build_sql_prompt
+            prompt = build_sql_prompt(
+                resolved, view, self.dialect,
+                feedback=("The previous SQL ran successfully but returned ZERO "
+                          "rows. The JOIN is almost certainly wrong (joining "
+                          "unrelated keys yields an empty set, not an error). "
+                          "Join ONLY through these validated relationships, "
+                          "adding the bridge table when the two sides live in "
+                          "different tables:\n" + "\n".join(f"- {r}" for r in rels)))
+            raw = self.llm.complete("sql", prompt, temperature=0.2, num_predict=300)
+            from .sql_engine import clean_sql
+            sql = clean_sql(raw)
+            retry = self.sql_engine.execute(sql, self.index.tables)
+            retry.attempts = (result.attempts or 1) + 1
+            if retry.ok and (retry.rows or []):
+                log.info("Copilot empty-result repair succeeded with validated join.")
+                return retry
+        except Exception as exc:
+            log.info("Copilot empty-result repair skipped (%s).", exc)
+        return result
+
     @staticmethod
     def _retrieved_columns(ctx, mapping: dict) -> list[str]:
         cols: list[str] = []
@@ -649,7 +761,9 @@ class CopilotPipeline:
         view, grounded = self._grounded_view(resolved, ctx)
         result = self.sql_engine.generate_and_run(
             resolved, view, self.llm, tables=self.index.tables, model_role="sql",
+            relationships=self._join_lines_for(getattr(ctx, "tables", None) or []),
         )
+        result = self._repair_empty_result(resolved, view, ctx, result)
 
         if not result.ok and resolved != question:
             # Follow-up repair (t.txt §13/26): re-run the previous turn's
@@ -710,6 +824,7 @@ class CopilotPipeline:
         result = self.sql_engine.generate_and_run(
             resolved, view, self.llm, tables=self.index.tables, model_role="sql",
         )
+        result = self._repair_empty_result(resolved, view, ctx, result)
 
         if not result.ok and resolved != question:
             result = self._rerun_previous_sql() or result

@@ -226,19 +226,46 @@ def sql_table_names(sql):
     return names
 
 
+def _known_table_aliases(schema_tables):
+    """Known names + bare last-segments (sales.orders <-> orders).
+
+    Multi-schema mappings key tables qualified (humanresources.employee)
+    while SQL legitimately uses the bare name (resolved via search_path).
+    Both directions are accepted; a bare name shared by several schemas
+    resolves via the database search_path (the DB is the final arbiter).
+    """
+    known: set[str] = set()
+    try:
+        for t in (schema_tables or []):
+            tl = str(t).lower()
+            known.add(tl)
+            if "." in tl:
+                known.add(tl.split(".")[-1])
+    except Exception:
+        pass
+    return known
+
+
 def unknown_sql_tables(sql, schema_tables):
     """Return referenced tables that do not exist in the schema.
 
     This catches hallucinations like `order_items` when the real table is
     `order_details` — deterministically, before a database round-trip.
+    Schema-qualified keys also accept their bare segment (search_path).
     """
-    known = {t.lower() for t in (schema_tables or [])}
+    known = _known_table_aliases(schema_tables)
     return sorted(n for n in sql_table_names(sql) if n.lower() not in known)
 
 
 def empty_sql_tables(sql, table_counts):
     """Return tables referenced by `sql` that exist but contain zero rows."""
     counts = {t.lower(): c for t, c in (table_counts or {}).items()}
+    try:
+        for t, c in list(counts.items()):
+            if "." in t:
+                counts.setdefault(t.split(".")[-1], c)
+    except Exception:
+        pass
     return sorted(n for n in sql_table_names(sql) if counts.get(n.lower(), 1) == 0)
 
 
@@ -299,6 +326,14 @@ def unknown_sql_columns(sql, columns_by_table):
         t.lower(): {c.lower() for c in cols}
         for t, cols in (columns_by_table or {}).items()
     }
+    # Schema-qualified keys (sales.orders) also validate under their bare
+    # segment (orders.col), since search_path resolves bare SQL names.
+    try:
+        for t, cols in list(columns_by_table.items()):
+            if "." in t:
+                columns_by_table.setdefault(t.split(".")[-1], cols)
+    except Exception:
+        pass
     bad = []
     for ref in sorted(sql_qualified_columns(sql)):
         table, _, col = ref.partition(".")

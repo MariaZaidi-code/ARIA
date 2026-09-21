@@ -61,6 +61,10 @@ class VectorStore:
         self.chunk_id_to_index = {}  # chunk_id -> faiss index
         self.index_to_chunk_id = {}  # faiss index -> chunk_id
         self._next_index = 0
+        # Tombstones for deleted chunks. FAISS IndexFlatIP has no efficient
+        # remove; SQLite is source of truth, and search filters these IDs so
+        # stale hits never return (prod PGVector path untouched).
+        self._deleted_chunk_ids: set[str] = set()
         
         # Initialize storage
         self._init_storage()
@@ -173,11 +177,12 @@ class VectorStore:
         start_idx = self._next_index
         self.index.add(vectors)
         
-        # Update mappings
+        # Update mappings (re-added ids clear any prior tombstone)
         for i, chunk_id in enumerate(chunk_ids):
             faiss_idx = start_idx + i
             self.chunk_id_to_index[chunk_id] = faiss_idx
             self.index_to_chunk_id[faiss_idx] = chunk_id
+            self._deleted_chunk_ids.discard(chunk_id)
         
         self._next_index += len(chunk_ids)
         
@@ -246,8 +251,13 @@ class VectorStore:
         faiss.normalize_L2(query_vec)
         
         # Search
-        # If filtering by document_ids, we need to search more and filter
+        # If filtering by document_ids, we need to search more and filter.
+        # Over-fetch when tombstones exist so deleted vectors consumed from
+        # top-k never shrink the visible result set.
+        over_fetch = len(self._deleted_chunk_ids)
         search_k = k * 3 if document_ids else k
+        if over_fetch:
+            search_k = max(search_k, k + over_fetch)
         scores, indices = self.index.search(query_vec, min(search_k, self.index.ntotal))
         
         results = []
@@ -260,8 +270,12 @@ class VectorStore:
             chunk_id = self.index_to_chunk_id.get(idx)
             if not chunk_id:
                 continue
-            
-            # Get metadata from DB
+            # Filter tombstoned chunks (deleted from SQLite but still resident
+            # in the FAISS index until rebuilt).
+            if chunk_id in self._deleted_chunk_ids:
+                continue
+
+            # Get metadata from DB (missing row == deleted -> skip stale hit)
             meta = self._get_chunk_metadata(chunk_id)
             if not meta:
                 continue
@@ -315,8 +329,10 @@ class VectorStore:
                 params.extend(document_ids)
             
             rows = conn.execute(query, params).fetchall()
-            
+
             for row in rows:
+                if row["chunk_id"] in self._deleted_chunk_ids:
+                    continue
                 # Fallback: construct SearchResult from DB metadata only (no vector similarity)
                 results.append(SearchResult(
                     chunk_id=row["chunk_id"],
@@ -348,10 +364,17 @@ class VectorStore:
         return None
     
     def delete_document(self, document_id: str) -> int:
-        """Delete all chunks for a document."""
+        """Delete all chunks for a document.
+
+        SQLite is the source of truth; FAISS IndexFlatIP has no efficient
+        deletion, so deleted chunk_ids are tombstoned in-memory (mappings
+        dropped) and filtered in :meth:`search`. When the index supports
+        removal/reconstruction we additionally rebuild without the deleted
+        vectors; otherwise filtering guarantees stale hits never return.
+        """
         if not self.db_path:
             return 0
-        
+
         # Get chunk IDs to delete
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -359,20 +382,79 @@ class VectorStore:
                 "SELECT chunk_id, faiss_index FROM chunks WHERE document_id = ?",
                 (document_id,)
             ).fetchall()
-            
+
             chunk_ids = [r["chunk_id"] for r in rows]
             faiss_indices = [r["faiss_index"] for r in rows if r["faiss_index"] is not None]
-            
+
             # Delete from SQLite
             conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
             conn.commit()
-        
-        # Note: FAISS doesn't support efficient deletion
-        # Would need to rebuild index or mark as deleted
-        # For now, we just remove from SQLite
+
+        # Tombstone + drop in-memory mappings so stale FAISS hits are skipped.
+        for cid in chunk_ids:
+            self._deleted_chunk_ids.add(cid)
+            self.chunk_id_to_index.pop(cid, None)
+        for fi in faiss_indices:
+            self.index_to_chunk_id.pop(fi, None)
+
+        # Best-effort FAISS cleanup: native remove_ids when available,
+        # else rebuild a fresh IndexFlatIP from surviving vectors.
+        if FAISS_AVAILABLE and self.index is not None and faiss_indices:
+            try:
+                if hasattr(self.index, "remove_ids"):
+                    try:
+                        import numpy as _np
+
+                        ids = _np.array(sorted(set(faiss_indices)), dtype=_np.int64)
+                        self.index.remove_ids(ids)  # type: ignore[attr-defined]
+                    except Exception:
+                        self._rebuild_index_without(set(faiss_indices))
+                else:
+                    self._rebuild_index_without(set(faiss_indices))
+                self.persist()
+            except Exception as exc:
+                logger.warning("FAISS index cleanup skipped (%s); tombstone filter active.", exc)
+
         logger.info(f"Deleted {len(chunk_ids)} chunks for document {document_id}")
-        
+
         return len(chunk_ids)
+
+    def _rebuild_index_without(self, condemned: set[int]) -> None:
+        """Rebuild IndexFlatIP excluding condemned positions (best-effort).
+
+        Reconstructs surviving vectors, builds a fresh index, and reassigns
+        dense faiss positions; mapping dicts and ``_next_index`` are updated.
+        No-op when reconstruction is unsupported.
+        """
+        if not FAISS_AVAILABLE or self.index is None:
+            return
+        if not hasattr(self.index, "reconstruct"):
+            return
+        survivors: list[tuple[str, Any]] = []
+        for pos in sorted(self.index_to_chunk_id):
+            if pos in condemned:
+                continue
+            cid = self.index_to_chunk_id.get(pos)
+            if not cid or cid in self._deleted_chunk_ids:
+                continue
+            try:
+                vec = self.index.reconstruct(int(pos))
+            except Exception:
+                continue
+            survivors.append((cid, vec))
+        try:
+            new_index = faiss.IndexFlatIP(self.dimension)
+            if survivors:
+                import numpy as _np
+
+                mat = _np.stack([v for _, v in survivors]).astype("float32")
+                new_index.add(mat)
+            self.index = new_index
+            self.chunk_id_to_index = {cid: i for i, (cid, _) in enumerate(survivors)}
+            self.index_to_chunk_id = {i: cid for i, (cid, _) in enumerate(survivors)}
+            self._next_index = len(survivors)
+        except Exception as exc:
+            logger.warning("FAISS rebuild skipped (%s); tombstone filter active.", exc)
     
     def get_document_chunks(self, document_id: str) -> List[Dict]:
         """Get all chunks for a document."""

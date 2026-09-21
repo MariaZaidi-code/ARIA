@@ -129,16 +129,41 @@ def _build_engine(session):
     db = db_config.get("db", "")
     if not db:
         raise HTTPException(status_code=400, detail="No database configured.")
+    _cargs: dict = {}
+    try:
+        from core.db import search_path_connect_args as _spa_a
+        _sch_a = [str(s).strip() for s in (session.get("schemas") or [])
+                  if str(s or "").strip()]
+        _db_schema = db_config.get("db_schema", "")
+        if _db_schema:
+            for _s in _db_schema.split(","):
+                _s = _s.strip()
+                if _s and _s not in _sch_a:
+                    _sch_a.append(_s)
+        _cargs = _spa_a(db_type, _sch_a)
+    except Exception:
+        _cargs = {}
     if db_type == "mysql":
         uri = (f"mysql+pymysql://{user}:{password}"
                f"@{host}:{port}/{db}")
     else:
         uri = (f"postgresql://{user}:{password}"
                f"@{host}:{port}/{db}")
-    return create_engine(uri, pool_pre_ping=True), session.get("dialect", "postgresql"), db_type
+    return create_engine(uri, pool_pre_ping=True,
+                         **({"connect_args": _cargs} if _cargs else {})), session.get("dialect", "postgresql"), db_type
 
 
 def _quote(name, dialect):
+    # Dotted keys (sales.employee) quote per segment, never as one name.
+    try:
+        segs = [s for s in str(name or "").split(".") if s]
+        if len(segs) > 1:
+            if dialect == "mysql":
+                return ".".join(f"`{s.replace('`', '``')}`" for s in segs)
+            return ".".join(
+                f'"{s.replace(chr(34), chr(34) + chr(34))}"' for s in segs)
+    except Exception:
+        pass
     if dialect == "mysql":
         return f"`{name.replace('`', '``')}`"
     return f'"{name.replace(chr(34), chr(34)+chr(34))}"'

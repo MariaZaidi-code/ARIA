@@ -175,20 +175,79 @@ def list_schemas_with_tables(conn):
 
 # ---- detect_schema_mode (1217-1230) ----
 
-def detect_schema_mode(conn):
+def detect_schema_mode(conn, requested=None):
     """Classify a database as single-schema or multi-schema.
 
     Returns {"mode": "single"|"multi", "schemas": [...], "count": n}.
     Databases like northwind use only 'public' (single); AdventureWorks-style
     databases spread tables across several schemas (multi). The caller picks
     the matching extraction path so the single-schema flow is untouched.
+
+    Generic fallback (no schema names): when `requested` names a schema with
+    no base tables (e.g. the default when tables live outside it), default to
+    ALL populated schemas so multi-schema databases never map to nothing.
+    `requested` matching is case-insensitive + quote-tolerant.
     """
     schemas = list_schemas_with_tables(conn)
+    if requested is not None:
+        try:
+            from schema_engine.lexical import canonical_identifier as _canon
+        except Exception:
+            _canon = lambda v: str(v or "").strip().strip("\"'`[]").lower()  # noqa: E731
+        try:
+            want = _canon(requested)
+        except Exception:
+            want = str(requested or "").lower()
+        try:
+            have = {_canon(s) for s in (schemas or [])}
+        except Exception:
+            have = {str(s or "").lower() for s in (schemas or [])}
+        if want and want not in have and len(schemas or []) > 1:
+            return {
+                "mode": "multi",
+                "schemas": list(schemas or []),
+                "count": len(schemas or []),
+            }
     return {
         "mode": "multi" if len(schemas) > 1 else "single",
         "schemas": schemas,
         "count": len(schemas),
     }
+
+
+def resolve_schemas_for_requested(conn, requested):
+    """Schemas to extract for `requested` (generic, no schema names).
+
+    Returns ALL populated schemas when `requested` is empty/missing there but
+    other schemas hold tables; otherwise returns [requested] (or ALL when the
+    database itself is multi-schema and the caller wants everything). Never
+    raises; [] means nothing populated.
+    """
+    try:
+        schemas = list_schemas_with_tables(conn)
+    except Exception:
+        return [requested] if requested else []
+    if not schemas:
+        return [requested] if requested else []
+    if not requested:
+        return list(schemas)
+    try:
+        from schema_engine.lexical import canonical_identifier as _canon2
+    except Exception:
+        _canon2 = lambda v: str(v or "").strip().strip("\"'`[]").lower()  # noqa: E731
+    try:
+        want = _canon2(requested)
+        have = {_canon2(s) for s in schemas}
+    except Exception:
+        want, have = str(requested or "").lower(), set()
+    if want in have:
+        # Requested schema is populated. Multi-schema databases still map
+        # everything when the caller detected multi mode; this helper only
+        # guarantees the empty-requested fallback, so return requested here
+        # and let the mode check above decide ALL vs single.
+        return [requested]
+    # Requested is empty elsewhere: default to ALL populated schemas.
+    return list(schemas)
 
 # ---- find_schema_with_tables (1233-1253) ----
 
@@ -361,6 +420,8 @@ def build_schema_mapping(conn, schema="public", db_type="postgresql", llm=None, 
             "inferred_primary_key": inferred_primary_keys.get(table_name, []),
             "unique_keys": unique_keys.get(table_name, []),
             "null_stats": null_stats.get(table_name, {}),
+            "table_schema": schema if isinstance(schema, str) else None,
+            "schema": schema if isinstance(schema, str) else None,
         }
 
     # Track all tables discovered in the DB (before dropping empties).
@@ -669,9 +730,23 @@ def _infer_cross_schema_relationships(mapping, conn, db_type="postgresql"):
         mapping.setdefault("_cross_schema_review", []).append(r)
     # Rejected cross-schema candidates are also retained (PART 14) rather than
     # disappearing, so benchmarks/debugging can explain every non-edge.
+    # Serialized to plain dicts: raw Outcome dataclasses are not JSON
+    # serializable and would break mapping persistence.
     if cross_registry is not None and cross_registry.rejected:
-        mapping.setdefault("_cross_schema_rejected", []).extend(
-            cross_registry.rejected)
+        for _rej in cross_registry.rejected:
+            try:
+                mapping.setdefault("_cross_schema_rejected", []).append({
+                    "candidate_id": getattr(_rej, "candidate_id", None),
+                    "source_table": getattr(_rej, "source_table", None),
+                    "source_column": getattr(_rej, "source_column", None),
+                    "state": getattr(_rej, "state", "REJECTED"),
+                    "rel": getattr(_rej, "rel", None),
+                    "reasons": list(getattr(_rej, "reasons", []) or []),
+                    "evidence_signals": dict(
+                        getattr(_rej, "evidence_signals", {}) or {}),
+                })
+            except Exception:
+                continue
 
 # ---- build_schema_mapping_all (1791-2008) ----
 
@@ -710,6 +785,9 @@ def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name
         schema_health.append(_h)
         for table_name, info in sub.get("tables", {}).items():
             qualified = f"{schema}.{table_name}"
+            if isinstance(info, dict):
+                info["table_schema"] = schema
+                info["schema"] = schema
             mapping["tables"][qualified] = info
             mapping["unique_keys"].update(
                 {f"{schema}.{t}": v for t, v in sub.get("unique_keys", {}).items()}
@@ -903,4 +981,5 @@ def build_schema_mapping_all(conn, db_type="postgresql", llm=None, database_name
     attach_data_intelligence(mapping)
 
     mapping.pop("_cross_schema_review", None)
+    mapping.pop("_cross_schema_rejected", None)
     return mapping

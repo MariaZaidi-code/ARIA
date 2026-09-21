@@ -132,7 +132,20 @@ def classify_type(data_type: str) -> str:
 
 
 def _safe_name(name: str, dialect: str = "postgresql") -> str:
-    """Quote an identifier for the given dialect (escapes embedded quotes)."""
+    """Quote an identifier for the given dialect (escapes embedded quotes).
+
+    Schema-qualified keys (sales.employee) quote per segment
+    ("sales"."employee"); bare names are unchanged.
+    """
+    try:
+        segs = [s for s in str(name or "").split(".") if s]
+        if len(segs) > 1:
+            if dialect == "mysql":
+                return ".".join(f"`{s.replace('`', '``')}`" for s in segs)
+            return ".".join(
+                f'"{s.replace(chr(34), chr(34) + chr(34))}"' for s in segs)
+    except Exception:
+        pass
     safe = str(name or "")
     if dialect == "mysql":
         return f"`{safe.replace('`', '``')}`"

@@ -21,16 +21,22 @@ _IDENT_RE = None
 def _quote_ident(name: str) -> str:
     """Quote an SQL identifier safely. Raises ValueError on invalid names.
 
-    Only letters/digits/underscore/space/dot-free simple names are allowed;
-    embedded double quotes are escaped by doubling. Prevents identifier
-    injection vs the previous raw f-string interpolation.
+    Schema-qualified keys (sales.employee) are quoted per segment
+    ("sales"."employee"); embedded double quotes are escaped by doubling.
+    Prevents identifier injection vs the previous raw f-string
+    interpolation.
     """
     import re as _re
-    if not isinstance(name, str) or not name or len(name) > 128:
+    if not isinstance(name, str) or not name or len(name) > 256:
         raise ValueError("Invalid identifier.")
-    if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_ ]*", name):
-        raise ValueError(f"Unsafe identifier: {name!r}")
-    return '"' + name.replace('"', '""') + '"'
+    parts = []
+    for seg in str(name).split("."):
+        if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_ ]*", seg or ""):
+            raise ValueError(f"Unsafe identifier: {name!r}")
+        parts.append('"' + seg.replace('"', '""') + '"')
+    if not parts:
+        raise ValueError("Invalid identifier.")
+    return ".".join(parts)
 
 
 def _bound_sample(n: int, default: int = 10000, cap: int = 100000) -> int:

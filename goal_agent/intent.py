@@ -574,13 +574,29 @@ class IntentMixin:
 
     # ---- _build_metrics_overview (_build_metrics_overview) ----
 
+    def _qt(self, table_name):
+        """Schema-aware table reference (sales.employee -> "sales"."employee").
+        Falls back to the bare quoted segment when the sql-mixin quoter is
+        unavailable (partial compositions in tests)."""
+        try:
+            _qtab = getattr(self, "_qtab", None)
+            if callable(_qtab):
+                return _qtab(table_name)
+        except Exception:
+            pass
+        try:
+            from core.db import base_table as _bt
+            return f'"{_bt(table_name)}"'
+        except Exception:
+            return f'"{table_name}"'
+
     def _build_metrics_overview(self, entity_table):
         """Deterministic metric set for an entity: entity count + one count and
         one sum per fact table that references it. Returns [(label, sql)]."""
         entity_label = self._natural_label(entity_table)
         metrics = [
             (f"Total {self._plural_label(entity_table)}",
-             f'SELECT COUNT(*) FROM "{entity_table}"'),
+             f'SELECT COUNT(*) FROM {self._qt(entity_table)}'),
         ]
         for table_name, info in self.tables.items():
             if table_name == entity_table:
@@ -591,7 +607,7 @@ class IntentMixin:
                 t_label = self._natural_label(table_name)
                 metrics.append(
                     (f"Total {self._plural_label(table_name)}",
-                     f'SELECT COUNT(*) FROM "{table_name}"')
+                     f'SELECT COUNT(*) FROM {self._qt(table_name)}')
                 )
                 measure_col = self._pick_measure_column(table_name)
                 if measure_col:
@@ -602,7 +618,7 @@ class IntentMixin:
                         label = f"Total {col_label}"
                     metrics.append(
                         (label, f'SELECT COALESCE(SUM("{measure_col}"), 0) '
-                                f'FROM "{table_name}"')
+                                f'FROM {self._qt(table_name)}')
                     )
                 break
         return metrics

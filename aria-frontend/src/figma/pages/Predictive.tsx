@@ -13,6 +13,7 @@ interface PredictiveProps {
   insightResult?: any;
   goalResult?: any;
   connectionStatus?: string;
+  dbName?: string;
 }
 
 type PeriodTab = "Monthly" | "Quarterly" | "Yearly";
@@ -261,7 +262,7 @@ function ForecastTooltip({ active, payload, rowsByLabel, modelName }: any) {
   );
 }
 
-export default function Predictive({ insightResult = null, goalResult = null, connectionStatus = "not-connected" }: PredictiveProps) {
+export default function Predictive({ insightResult = null, goalResult = null, connectionStatus = "not-connected", dbName = "" }: PredictiveProps) {
   const { isDark } = useTheme();
   const [forecast, setForecast] = useState<any>(null);
   const [forecastInfo, setForecastInfo] = useState<any>(null);
@@ -339,9 +340,9 @@ export default function Predictive({ insightResult = null, goalResult = null, co
         setElig(data);
         const rec = data.recommended;
         if (rec) {
-          setSelectedTarget((prev) => prev || rec.measure);
-          setSelectedTable((prev) => prev || rec.table);
-          setSelectedTime((prev) => prev || rec.time_dim);
+          setSelectedTarget((prev) => prev !== "" ? prev : (rec.measure || ""));
+          setSelectedTable((prev) => prev !== "" ? prev : (rec.table || ""));
+          setSelectedTime((prev) => prev !== "" ? prev : (rec.time_dim || ""));
         }
       } else {
         setEligError(data.detail || "Couldn't inspect the data for forecasting.");
@@ -361,6 +362,19 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     if (connectionStatus === "connected") loadEligibility();
     else { setElig(null); setForecast(null); setError(""); }
   }, [connectionStatus, loadEligibility]);
+  // Also re-fetch when DB name changes (user switched databases without disconnecting).
+  const prevDbRef = useRef(dbName);
+  useEffect(() => {
+    if (prevDbRef.current !== dbName) {
+      prevDbRef.current = dbName;
+      forecastAbort.current?.abort();
+      setElig(null); setForecast(null); setError(""); setScenario(null);
+      setEligError(""); setLoading(false);
+      setSelectedTarget(""); setSelectedTable(""); setSelectedTime("");
+      setFilters([]); setSchemaCols([]); setRxItems([]); rxFor.current = "";
+      if (connectionStatus === "connected") loadEligibility();
+    }
+  }, [dbName, connectionStatus, loadEligibility]);
 
   const tables: any[] = elig?.tables || [];
   const activeTable = tables.find((t) => t.table === selectedTable) || tables.find((t) => (t.measures || []).includes(selectedTarget)) || null;
@@ -964,12 +978,13 @@ export default function Predictive({ insightResult = null, goalResult = null, co
           <h2 className="text-xl font-bold text-foreground tracking-tight">Forecast</h2>
           <p className="text-sm text-muted-foreground mt-0.5">See where your business is heading.</p>
         </div>
-        <div className="flex bg-card border border-border rounded-lg p-0.5 text-xs font-medium" role="group" aria-label="Granularity">
+        <div className="flex bg-secondary border border-border rounded-xl p-0.5 text-xs font-medium" role="group" aria-label="Granularity">
           {(["Monthly", "Quarterly", "Yearly"] as PeriodTab[]).map((p) => (
             <button
               key={p}
               onClick={() => setTab(p)}
-              className={`px-3 py-1.5 rounded-md transition-colors ${tab === p ? "bg-secondary text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"}`}
+              aria-pressed={tab === p}
+              className={`px-3 py-1.5 rounded-lg transition-all duration-200 ${tab === p ? "bg-card text-foreground shadow-sm border border-border/60" : "text-muted-foreground hover:text-foreground border border-transparent"}`}
             >
               {p}
             </button>
@@ -1084,12 +1099,13 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                   aria-label="Forecast horizon in periods"
                   className="w-20 bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none"
                 />
-                <div className="flex gap-1">
+                <div className="flex bg-secondary border border-border rounded-xl p-0.5" role="group" aria-label="Quick horizon">
                   {[3, 6, 12].map((h) => (
                     <button
                       key={h}
                       onClick={() => setHorizon(h)}
-                      className={`text-[11px] font-medium px-2 py-1.5 rounded-md border transition-colors ${horizon === h ? "border-primary text-primary" : "border-border text-muted-foreground hover:text-foreground"}`}
+                      aria-pressed={horizon === h}
+                      className={`text-[11px] font-medium px-2.5 py-1.5 rounded-lg transition-all duration-200 ${horizon === h ? "bg-card text-primary shadow-sm border border-border/60" : "text-muted-foreground hover:text-foreground border border-transparent"}`}
                     >
                       {h}
                     </button>

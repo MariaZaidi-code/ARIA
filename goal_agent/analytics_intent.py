@@ -358,6 +358,17 @@ def map_visualization(primary_intent: str, chart_spec: dict | None = None) -> st
 # ---------------------------------------------------------------------------
 
 def _quote_ident(name: str, dialect: str) -> str:
+    # Schema-qualified keys quote per segment ("sales"."employee"), so the
+    # dot stays a schema separator. Bare names are unchanged.
+    try:
+        segs = [s for s in str(name or "").split(".") if s]
+        if len(segs) > 1:
+            if (dialect or "") == "mysql":
+                return ".".join(f"`{s.replace('`', '``')}`" for s in segs)
+            return ".".join(f'"{s.replace(chr(34), chr(34) + chr(34))}"'
+                            for s in segs)
+    except Exception:
+        pass
     safe = str(name or "").replace("`", "``").replace('"', '""')
     if (dialect or "") == "mysql":
         return f"`{safe}`"

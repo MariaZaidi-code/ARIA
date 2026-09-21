@@ -740,7 +740,11 @@ def check_session_store_shared() -> None:
 def _ensure_provider(session):
     """Reconstruct the LLMProvider instance if session['provider'] is a string
     (happens after deserialization from disk where default=str serializes the
-    LLMProvider object to its string representation)."""
+    LLMProvider object to its string representation).
+
+    Fail-closed: if the configured provider cannot be reconstructed (missing
+    API key, consent, or package), fall back to local Ollama so downstream
+    agents never receive provider=None."""
     from llm_provider import create_provider
     prov = session.get("provider")
     if prov is None or isinstance(prov, str):
@@ -749,10 +753,20 @@ def _ensure_provider(session):
             api_key = resolve_provider_key(name, session.get("api_keys", {}))
             try:
                 session["provider"] = create_provider(provider=name, api_key=api_key)
-            except Exception:
-                session["provider"] = None
-        else:
+                session.pop("_provider_error", None)
+                return
+            except Exception as exc:
+                _logger.warning("create_provider(%s) failed: %s – falling back to local", name, exc)
+                session["_provider_error"] = str(exc)
+        # Fall back to local Ollama so the provider is never None.
+        try:
+            session["provider"] = create_provider(provider="local")
+            session["provider_name"] = "local"
+            _logger.info("_ensure_provider: fallback to local Ollama")
+        except Exception:
+            _logger.warning("_ensure_provider: local fallback also failed – provider stays None")
             session["provider"] = None
+            session["_provider_error"] = session.get("_provider_error") or "No provider available"
 
 
 def _copy_session(session):

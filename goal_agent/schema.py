@@ -121,6 +121,39 @@ class SchemaMixin:
             if lt not in self.relationship_graph.get(rt, []):
                 self.relationship_graph[rt].append(lt)
 
+    def _canon_ident(self, value):
+        """Generic identifier match key: lower + strip quotes/brackets."""
+        try:
+            s = str(value or "").strip()
+            while len(s) >= 2 and ((s[0] == '"' and s[-1] == '"')
+                                   or (s[0] == "'" and s[-1] == "'")
+                                   or (s[0] == "`" and s[-1] == "`")
+                                   or (s[0] == "[" and s[-1] == "]")):
+                s = s[1:-1].strip()
+            return s.lower()
+        except Exception:
+            return str(value or "").lower()
+
+    def _bare_ident(self, value):
+        try:
+            segs = [s for s in str(value or "").split(".") if s.strip()]
+            last = segs[-1] if segs else str(value or "")
+            return self._canon_ident(last)
+        except Exception:
+            return self._canon_ident(value)
+
+    def _resolve_table_key(self, name):
+        """Resolve `name` to a real table key (exact, case-insensitive, bare)."""
+        if name in self.tables:
+            return name
+        low = self._canon_ident(name)
+        for k in self.tables:
+            if self._canon_ident(k) == low:
+                return k
+        bare = self._bare_ident(name)
+        cands = [k for k in self.tables if self._bare_ident(k) == bare]
+        return cands[0] if len(cands) == 1 else None
+
     def _normalize_schema(self, raw_schema):
         raw_tables = raw_schema.get("tables", {})
         if not isinstance(raw_tables, dict) or not raw_tables:
@@ -228,14 +261,34 @@ class SchemaMixin:
 
         for table_name, info in tables.items():
             for fk in info.get("foreign_keys", []):
-                target = fk["referenced_table"]
+                target = fk.get("referenced_table")
+                real_target = None
+                if target in tables:
+                    real_target = target
+                else:
+                    # Case-insensitive / bare-segment resolution so quoted
+                    # CamelCase or search_path-bare declared names still bind.
+                    low = self._canon_ident(target)
+                    for k in tables:
+                        if self._canon_ident(k) == low:
+                            real_target = k
+                            break
+                    if real_target is None:
+                        bare = self._bare_ident(target)
+                        cands = [k for k in tables
+                                 if self._bare_ident(k) == bare]
+                        real_target = cands[0] if len(cands) == 1 else None
+                if real_target is not None and real_target != target:
+                    fk["referenced_table"] = real_target
+                    target = real_target
                 if target and target not in tables:
                     logger.warning(
                         "Schema mapping references unknown table '%s' from %s.%s "
                         "(stale/manually-edited JSON?)",
                         target, table_name, fk.get("column"),
                     )
-                elif target and fk.get("referenced_column") not in tables[target]["columns"]:
+                elif target and self._canon_ident(fk.get("referenced_column") or "") not in {
+                        self._canon_ident(c) for c in tables[target]["columns"]}:
                     logger.warning(
                         "Schema mapping references unknown column '%s.%s' from %s.%s",
                         target, fk.get("referenced_column"), table_name, fk.get("column"),
@@ -263,10 +316,13 @@ class SchemaMixin:
         graph = defaultdict(list)
         for table_name, info in self.tables.items():
             for fk in info.get("foreign_keys", []):
-                target = fk["referenced_table"]
+                target = self._resolve_table_key(fk.get("referenced_table")) \
+                    or fk.get("referenced_table")
                 if target in self.tables:
-                    graph[table_name].append(target)
-                    graph[target].append(table_name)
+                    if target not in graph[table_name]:
+                        graph[table_name].append(target)
+                    if table_name not in graph[target]:
+                        graph[target].append(table_name)
         return graph
 
     # ---- _relationship_trust (_relationship_trust) ----
@@ -309,11 +365,22 @@ class SchemaMixin:
 
     def _build_relationship_edges(self):
         """Every FK edge with full metadata (spec §5): both endpoints, the
-        original FK direction, relationship type, confidence and trust level."""
+        original FK direction, relationship type, confidence and trust level.
+
+        Generic multi-schema resolution: targets bind case-insensitively +
+        bare-segment aware so quoted CamelCase or search_path-bare declared
+        names still yield cross-schema edges; ambiguous bare names are
+        dropped so the database stays the final arbiter.
+        """
         edges = []
         for table_name, info in self.tables.items():
             for fk in info.get("foreign_keys", []):
-                target = fk["referenced_table"]
+                target = fk.get("referenced_table")
+                try:
+                    real = self._resolve_table_key(target)
+                except Exception:
+                    real = None
+                target = real or target
                 if target not in self.tables:
                     continue
                 rel_type = fk.get("type", "declared")
@@ -370,6 +437,30 @@ class SchemaMixin:
 
     # ---- _build_schema_ddl (_build_schema_ddl) ----
 
+    def _qtn(self, table_name):
+        """Table reference for DDL: schema-qualified keys become
+        "sales"."salesorderheader" (schema separator, never a dotted name)."""
+        def _strip(v):
+            try:
+                s = str(v or "").strip()
+                while len(s) >= 2 and ((s[0] == '"' and s[-1] == '"')
+                                       or (s[0] == "'" and s[-1] == "'")
+                                       or (s[0] == "`" and s[-1] == "`")
+                                       or (s[0] == "[" and s[-1] == "]")):
+                    s = s[1:-1].strip()
+                return s
+            except Exception:
+                return str(v or "")
+        try:
+            segs = [_strip(s) for s in str(table_name or "").split(".")]
+            segs = [s for s in segs if s]
+            if len(segs) > 1:
+                return ".".join(f'"{s.replace(chr(34), chr(34) + chr(34))}"'
+                                for s in segs)
+        except Exception:
+            pass
+        return f'"{_strip(table_name).replace(chr(34), chr(34) + chr(34))}"'
+
     def _build_schema_ddl(self, join_path, full=False):
         """Build DDL for the tables in the join path.
 
@@ -420,10 +511,10 @@ class SchemaMixin:
             fk_lines = []
             for fk in info.get("foreign_keys", []):
                 fk_lines.append(
-                    f'    FOREIGN KEY ("{fk["column"]}") REFERENCES "{fk["referenced_table"]}"("{fk["referenced_column"]}")'
+                    f'    FOREIGN KEY ("{fk["column"]}") REFERENCES {self._qtn(fk["referenced_table"])}("{fk["referenced_column"]}")'
                 )
             all_defs = ",\n".join(col_defs + fk_lines)
-            ddl_parts.append(f'CREATE TABLE "{table_name}" (\n{all_defs}\n);')
+            ddl_parts.append(f'CREATE TABLE {self._qtn(table_name)} (\n{all_defs}\n);')
         return "\n\n".join(ddl_parts)
 
     # ---- _fk_edges (_fk_edges) ----
@@ -454,15 +545,24 @@ class SchemaMixin:
         required = set()
         for m in ir.get("metrics", []):
             if m.get("resolved_table"):
-                required.add(m["resolved_table"])
+                real = self._resolve_table_key(m["resolved_table"]) \
+                    or m["resolved_table"]
+                if real in self.tables:
+                    required.add(real)
         for d in ir.get("dimensions", []):
             if d.get("resolved_table"):
-                required.add(d["resolved_table"])
+                real = self._resolve_table_key(d["resolved_table"]) \
+                    or d["resolved_table"]
+                if real in self.tables:
+                    required.add(real)
         for f in ir.get("filters", []) or []:
             try:
                 _col = str(f.get("column") or "")
-                if "." in _col and _col.split(".")[0] in self.tables:
-                    required.add(_col.split(".")[0])
+                if "." in _col:
+                    _t = _col.split(".")[0]
+                    real = self._resolve_table_key(_t)
+                    if real is not None:
+                        required.add(real)
             except Exception:
                 pass
         return sorted(required) if required else list(join_path)
@@ -478,7 +578,11 @@ class SchemaMixin:
         relationships are preferred; LOW_CONFIDENCE_INFERRED edges are only
         used when there is no other way to connect a required table.
         """
-        req = [t for t in required_tables if t in self.tables]
+        req = []
+        for t in (required_tables or []):
+            real = self._resolve_table_key(t)
+            if real is not None and real not in req:
+                req.append(real)
         if not req:
             return {"required_tables": [], "nodes": [], "edges": []}
 
@@ -487,8 +591,11 @@ class SchemaMixin:
         adj = defaultdict(list)
         for e in self.relationship_edges:
             rank = trust_rank.get(e.get("trust"), 4)
-            adj[e["left_table"]].append((rank, e))
-            adj[e["right_table"]].append((rank, e))
+            left = self._resolve_table_key(e.get("left_table")) or e.get("left_table")
+            right = self._resolve_table_key(e.get("right_table")) or e.get("right_table")
+            if left in self.tables and right in self.tables:
+                adj[left].append((rank, e))
+                adj[right].append((rank, e))
         for table in adj:
             adj[table].sort(key=lambda pair: pair[0])
 

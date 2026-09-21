@@ -779,7 +779,10 @@ class LLMProvider:
 # Convenience helpers
 # ---------------------------------------------------------------------------
 
-def create_provider(provider="local", api_key=None, models=None, base_url=None):
+_UNSET = object()
+
+def create_provider(provider=_UNSET, api_key=None, models=None, base_url=None,
+                    warn_on_default=False):
     """Build an LLMProvider.
 
     Policy: never silently switch backend. If a hosted provider ('cloud',
@@ -788,6 +791,12 @@ def create_provider(provider="local", api_key=None, models=None, base_url=None):
     mid-session only happens through an explicit user action (see
     /api/provider/switch) — never automatically.
     """
+    if provider is _UNSET:
+        if warn_on_default:
+            logging.getLogger("aria.llm_provider").warning(
+                "create_provider called without explicit provider – defaulting to local"
+            )
+        provider = "local"
     # Provider-selection layer enforcement (fail closed before any import,
     # client construction, or network I/O for hosted providers).
     if provider != "local":

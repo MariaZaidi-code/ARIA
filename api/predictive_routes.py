@@ -85,29 +85,77 @@ def _coerced_ref(tables, tname, col, dialect):
     return q
 
 
-def _validate_time_dim(engine, dialect, table, column, dtype):
+# Eligibility cache: keyed by (user_id, db_name, schema mtime) so reconnects
+# and re-renders never rescan wide databases. Bounded, short TTL, and only
+# successful results are cached — errors always recompute. Generic pattern
+# (mirrors the dashboard config cache).
+_ELIG_CACHE: dict = {}
+_ELIG_CACHE_TTL = 180.0
+_ELIG_CACHE_MAX = 200
+
+
+def _apply_stmt_timeout(conn, dialect):
+    """Best-effort per-connection statement timeout (ms, env-tunable).
+
+    Guards the eligibility scan against pathological full-table aggregations
+    on very large databases. Never raises; dialects without support skip.
+    """
+    try:
+        import os as _os
+        _ms = int(_os.getenv("ARIA_ELIG_STMT_TIMEOUT_MS", "8000"))
+    except Exception:
+        _ms = 8000
+    if _ms <= 0:
+        return
+    try:
+        from sqlalchemy import text as _t
+        if str(dialect or "").lower() in ("postgresql", "postgres", "pgsql"):
+            conn.execute(_t(f"SET statement_timeout TO '{int(_ms)}ms'"))
+        elif str(dialect or "").lower() == "sqlite":
+            conn.execute(_t(f"PRAGMA busy_timeout={int(_ms)}"))
+    except Exception:
+        pass
+
+
+def _validate_time_dim(engine_or_conn, dialect, table, column, dtype):
     """Check a candidate time column against REAL data.
 
     Returns dict with kind/distinct/null_pct/parse_ratio/span or None when
     the column cannot serve as a forecast axis. Never invents dates.
+
+    Accepts an Engine (opens a short-lived connection) or a live
+    Connection (reused by the eligibility pass to avoid per-candidate
+    reconnects on wide multi-table databases).
     """
     from sqlalchemy import text as _t
     from api.schema_intel import _safe_name
+
+    def _run(conn):
+        row = conn.execute(_t(
+            f"SELECT COUNT(*) n, COUNT({_safe_name(column, dialect)}) nn, "
+            f"COUNT(DISTINCT {_safe_name(column, dialect)}) nd "
+            f"FROM {_safe_name(table, dialect)}"
+        )).fetchone()
+        n, nn, nd = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+        if n == 0 or nd < 2:
+            return None, None
+        vals = [r[0] for r in conn.execute(_t(
+            f"SELECT DISTINCT {_safe_name(column, dialect)} "
+            f"FROM {_safe_name(table, dialect)} "
+            f"WHERE {_safe_name(column, dialect)} IS NOT NULL LIMIT 200"
+        )).fetchall()]
+        return (n, nn, nd), vals
+
     try:
-        with engine.connect() as conn:
-            row = conn.execute(_t(
-                f"SELECT COUNT(*) n, COUNT({_safe_name(column, dialect)}) nn, "
-                f"COUNT(DISTINCT {_safe_name(column, dialect)}) nd "
-                f"FROM {_safe_name(table, dialect)}"
-            )).fetchone()
-            n, nn, nd = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
-            if n == 0 or nd < 2:
-                return None
-            vals = [r[0] for r in conn.execute(_t(
-                f"SELECT DISTINCT {_safe_name(column, dialect)} "
-                f"FROM {_safe_name(table, dialect)} "
-                f"WHERE {_safe_name(column, dialect)} IS NOT NULL LIMIT 200"
-            )).fetchall()]
+        if hasattr(engine_or_conn, "connect"):
+            with engine_or_conn.connect() as conn:
+                _apply_stmt_timeout(conn, dialect)
+                counts, vals = _run(conn)
+        else:
+            counts, vals = _run(engine_or_conn)
+        if counts is None:
+            return None
+        n, nn, nd = counts
     except Exception as exc:
         log.warning("Eligibility sampling failed for %s.%s: %s", table, column, exc)
         return None
@@ -199,8 +247,25 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
                 "reasons": ["This source type cannot be queried for forecasting yet."]}
     from sqlalchemy import text as _t
     from api.schema_intel import _safe_name
-    out_tables = []
-    reasons: list[str] = []
+
+    # Short-TTL cache so remounts, StrictMode double-fetches and DB-switch
+    # re-renders never rescan wide databases. Keyed by schema mtime so
+    # reconnects/uploads invalidate automatically. Errors are never cached.
+    try:
+        _schema_mtime = Path(str(schema_path)).stat().st_mtime
+    except Exception:
+        _schema_mtime = 0.0
+    _elig_key = (user.get("user_id"), session.get("db_name", ""), _schema_mtime)
+    _cached = _ELIG_CACHE.get(_elig_key)
+    if _cached and (time.time() - _cached[0]) < _ELIG_CACHE_TTL:
+        return {"ok": True, **_cached[1], "cached": True}
+    if len(_ELIG_CACHE) > _ELIG_CACHE_MAX:
+        _ELIG_CACHE.clear()
+
+    # Metadata-only plan (no SQL): measures + time candidates per table.
+    # Date-dtype columns first, then date-hinted text; capped so wide
+    # databases validate the most promising axes instead of everything.
+    _plan = []
     for tname in list(tables)[:15]:
         cols = _table_columns(tables, tname)
         measures = [m for m in (intel.find_all_measures(tname) or [])]
@@ -210,29 +275,62 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
                      if any(k in d.lower() for k in ("date", "time", "timestamp"))]
         text_hints = [n for n, d in cols
                       if n not in date_cols and _hint_hit(n, _DATE_NAME_HINTS)]
+        _plan.append((tname, cols, measures, (date_cols + text_hints)[:3]))
+
+    def _scan_one(tname, cols, measures, cands):
+        """Validate one table on its own connection (thread-safe)."""
+        t_reasons: list[str] = []
         time_dims = []
-        for cand in (date_cols + text_hints)[:5]:
-            dtype = next((d for n, d in cols if n == cand), "")
-            checked = _validate_time_dim(engine, dialect, tname, cand, dtype)
-            if checked:
-                if checked["null_pct"] > 50:
-                    reasons.append(
-                        f"{tname}.{cand} looks like a date but is empty too often "
-                        f"({checked['null_pct']}% missing), so it was skipped.")
-                    continue
-                time_dims.append(checked)
+        n_rows = 0
         try:
             with engine.connect() as conn:
-                n_rows = int(conn.execute(_t(
-                    f"SELECT COUNT(*) FROM {_safe_name(tname, dialect)}")).fetchone()[0] or 0)
+                _apply_stmt_timeout(conn, dialect)
+                for cand in cands:
+                    dtype = next((d for n, d in cols if n == cand), "")
+                    checked = _validate_time_dim(conn, dialect, tname, cand, dtype)
+                    if checked:
+                        if checked["null_pct"] > 50:
+                            t_reasons.append(
+                                f"{tname}.{cand} looks like a date but is empty too often "
+                                f"({checked['null_pct']}% missing), so it was skipped.")
+                            continue
+                        time_dims.append(checked)
+                try:
+                    n_rows = int(conn.execute(_t(
+                        f"SELECT COUNT(*) FROM {_safe_name(tname, dialect)}")).fetchone()[0] or 0)
+                except Exception:
+                    n_rows = 0
         except Exception:
-            n_rows = 0
-        out_tables.append({
-            "table": tname,
-            "measures": measures,
-            "time_dims": time_dims,
-            "row_count": n_rows,
-        })
+            pass
+        return ({"table": tname, "measures": measures,
+                 "time_dims": time_dims, "row_count": n_rows}, t_reasons)
+
+    def _prio(item):
+        _tname, _cols, _measures, _cands = item
+        if _measures and _cands:
+            return 0
+        if _measures or _cands:
+            return 1
+        return 2
+
+    # Forecast-ready tables scan first; results reassembled in mapping order
+    # so dropdowns and the recommendation pick stay deterministic.
+    _order = sorted(range(len(_plan)), key=lambda i: (_prio(_plan[i]), i))
+    _entries: dict[int, dict] = {}
+    _t_reasons: dict[int, list] = {}
+    if str(dialect or "").lower() in ("postgresql", "postgres", "pgsql", "mysql", "mariadb"):
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=4) as _ex:
+            for _idx, _res in zip(_order, _ex.map(lambda _i: _scan_one(*_plan[_i]), _order)):
+                _entries[_idx], _t_reasons[_idx] = _res
+    else:
+        for _idx in _order:
+            _entries[_idx], _t_reasons[_idx] = _scan_one(*_plan[_idx])
+    out_tables = []
+    reasons: list[str] = []
+    for _i in range(len(_plan)):
+        out_tables.append(_entries[_i])
+        reasons.extend(_t_reasons[_i])
     if not any(t["measures"] for t in out_tables):
         reasons.append("No measurable numeric metric was found (only ids, keys, codes or text). "
                        "Forecasting needs a number that changes over time, such as an amount, quantity or count.")
@@ -309,6 +407,10 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
             _elig["eligible"] = False
             if _ev_el.get("reason") and _ev_el["reason"] not in _elig["reasons"]:
                 _elig["reasons"] = [_ev_el["reason"]] + list(_elig["reasons"])
+    try:
+        _ELIG_CACHE[_elig_key] = (time.time(), {k: v for k, v in _elig.items() if k != "ok"})
+    except Exception:
+        pass
     return _elig
 
 
@@ -694,6 +796,7 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
             api_key=api_key,
             dialect=dialect,
             overrides=load_user_overrides(user["user_id"], session.get("db_name", "")),
+            schemas=session.get("schemas"),
         )
         goal_result = agent.process_goal(question, output_path=str(output_path))
     except Exception as e:
@@ -991,6 +1094,7 @@ def generate_prescription(req: PrescriptionRequest, request: Request, user: dict
             api_key=api_key,
             dialect=dialect,
             overrides=load_user_overrides(user["user_id"], session.get("db_name", "")),
+            schemas=session.get("schemas"),
         )
         goal_result = agent.process_goal(
             "Analyze the data and identify key metrics, trends, and anomalies",

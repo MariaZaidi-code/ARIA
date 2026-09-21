@@ -584,10 +584,14 @@ def build_recommendation_detail(ins: dict) -> dict:
 
 
 def build_explains(ins: dict) -> str:
-    """Short conversational reading of one insight (2-3 sentences).
+    """Thorough, multi-paragraph explanation of an insight.
 
-    Built only from the insight's own title/description/evidence numbers.
-    Returns '' when there is nothing meaningful to say (caller hides it).
+    Dynamically composed from the insight's own title, description, evidence
+    numbers, observations, confidence, and type. Each paragraph serves a
+    purpose: what happened, why it matters, what the evidence shows, and
+    what to do next. No hardcoded business text — everything is derived
+    from the data at hand. Returns '' when there is nothing meaningful
+    to say (caller hides the section).
     """
     try:
         ins = ins if isinstance(ins, dict) else {}
@@ -598,6 +602,11 @@ def build_explains(ins: dict) -> str:
         metric_low = metric[:1].lower() + metric[1:] if metric else "this measure"
         period = str(ins.get("affectedPeriod") or "").strip()
         itype = str(ins.get("type") or "").lower()
+        conf = ins.get("confidence")
+        try:
+            conf = int(conf) if conf is not None else None
+        except (TypeError, ValueError):
+            conf = None
 
         def _num(v):
             try:
@@ -609,37 +618,175 @@ def build_explains(ins: dict) -> str:
         cp = _num(ev.get("changePercent"))
         current = _num(ev.get("currentValue"))
         baseline = _num(ev.get("baseline"))
+        ss = ev.get("sampleSize") or ins.get("sample_size")
+        try:
+            ss = int(ss) if ss is not None else None
+        except (TypeError, ValueError):
+            ss = None
+        obs = ev.get("observations") or []
+        sup = ev.get("supportingMetrics") or []
+        conf_label = _confidence_level(conf) if conf is not None else ""
+        eq_label = _evidence_quality(ss) if ss is not None else ""
+
         if not title and not desc:
             return ""
-        # Thin evidence -> say so honestly, briefly.
-        if cp is None and current is None and baseline is None:
-            base = title or desc
-            base = _scrub_line(base)
-            if len(base) < 20:
-                return ""
-            if "opportunit" in itype:
-                return _scrub_line(f"Here is the short version: {base} Worth exploring while it holds.")
-            if "risk" in itype or "decline" in itype:
-                return _scrub_line(f"Here is the short version: {base} Worth a closer look soon.")
-            return _scrub_line(f"Here is the short version: {base}")
+
+        paragraphs = []
+
+        # --- Paragraph 1: The Finding ---
         if cp is not None and cp > 0:
-            move = f"{metric} is up {abs(cp):.0f}%"
+            move = f"{metric} is up {abs(cp):.1f}%"
         elif cp is not None and cp < 0:
-            move = f"{metric} is down {abs(cp):.0f}%"
+            move = f"{metric} is down {abs(cp):.1f}%"
         elif baseline is not None and current is not None:
             move = f"{metric} moved from {_human_scale(baseline)} to {_human_scale(current)}"
         elif current is not None:
             move = f"{metric} is at {_human_scale(current)}"
         else:
-            move = title
-        where = f" in {period}" if period else ""
-        kind = "an opportunity" if "opportunit" in itype else ("a risk" if ("risk" in itype or "decline" in itype) else "the pattern")
-        action = ("Worth exploring while it holds." if "opportunit" in itype
-                  else ("Worth a closer look soon." if ("risk" in itype or "decline" in itype or (cp is not None and cp < 0))
-                        else "That is the shape of it."))
-        text = f"{move}{where}. In plain terms — {_scrub_line(title or desc)} {action} This is {kind} the numbers point to."
+            move = _scrub_line(title) if title else ""
+
+        if move:
+            where = f" over {period}" if period else ""
+            finding = f"{move}{where}."
+            if title:
+                title_clean = _scrub_line(title)
+                if title_clean and title_clean.lower() != move.lower().rstrip("."):
+                    finding = f"{move}{where}. {title_clean}."
+            paragraphs.append(finding)
+        elif title:
+            paragraphs.append(_scrub_line(title))
+        elif desc:
+            paragraphs.append(_scrub_line(desc))
+
+        # --- Paragraph 2: Why It Matters ---
+        why_parts = []
+        if cp is not None and baseline is not None and current is not None:
+            direction = "growth" if cp > 0 else "decline"
+            if abs(cp) >= 20:
+                magnitude = "significant"
+            elif abs(cp) >= 10:
+                magnitude = "notable"
+            elif abs(cp) >= 5:
+                magnitude = "moderate"
+            else:
+                magnitude = "slight"
+            why_parts.append(
+                f"This {magnitude} {direction} ({_fmt_pct(cp)}) represents a shift "
+                f"from {_human_scale(baseline)} to {_human_scale(current)}."
+            )
+            if abs(cp) >= 15 and ss and ss >= 30:
+                why_parts.append(
+                    f"With {ss:,} data points behind this movement, the pattern is "
+                    f"unlikely to be random noise."
+                )
+            elif ss is not None and ss < 20:
+                why_parts.append(
+                    f"However, this is based on only {ss} observations, so the "
+                    f"pattern may not hold at scale."
+                )
+        elif current is not None:
+            why_parts.append(
+                f"The current level of {_human_scale(current)} for {metric_low} "
+                f"provides a baseline for understanding where things stand."
+            )
+
+        if "opportunit" in itype:
+            if cp is not None and cp > 0:
+                why_parts.append(
+                    f"Because {metric_low} is trending upward, there may be a window "
+                    f"to build on this momentum before the trend plateaus."
+                )
+            else:
+                why_parts.append(
+                    f"This represents a potential area to invest in or explore further, "
+                    f"as the data suggests room for positive movement."
+                )
+        elif "risk" in itype or "decline" in itype:
+            if cp is not None and cp < 0:
+                why_parts.append(
+                    f"The downward movement in {metric_low} signals something worth "
+                    f"monitoring — left unaddressed, the trend could compound."
+                )
+            else:
+                why_parts.append(
+                    f"This pattern carries risk if it persists. Understanding the "
+                    f"underlying drivers early gives you room to intervene."
+                )
+        elif "anomal" in itype:
+            why_parts.append(
+                f"An unusual pattern like this often points to an external factor "
+                f"or a one-time event worth investigating."
+            )
+
+        if why_parts:
+            paragraphs.append(" ".join(why_parts))
+
+        # --- Paragraph 3: What the Evidence Shows ---
+        evidence_parts = []
+        if obs:
+            top_obs = [_scrub_line(str(o)) for o in obs[:3] if str(o).strip()]
+            if top_obs:
+                evidence_parts.append(
+                    f"The data shows: {'; '.join(top_obs)}."
+                )
+        if sup:
+            top_sup = [_scrub_line(str(s)) for s in sup[:2] if str(s).strip()]
+            if top_sup:
+                evidence_parts.append(
+                    f"Supporting this: {'; '.join(top_sup)}."
+                )
+        if conf_label and eq_label:
+            evidence_parts.append(
+                f"Confidence is {conf_label.lower()} with {eq_label.lower()} evidence."
+            )
+        elif conf_label:
+            evidence_parts.append(f"Confidence: {conf_label.lower()}.")
+
+        if evidence_parts:
+            paragraphs.append(" ".join(evidence_parts))
+
+        # --- Paragraph 4: What To Do ---
+        action_parts = []
+        if "opportunit" in itype:
+            action_parts.append(
+                f"Consider exploring what is driving this upward movement in "
+                f"{metric_low} and whether those drivers can be amplified."
+            )
+            if cp is not None and cp > 10:
+                action_parts.append(
+                    f"A {abs(cp):.0f}% gain is material — even small investments to "
+                    f"sustain it could compound into meaningful returns."
+                )
+        elif "risk" in itype or "decline" in itype:
+            action_parts.append(
+                f"It would be prudent to dig into what is causing {metric_low} to "
+                f"weaken and whether the trend is accelerating or stabilizing."
+            )
+            if cp is not None and cp < -10:
+                action_parts.append(
+                    f"A {abs(cp):.0f}% decline is significant enough to warrant "
+                    f"attention before the pattern becomes harder to reverse."
+                )
+        elif "anomal" in itype:
+            action_parts.append(
+                f"Investigate whether this anomaly correlates with a specific "
+                f"event, segment, or time period to determine if action is needed."
+            )
+        else:
+            action_parts.append(
+                f"Keep monitoring {metric_low} to see whether this pattern "
+                f"holds, strengthens, or fades over the next few periods."
+            )
+
+        if action_parts:
+            paragraphs.append(" ".join(action_parts))
+
+        if not paragraphs:
+            return ""
+
+        text = " ".join(paragraphs)
         text = _scrub_line(text)
-        return text[:600] if len(text) > 600 else text
+        return text[:2000] if len(text) > 2000 else text
     except Exception:
         return ""
 

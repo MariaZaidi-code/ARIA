@@ -37,10 +37,67 @@ def redact(value, keep: int = 0) -> str:
 
 
 def ensure_private_file(path) -> None:
-    """Best-effort 0600 on a secret-bearing file (POSIX; no-op on Windows)."""
+    """Best-effort private perms on a secret-bearing file.
+
+    POSIX: chmod 0600 (unchanged). Windows: restrict the file ACL to the
+    current user only via icacls (fail-open with warning, never crashes
+    startup, never logs secret values).
+    """
     try:
         if sys.platform != "win32":
             os.chmod(path, 0o600)
+            return
+        # Windows branch: current-user-only ACL via icacls (no shell).
+        try:
+            import ctypes  # noqa: F401 - confirms Win32 API surface present
+        except Exception:
+            pass
+        try:
+            import logging as _logging
+            import subprocess as _subprocess
+
+            _username = (os.getenv("USERNAME") or "").strip()
+            if not _username:
+                try:
+                    import getpass as _getpass
+
+                    _username = (_getpass.getuser() or "").strip()
+                except Exception:
+                    _username = ""
+            if not _username:
+                _logging.getLogger("uvicorn.error").warning(
+                    "core.secret_box: cannot determine current user; "
+                    "leaving file ACL unchanged."
+                )
+                return
+            try:
+                _subprocess.run(
+                    [
+                        "icacls",
+                        str(path),
+                        "/inheritance:r",
+                        "/grant:r",
+                        f"{_username}:F",
+                    ],
+                    shell=False,
+                    check=False,
+                    capture_output=True,
+                    timeout=10,
+                )
+            except (FileNotFoundError, OSError) as exc:
+                _logging.getLogger("uvicorn.error").warning(
+                    "core.secret_box: icacls unavailable (%s); "
+                    "leaving file ACL unchanged.",
+                    type(exc).__name__,
+                )
+            except Exception as exc:
+                _logging.getLogger("uvicorn.error").warning(
+                    "core.secret_box: Windows ACL hardening failed (%s); "
+                    "leaving file ACL unchanged.",
+                    type(exc).__name__,
+                )
+        except Exception:
+            pass
     except Exception:
         pass
 

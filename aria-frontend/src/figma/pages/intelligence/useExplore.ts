@@ -429,3 +429,97 @@ export function useExplore(meta: any) {
 }
 
 export type UseExploreReturn = ReturnType<typeof useExplore>;
+
+/* ---------- Explore → Prescriptions handoff (no new endpoints) ----------
+   The Prescriptions tab accepts this context (via props or the URL hash)
+   to prefill its metric/driver/segment pickers. Everything is dynamic —
+   values come from the live Explore state; nothing is hardcoded here.
+
+   Hash keys: rx_metric, rx_driver, rx_segment, rx_value. Example:
+     #tab=prescriptions&rx_metric=gross_revenue&rx_driver=promo_spend
+   ExploreTab can link with:
+     `#tab=prescriptions&${buildRxHandoffHash(rxHandoffFromExplore(ex))}`
+   and PrescriptionsTab picks it up via parseRxHandoff(). */
+
+export interface RxHandoff {
+  metric?: string;
+  driver?: string;
+  segmentField?: string;
+  segmentValue?: string;
+}
+
+const RX_HASH_KEYS = {
+  metric: "rx_metric",
+  driver: "rx_driver",
+  segmentField: "rx_segment",
+  segmentValue: "rx_value",
+} as const;
+
+/** Read an Explore→Prescriptions handoff from a hash string (defaults to
+ *  window.location.hash). Returns null when no rx_* params are present. */
+export function parseRxHandoff(source?: string): RxHandoff | null {
+  let hash = source ?? "";
+  if (source === undefined) {
+    try {
+      hash = window.location.hash || "";
+    } catch {
+      return null;
+    }
+  }
+  const frag = hash.startsWith("#") ? hash.slice(1) : hash;
+  if (!frag) return null;
+  /* Accept both "#tab=x&rx_metric=y" and "#...?rx_metric=y" shapes. */
+  const query = frag.includes("?") ? frag.slice(frag.indexOf("?") + 1) : frag;
+  let params: URLSearchParams;
+  try {
+    params = new URLSearchParams(query);
+  } catch {
+    return null;
+  }
+  const pick = (k: string): string => {
+    try {
+      return (params.get(k) || "").trim();
+    } catch {
+      return "";
+    }
+  };
+  const handoff: RxHandoff = {
+    ...(pick(RX_HASH_KEYS.metric) ? { metric: pick(RX_HASH_KEYS.metric) } : {}),
+    ...(pick(RX_HASH_KEYS.driver) ? { driver: pick(RX_HASH_KEYS.driver) } : {}),
+    ...(pick(RX_HASH_KEYS.segmentField) ? { segmentField: pick(RX_HASH_KEYS.segmentField) } : {}),
+    ...(pick(RX_HASH_KEYS.segmentValue) ? { segmentValue: pick(RX_HASH_KEYS.segmentValue) } : {}),
+  };
+  return Object.keys(handoff).length ? handoff : null;
+}
+
+/** Encode a handoff as a hash fragment (no navigation performed here —
+ *  the caller merges it into location.hash). */
+export function buildRxHandoffHash(h: RxHandoff): string {
+  const p = new URLSearchParams();
+  if (h?.metric) p.set(RX_HASH_KEYS.metric, h.metric);
+  if (h?.driver) p.set(RX_HASH_KEYS.driver, h.driver);
+  if (h?.segmentField) p.set(RX_HASH_KEYS.segmentField, h.segmentField);
+  if (h?.segmentValue) p.set(RX_HASH_KEYS.segmentValue, h.segmentValue);
+  return p.toString();
+}
+
+/** Map live Explore builder state onto a prescription handoff: the metric
+ *  carries over, the breakdown becomes the driver candidate, and the first
+ *  active filter becomes the segment candidate. */
+export function rxHandoffFromExplore(s: {
+  metric?: unknown;
+  breakdown?: unknown;
+  filters?: Array<{ column?: unknown; value?: unknown }>;
+}): RxHandoff {
+  const str = (v: unknown): string => (v === null || v === undefined ? "" : String(v).trim());
+  const firstFilter = Array.isArray(s?.filters)
+    ? s.filters.find((f) => str(f?.column) && str(f?.value))
+    : undefined;
+  return {
+    ...(str(s?.metric) ? { metric: str(s.metric) } : {}),
+    ...(str(s?.breakdown) ? { driver: str(s.breakdown) } : {}),
+    ...(firstFilter
+      ? { segmentField: str(firstFilter.column), segmentValue: str(firstFilter.value) }
+      : {}),
+  };
+}

@@ -35,9 +35,10 @@ log = logging.getLogger("aria.prescription")
 # ---------------------------------------------------------------------------
 _RX_INTERNAL_KEYS = frozenset({
     "scenario_label", "dedupe_key", "risk_reasons", "score_breakdown",
-    "sql", "query", "debug", "traceback", "trace",
+    "join_ref", "sql", "query", "debug", "traceback", "trace",
 })
-_TOP_INTERNAL_KEYS = frozenset({"fit", "sql", "query", "debug", "traceback", "trace"})
+_TOP_INTERNAL_KEYS = frozenset({"fit", "sql", "query", "debug", "traceback", "trace",
+                                "score_breakdown", "join_ref"})
 
 
 def _strip_prescription_response(out):
@@ -393,6 +394,29 @@ def prescription_analyze(req: AnalyzeRequest, request: Request,
         seg = None
         if req.segment and req.segment.field:
             seg = {"field": req.segment.field, "value": req.segment.value}
+            # Integrity gate: validate segment.value against live DISTINCT
+            # values (LIMIT 100) with suggestions — never a silent wrong cut.
+            try:
+                from prescription_engine.engine import validate_segment_value as _vseg
+                _dims = set()
+                try:
+                    _dims = set(intel.find_all_dimensions(table) or [])
+                except Exception:
+                    _dims = set()
+                if seg["field"] not in _dims:
+                    return {"ok": False, "success": False, "code": "INVALID_SEGMENT",
+                            "detail": f"'{seg['field']}' is not a usable segment here.",
+                            "recoverable": True}
+                if seg.get("value") is not None:
+                    _chk = _vseg(engine, dialect, table, seg["field"], seg["value"], limit=100)
+                    if isinstance(_chk, dict) and not _chk.get("ok", True):
+                        return {"ok": False, "success": False, "code": "INVALID_SEGMENT",
+                                "detail": (f"'{seg['value']}' was not found in '{seg['field']}'. "
+                                           f"Try one of: {', '.join(_chk.get('suggestions', [])[:5]) or 'no values'}."),
+                                "suggestions": _chk.get("suggestions", [])[:5],
+                                "recoverable": True}
+            except Exception:
+                log.debug("segment validation failed closed-open", exc_info=True)
         out = _analyze(engine, dialect, intel, table, metric, driver=driver,
                        dimensions=req.dimensions, segment=seg,
                        question=req.question, priors=priors)
@@ -418,6 +442,21 @@ def prescription_analyze(req: AnalyzeRequest, request: Request,
             pass
 
 
+_POLISH_CAUSALITY_VERBS = ("cause", "causes", "caused", "causing", "prove",
+                             "proves", "proved", "proof", "guarantee", "guarantees",
+                             "will increase", "will decrease", "will improve",
+                             "definitely", "certainly")
+
+
+def _polish_numbers(text):
+    """Numbers appearing in a story string (ints/floats/%-values)."""
+    import re as _re
+    try:
+        return _re.findall(r"-?\d+(?:\.\d+)?%?", str(text or ""))
+    except Exception:
+        return []
+
+
 def _polish_story(session, out):
     """LLM rewording of the story only; None on any failure (§24).
 
@@ -427,6 +466,11 @@ def _polish_story(session, out):
 
     Evidence gate FIRST: prescriptions resting on < 10 observations keep
     their deterministic honest wording — the LLM never compensates.
+
+    Integrity gate: the polished text is REJECTED (fallback to the
+    deterministic story) when numbers differ from the original or when
+    causality verbs appear — the LLM may only polish wording, never
+    compute numbers or claim proof.
     """
     try:
         try:
@@ -445,18 +489,28 @@ def _polish_story(session, out):
         prov = session.get("provider")
         if prov is None:
             return None
-        fit = out.get("fit", {})
+        original = str(out.get("story") or "")
         prompt = (
             "Rewrite this business finding in one plain sentence for a manager. "
             "Keep every number exactly as given. Do not calculate, invent, or "
-            "claim causality.\nFinding: " + str(out.get("story"))
-            + f"\nNumbers: r={fit.get('r')}, n={fit.get('n')}, p={fit.get('p_value')}"
+            "claim causality. Do not use the words cause/prove/guarantee/will.\n"
+            "Finding: " + original
         )
         text = prov.chat("story", messages=[{"role": "user", "content": prompt}],
                          temperature=0.3, num_predict=120, timeout=30)
         text = (text or "").strip()
-        if 20 <= len(text) <= 400:
-            return text
+        if not (20 <= len(text) <= 400):
+            return None
+        # Reject when numbers differ from the deterministic story.
+        if _polish_numbers(text) != _polish_numbers(original):
+            log.debug("polish story rejected: numbers differ")
+            return None
+        # Reject when causality verbs appear.
+        _low = text.lower()
+        if any(v in _low for v in _POLISH_CAUSALITY_VERBS):
+            log.debug("polish story rejected: causality verb")
+            return None
+        return text
     except Exception:
         pass
     return None
@@ -517,6 +571,23 @@ def prescription_scenario(req: ScenarioRequest, request: Request,
             pass
 
 
+def _sanitize_saved_text(value, max_len=500):
+    """Neutralize saved question/note text: strip tags + controls, cap length.
+
+    Saved items are echoed back in list endpoints and rendered as titles, so
+    untrusted markup or directive prose must not survive the round-trip.
+    Generic helper — no dataset names.
+    """
+    import re as _re
+    s = "" if value is None else str(value)
+    s = _re.sub(r"<[^>]*>", " ", s)
+    s = "".join(c if c.isprintable() else " " for c in s)
+    s = _re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_len:
+        s = s[:max(0, max_len - 1)].rstrip() + "…"
+    return s
+
+
 @router.post("/api/prescriptions/save")
 def prescription_save(req: SaveRequest, request: Request,
                       user: dict = Depends(require_writable)):
@@ -525,7 +596,7 @@ def prescription_save(req: SaveRequest, request: Request,
     saved = session.get("saved_prescriptions", [])
     entry = {"id": f"rxsv_{int(time.time() * 1000)}",
              "created_at": datetime.now().isoformat(),
-             "question": req.question,
+             "question": _sanitize_saved_text(req.question, 500) or None,
              **(req.prescription or {})}
     saved = [entry] + saved[:49]
     session["saved_prescriptions"] = saved
@@ -572,6 +643,9 @@ def prescription_saved_update(sid: str, req: SavedUpdateRequest,
     found = False
     patch = {k: v for k, v in req.model_dump().items()
              if k in _RX_SAVED_EDITABLE and v is not None}
+    for _tk in ("owner", "review_note"):
+        if isinstance(patch.get(_tk), str):
+            patch[_tk] = _sanitize_saved_text(patch[_tk], 500) or None
     if patch.get("priority") and str(patch["priority"]).lower() not in (
             "low", "medium", "high", "critical"):
         return {"ok": False, "success": False, "code": "INVALID_REQUEST",

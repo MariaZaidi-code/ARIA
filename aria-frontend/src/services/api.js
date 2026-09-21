@@ -1481,8 +1481,13 @@ export const prescriptionApi = {
   // The backend attaches display{title,action_text,outcome_text,
   // confidence_label,why_summary} + details{evidence_pass,checks,numbers,
   // limitations} to every prescription; refusal{headline,reason_code,
-  // alternatives[]} to refusals. These helpers read the new keys with
-  // legacy fallbacks so cards never invent numbers client-side.
+  // alternatives[]} to refusals. Newer engine builds may also attach
+  // display.problem_text (one plain sentence: what looks wrong) and
+  // display.why_text (string[]: up to 3 plain reasons, no statistics).
+  // These helpers read the new keys with legacy fallbacks
+  // (story/summary/summary_plain/why_summary) so cards render on every
+  // backend version and never invent numbers client-side. Pure reads only —
+  // no requests, no URL changes.
   /** @param {any} p */
   displayOf: (p) => (p && typeof p.display === "object" && p.display) || {},
   /** @param {any} p */
@@ -1497,6 +1502,55 @@ export const prescriptionApi = {
     (p && (p.display?.confidence_label || p.confidence_label || p.confidence)) || "—",
   /** @param {any} p */
   whyOf: (p) => (p && (p.display?.why_summary || p.why_summary)) || "",
+  // One plain "what looks wrong" sentence: new display.problem_text first,
+  // then the legacy story/summary fields. Never a hardcoded string.
+  /** @param {any} p */
+  problemOf: (p) => {
+    const d = (p && typeof p.display === "object" && p.display) || {};
+    const s = (v) => (v === null || v === undefined ? "" : String(v).trim());
+    return (
+      s(d.problem_text) ||
+      s(p && p.problem_text) ||
+      s(p && (p.summary_plain || p.story || p.summary)) ||
+      ""
+    );
+  },
+  // Always-visible reason bullets (max `max`, default 3): new
+  // display.why_text (array or single string) first, then the legacy
+  // why_summary as a single bullet. Empty when the backend sent nothing.
+  /** @param {any} p @param {number} [max] */
+  whyBulletsOf: (p, max = 3) => {
+    const d = (p && typeof p.display === "object" && p.display) || {};
+    const s = (v) => (v === null || v === undefined ? "" : String(v).trim());
+    const cap = Math.max(1, Number(max) || 3);
+    const raw = d.why_text !== undefined ? d.why_text : p && p.why_text;
+    const list = Array.isArray(raw) ? raw : raw !== undefined && raw !== null ? [raw] : [];
+    const bullets = list.map(s).filter(Boolean).slice(0, cap);
+    if (bullets.length) return bullets;
+    const legacy = s(d.why_summary) || s(p && p.why_summary);
+    return legacy ? [legacy] : [];
+  },
+  // Plain-language labels for evidence numbers (non-technical UI).
+  // Raw statistic keys (r / p / slope …) must never reach end users.
+  /** @param {any} key */
+  plainNumberLabel: (key) => {
+    const k = String(key || "").toLowerCase();
+    if (k === "effect_r" || k === "r" || k === "spearman_r" || k === "link_strength") return "Link strength";
+    if (k === "n" || k === "n_points" || k === "data_points") return "Data points";
+    if (k === "p_value" || k === "p" || k === "chance_noise") return "Chance noise";
+    if (k === "slope") return "Change per unit";
+    return null;
+  },
+  // Plain-words reading of a p-value: "how likely is this just chance?".
+  // Returns "" when the value is not a usable number.
+  /** @param {any} v */
+  chanceNoiseWords: (v) => {
+    const n = typeof v === "string" && v.trim() !== "" ? Number(v) : typeof v === "number" ? v : NaN;
+    if (!Number.isFinite(n)) return "";
+    if (n < 0.001) return "Very unlikely to be just chance";
+    if (n < 0.05) return "Unlikely to be just chance";
+    return "Could still be just chance";
+  },
   /** @param {any} out */
   refusalOf: (out) => (out && typeof out.refusal === "object" && out.refusal) || null,
 };

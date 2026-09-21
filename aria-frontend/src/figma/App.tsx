@@ -646,7 +646,7 @@ export default function App() {
                 />
               );
             case "predictive":
-              return <Predictive insightResult={insightResult} goalResult={goalResult} connectionStatus={connectionStatus} />;
+              return <Predictive insightResult={insightResult} goalResult={goalResult} connectionStatus={connectionStatus} dbName={dbName} />;
             case "intelligence":
               return <Intelligence connectionStatus={connectionStatus} onAskCopilot={goCopilot} />;
             case "data":

@@ -1457,13 +1457,35 @@ function WhatIfTab() {
             </Field>
             <div>
               <label htmlFor="wi-value" className="block text-[11px] font-medium text-slate-500 mb-1">
-                Change Value{range ? ` (supported range ${range.min} to ${range.max})` : ""}
+                Change Value{range ? ` (supported range ${range.min}% to ${range.max}%)` : ""}
               </label>
               {range ? (
-                <div className="flex items-center gap-2">
-                  <input id="wi-value" type="range" min={range.min} max={range.max} step={range.step} value={changeValue}
-                    onChange={(e) => setChangeValue(Number(e.target.value))} className="flex-1 accent-blue-700" aria-label="Change value slider" />
-                  <span className="text-[12.5px] font-semibold text-[#0F2440] tabular-nums w-14 text-right">{changeValue}%</span>
+                <div className="flex items-center gap-3">
+                  <span className="text-[11px] text-slate-400 w-8 text-right tabular-nums">{range.min}%</span>
+                  <div className="relative flex-1 h-6 flex items-center">
+                    <div className="absolute inset-x-0 h-[3px] bg-slate-200 rounded-full" />
+                    <div
+                      className="absolute h-[3px] bg-blue-500 rounded-full"
+                      style={{
+                        left: `${((Math.max(range.min, Math.min(range.max, changeValue)) - range.min) / (range.max - range.min)) * 100}%`,
+                        right: 0,
+                      }}
+                    />
+                    <input
+                      id="wi-value" type="range" min={range.min} max={range.max} step={range.step} value={changeValue}
+                      onChange={(e) => setChangeValue(Number(e.target.value))}
+                      className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+                      aria-label="Change value slider"
+                    />
+                    <div
+                      className="absolute w-4 h-4 bg-white border-2 border-blue-600 rounded-full shadow-sm pointer-events-none z-20 transition-transform hover:scale-110"
+                      style={{
+                        left: `calc(${((Math.max(range.min, Math.min(range.max, changeValue)) - range.min) / (range.max - range.min)) * 100}% - 8px)`,
+                      }}
+                    />
+                  </div>
+                  <span className="text-[11px] text-slate-400 w-8 tabular-nums">{range.max}%</span>
+                  <span className="text-[13px] font-bold text-[#0F2440] tabular-nums w-14 text-right">{changeValue >= 0 ? "+" : ""}{changeValue}%</span>
                 </div>
               ) : (
                 <input id="wi-value" type="number" value={changeValue} onChange={(e) => setChangeValue(Number(e.target.value) || 0)} className={inputCls} aria-label="Change value" />

@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { ArrowRight, ArrowUpRight, ArrowDownRight, Zap, Search, AlertTriangle, ChevronRight, RefreshCw, Database, DollarSign, Store, CalendarDays, Percent, TrendingUp, Users, ShoppingCart, RotateCcw, X, Sparkles, MessageSquare, Send, Lightbulb, Shield, BarChart3, GitBranch, Sun } from "lucide-react";
 import { AreaChart, Area, Line, BarChart, Bar, Cell, PieChart, Pie, ResponsiveContainer, Tooltip, CartesianGrid, XAxis, YAxis, Brush, ReferenceDot, ScatterChart, Scatter, ZAxis } from "recharts";
 import type { Page } from "../App";
+import { TimeRangeSelector } from "../components/TimeRangeSelector";
 import { colorForName } from "../lib/charts";
 import { fmtBiz } from "../lib/format";
 import { fmtPeriod, validateDashboardCharts } from "../components/charts";
@@ -27,14 +28,6 @@ const fallbackExamples = [
 ];
 
 /* ---------- filter semantics (mirrors Insights.matchesFilter, generic) ---------- */
-const PILLS = [
-  { id: "all", label: "All" },
-  { id: "trends", label: "Trends" },
-  { id: "anomalies", label: "Anomalies" },
-  { id: "opportunities", label: "Opportunities" },
-  { id: "risks", label: "Risks" },
-] as const;
-
 function matchesFilter(type: string, filter: string): boolean {
   if (filter === "all") return true;
   const t = (type || "").toLowerCase();
@@ -824,16 +817,11 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
             >
               <span className="inline-block w-3 border-t-2 border-blue-600 mr-1.5 align-middle" />Trend
             </button>
-            {(["all", "12", "6"] as const).map((r) => (
-              <button
-                key={r}
-                onClick={() => setRange(r)}
-                aria-pressed={range === r}
-                className={`text-[11px] font-medium px-2 py-1 rounded-md border transition-colors ${range === r ? "border-blue-300 text-[#0F2440] bg-blue-50" : "border-slate-200 text-slate-500 hover:text-[#0F2440]"}`}
-              >
-                {r === "all" ? "All" : `Last ${r}`}
-              </button>
-            ))}
+            <TimeRangeSelector
+              options={[{ key: "all", label: "All" }, { key: "12", label: "Last 12" }, { key: "6", label: "Last 6" }]}
+              value={range}
+              onChange={(r) => setRange(r as any)}
+            />
           </>
         ) : !isDonut ? (
           <>
@@ -1490,36 +1478,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                 <span className="text-[11px] text-slate-400">Updated {new Date(lastUpdated).toLocaleTimeString()}</span>
               )}
             </div>
-            {/* Functional filter pills — counts, scroll to results, disabled when empty */}
-            <div className="mt-4 flex items-center gap-2 flex-wrap">
-              {PILLS.map((p) => {
-                const on = activeFilter === p.id;
-                const n = p.id === "all" ? pool.length : pool.filter((x) => matchesFilter(x.type, p.id)).length;
-                const empty = pool.length === 0;
-                return (
-                  <button
-                    key={p.id}
-                    onClick={() => {
-                      setActiveFilter(p.id);
-                      try {
-                        document.getElementById("dash-insights")?.scrollIntoView({ behavior: "smooth", block: "start" });
-                      } catch { /* best-effort */ }
-                    }}
-                    disabled={empty}
-                    aria-pressed={on}
-                    title={empty ? "No insights loaded yet" : `${n} item${n === 1 ? "" : "s"}`}
-                    className={`text-[11px] font-semibold px-3.5 py-1.5 rounded-full border transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-40 ${on ? "bg-blue-700 text-white border-blue-700 shadow-md" : "bg-white text-slate-500 border-slate-200 hover:border-blue-300 hover:text-[#0F2440] hover:shadow-sm"}`}
-                  >
-                    {p.label}{!empty && p.id !== "all" ? ` (${n})` : ""}
-                  </button>
-                );
-              })}
-              {activeFilter !== "all" && (
-                <button onClick={() => setActiveFilter("all")} className="text-[11px] font-medium text-slate-400 hover:text-[#0F2440] underline">
-                  Clear
-                </button>
-              )}
-            </div>
+          {/* Upper insight-category filter pills removed — Recent/Important Insights below show the full unfiltered pool. */}
           </div>
 
           {/* Connected data card — real source only */}
@@ -1729,17 +1688,11 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                 <Sparkles size={14} className="text-blue-600" />
                 <h2 className="text-[14px] font-semibold tracking-tight">Key Visualizations</h2>
                 <div className="ml-auto flex items-center gap-2">
-                  {(["all", "12", "6"] as const).map((r) => (
-                    <button
-                      key={r}
-                      onClick={() => setChartRange(r)}
-                      aria-pressed={chartRange === r}
-                      className={`text-[11px] font-medium px-2 py-1 rounded-md border transition-colors ${chartRange === r ? "border-blue-300 text-[#0F2440] bg-blue-50" : "border-slate-200 text-slate-400 hover:text-[#0F2440]"}`}
-                      title={r === "all" ? "Show full history" : `Show last ${r} points of time charts`}
-                    >
-                      {r === "all" ? "All" : `Last ${r}`}
-                    </button>
-                  ))}
+                  <TimeRangeSelector
+                    options={[{ key: "all", label: "All" }, { key: "12", label: "Last 12" }, { key: "6", label: "Last 6" }]}
+                    value={chartRange}
+                    onChange={(r) => setChartRange(r as any)}
+                  />
                   {selection && (
                     <button onClick={() => setSelection(null)} className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-[#0F2440] transition-colors" title="Clear chart selection">
                       <X size={11} /> Clear selection

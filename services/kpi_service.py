@@ -125,15 +125,34 @@ def _validate_schema_ident(intel, tname: str, col: str | None = None) -> None:
     Table/column names can never be bound params, so the control is
     membership in the extracted schema plus the existing ``_safe_name``
     quoting at use sites. Unknown names raise instead of reaching SQL.
+
+    Multi-schema mappings key tables as ``schema.table`` (e.g. AdventureWorks
+    ``sales.salesorderheader``): each dot-separated segment is validated as
+    an identifier (max 3 segments), then the full key must be a member of the
+    extracted schema. Single-segment names follow the exact old path.
     """
     from core.semantic import is_valid_identifier
-    if not is_valid_identifier(str(tname or ""), max_len=128):
+
+    def _ok_dotted(value: str) -> bool:
+        try:
+            segs = [s for s in str(value or "").split(".") if s]
+        except Exception:
+            return False
+        if not segs or len(segs) > 3:
+            return False
+        # Reject empty segments ("a..b", ".a", "a.") and any segment that
+        # is not a plain identifier (injection payloads still raise).
+        if len(".".join(segs)) != len(str(value or "")):
+            return False
+        return all(is_valid_identifier(s, max_len=128) for s in segs)
+
+    if not _ok_dotted(str(tname or "")):
         raise ValueError(f"Invalid table name: {tname!r}")
     known_tables = set(getattr(intel, "tables", {}).keys()) if intel is not None else set()
     if known_tables and str(tname) not in known_tables:
         raise ValueError(f"Unknown table: {tname!r}")
     if col is not None:
-        if not is_valid_identifier(str(col or ""), max_len=128):
+        if not _ok_dotted(str(col or "")):
             raise ValueError(f"Invalid column name: {col!r}")
         try:
             known_cols = set(intel.get_col_names(tname)) if intel is not None else set()

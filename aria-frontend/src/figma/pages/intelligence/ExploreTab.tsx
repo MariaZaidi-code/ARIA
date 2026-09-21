@@ -8,11 +8,11 @@ import {
   BarChart3, Compass, FlaskConical, AlertTriangle, Target, SlidersHorizontal,
   FileText, Play, RotateCcw, Bookmark, ChevronRight, RefreshCw, Sparkles,
   Send, X, ArrowUpRight, ArrowDownRight, Info, Search, CalendarDays,
-  Download, Maximize2,
+  Download, Maximize2, TrendingUp, TrendingDown, ShieldCheck,
 } from "lucide-react";
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, Legend,
+  ResponsiveContainer, Legend, Cell,
 } from "recharts";
 import { colorForName } from "../../lib/charts";
 import { fmtPctBiz } from "../../lib/format";
@@ -28,6 +28,7 @@ import { useExplore, RANGE_OPTIONS, type RangeKey } from "./useExplore";
 import { prescriptionApi } from "../../../services/api";
 import EvidenceDrawer, { type EvidenceContext } from "./EvidenceDrawer";
 import CompareView from "./CompareView";
+import { TimeRangeSelector } from "../../components/TimeRangeSelector";
 import type { IntelTab } from "../Intelligence";
 
 export interface ExploreTabProps {
@@ -696,17 +697,11 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
                   <button onClick={() => setShowFilterRow(false)} className="text-slate-400 hover:text-[#0F2440]" aria-label="Collapse filter"><X size={14} /></button>
                 </div>
               )}
-              <div className="relative">
-                <CalendarDays size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-                <select
-                  value={rangeKey}
-                  onChange={(e) => applyRange(e.target.value as RangeKey)}
-                  className={`${selectCls} !w-48 !pl-8`}
-                  aria-label="Date range (filters results)"
-                >
-                  {RANGE_OPTIONS.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
-                </select>
-              </div>
+              <TimeRangeSelector
+                options={RANGE_OPTIONS.map((o) => ({ key: o.key, label: o.key === "all" ? "All data" : o.label.replace("Last ", "") }))}
+                value={rangeKey}
+                onChange={(k) => applyRange(k as RangeKey)}
+              />
             </div>
 
             <div className="mt-2 flex items-center gap-1.5 flex-wrap" aria-label="Active filters and range">
@@ -944,76 +939,127 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
                         const disp = rxDispOf(p);
                         const det = rxDetailsOf(p);
                         const title = strOf(disp.title || p?.title || p?.name, `Recommendation ${i + 1}`);
+                        const problem = strOf(disp.problem_text || p?.summary_plain || p?.story || p?.summary);
                         const actionText = strOf(disp.action_text);
                         const outcomeText = strOf(disp.outcome_text);
                         const confTxt = strOf(disp.confidence_label || p?.confidence_label || p?.confidence) || "—";
                         const risk = strOf(p?.risk);
-                        const why = strOf(disp.why_summary || p?.why_summary);
+                        const whyBullets = asList(disp.why_text?.length ? disp.why_text : null)
+                          .concat(strOf(disp.why_summary || p?.why_summary) ? [strOf(disp.why_summary || p?.why_summary)] : [])
+                          .filter(Boolean).slice(0, 3);
                         const numbers = rxNumbersOf(p);
-                        const numRows = Object.entries(numbers);
                         const lims = rxLimsOf(p);
                         const honesty = strOf(p?.impact_note || p?.impactNote);
                         const evPass = det.evidence_pass;
+                        const impact = p?.impact && typeof p.impact === "object" ? p.impact : {};
+                        const bl = numOf(impact.baseline);
+                        const sc = numOf(impact.scenario);
+                        const dl = numOf(impact.delta);
+                        const relPct = numOf(impact.rel_pct);
+                        const n = numOf(det?.numbers?.n || det?.numbers?.n_points);
                         const saved = rxSavedIds.includes(id);
                         const savingThis = rxSavingId === id;
+                        const showChart = bl !== null && sc !== null;
+                        const s = (confTxt || "").toLowerCase();
+                        const confFilled = s === "high" ? 3 : s === "moderate" || s === "medium" ? 2 : 1;
+                        const fmt = (v: number) => {
+                          if (Math.abs(v) >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+                          if (Math.abs(v) >= 1_000) return `${(v / 1_000).toFixed(0)}K`;
+                          return v.toFixed(0);
+                        };
                         return (
-                          <div key={id} className="rounded-xl border border-slate-200/80 p-3">
+                          <div key={id} className="rounded-xl border border-slate-200/80 p-4 hover:border-blue-200 transition-colors">
+                            {/* Header: Title + Confidence dots + Risk badge */}
                             <div className="flex items-start justify-between gap-2 flex-wrap">
                               <p className="text-[13px] font-semibold text-[#0F2440] leading-snug flex-1 min-w-[200px]">
                                 {title}
                               </p>
-                              <span className="flex items-center gap-1.5 flex-shrink-0">
-                                <StatPill tone={rxConfidenceTone(confTxt)} title={`Engine confidence: ${confTxt}`}>
-                                  {confTxt === "—" ? "—" : titleCase(confTxt)}
-                                </StatPill>
+                              <span className="flex items-center gap-2 flex-shrink-0">
+                                <span className="inline-flex items-center gap-0.5" title={`Confidence: ${confTxt}`}>
+                                  {[0, 1, 2].map((dot) => (
+                                    <span key={dot} className={`inline-block w-1.5 h-1.5 rounded-full ${dot < confFilled ? "bg-blue-600" : "bg-slate-200"}`} />
+                                  ))}
+                                </span>
+                                {risk && (() => {
+                                  const rl = risk.toLowerCase();
+                                  if (rl === "high") return <span className="inline-flex items-center gap-1 text-[10px] text-red-700 bg-red-50 border border-red-200 rounded-full px-1.5 py-0.5"><AlertTriangle size={10} /> High risk</span>;
+                                  if (rl === "moderate" || rl === "medium") return <span className="inline-flex items-center gap-1 text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-1.5 py-0.5"><ShieldCheck size={10} /> Moderate risk</span>;
+                                  return <span className="inline-flex items-center gap-1 text-[10px] text-green-700 bg-green-50 border border-green-200 rounded-full px-1.5 py-0.5"><ShieldCheck size={10} /> Low risk</span>;
+                                })()}
                               </span>
                             </div>
+
+                            {/* Problem */}
+                            {problem && (
+                              <p className="mt-2 text-[12.5px] text-slate-700 leading-relaxed">{problem}</p>
+                            )}
+
+                            {/* Why — always visible, no drill-down needed */}
+                            {whyBullets.length > 0 && (
+                              <div className="mt-2">
+                                {whyBullets.map((b, j) => (
+                                  <p key={j} className="text-[12px] text-slate-600 leading-relaxed">• {b}</p>
+                                ))}
+                              </div>
+                            )}
+
+                            {/* Mini chart: baseline vs projected */}
+                            {showChart && bl !== null && sc !== null && (
+                              <div className="h-16 w-full mt-2">
+                                <ResponsiveContainer width="100%" height="100%">
+                                  <BarChart data={[{ name: "Current", value: bl, fill: "#94a3b8" }, { name: "Projected", value: sc, fill: (dl ?? 0) >= 0 ? "#22c55e" : "#ef4444" }]} layout="vertical" margin={{ left: 0, right: 0, top: 0, bottom: 0 }} barSize={14}>
+                                    <XAxis type="number" hide domain={[0, Math.max(bl, sc) * 1.15 || 1]} />
+                                    <YAxis type="category" dataKey="name" width={65} tick={{ fontSize: 10, fill: "#64748b" }} axisLine={false} tickLine={false} />
+                                    <Tooltip formatter={(v: number) => [fmt(v), "Value"]} contentStyle={{ fontSize: 11, borderRadius: 8, border: "1px solid #e2e8f0" }} cursor={false} />
+                                    <Bar dataKey="value" radius={[0, 4, 4, 0]}>
+                                      {[{ fill: "#94a3b8" }, { fill: (dl ?? 0) >= 0 ? "#22c55e" : "#ef4444" }].map((entry, idx) => (
+                                        <Cell key={idx} fill={entry.fill} />
+                                      ))}
+                                    </Bar>
+                                  </BarChart>
+                                </ResponsiveContainer>
+                              </div>
+                            )}
+
+                            {/* Action + Outcome — prominent */}
                             {actionText && (
-                              <p className="mt-1 text-[12.5px] text-slate-700 leading-relaxed">{actionText}</p>
-                            )}
-                            {outcomeText && (
-                              <p className="mt-1 text-[13px] font-semibold text-[#0F2440] tabular-nums leading-relaxed">
-                                {outcomeText}
-                              </p>
-                            )}
-                            {(why || numRows.length > 0 || lims.length > 0 || honesty || risk) && (
-                              <details className="mt-2 rounded-xl bg-slate-50 border border-slate-100 px-2.5 py-2">
-                                <summary className="text-[11.5px] font-semibold text-blue-700 cursor-pointer hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded">
-                                  Why is this suggested?
-                                </summary>
-                                <div className="mt-1.5 space-y-1.5">
-                                  {why && <p className="text-[11.5px] text-slate-600 leading-relaxed">{why}</p>}
-                                  {numRows.length > 0 && (
-                                    <dl className="grid grid-cols-2 sm:grid-cols-3 gap-x-3 gap-y-1">
-                                      {numRows.map(([k, v]) => (
-                                        <div key={k} className="flex items-baseline justify-between gap-2 text-[11px]">
-                                          <dt className="text-slate-400 truncate">{humanize(k)}</dt>
-                                          <dd className="font-medium text-[#0F2440] tabular-nums text-right truncate">{rxFmtNumberRow(k, v)}</dd>
-                                        </div>
-                                      ))}
-                                    </dl>
-                                  )}
-                                  {honesty && (
-                                    <div className="flex items-start gap-1.5 text-[11.5px] text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-2.5 py-2">
-                                      <Info size={13} className="text-amber-600 flex-shrink-0 mt-px" />
-                                      <span>{honesty}</span>
-                                    </div>
-                                  )}
-                                  {lims.length > 0 && (
-                                    <ul className="space-y-1">
-                                      {lims.map((l, j) => (
-                                        <li key={j} className="text-[11px] text-slate-500 leading-relaxed">• {l}</li>
-                                      ))}
-                                    </ul>
-                                  )}
-                                  <p className="text-[11px] text-slate-400">
-                                    {risk ? `Engine risk: ${titleCase(risk)}.` : ""}
-                                    {evPass === true ? " Evidence check passed." : evPass === false ? " Evidence check limited." : ""}
+                              <div className="mt-3 rounded-lg bg-blue-50/60 border border-blue-100 px-3 py-2.5">
+                                <p className="text-[12.5px] font-semibold text-[#0F2440]">{actionText}</p>
+                                {outcomeText && (
+                                  <p className="mt-1 text-[12px] text-slate-700">
+                                    {dl !== null && relPct !== null ? (
+                                      <span className="font-medium">
+                                        {dl >= 0 ? <TrendingUp size={12} className="inline mr-1 text-green-600" /> : <TrendingDown size={12} className="inline mr-1 text-red-600" />}
+                                        {dl >= 0 ? "+" : ""}{relPct.toFixed(1)}% {dl >= 0 ? "lift" : "drop"} expected
+                                      </span>
+                                    ) : outcomeText}
                                   </p>
-                                </div>
-                              </details>
+                                )}
+                              </div>
                             )}
-                            <div className="mt-2 flex items-center gap-2">
+
+                            {/* Inline evidence summary */}
+                            <div className="mt-2 flex items-center gap-3 flex-wrap text-[11px] text-slate-500">
+                              {n !== null && <span className="flex items-center gap-1"><BarChart3 size={11} /> {Math.round(n).toLocaleString()} data points</span>}
+                              {evPass === true && <span className="flex items-center gap-1 text-green-600"><ShieldCheck size={11} /> Evidence verified</span>}
+                              {evPass === false && <span className="flex items-center gap-1 text-amber-600"><AlertTriangle size={11} /> Limited evidence</span>}
+                              {lims.length > 0 && (
+                                <span className="text-slate-400" title={lims.join("; ")}>
+                                  {lims.length} limitation{lims.length === 1 ? "" : "s"}
+                                </span>
+                              )}
+                            </div>
+
+                            {/* Honest caveat */}
+                            {honesty && (
+                              <div className="mt-2 flex items-start gap-1.5 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
+                                <Info size={11} className="text-amber-500 flex-shrink-0 mt-px" />
+                                <span>{honesty}</span>
+                              </div>
+                            )}
+
+                            {/* Actions */}
+                            <div className="mt-2.5 flex items-center gap-2">
                               <button
                                 onClick={() => void saveRecommendation(p, i)}
                                 disabled={savingThis || saved}

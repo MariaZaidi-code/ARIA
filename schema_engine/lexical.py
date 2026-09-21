@@ -26,8 +26,43 @@ REF_FLAVORED_SUFFIXES = ("_id", "_by", "_to", "_from", "_via", "_for", "_at",
                          "_uuid", "_sk", "_nk")
 
 
+def _strip_outer_quotes(value: str) -> str:
+    """Strip surrounding quotes/brackets/whitespace (generic, dialect-agnostic)."""
+    s = str(value or "").strip()
+    while len(s) >= 2 and ((s[0] == '"' and s[-1] == '"')
+                           or (s[0] == "'" and s[-1] == "'")
+                           or (s[0] == "`" and s[-1] == "`")
+                           or (s[0] == "[" and s[-1] == "]")):
+        s = s[1:-1].strip()
+    return s
+
+
+def canonical_identifier(value: str) -> str:
+    """Lower + quote-stripped match key for case-insensitive identifiers."""
+    return _strip_outer_quotes(value).lower()
+
+
+def bare_identifier(value: str) -> str:
+    """Bare last dot-segment, canonicalized (multi-schema aware)."""
+    segs = [s for s in str(value or "").split(".") if s.strip()]
+    last = segs[-1] if segs else str(value or "")
+    return canonical_identifier(last)
+
+
+def fold_identifier_tokens(value: str) -> List[str]:
+    """Lowercase word tokens folding CamelCase + separators + quotes.
+
+    "SalesOrderHeader" -> ["sales", "order", "header"]; '"TotalDue"' ->
+    ["total", "due"]. Generic English-convention folding, no name lists.
+    """
+    s = _strip_outer_quotes(value)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)
+    return [w for w in re.split(r"[^a-zA-Z0-9]+", s.lower()) if w]
+
+
 def normalize_identifier(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+    return re.sub(r"[^a-z0-9]+", "", canonical_identifier(value))
 
 
 def singularize(name: str) -> str:

@@ -117,7 +117,15 @@ class InsightAgent:
     ANOMALY_METHOD = "zscore"
 
     def __init__(self, provider=None):
-        self.llm = provider or create_provider()
+        if provider is None:
+            logging.getLogger(__name__).warning(
+                "InsightAgent created with provider=None – failing closed"
+            )
+            raise ValueError(
+                "InsightAgent requires an explicit provider. "
+                "Pass the LLMProvider object from require_data() or session['provider']."
+            )
+        self.llm = provider
         self.prediction = PredictionAgent()
         self.prescription = PrescriptionAgent(provider=self.llm)
         self._templates = None

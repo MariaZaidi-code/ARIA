@@ -626,6 +626,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             api_key=api_key,
             dialect=session.get("dialect"),
             overrides=load_user_overrides(user["user_id"], session.get("db_name", "")),
+            schemas=session.get("schemas"),
         )
         # P3 §31 context for the internal diagnostic trace (never exposed).
         try:

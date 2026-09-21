@@ -475,8 +475,17 @@ function explainsTextOf(ins: Insight): string {
   const direct = typeof (ins as unknown as Record<string, unknown>).explains === "string"
     ? String((ins as unknown as Record<string, unknown>).explains).trim()
     : "";
-  if (direct && !isRoboticText(direct)) return direct.slice(0, 600);
+  if (direct && !isRoboticText(direct)) return direct.slice(0, 2000);
   return "";
+}
+
+/** Split explains text into paragraphs for rendering. */
+function explainsParagraphs(text: string): string[] {
+  if (!text) return [];
+  return text
+    .split(/\n{2,}|(?<=[.!?])\s{2,}/g)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 10);
 }
 
 function associatedFactorsOf(ins: Insight): string[] {
@@ -1105,6 +1114,7 @@ export default function Insights({
     const recoText = recommendationTextOf(selected);
     const recoDetail = recommendationDetailOf(selected);
     const explains = explainsTextOf(selected);
+    const explainsParas = explainsParagraphs(explains);
     const dims = selected.recommendedNextAnalysis?.dimensions || [];
     const affectedSegment = dims[0] || selected.tags?.[0] || "";
     const scenarioAvailable = selected.scenario?.available === true;
@@ -1276,16 +1286,21 @@ export default function Insights({
                 </div>
 
                 {/* ARIA explains — backend conversational prose (`explains`)
-                    when present; hidden entirely when empty or robotic. */}
-                {explains ? (
+                    when present; hidden entirely when empty or robotic.
+                    Renders multi-paragraph explanations when available. */}
+                {explains && explainsParas.length > 0 ? (
                   <div className="rounded-xl border border-blue-100 bg-blue-50/40 p-4">
                     <p className="text-[13px] font-semibold flex items-center gap-1.5 text-[#0F2440]">
                       <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-blue-600 text-white"><Sparkles size={12} /></span>
                       ARIA explains
                     </p>
-                    <p className="mt-2 text-[12.5px] text-slate-700 leading-relaxed">
-                      {explains}
-                    </p>
+                    <div className="mt-2 space-y-2">
+                      {explainsParas.map((para, i) => (
+                        <p key={i} className="text-[12.5px] text-slate-700 leading-relaxed">
+                          {para}
+                        </p>
+                      ))}
+                    </div>
                   </div>
                 ) : null}
 

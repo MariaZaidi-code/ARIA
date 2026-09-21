@@ -13,6 +13,10 @@
     // Dashboard), then flip strict:true and remove these two lines.
     "strictNullChecks": true,
     "noImplicitAny": false,
+    // Hygiene without strict:true: catches accidental switch fallthrough
+    // (safe: all switch cases in src return/throw; verified via typecheck).
+    // Full `strict: true` still stays OFF per the TODO below (would break build).
+    "noFallthroughCasesInSwitch": true,
     "skipLibCheck": true,
     "allowJs": true,
     "checkJs": false,

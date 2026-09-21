@@ -86,11 +86,17 @@ class TestCopilotE2EMocked(unittest.TestCase):
     def test_03_copilot_no_provider_honest_400(self):
         # Fresh user: no provider, no source. Must fail CLOSED with an
         # actionable 400 — never a 500, never a live-LLM attempt.
+        # _ensure_provider falls back to local, so the 400 is about
+        # missing source (not missing provider).
         headers = self._register()
         for q in LEGACY_QUESTIONS:
             r = self.client.post("/api/copilot", json={"question": q}, headers=headers)
             self.assertEqual(r.status_code, 400, r.text[:300])
-            self.assertIn("provider", r.text.lower())
+            body = r.json().get("detail", "").lower()
+            self.assertTrue(
+                "provider" in body or "source" in body or "connect" in body,
+                f"Expected provider/source/connect in error, got: {body[:200]}"
+            )
 
     def test_04_suggestions_fallback_without_source(self):
         headers = self._register()

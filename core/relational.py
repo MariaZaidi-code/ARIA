@@ -70,6 +70,54 @@ _DATETIME_TOKENS = ("date", "time", "timestamp", "datetime", "interval", "year")
 _BOOLEAN_TOKENS = ("bool", "boolean", "bit")
 
 
+def _canon_ident(value: Any) -> str:
+    """Generic identifier match key: lower + strip quotes/brackets/whitespace."""
+    try:
+        s = str(value or "").strip()
+        while len(s) >= 2 and ((s[0] == '"' and s[-1] == '"')
+                               or (s[0] == "'" and s[-1] == "'")
+                               or (s[0] == "`" and s[-1] == "`")
+                               or (s[0] == "[" and s[-1] == "]")):
+            s = s[1:-1].strip()
+        return s.lower()
+    except Exception:
+        return str(value or "").lower()
+
+
+def _bare_key(value: Any) -> str:
+    """Bare last dot-segment, canonicalized (multi-schema aware)."""
+    try:
+        segs = [s for s in str(value or "").split(".") if s.strip()]
+        last = segs[-1] if segs else str(value or "")
+        return _canon_ident(last)
+    except Exception:
+        return _canon_ident(value)
+
+
+def _resolve_table_key(name: Any, tables) -> str | None:
+    """Resolve `name` to a real table key (exact, case-insensitive, bare-segment).
+
+    Bare-segment fallback applies only when exactly one table shares that
+    bare name (search_path semantics); ambiguous bare names resolve to None
+    so the database remains the final arbiter.
+    """
+    try:
+        keys = list((tables or {}).keys() if isinstance(tables, dict) else (tables or []))
+    except Exception:
+        return None
+    if name in keys:
+        return name  # type: ignore[return-value]
+    low = _canon_ident(name)
+    for k in keys:
+        if _canon_ident(k) == low:
+            return k
+    bare = _bare_key(name)
+    cands = [k for k in keys if _bare_key(k) == bare]
+    if len(cands) == 1:
+        return cands[0]
+    return None
+
+
 def quote_identifier(name: Any, dialect: str = "sqlite") -> str:
     safe = str(name or "")
     if (dialect or "") == "mysql":
@@ -112,7 +160,7 @@ def duplicate_columns(tables_columns: Dict[str, List[str]]) -> Dict[str, List[st
     owners: Dict[str, List[str]] = defaultdict(list)
     for table, cols in (tables_columns or {}).items():
         for col in cols or []:
-            owners[str(col).lower()].append(table)
+            owners[_canon_ident(col)].append(table)
     return {c: sorted(set(ts)) for c, ts in owners.items() if len(set(ts)) > 1}
 
 
@@ -123,16 +171,17 @@ def resolve_column(column: str, tables_columns: Dict[str, List[str]],
     ``preferred`` (a table name) is listed first when it owns the column.
     Returns [] when no table owns it.
     """
-    low = str(column or "").lower()
+    low = _canon_ident(column)
     owners = [t for t, cols in (tables_columns or {}).items()
-              if any(str(c).lower() == low for c in (cols or []))]
+              if any(_canon_ident(c) == low for c in (cols or []))]
     owners = sorted(set(owners))
-    if preferred in owners:
-        owners = [preferred] + [t for t in owners if t != preferred]
+    real_preferred = _resolve_table_key(preferred, tables_columns)
+    if real_preferred in owners:
+        owners = [real_preferred] + [t for t in owners if t != real_preferred]
     real = {}
     for t in owners:
         for c in tables_columns[t]:
-            if str(c).lower() == low:
+            if _canon_ident(c) == low:
                 real[t] = c
                 break
     return [f"{t}.{real[t]}" for t in owners]
@@ -289,14 +338,26 @@ def infer_foreign_keys(tables_columns: Dict[str, Dict[str, str]],
 
 def build_relationship_graph(tables: List[str], edges: List[dict]) -> Dict[str, List[str]]:
     graph: Dict[str, List[str]] = {t: [] for t in tables}
+    canon = {_canon_ident(t): t for t in tables}
+    bare: Dict[str, List[str]] = {}
+    for t in tables:
+        bare.setdefault(_bare_key(t), []).append(t)
     for e in edges or []:
         a = e.get("left_table", e.get("source_table"))
         b = e.get("right_table", e.get("target_table"))
-        if a in graph and b in graph:
-            if b not in graph[a]:
-                graph[a].append(b)
-            if a not in graph[b]:
-                graph[b].append(a)
+        ra = a if a in graph else canon.get(_canon_ident(a))
+        rb = b if b in graph else canon.get(_canon_ident(b))
+        if ra is None:
+            cands = bare.get(_bare_key(a), [])
+            ra = cands[0] if len(cands) == 1 else None
+        if rb is None:
+            cands = bare.get(_bare_key(b), [])
+            rb = cands[0] if len(cands) == 1 else None
+        if ra in graph and rb in graph:
+            if rb not in graph[ra]:
+                graph[ra].append(rb)
+            if ra not in graph[rb]:
+                graph[rb].append(ra)
     return graph
 
 
@@ -453,17 +514,36 @@ _TRUST_RANK = {"USER_CONFIRMED": -1, "DECLARED": 0,
 def plan_joins(required_tables: List[str], graph: Dict[str, List[str]],
                edges: List[dict]) -> Dict[str, Any]:
     """Minimum connected subgraph covering ``required_tables`` (generic BFS)."""
-    req = [t for t in (required_tables or []) if t in (graph or {})]
+    graph = graph or {}
+    canon = {_canon_ident(t): t for t in graph}
+    bare: Dict[str, List[str]] = {}
+    for t in graph:
+        bare.setdefault(_bare_key(t), []).append(t)
+
+    def _resolve(name):
+        if name in graph:
+            return name
+        hit = canon.get(_canon_ident(name))
+        if hit is not None:
+            return hit
+        cands = bare.get(_bare_key(name), [])
+        return cands[0] if len(cands) == 1 else None
+
+    req = []
+    for t in (required_tables or []):
+        r = _resolve(t)
+        if r is not None and r not in req:
+            req.append(r)
     if not req:
         return {"required_tables": [], "nodes": [], "edges": []}
     if len(req) == 1:
         return {"required_tables": req, "nodes": [req[0]], "edges": []}
     adj: Dict[str, list] = defaultdict(list)
     for e in edges or []:
-        a = e.get("left_table", e.get("source_table"))
-        b = e.get("right_table", e.get("target_table"))
+        a = _resolve(e.get("left_table", e.get("source_table")))
+        b = _resolve(e.get("right_table", e.get("target_table")))
         rank = _TRUST_RANK.get(e.get("trust"), 4)
-        if a in graph and b in graph:
+        if a is not None and b is not None and a in graph and b in graph:
             adj[a].append((rank, e))
             adj[b].append((rank, e))
     for t in adj:

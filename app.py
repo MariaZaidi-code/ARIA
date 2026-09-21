@@ -111,6 +111,14 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     logging.getLogger("uvicorn.error").info("ARIA startup checks complete.")
+    try:
+        _eff_workers = _resolve_workers()
+    except Exception:
+        _eff_workers = 1
+    logging.getLogger("uvicorn.error").info(
+        "ARIA effective workers=%d (UVICORN_WORKERS/WEB_CONCURRENCY/ARIA_WORKERS).",
+        _eff_workers,
+    )
     yield
 
 
@@ -361,6 +369,27 @@ def catch_all(full_path: str, request: Request):
     return FileResponse(STATIC_DIR / "index.html", headers=dict(_INDEX_NO_STORE))
 
 
+def _resolve_workers() -> int:
+    """Return effective uvicorn worker count (default 1, clamp 1-16).
+
+    Reads UVICORN_WORKERS / WEB_CONCURRENCY / ARIA_WORKERS (max wins);
+    unparseable values are ignored. Single-worker default unchanged.
+    """
+    _workers = 1
+    for _var in ("UVICORN_WORKERS", "WEB_CONCURRENCY", "ARIA_WORKERS"):
+        try:
+            _n = int(os.getenv(_var, "1") or 1)
+            if _n > _workers:
+                _workers = _n
+        except (TypeError, ValueError):
+            continue
+    try:
+        _workers = int(_workers)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(16, _workers))
+
+
 def _resolve_port(start_port: int = 8000, max_tries: int = 20) -> int:
     """Return the first free local port starting from the requested value."""
     for port in range(start_port, start_port + max_tries):
@@ -382,5 +411,6 @@ if __name__ == "__main__":
     except (ValueError, TypeError):
         requested_port = 8000
     port = _resolve_port(requested_port)
-    print(f"ARIA Testing UI running at http://127.0.0.1:{port}")
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    _workers = _resolve_workers()
+    print(f"ARIA Testing UI running at http://127.0.0.1:{port} (workers={_workers})")
+    uvicorn.run(app, host="127.0.0.1", port=port, workers=_workers)

@@ -1,7 +1,10 @@
-/* Business-case drawer for one prescription: situation, action, outcome
-   (with modeled range bands + comparison chart), why, risks, review plan
-   with tracker, business fields, HTML export. Every value comes from the
-   live prescription payload — nothing invented. */
+/* Business-case drawer for one prescription: problem, why this is
+   suggested, action, outcome (with modeled range bands + comparison
+   chart, or an honest no-sized-outcome note when impact.delta is None),
+   risks, review plan with tracker, business fields, HTML export. Every
+   value comes from the live prescription payload — nothing invented.
+   Statistic keys (r/p/slope) are never rendered raw — only plain labels
+   (Link strength / Data points / Chance noise). */
 
 import { useMemo, useState } from "react";
 import { X, Download, Check, AlertTriangle, CalendarDays, User, Flag } from "lucide-react";
@@ -12,6 +15,7 @@ import {
 import {
   asList, strOf, numOf, humanize, titleCase, fmtMetric,
 } from "../../lib/intelHelpers";
+import { prescriptionApi } from "../../../services/api";
 
 export interface RxCaseDrawerProps {
   open: boolean;
@@ -56,13 +60,79 @@ export default function RxCaseDrawer({ open, onClose, rx, onAsk, onUpdateSaved }
     return { range, delta, base, scen, rel };
   }, [rx]);
 
+  /* Non-technical contract (new display fields first, legacy fallback):
+     Problem <- display.problem_text (else summary_plain/story/summary);
+     Why    <- display.why_text bullets via the api.js contract (else
+               why_summary). Statistic keys never render raw — plain
+     labels come from the same contract. */
+  const rxApi: any = prescriptionApi as any;
+  const problem: string = (() => {
+    try {
+      const v = strOf(rxApi.problemOf?.(rx));
+      if (v) return v;
+    } catch { /* fall through */ }
+    return strOf(rx?.summary_plain || rx?.story || rx?.summary || disp.why_summary);
+  })();
+  const bullets: string[] = (() => {
+    try {
+      const v = rxApi.whyBulletsOf?.(rx, 3);
+      if (Array.isArray(v)) return v.map((x) => strOf(x)).filter(Boolean).slice(0, 3);
+    } catch { /* fall through */ }
+    const legacy = strOf(disp.why_summary);
+    return legacy ? [legacy] : [];
+  })();
+  const plainLabelOf = (key: string): string => {
+    try {
+      const v = strOf(rxApi.plainNumberLabel?.(key));
+      if (v) return v;
+    } catch { /* fall through */ }
+    if (/^[a-z]$/i.test(String(key ?? "").trim())) return "Detail";
+    return humanize(key);
+  };
+  const det = (rx?.details && typeof rx.details === "object" ? rx.details : {}) as any;
+  const detNumbers: Record<string, unknown> = (() => {
+    try {
+      const n = rxApi.numbersOf?.(rx);
+      if (n && typeof n === "object") return n as Record<string, unknown>;
+    } catch { /* fall through */ }
+    const raw = det.numbers;
+    return raw && typeof raw === "object" ? raw : {};
+  })();
+  const numRows = Object.entries(detNumbers);
+  const fmtNum = (key: string, v: unknown): string => {
+    if (typeof v === "string") return v;
+    const k = String(key || "").toLowerCase();
+    if (k === "p_value" || k === "p") {
+      try {
+        const w = strOf(rxApi.chanceNoiseWords?.(v));
+        if (w) return w;
+      } catch { /* fall through to numeric */ }
+    }
+    const n = numOf(v);
+    if (n === null) return strOf(v);
+    if (k === "n" || k === "n_points") return Math.round(n).toLocaleString();
+    if (k === "effect_r" || k === "r" || k === "spearman_r" || k === "slope") {
+      return `${n >= 0 ? "+" : ""}${Math.round(n * 100) / 100}`;
+    }
+    if (["baseline", "scenario", "delta", "first", "last", "mean", "driver_value"].includes(k)) {
+      return money(n, metric);
+    }
+    if (k.includes("pct") || k.includes("gap") || k.includes("share") || k.includes("momentum") || k === "rel_pct") {
+      return `${n >= 0 ? "+" : ""}${Math.round(n * 10) / 10}%`;
+    }
+    return strOf(v);
+  };
+  /* No sized outcome when the engine left impact.delta empty: hide the
+     Worst/Expected/Best boxes and say so honestly instead. */
+  const hasSizedOutcome = bands.delta !== null;
+
   if (!open || !rx) return null;
 
   const esc = (s: any): string => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const exportHtml = () => {
     try {
       const rows = options.map((o: any) => `<tr><td>${esc(o?.label || o?.scenario_label || "")}</td><td>${esc(o?.baseline ?? "")}</td><td>${esc(o?.scenario ?? "")}</td><td>${esc(o?.delta ?? "")}</td><td>${esc(o?.rel_pct ?? "")}%</td></tr>`).join("");
-      const html = `<!doctype html><html><head><meta charset="utf-8"><title>${esc(rx?.title || "Business case")}</title></head><body style="font-family:sans-serif;max-width:720px;margin:32px auto;color:#0F2440"><p style="color:#1d4ed8;font-weight:700;letter-spacing:2px">ARIA</p><h1>${esc(rx?.title || "Recommendation")}</h1><p>${esc(disp.action_text || rx?.summary || "")}</p><h2>Expected outcome</h2><p>${esc(disp.outcome_text || "")}</p>${options.length ? `<table border="1" cellpadding="6" cellspacing="0"><tr><th>Option</th><th>Baseline</th><th>Scenario</th><th>Delta</th><th>Change %</th></tr>${rows}</table>` : ""}<h2>Why</h2><p>${esc(disp.why_summary || "")}</p>${honest ? `<p><em>${esc(honest)}</em></p>` : ""}<h2>Risks &amp; assumptions</h2><ul>${assumptions.map((a) => `<li>${esc(a)}</li>`).join("")}${lims.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>${review ? `<h2>Review plan</h2><p>${esc(review)}${reviewBasis ? ` — ${esc(reviewBasis)}` : ""}</p>` : ""}<p style="color:#64748b;font-size:12px">Modeled estimate from your historical data. Actual results may vary.</p></body></html>`;
+      const html = `<!doctype html><html><head><meta charset="utf-8"><title>${esc(rx?.title || "Business case")}</title></head><body style="font-family:sans-serif;max-width:720px;margin:32px auto;color:#0F2440"><p style="color:#1d4ed8;font-weight:700;letter-spacing:2px">ARIA</p><h1>${esc(rx?.title || "Recommendation")}</h1>${problem ? `<h2>The problem</h2><p>${esc(problem)}</p>` : ""}<p>${esc(disp.action_text || rx?.summary || "")}</p><h2>Expected outcome</h2><p>${esc(disp.outcome_text || "")}</p>${options.length ? `<table border="1" cellpadding="6" cellspacing="0"><tr><th>Option</th><th>Baseline</th><th>Scenario</th><th>Delta</th><th>Change %</th></tr>${rows}</table>` : ""}${bullets.length ? `<h2>Why this is suggested</h2><ul>${bullets.map((b) => `<li>${esc(b)}</li>`).join("")}</ul>` : ""}${honest ? `<p><em>${esc(honest)}</em></p>` : ""}<h2>Risks &amp; assumptions</h2><ul>${assumptions.map((a) => `<li>${esc(a)}</li>`).join("")}${lims.map((l) => `<li>${esc(l)}</li>`).join("")}</ul>${review ? `<h2>Review plan</h2><p>${esc(review)}${reviewBasis ? ` — ${esc(reviewBasis)}` : ""}</p>` : ""}<p style="color:#64748b;font-size:12px">Modeled estimate from your historical data. Actual results may vary.</p></body></html>`;
       const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
       const a = document.createElement("a");
       a.href = url;
@@ -115,8 +185,33 @@ export default function RxCaseDrawer({ open, onClose, rx, onAsk, onUpdateSaved }
         </div>
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-5">
           <section>
-            <h4 className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide">The situation</h4>
-            <p className="mt-1.5 text-[13px] text-slate-700 leading-relaxed">{strOf(rx?.summary_plain || rx?.story || rx?.summary || disp.why_summary || "See evidence below.")}</p>
+            <h4 className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide">The problem</h4>
+            <p className="mt-1.5 text-[13px] text-slate-700 leading-relaxed">{problem || "See the evidence below."}</p>
+          </section>
+          <section>
+            <h4 className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide">Why this is suggested</h4>
+            {bullets.length > 0 ? (
+              <ul className="mt-1.5 space-y-1">
+                {bullets.map((b, i) => <li key={i} className="text-[13px] text-slate-700 leading-relaxed">• {b}</li>)}
+              </ul>
+            ) : (
+              <p className="mt-1.5 text-[12.5px] text-slate-400">No plain-language reason was provided.</p>
+            )}
+            {numRows.length > 0 && (
+              <details className="mt-2 rounded-xl bg-slate-50 border border-slate-100 px-2.5 py-2">
+                <summary className="text-[11.5px] font-semibold text-blue-700 cursor-pointer hover:underline">
+                  See the numbers
+                </summary>
+                <dl className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-1">
+                  {numRows.map(([k, v]) => (
+                    <div key={k} className="flex items-baseline justify-between gap-2 text-[11px]">
+                      <dt className="text-slate-400 truncate">{plainLabelOf(k)}</dt>
+                      <dd className="font-medium text-[#0F2440] tabular-nums text-right truncate">{fmtNum(k, v)}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </details>
+            )}
           </section>
           <section>
             <h4 className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide">Recommended action</h4>
@@ -125,18 +220,26 @@ export default function RxCaseDrawer({ open, onClose, rx, onAsk, onUpdateSaved }
           </section>
           <section>
             <h4 className="text-[12px] font-semibold text-slate-500 uppercase tracking-wide">Expected outcome</h4>
-            <div className="mt-2 grid grid-cols-3 gap-2">
-              {[
-                ["Worst (modeled low)", bands.range.length ? bands.range[0] : null],
-                ["Expected", bands.delta],
-                ["Best (modeled high)", bands.range.length ? bands.range[bands.range.length - 1] : null],
-              ].map(([label, v]: any) => (
-                <div key={label} className="rounded-xl bg-slate-50 border border-slate-100 px-3 py-2">
-                  <p className="text-[10.5px] text-slate-500">{label}</p>
-                  <p className="text-[15px] font-bold text-[#0F2440] tabular-nums">{v === null ? "—" : money(v, metric)}</p>
-                </div>
-              ))}
-            </div>
+            {!hasSizedOutcome ? (
+              <div className="mt-2 rounded-xl bg-amber-50 border border-amber-200 px-3 py-2">
+                <p className="text-[12.5px] text-amber-800 leading-relaxed">
+                  {honest || strOf(disp.outcome_text) || "No sized outcome — this is guidance to review, not a forecast."}
+                </p>
+              </div>
+            ) : (
+              <div className="mt-2 grid grid-cols-3 gap-2">
+                {[
+                  ["Worst (modeled low)", bands.range.length ? bands.range[0] : null],
+                  ["Expected", bands.delta],
+                  ["Best (modeled high)", bands.range.length ? bands.range[bands.range.length - 1] : null],
+                ].map(([label, v]: any) => (
+                  <div key={label} className="rounded-xl bg-slate-50 border border-slate-100 px-3 py-2">
+                    <p className="text-[10.5px] text-slate-500">{label}</p>
+                    <p className="text-[15px] font-bold text-[#0F2440] tabular-nums">{v === null ? "—" : money(v, metric)}</p>
+                  </div>
+                ))}
+              </div>
+            )}
             {chartData.length > 0 && (
               <div className="h-44 mt-2" role="img" aria-label="Baseline versus scenario outcomes">
                 <ResponsiveContainer width="100%" height="100%">
@@ -162,7 +265,9 @@ export default function RxCaseDrawer({ open, onClose, rx, onAsk, onUpdateSaved }
               {lims.map((l, i) => <li key={`l${i}`} className="text-[12.5px] text-slate-600">• {l}</li>)}
               {!assumptions.length && !lims.length && !strOf(rx?.risk) && <li className="text-[12.5px] text-slate-400">None recorded.</li>}
             </ul>
-            {honest && (
+            {/* Shown here only when a sized outcome exists — otherwise the
+               same note already appears under Expected outcome. */}
+            {honest && hasSizedOutcome && (
               <div className="mt-2 flex items-start gap-1.5 text-[11.5px] text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-2.5 py-2">
                 <AlertTriangle size={13} className="text-amber-600 flex-shrink-0 mt-px" /><span>{honest}</span>
               </div>

@@ -61,6 +61,23 @@ def _build_engine(session):
             logging.getLogger("aria.kpi").debug("kpi secret decrypt skipped: %s", exc)
 
     schema = db_config.get("db_schema", "public")
+    # Multi-schema databases: resolve via every mapped schema so bare
+    # table names work on all engines (session["schemas"] is authoritative;
+    # db_schema stays the single-schema fallback). Generic, no names.
+    try:
+        _schemas = [str(s).strip() for s in (session.get("schemas") or [])
+                    if str(s or "").strip()] or [schema]
+    except Exception:
+        _schemas = [schema]
+    # Ensure the discovered/actual schema is included even when session
+    # schemas were not updated (legacy sessions with stale "public").
+    # db_schema may be comma-separated (e.g. "sales,production,humanresources")
+    # from _discover_table_schema — split into individual names.
+    if schema:
+        for _s in schema.split(","):
+            _s = _s.strip()
+            if _s and _s not in _schemas:
+                _schemas.insert(0, _s)
     # Required connection fields via .get(): incomplete mappings return
     # (None, ...) so callers show "not connected" instead of 500 KeyError.
     _user = db_config.get("user")
@@ -75,9 +92,11 @@ def _build_engine(session):
         return create_engine(uri, pool_pre_ping=True,
                              connect_args={"connect_timeout": 10}), db_type, db_type
     else:
+        from urllib.parse import quote as _uq
+        _sp = ",".join(_schemas + (["public"] if "public" not in _schemas else []))
         uri = (f"postgresql://{quote_plus(str(_user))}:{quote_plus(str(_pw))}"
                f"@{_host}:{db_config.get('port', 5432)}/{_db}"
-               f"?options=-c%20search_path%3D{schema}")
+               f"?options=-c%20search_path%3D{_uq(_sp, safe=',')}")
 
     return create_engine(uri, pool_pre_ping=True,
                          connect_args={"connect_timeout": 10}), db_type, db_type
@@ -814,6 +833,28 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
     engine, dialect, db_type = _build_engine(session)
     db_name = session.get("db_name", session.get("source_type", "data"))
     tables_list = list(intel.tables.keys())
+    # Prioritize analysis-ready tables (metadata only, no SQL): tables with
+    # real measures and datetime columns first so the [:N] discovery slices
+    # below reach fact tables on wide multi-schema databases instead of
+    # stopping at lookup/dimension tables. Generic — no table names.
+    def _dash_rank(tname):
+        try:
+            _has_m = bool(intel.find_all_measures(tname))
+        except Exception:
+            _has_m = False
+        try:
+            _has_d = bool(intel.get_datetime_cols(tname))
+        except Exception:
+            _has_d = False
+        if _has_m and _has_d:
+            return (0, str(tname))
+        if _has_m or _has_d:
+            return (1, str(tname))
+        return (2, str(tname))
+    try:
+        tables_ranked = sorted(tables_list, key=_dash_rank)
+    except Exception:
+        tables_ranked = list(tables_list)
 
     metrics = []
     charts = []
@@ -852,7 +893,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                 # Profile → score → diversity → threshold. Shape unchanged.
                 kpi_candidates: list[dict] = []
                 tables_with_measures = []
-                for tname in tables_list[:10]:
+                for tname in tables_ranked[:10]:
                     if intel.tables[tname].get("empty"):
                         continue
                     _m = intel.find_best_measure(tname)
@@ -926,7 +967,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                 # first — dupes by (column, agg) are admitted once.
                 _retail_cands: list[dict] = []
                 try:
-                    for tname in tables_list[:3]:
+                    for tname in tables_ranked[:3]:
                         if intel.tables[tname].get("empty"):
                             continue
                         _retail_cands.extend(

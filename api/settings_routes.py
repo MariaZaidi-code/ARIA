@@ -161,12 +161,102 @@ async def providers_status(_user: dict = Depends(get_current_user)):
             "active": session.get("provider_name")}
 
 
+def _validate_hosted_base_url(base_url: str | None) -> None:
+    """Allowlist check for outbound hosted/loopback base URLs (fail closed).
+
+    Allowed: ``http://127.0.0.1*``, ``http://localhost*`` (loopback dev,
+    including ``::1``), and ``https://*`` (any public host). Rejected with
+    HTTP 400: ``169.254.169.254`` (any numeric form), ``0.0.0.0``,
+    cloud-metadata hosts (``metadata.google.internal``), ``nip.io`` /
+    ``sslip.io`` suffixes, non-http(s) schemes, credentials in URL, and
+    unresolved/invalid hosts. ``None``/empty passes (provider default).
+    """
+    from urllib.parse import urlparse as _urlparse
+
+    if not base_url:
+        return
+    try:
+        parts = _urlparse(str(base_url).strip())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base_url.")
+    if parts.username or parts.password or "@" in (parts.netloc or ""):
+        raise HTTPException(status_code=400, detail="Custom base_url must not contain credentials.")
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower().rstrip(".")
+    if scheme not in ("http", "https") or not host:
+        raise HTTPException(status_code=400, detail="Custom base_url must be http(s)://host.")
+    blocked_names = {"169.254.169.254", "metadata.google.internal", "0.0.0.0"}
+    if host in blocked_names or ".nip.io" in host or ".sslip.io" in host:
+        raise HTTPException(status_code=400, detail="Custom base_url host is blocked.")
+    # Numeric-form bypasses (decimal / hex / octal IP spellings).
+    try:
+        import ipaddress as _ip
+
+        norm: str | None = None
+        h = host
+        if h.isdigit():
+            try:
+                norm = str(_ip.ip_address(int(h)))
+            except Exception:
+                norm = None
+        elif h.lower().startswith("0x"):
+            try:
+                norm = str(_ip.ip_address(int(h, 16)))
+            except Exception:
+                norm = None
+        else:
+            try:
+                norm = str(_ip.ip_address(h))
+            except Exception:
+                norm = None
+        if norm is not None:
+            ip = _ip.ip_address(norm)
+            if norm in ("169.254.169.254", "0.0.0.0"):
+                raise HTTPException(status_code=400, detail="Custom base_url host is blocked.")
+            if ip.is_loopback:
+                # Loopback only over http(s) loopback names; metadata/any-addr never.
+                if host not in ("localhost", "127.0.0.1", "::1") and norm not in ("127.0.0.1", "::1"):
+                    # e.g. 2130706433 (decimal for 127.0.0.1): allow http only.
+                    if scheme != "http":
+                        raise HTTPException(status_code=400, detail="Custom base_url host is blocked.")
+                if scheme not in ("http", "https"):
+                    raise HTTPException(status_code=400, detail="Custom base_url host is blocked.")
+                return
+            # Non-loopback numeric IP: http is never allowed (loopback-only);
+            # https must still not be metadata/link-local/etc.
+            if scheme == "http":
+                raise HTTPException(status_code=400, detail="Custom base_url must be loopback for http (or use https).")
+            if (ip.is_link_local or ip.is_multicast or ip.is_reserved
+                    or ip.is_private or str(ip) in ("169.254.169.254", "0.0.0.0")):
+                raise HTTPException(status_code=400, detail="Custom base_url host is blocked.")
+            return
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base_url.")
+    # Hostnames: http only for loopback names (dev); https for the rest.
+    if scheme == "http":
+        if host not in ("localhost", "127.0.0.1", "::1"):
+            raise HTTPException(status_code=400, detail="Custom base_url must be loopback for http (or use https).")
+    else:
+        if host.startswith("169.254.") or host == "0.0.0.0":
+            raise HTTPException(status_code=400, detail="Custom base_url host is blocked.")
+
+
 def _ping_ollama(timeout: int) -> None:
     """Fast Ollama liveness check (tags endpoint, no generation)."""
     import urllib.request as _url
     import json as _json
     from urllib.parse import urlparse as _urlparse
     base = (os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434") or "").rstrip("/")
+    # SSRF allowlist gate for the _url.urlopen call below: http only for
+    # loopback (127.0.0.1/localhost/::1, dev), https otherwise; metadata /
+    # 0.0.0.0 / blocked hosts fail closed (400 at route layer, unavailable
+    # here). Runs before the stricter operator-env check below.
+    try:
+        _validate_hosted_base_url(base)
+    except HTTPException as exc:
+        raise RuntimeError(str(exc.detail)) from exc
     try:
         _parts = _urlparse(base)
         _host = (_parts.hostname or "").lower().rstrip(".")

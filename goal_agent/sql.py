@@ -326,12 +326,16 @@ class SqlMixin:
             # are both non-word chars), so quoted tables were invisible here.
             # The lookahead accepts a closing quote or any non-identifier char.
             m = re.search(
-                r"\b(?:FROM|JOIN)\s+[\"'`\[]?([A-Za-z_][A-Za-z0-9_]*)(?:[\"'`\]])?(?![A-Za-z0-9_])",
+                r"\b(?:FROM|JOIN)\s+[\"'`\[]?([A-Za-z_][A-Za-z0-9_]*)"
+                r"(?:[\"'`\]])?(?:\s*\.\s*[\"'`\[]?([A-Za-z_][A-Za-z0-9]*)"
+                r"(?:[\"'`\]])?)?(?![A-Za-z0-9_])",
                 sql[pos:], re.IGNORECASE,
             )
             if not m:
                 break
             table = m.group(1)
+            if m.group(2):
+                table = f"{table}.{m.group(2)}"
             out["in_from"].add(table)
             after = pos + m.end()
             alias = None
@@ -406,7 +410,12 @@ class SqlMixin:
             else:
                 candidates = [t for t in self.tables if t.lower().startswith(prefix)]
                 if len(candidates) != 1:
-                    continue
+                    # Schema-qualified keys: match the bare segment too
+                    # (salesorderheader -> sales.salesorderheader).
+                    candidates = [t for t in self.tables
+                                  if t.lower().split(".")[-1] == prefix]
+                    if len(candidates) != 1:
+                        continue
                 table = candidates[0].lower()
             if table not in in_from_lc and table in table_names_lc:
                 found[table] = prefix
@@ -1150,7 +1159,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         # If multiple aggregates, simplify to just the requested one
         agg_count = len(re.findall(r'\b(AVG|SUM|COUNT)\s*\(', sql, re.IGNORECASE))
         if agg_count > 1:
-            return f'SELECT {agg_match}({_tgt}) AS result FROM "{target_table}";'
+            return f'SELECT {agg_match}({_tgt}) AS result FROM {self._qtab(target_table)};'
         # Fix wrong column in the aggregate
         agg_pattern = re.compile(rf'{agg_match}\s*\(\s*["\']?(\w+)["\']?\s*\)', re.IGNORECASE)
         m = agg_pattern.search(sql)
@@ -1188,15 +1197,31 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                     out.append((str(c), ""))
         return [(n, dt) for n, dt in out if n]
 
+    def _qtab(self, table):
+        """Dialect-aware table reference; schema-qualified keys
+        (sales.salesorderheader) become "sales"."salesorderheader" so the
+        dot is a schema separator, never part of the name."""
+        q = lambda n: self._quote(n, getattr(self, "dialect", "postgresql"))
+        try:
+            segs = [s for s in str(table or "").split(".") if s]
+            if len(segs) > 1:
+                return ".".join(q(s) for s in segs)
+        except Exception:
+            pass
+        return self._quote(table, getattr(self, "dialect", "postgresql"))
+
     def _qcol(self, table, col):
         """Dialect-aware qualified column reference (quotes identifiers)."""
         q = lambda n: self._quote(n, getattr(self, "dialect", "postgresql"))
         if table:
+            try:
+                segs = [s for s in str(table).split(".") if s]
+                if len(segs) > 1:
+                    return ".".join([q(s) for s in segs] + [q(col)])
+            except Exception:
+                pass
             return f"{q(table)}.{q(col)}"
         return q(col)
-
-    def _qtab(self, table):
-        return self._quote(table, getattr(self, "dialect", "postgresql"))
 
     def _best_measure_for_table(self, table, ir=None):
         """Best SUM-able measure for `table`: IR-resolved metric wins, else the
@@ -1774,10 +1799,26 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         are dropped (single-home-table fallback) rather than cross-joined.
         Every emitted JOIN carries a validated ON condition whose columns
         exist in the mapping. Returns (from_join_sql, included_tables).
+
+        Generic multi-schema binding: table names resolve case-insensitively
+        + bare-segment aware so search_path-bare or differently-cased names
+        still bind; ambiguous bare names are dropped.
         """
-        wanted = [t for t in (tables or []) if t in self.tables]
-        if base not in self.tables:
-            base = wanted[0] if wanted else None
+        def _res(name):
+            try:
+                if name in self.tables:
+                    return name
+                if hasattr(self, "_resolve_table_key"):
+                    return self._resolve_table_key(name)
+            except Exception:
+                pass
+            return None
+        wanted = []
+        for t in (tables or []):
+            r = _res(t)
+            if r is not None and r not in wanted:
+                wanted.append(r)
+        base = _res(base) or (wanted[0] if wanted else None)
         if base is None:
             return "", []
         if not wanted:
@@ -1803,15 +1844,22 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                  and e.get("right_table") in self.tables
                  and _col_exists(e.get("left_table"), e.get("left_column"))
                  and _col_exists(e.get("right_table"), e.get("right_column"))]
+        # Composite FKs share one table pair across several edges
+        # (specialofferid + productid): group by pair so the JOIN below can
+        # AND every condition. Emitting only the first silently fans out and
+        # inflates aggregates. Generic (edge-driven, no table names).
+        pair_edges: dict = {}
+        for e in valid:
+            _key = (e["left_table"], e["right_table"])
+            pair_edges.setdefault(_key, []).append(e)
         included = [base]
-        used = []
+        used_pairs = set()
         progressed = True
         while progressed:
             progressed = False
-            for e in valid:
-                if e in used:
+            for (a, b) in pair_edges:
+                if (a, b) in used_pairs:
                     continue
-                a, b = e["left_table"], e["right_table"]
                 if (a in included) == (b in included):
                     continue
                 nxt = b if a in included else a
@@ -1820,20 +1868,25 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 # `wanted`; tables outside the plan are never attached.
                 if nxt not in plan_nodes or nxt in included:
                     continue
-                used.append(e)
+                used_pairs.add((a, b))
                 included.append(nxt)
                 progressed = True
         parts = [f"FROM {self._qtab(base)}"]
         joined = {base}
-        for e in used:
-            a, b = e["left_table"], e["right_table"]
+        for (a, b) in pair_edges:
+            if (a, b) not in used_pairs:
+                continue
             # Attach the side not yet in the query (both orders validated).
             nxt = b if a in joined else a
-            parts.append(
-                f"JOIN {self._qtab(nxt)} ON "
-                f"{self._qcol(e['left_table'], e['left_column'])} = "
-                f"{self._qcol(e['right_table'], e['right_column'])}"
-            )
+            try:
+                _conds = " AND ".join(
+                    f"{self._qcol(e['left_table'], e['left_column'])} = "
+                    f"{self._qcol(e['right_table'], e['right_column'])}"
+                    for e in pair_edges[(a, b)]
+                )
+            except Exception:
+                continue
+            parts.append(f"JOIN {self._qtab(nxt)} ON {_conds}")
             joined.add(nxt)
         return " ".join(parts), included
 
@@ -1905,13 +1958,31 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                         or user_goal
                         or getattr(self, "_active_original_goal", "") or "")
         goal_l = goal_text.lower()
-        tables = [t for t in (join_path or []) if t in self.tables]
+        def _res2(name):
+            try:
+                if name in self.tables:
+                    return name
+                if hasattr(self, "_resolve_table_key"):
+                    return self._resolve_table_key(name)
+            except Exception:
+                pass
+            return None
+        tables = []
+        for t in (join_path or []):
+            r = _res2(t)
+            if r is not None and r not in tables:
+                tables.append(r)
         try:
             required = list(self._required_tables_from_ir(ir, join_path or [])) \
                 if ir else list(tables)
         except Exception:
             required = list(tables)
-        required = [t for t in required if t in self.tables]
+        _req = []
+        for t in required:
+            r = _res2(t)
+            if r is not None and r not in _req:
+                _req.append(r)
+        required = _req
         if not required:
             required = list(tables) or list(self.tables.keys())[:1]
         if not required:
@@ -2170,7 +2241,27 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         def _dim_score(d, got):
             _rt, _rc = got
             _toks = _fallback_name_tokens(_rc)
-            _exact = any(t in _goal_words for t in _toks)
+            # Table-name parts count too (countryregion.name for "country"):
+            # synonym/substring-aware so compounds match. Generic, no names.
+            _table_hit = False
+            try:
+                _stm = getattr(self, "_schema_token_matches_goal", None)
+                if callable(_stm):
+                    for _seg in str(_rt or "").lower().split("."):
+                        for _p in _seg.split("_"):
+                            if not _p:
+                                continue
+                            for _gw in _goal_words:
+                                if _stm(_p, _gw):
+                                    _table_hit = True
+                                    break
+                            if _table_hit:
+                                break
+                        if _table_hit:
+                            break
+            except Exception:
+                _table_hit = False
+            _exact = (_table_hit or any(t in _goal_words for t in _toks))
             _plural = any(t + "s" in _goal_words
                           or (t.endswith("s") and t[:-1] in _goal_words)
                           for t in _toks)
@@ -2211,10 +2302,32 @@ Use date_trunc('quarter', date_col) for quarter filtering.
             # fallback so "best territory" never groups by customer name.
             def _rank_groupables(t, cands):
                 gl = " " + goal_l + " "
+                # Table-name parts also count: "revenue by country" names the
+                # countryregion table even though its label column is just
+                # "name". Synonym/substring-aware (compounds match). Generic.
+                _tnamed = False
+                try:
+                    _stm2 = getattr(self, "_schema_token_matches_goal", None)
+                    if callable(_stm2):
+                        _gwords = set(re.findall(r"[a-z0-9]+", gl))
+                        for _seg in str(t or "").lower().split("."):
+                            for _p in _seg.split("_"):
+                                if not _p:
+                                    continue
+                                for _gw in _gwords:
+                                    if _stm2(_p, _gw):
+                                        _tnamed = True
+                                        break
+                                if _tnamed:
+                                    break
+                            if _tnamed:
+                                break
+                except Exception:
+                    _tnamed = False
                 rows = []
                 for c in cands:
                     parts = [p for p in c.lower().split("_") if p]
-                    named = any(p in gl or p.rstrip("s") in gl
+                    named = _tnamed or any(p in gl or p.rstrip("s") in gl
                                 or (p + "s") in gl for p in parts)
                     try:
                         geo = bool(self._is_geo_cat_like(c)) if hasattr(
@@ -2883,7 +2996,18 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 required.add(d["resolved_table"])
         if not required and join_path:
             required.add(join_path[0])
-        missing = [t for t in sorted(required) if t.lower() not in in_from]
+        # Schema-alias aware: required 'sales.order' is satisfied by bare
+        # 'order' in SQL (search_path resolves it) and vice versa.
+        _present = set(in_from)
+        try:
+            for _t in list(in_from):
+                if "." in _t:
+                    _present.add(_t.split(".")[-1])
+        except Exception:
+            pass
+        missing = [t for t in sorted(required)
+                   if t.lower() not in _present
+                   and str(t).split(".")[-1].lower() not in _present]
         if missing:
             issues.append(
                 f"required table(s) {', '.join(missing)} are missing from FROM/JOIN"
@@ -2983,19 +3107,33 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 )
 
         if join_plan and join_plan.get("edges"):
+            def _bare(t):
+                try:
+                    return str(t or "").split(".")[-1].lower()
+                except Exception:
+                    return str(t or "").lower()
             joined_pairs = set()
             for j in self._extract_sql_joins(sql):
                 joined_pairs.add((j["left_table"].lower(), j["right_table"].lower()))
                 joined_pairs.add((j["right_table"].lower(), j["left_table"].lower()))
+                joined_pairs.add((_bare(j["left_table"]), _bare(j["right_table"])))
+                joined_pairs.add((_bare(j["right_table"]), _bare(j["left_table"])))
             plan_nodes = {t.lower() for t in join_plan.get("nodes", [])}
             for e in join_plan["edges"]:
                 pair = (e["left_table"].lower(), e["right_table"].lower())
-                if pair not in joined_pairs:
+                bare_pair = (_bare(e["left_table"]), _bare(e["right_table"]))
+                if pair not in joined_pairs and bare_pair not in joined_pairs:
                     issues.append(
                         f"the planned join {e['left_table']}.{e['left_column']} = "
                         f"{e['right_table']}.{e['right_column']} is missing from the SQL"
                     )
-            extra = [t for t in in_from if t not in plan_nodes]
+            try:
+                _pn_bare = {str(_pn).split(".")[-1].lower() for _pn in plan_nodes}
+            except Exception:
+                _pn_bare = set()
+            extra = [t for t in in_from
+                     if t not in plan_nodes
+                     and str(t).split(".")[-1].lower() not in _pn_bare]
             if extra:
                 warnings.append(
                     f"SQL uses table(s) {', '.join(sorted(extra))} outside the "
@@ -3200,14 +3338,14 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                     ft_fk = next((c for c in ft_info.get("columns", {})
                                    if c.lower() == f"{dt.lower()}_id" or c.lower().endswith("_id")), None)
                     if dt_pk and ft_fk:
-                        return (f'SELECT t1.* FROM "{dt}" t1 '
-                                f'LEFT JOIN "{ft}" t2 ON t1."{dt_pk}" = t2."{ft_fk}" '
+                        return (f'SELECT t1.* FROM {self._qtab(dt)} t1 '
+                                f'LEFT JOIN {self._qtab(ft)} t2 ON t1."{dt_pk}" = t2."{ft_fk}" '
                                 f'WHERE t2."{ft_fk}" IS NULL LIMIT 50;')
 
         # COUNT pattern
         if any(kw in goal for kw in ("how many", "count", "number of")):
             table = relevant[0]
-            return f'SELECT COUNT(*) AS count FROM "{table}";'
+            return f'SELECT COUNT(*) AS count FROM {self._qtab(table)};'
 
         # TOTAL/SUM pattern
         if any(kw in goal for kw in ("total", "sum", "overall")):
@@ -3218,7 +3356,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 num_cols = [c for c in num_cols if _safe_num(t, c)]
                 if num_cols:
                     return (f'SELECT {self._measure_agg_expr(t, num_cols[0], "SUM")}'
-                            f' AS total FROM "{t}";')
+                            f' AS total FROM {self._qtab(t)};')
 
         # AVERAGE pattern — try to match the specific column the user asked about
         if any(kw in goal for kw in ("average", "avg", "mean")):
@@ -3234,7 +3372,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                         break
                 if target_col and _safe_num(t, target_col):
                     return (f'SELECT {self._measure_agg_expr(t, target_col, "AVG")}'
-                            f' AS average FROM "{t}";')
+                            f' AS average FROM {self._qtab(t)};')
                 # Fallback: pick any verified-safe numeric column
                 num_cols = [c for c, dt in self._table_columns_norm(t)
                             if dt.upper() in NUMERIC_TYPES or any(k in dt.lower() for k in ("int", "decimal", "numeric", "float", "real", "double", "money"))
@@ -3242,7 +3380,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 num_cols = [c for c in num_cols if _safe_num(t, c)]
                 if num_cols:
                     return (f'SELECT {self._measure_agg_expr(t, num_cols[0], "AVG")}'
-                            f' AS average FROM "{t}";')
+                            f' AS average FROM {self._qtab(t)};')
 
         # GROUP BY pattern ("by category", "by region", "by country")
         by_match = None
@@ -3265,7 +3403,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                     cat = cat_cols[0]
                     num = num_cols[0]
                     return (f'SELECT t."{cat}", {self._measure_agg_expr(t, num, "SUM")} AS total '
-                            f'FROM "{t}" t GROUP BY t."{cat}" ORDER BY total DESC;')
+                            f'FROM {self._qtab(t)} t GROUP BY t."{cat}" ORDER BY total DESC;')
 
         # RANKING pattern ("top", "best", "highest", "most")
         if any(kw in goal for kw in ("top", "best", "highest", "most", "leading", "largest")):
@@ -3282,10 +3420,10 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                     name = name_cols[0]
                     num = num_cols[0]
                     return (f'SELECT "{name}", {self._measure_agg_expr(t, num, "SUM")} AS total '
-                            f'FROM "{t}" GROUP BY "{name}" ORDER BY total DESC LIMIT 10;')
+                            f'FROM {self._qtab(t)} GROUP BY "{name}" ORDER BY total DESC LIMIT 10;')
 
         # Default: SELECT from the first table
-        return f'SELECT * FROM "{relevant[0]}" LIMIT 50;'
+        return f'SELECT * FROM {self._qtab(relevant[0])} LIMIT 50;'
 
     # ---- _row_counts (_row_counts) ----
 

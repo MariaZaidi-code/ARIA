@@ -65,3 +65,10 @@ test_copilot_e2e.py
 # coverage outputs (local only)
 .coverage
 coverage.xml
+# local dev helpers with secrets (never commit)
+write_key.py
+check_groq.py
+check_cloud_complete.py
+groqkey.txt
+**/groqkey.txt
+test_cloud_ask.cjs

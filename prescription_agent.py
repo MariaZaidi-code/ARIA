@@ -24,7 +24,15 @@ logging.basicConfig(level=logging.INFO)
 
 class PrescriptionAgent:
     def __init__(self, provider=None):
-        self.llm = provider or create_provider()
+        if provider is None:
+            logging.getLogger(__name__).warning(
+                "PrescriptionAgent created with provider=None – failing closed"
+            )
+            raise ValueError(
+                "PrescriptionAgent requires an explicit provider. "
+                "Pass the LLMProvider object from require_data() or session['provider']."
+            )
+        self.llm = provider
 
     def prescribe(self, processed_data, kpis, trends, anomalies, hypotheses,
                   predictions=None, max_actions=5, *,
@@ -108,42 +116,38 @@ Rules:
             if not (text or "").strip():
                 logging.getLogger("aria.prescription").warning(
                     "Prescription LLM returned empty; using template actions")
-                return {
-                    "actions": self._template_actions(kpis, trends, anomalies, hypotheses,
-                                                      predictions, max_actions),
-                    "source": "template",
-                    "status": "LLM_EMPTY",
-                    "impact_note": "Impact could not be reliably estimated from the available data.",
-                }
+                return self._honest_fallback(
+                    self._template_actions(kpis, trends, anomalies, hypotheses,
+                                           predictions, max_actions),
+                    "template", "LLM_EMPTY")
             actions = self._parse_actions(text, max_actions)
             if actions:
+                # Integrity gate: LLM numbers survive only on quality_gate
+                # pass — otherwise scrub + tag source + honest note.
+                if not self._fallback_gate_passes(processed_data, kpis, trends, anomalies, hypotheses):
+                    actions = [self._scrub_numbers(a) for a in actions]
                 return {
                     "actions": actions,
                     "source": "llm",
                     "status": "SUCCESS",
+                    "evidence_pass": self._fallback_gate_passes(
+                        processed_data, kpis, trends, anomalies, hypotheses),
                     # Honesty guard (t.txt section 43): never invent financial impact.
                     "impact_note": "Impact could not be reliably estimated from the available data.",
                 }
             logging.getLogger("aria.prescription").warning(
                 "Prescription LLM returned unparseable prose; using template actions")
-            return {
-                "actions": self._template_actions(kpis, trends, anomalies, hypotheses,
-                                                  predictions, max_actions),
-                "source": "template",
-                "status": "INVALID_LLM_RESPONSE",
-                "impact_note": "Impact could not be reliably estimated from the available data.",
-            }
+            return self._honest_fallback(
+                self._template_actions(kpis, trends, anomalies, hypotheses,
+                                       predictions, max_actions),
+                "template", "INVALID_LLM_RESPONSE")
         except Exception as exc:
             logging.getLogger("aria.prescription").exception("Prescription LLM failed; using template actions")
 
-        return {
-            "actions": self._template_actions(kpis, trends, anomalies, hypotheses,
-                                              predictions, max_actions),
-            "source": "template",
-            "status": "LLM_UNAVAILABLE",
-            # Honesty guard (t.txt section 43): never invent financial impact.
-            "impact_note": "Impact could not be reliably estimated from the available data.",
-        }
+        return self._honest_fallback(
+            self._template_actions(kpis, trends, anomalies, hypotheses,
+                                   predictions, max_actions),
+            "template", "LLM_UNAVAILABLE")
 
     def recommendation_for_validated_decision(self, decision: dict):
         """PHASE 10: validated Decision -> existing prescription engine.
@@ -196,38 +200,91 @@ Rules:
         # caller falls back to template actions instead of promoting prose.
         return []
 
+    # Integrity gate: legacy fallback must NEVER return unvalidated
+    # numbers. Numbers survive only when quality_gate passes; otherwise the
+    # caller gets plain words tagged with source + an honest note.
+    _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?%?")
+    _CAUSAL_RE = re.compile(
+        r"\b(cause[sd]?|causing|prove[sd]?|proof|guarantee[sd]?|will\s+(increase|decrease|improve))\b",
+        re.IGNORECASE)
+
+    @staticmethod
+    def _scrub_numbers(text):
+        """Strip unvalidated numbers from a fallback action (plain words)."""
+        try:
+            s = re.sub(r"\(change [^)]*\)", "", str(text or ""))
+            s = re.sub(r"\(observed [^)]*\)", "(outside its usual range)", s)
+            s = re.sub(r"\(backtest accuracy [^)]*\)", "", s)
+            s = re.sub(r"\(mean [^)]*\)", "", s)
+            s = re.sub(r"-?\d+(?:\.\d+)?%\s*(change|accuracy)?", "a notable change", s)
+            s = re.sub(r"\s{2,}", " ", s).strip(" .")
+            return s
+        except Exception:
+            return str(text or "")
+
+    @staticmethod
+    def _fallback_gate_passes(processed_data, kpis, trends, anomalies, hypotheses):
+        """quality_gate probe for legacy fallback inputs (never invents pass).
+
+        Legacy insight inputs carry no fitted r/p/n evidence, so the gate
+        can only pass when the caller already supplies validated evidence
+        (e.g. a hypothesis with n + p_value + effect). Otherwise False —
+        numbers are scrubbed and the honest note carries the decision.
+        """
+        try:
+            from prescription_engine.engine import quality_gate as _qg
+            cands = []
+            for h in (hypotheses or []):
+                if not isinstance(h, dict):
+                    continue
+                try:
+                    n = h.get("n", h.get("sample_n"))
+                    n = int(n) if n is not None else None
+                except (TypeError, ValueError):
+                    n = None
+                probe = {"metric": h.get("metric") or h.get("column") or h.get("outcome"),
+                         "n": n, "p_value": h.get("p_value", h.get("p")),
+                         "r": h.get("r", h.get("effect_r")),
+                         "confidence": h.get("confidence", "unknown")}
+                g = _qg(probe)
+                if isinstance(g, dict) and g.get("pass"):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    @classmethod
+    def _honest_fallback(cls, actions, source, status):
+        """Tag source + honest note; scrub numbers unless the gate passes."""
+        return {"actions": actions, "source": source, "status": status,
+                "evidence_pass": False,
+                "impact_note": "Impact could not be reliably estimated from the available data."}
+
     @staticmethod
     def _template_actions(kpis, trends, anomalies, hypotheses, predictions, max_actions):
+        # Plain-language template: no unvalidated numbers (no pct/value/
+        # mean/accuracy figures) — validated numbers only flow through the
+        # deterministic engine path with quality_gate evidence.
         actions = []
-        if hypotheses:
+        if hypotheses and isinstance(hypotheses[0], dict):
             actions.append(f"Validate the leading hypothesis: {hypotheses[0].get('hypothesis', 'N/A')}")
-        if trends:
+        if trends and isinstance(trends[0], dict):
             t = trends[0]
-            actions.append(
-                f"Review the {t.get('direction', 'unknown')} trend in "
-                f"{', '.join(t.get('columns', []))} "
-                f"(change {t.get('pct_change', 'N/A')}%)."
-            )
-        if anomalies:
+            cols = ", ".join(t.get("columns", []) or []) or "the key measure"
+            actions.append(f"Review the {t.get('direction', 'unknown')} trend in {cols}.")
+        if anomalies and isinstance(anomalies[0], dict):
             a = anomalies[0]
-            actions.append(
-                f"Investigate the unusual {a.get('column', 'reading')} "
-                f"(observed {a.get('value', 'N/A')}, well outside its usual range)."
-            )
+            actions.append(f"Investigate the unusual {a.get('column', 'reading')} — well outside its usual range.")
         if predictions and predictions.get("valid") and predictions.get("points"):
             period_word = predictions.get("period") or "periods"
             if period_word in ("sequence", "daily", "weekly", "monthly"):
                 period_word = "periods"
-            actions.append(
-                f"Plan for the projected {predictions['projected_pct_change']}% change in "
-                f"{predictions['column']} over the next {predictions['horizon']} {period_word} "
-                f"(backtest accuracy {predictions['accuracy_pct']}% if shown)."
-            )
+            actions.append(f"Plan for the projected change in {predictions['column']} over the next "
+                           f"{predictions['horizon']} {period_word}.")
         if kpis and not actions:
-            valid = [k for k in kpis if isinstance(k, dict) and k.get("mean") is not None]
+            valid = [k for k in kpis if isinstance(k, dict) and k.get("column")]
             if valid:
-                top = max(valid, key=lambda k: k.get("mean", 0))
-                actions.append(f"Keep monitoring {top.get('column', 'key metric')} (mean {top.get('mean')}).")
+                actions.append(f"Keep monitoring {valid[0].get('column', 'key metric')}.")
         if not actions:
             actions.append("Continue monitoring the key metrics; no urgent action is indicated.")
         return actions[:max_actions]

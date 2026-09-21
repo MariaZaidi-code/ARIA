@@ -314,16 +314,21 @@ def _linked_context(session: dict) -> dict:
             "db_name": linked.get("db_name"), "mapping": mapping}
 
 
+# NOTE: POST-only route (no behavior break). FastAPI returns 405 Method Not
+# Allowed for wrong methods (e.g. GET) automatically via the router's
+# method routing; no explicit handler needed. Kept functional as-is.
 @router.post("")
 async def copilot_endpoint(body: CopilotRequest, user: dict = Depends(get_current_user)):
     """Answer an analytical question over the connected source via RAG."""
     session = get_session(user["user_id"])
     provider = session.get("provider")
     if not provider:
-        raise HTTPException(
-            status_code=400,
-            detail="No LLM provider configured. Connect a source first (POST /api/connect).",
-        )
+        provider_error = session.get("_provider_error", "")
+        detail = "No LLM provider available."
+        if provider_error:
+            detail += f" ({provider_error})"
+        detail += " Connect a data source first (POST /api/connect) or configure a provider in Settings."
+        raise HTTPException(status_code=400, detail=detail)
     if not session.get("db_uri"):
         raise HTTPException(
             status_code=400,

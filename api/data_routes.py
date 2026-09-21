@@ -70,9 +70,47 @@ def _save_user_overrides(user_id, db_name, overrides):
 
 
 def _quote(name, dialect="postgresql"):
+    # Dotted names (schema.table from multi-schema mappings) quote each
+    # part separately: "sales"."employee", never "sales.employee".
+    try:
+        segs = [s for s in str(name or "").split(".") if s]
+        if len(segs) > 1:
+            if dialect == "mysql":
+                return ".".join(f"`{s.replace('`', '``')}`" for s in segs)
+            return ".".join(
+                f'"{s.replace(chr(34), chr(34) + chr(34))}"' for s in segs)
+    except Exception:
+        pass
     if dialect == "mysql":
         return f"`{name.replace('`', '``')}`"
     return f'"{name.replace(chr(34), chr(34)+chr(34))}"'
+
+
+def _resolve_table_param(table, tables):
+    """Resolve a preview/table parameter against mapping keys.
+
+    Accepts the qualified key (sales.employee) or the bare segment
+    (employee) when it is unambiguous; raises HTTPException 400 otherwise.
+    Generic — no schema or table names.
+    """
+    keys = list((tables or {}).keys())
+    if table in keys:
+        return table
+    try:
+        bare = str(table or "").split(".")[-1].lower()
+        hits = [k for k in keys if str(k).split(".")[-1].lower() == bare]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Table '{table}' exists in several schemas "
+                        f"({', '.join(hits)}). Pick one explicitly."))
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    raise HTTPException(status_code=400, detail=f"Table '{table}' not found in schema.")
 
 
 # =============================================================
@@ -290,10 +328,9 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
     if not mapping:
         raise HTTPException(status_code=400, detail="No schema extracted. Run schema extraction first.")
 
-    if req.table not in mapping.get("tables", {}):
-        raise HTTPException(status_code=400, detail=f"Table '{req.table}' not found in schema.")
+    _tkey = _resolve_table_param(req.table, mapping.get("tables", {}))
 
-    table_info = mapping["tables"][req.table]
+    table_info = mapping["tables"][_tkey]
     columns = [c["column"] for c in table_info.get("columns", [])]
     dialect = session.get("dialect", "postgresql")
     # Explicit search scope wins (validated against the mapping so unknown
@@ -324,7 +361,7 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
 
     try:
         engine = create_engine(engine_url, pool_pre_ping=True)
-        q_t = _quote(req.table, dialect)
+        q_t = _quote(_tkey, dialect)
         # ILIKE is PostgreSQL-only; use portable LOWER(...) LIKE on others.
         like_op = "ILIKE" if dialect == "postgresql" else "LIKE"
 
@@ -376,6 +413,21 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
             rows = conn.execute(text(query), params).fetchall()
             result_rows = [dict(row._mapping) for row in rows]
 
+        # CSV formula-injection signal (additive only, no mutation): flag when
+        # any preview cell starts with =, +, -, @ so the UI can warn before
+        # export/open. Imported lazily with a local fallback to avoid cycles.
+        try:
+            from api.connect_routes import _scan_formula_risk as _scan_fr
+            _formula_risk = bool(_scan_fr(result_rows))
+        except Exception:
+            _formula_risk = any(
+                isinstance(r, dict) and any(
+                    str(v).lstrip()[:1] in ("=", "+", "-", "@")
+                    for v in r.values() if v is not None
+                )
+                for r in (result_rows or [])
+            )
+
         return {
             "ok": True,
             "rows": result_rows,
@@ -383,6 +435,7 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
             "total": total,
             "limit": safe_limit,
             "offset": safe_offset,
+            "formula_risk": _formula_risk,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preview failed: {sanitize_error(e)}")
@@ -401,8 +454,9 @@ def get_column_profile(request: Request, table: str = "", user: dict = Depends(g
     if not mapping:
         raise HTTPException(status_code=400, detail="No schema extracted.")
 
-    if not table or table not in mapping.get("tables", {}):
-        raise HTTPException(status_code=400, detail=f"Table '{table}' not found.")
+    if not table:
+        raise HTTPException(status_code=400, detail="Table '' not found.")
+    table = _resolve_table_param(table, mapping.get("tables", {}))
 
     table_info = mapping["tables"][table]
     cols = table_info.get("columns", [])
@@ -692,16 +746,33 @@ def apply_override(req: OverrideRequest, request: Request, user: dict = Depends(
         raise HTTPException(status_code=400, detail="No schema extracted.")
 
     # Identifier hygiene (t.txt section 58): never trust raw table/column strings.
+    # Multi-schema keys are schema-qualified (sales.employee): validate each
+    # dot-separated segment, then _resolve_table_param enforces membership.
+    def _ident_ok(value: str) -> bool:
+        try:
+            segs = [s for s in str(value or "").split(".") if s]
+        except Exception:
+            return False
+        if not segs or len(segs) > 3:
+            return False
+        if len(".".join(segs)) != len(str(value or "")):
+            return False
+        return all(is_valid_identifier(s) for s in segs)
+
     for label, value in (
         ("table", req.table),
         ("column", req.column),
         ("references_table", req.references_table),
         ("references_column", req.references_column),
     ):
-        if value and not is_valid_identifier(value):
+        if value and not _ident_ok(value):
             raise HTTPException(status_code=400, detail=f"Invalid {label} name: {value!r}")
     tables = mapping.get("tables", {})
     if isinstance(tables, dict) and tables:
+        try:
+            req.table = _resolve_table_param(req.table, tables)
+        except HTTPException as _he:
+            raise HTTPException(status_code=400, detail=f"Unknown table: {req.table!r}") from _he
         if req.table not in tables:
             raise HTTPException(status_code=400, detail=f"Unknown table: {req.table!r}")
         cols = tables[req.table].get("columns", []) if isinstance(tables[req.table], dict) else []

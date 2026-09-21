@@ -177,6 +177,13 @@ def _sample_values(db_uri: str | None, dialect: str, table: str,
 
         quote = "`" if dialect == "mysql" else '"'
         _cargs = {} if "sqlite" in str(db_uri) else {"connect_timeout": 5}
+        try:
+            # Schema-qualified keys quote per segment ("sales"."employee").
+            _tsegs = [s for s in str(table or "").split(".") if s]
+            _qtable = (".".join(f"{quote}{s}{quote}" for s in _tsegs)
+                       if len(_tsegs) > 1 else f"{quote}{table}{quote}")
+        except Exception:
+            _qtable = f"{quote}{table}{quote}"
         engine = create_engine(db_uri, pool_pre_ping=True,
                                connect_args=_cargs)
         try:
@@ -184,7 +191,7 @@ def _sample_values(db_uri: str | None, dialect: str, table: str,
                 for col in columns[:MAX_SAMPLE_COLUMNS_PER_TABLE]:
                     try:
                         sql = (f"SELECT DISTINCT {quote}{col}{quote} FROM "
-                               f"{quote}{table}{quote} LIMIT {MAX_SAMPLE_VALUES}")
+                               f"{_qtable} LIMIT {MAX_SAMPLE_VALUES}")
                         rows = conn.execute(_text(sql)).fetchmany(MAX_SAMPLE_VALUES)
                         vals = [str(r[0])[:24] for r in rows if r[0] is not None]
                         if vals:
@@ -199,6 +206,14 @@ def _sample_values(db_uri: str | None, dialect: str, table: str,
 
 
 def _quote(name: str, dialect: str) -> str:
+    # Schema-qualified keys quote per segment ("sales"."employee").
+    try:
+        segs = [s for s in str(name or "").split(".") if s]
+        if len(segs) > 1:
+            q = "`" if dialect == "mysql" else '"'
+            return ".".join(f"{q}{s}{q}" for s in segs)
+    except Exception:
+        pass
     q = "`" if dialect == "mysql" else '"'
     return f"{q}{name}{q}"
 
@@ -330,6 +345,13 @@ def build_grounded_db_context(
 
 
 def _q(name: object, dialect: str) -> str:
+    # Schema-qualified keys render per segment (sales.employee."col").
+    try:
+        segs = [s for s in str(name or "").split(".") if s]
+        if len(segs) > 1:
+            return ".".join(_quote(s, dialect) for s in segs)
+    except Exception:
+        pass
     return _quote(str(name or ""), dialect)
 
 

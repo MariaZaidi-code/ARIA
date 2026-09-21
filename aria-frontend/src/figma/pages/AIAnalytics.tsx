@@ -1025,8 +1025,8 @@ export default function AIAnalytics({
   const showResults = result || running || error;
 
   /* ---- Chart spec: chart_spec first, visualization envelope as fallback.
-     Both carry REAL column names (x/y) pointing into the data keys — never
-     positional guesses, so charts show names (artists, regions…) not blanks. */
+      Both carry REAL column names (x/y) pointing into the data keys — never
+      positional guesses, so charts show names (artists, regions…) not blanks. */
   const _cs: any = (gd as any)?.chart_spec || {};
   const _vz: any = (gd as any)?.visualization || {};
   const chartSpec = {
@@ -1035,7 +1035,12 @@ export default function AIAnalytics({
     y: _cs.y || _vz.y || "",
     label: _cs.label || "",
   };
-  const showChart = vizData.length > 0 && chartSpec.chart_type !== "table" && !!chartSpec.x && !!chartSpec.y;
+  const hasChartData = vizData.length >= 2;
+  const hasAxes = !!chartSpec.x && !!chartSpec.y;
+  const isChartType = chartSpec.chart_type !== "table" && chartSpec.chart_type !== "text";
+  const showChart = hasChartData && hasAxes && isChartType;
+  /* Is the answer text-only (no chart, no findings, just narrative)? */
+  const isTextOnly = !showChart && findings.length === 0 && !story;
 
   /* ------------------------------------------------------------------ */
   /*  Not connected / Loading / Error / No dataset                       */
@@ -1251,9 +1256,7 @@ export default function AIAnalytics({
                     );
                   })()}
 
-                  {/* Chart — only for real chart types with named x/y axes.
-                      Table-type or axis-less results skip the chart so we never
-                      render a nameless/zeroed graph. */}
+                  {/* Chart — adapts to result type: chart for visual data, table for tabular, nothing for text-only */}
                   {showChart && (
                     <Card className="p-5">
                       <CardHead title={chartSpec.label || (chartMetric ? `${humanize(chartMetric)} Analysis` : "Analysis Results")} sub={`${vizData.length} data points`} />
@@ -1262,6 +1265,38 @@ export default function AIAnalytics({
                       </div>
                     </Card>
                   )}
+
+                  {/* Table — for table-type results or when chart axes are missing but data exists */}
+                  {!showChart && vizData.length > 0 && (() => {
+                    const keys = vizData.length > 0 ? Object.keys(vizData[0]).filter((k) => k !== "_idx") : [];
+                    if (keys.length === 0) return null;
+                    return (
+                      <Card className="p-5">
+                        <CardHead title={chartSpec.label || (chartMetric ? `${humanize(chartMetric)} Data` : "Data")} sub={`${vizData.length} rows`} />
+                        <div className="mt-3 overflow-x-auto">
+                          <table className="w-full text-[12px]">
+                            <thead>
+                              <tr className="border-b border-slate-200">
+                                {keys.map((k) => (
+                                  <th key={k} className="text-left font-semibold text-slate-600 px-3 py-2 whitespace-nowrap">{humanize(k)}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {vizData.slice(0, 20).map((row: any, i: number) => (
+                                <tr key={i} className="border-b border-slate-100 hover:bg-slate-50/50">
+                                  {keys.map((k) => (
+                                    <td key={k} className="px-3 py-2 text-[#0F2440] tabular-nums whitespace-nowrap">{typeof row[k] === "number" ? row[k].toLocaleString() : String(row[k] ?? "—")}</td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                          {vizData.length > 20 && <p className="mt-2 text-[11px] text-slate-400">Showing first 20 of {vizData.length} rows.</p>}
+                        </div>
+                      </Card>
+                    );
+                  })()}
 
                   {/* Key Insights / Findings */}
                   {findings.length > 0 && (

@@ -218,8 +218,16 @@ def _engine_for_session(session):
         engine_url = f"mysql+pymysql://{quote_plus(str(user_name))}:{quote_plus(str(password))}@{host}:{port}/{db}"
     else:
         engine_url = f"postgresql+psycopg2://{quote_plus(str(user_name))}:{quote_plus(str(password))}@{host}:{port}/{db}"
+    _cargs: dict = {"connect_timeout": 10}
+    try:
+        from core.db import search_path_connect_args as _spa_h
+        _sch_h = [str(s).strip() for s in (session.get("schemas") or [])
+                  if str(s or "").strip()]
+        _cargs.update(_spa_h("postgresql" if driver != "mysql" else "mysql", _sch_h))
+    except Exception:
+        pass
     return create_engine(engine_url, pool_pre_ping=True,
-                         connect_args={"connect_timeout": 10}), dialect
+                         connect_args=_cargs), dialect
 
 
 @router.get("/api/hypothesis/suggest")

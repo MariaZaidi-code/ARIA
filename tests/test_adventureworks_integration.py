@@ -296,3 +296,210 @@ def test_10_cross_schema_equivalence(aw_conn, flat_conn):
                 _scalar(flat_conn, FLAT_SQL[key])), key
         else:
             assert _all(aw_conn, AW_SQL[key]) == _all(flat_conn, FLAT_SQL[key]), key
+
+
+# ---------------------------------------------------------------------------
+# Real-shape CamelCase multi-schema fixture (AdventureWorks LIVE gaps).
+# Tables use quoted CamelCase + schema-qualified mapping keys:
+# header monetary total vs line qty*price, Person/Customer split.
+# ---------------------------------------------------------------------------
+
+def _camel_typed(cols):
+    return [{"column": c, "data_type": t, "nullable": True} for c, t in cols]
+
+
+def _camel_mapping():
+    return {
+        "schema": "public",
+        "schemas": ["Sales", "Person", "Production"],
+        "tables": {
+            "Sales.SalesOrderHeader": {
+                "columns": _camel_typed([
+                    ("SalesOrderID", "integer"), ("CustomerID", "integer"),
+                    ("TerritoryID", "integer"), ("OrderDate", "timestamp"),
+                    ("SubTotal", "numeric"), ("TaxAmt", "numeric"),
+                    ("Freight", "numeric"), ("TotalDue", "numeric")]),
+                "primary_key": ["SalesOrderID"]},
+            "Sales.SalesOrderDetail": {
+                "columns": _camel_typed([
+                    ("SalesOrderID", "integer"), ("ProductID", "integer"),
+                    ("OrderQty", "integer"), ("UnitPrice", "numeric"),
+                    ("LineTotal", "numeric")]),
+                "primary_key": ["SalesOrderID", "ProductID"]},
+            "Sales.Customer": {
+                "columns": _camel_typed([
+                    ("CustomerID", "integer"), ("PersonID", "integer"),
+                    ("TerritoryID", "integer")]),
+                "primary_key": ["CustomerID"]},
+            "Person.Person": {
+                "columns": _camel_typed([
+                    ("BusinessEntityID", "integer"), ("FirstName", "text"),
+                    ("LastName", "text")]),
+                "primary_key": ["BusinessEntityID"]},
+            "Production.Product": {
+                "columns": _camel_typed([
+                    ("ProductID", "integer"), ("Name", "text"),
+                    ("ProductCategory", "text")]),
+                "primary_key": ["ProductID"]},
+            "Sales.SalesTerritory": {
+                "columns": _camel_typed([
+                    ("TerritoryID", "integer"), ("Name", "text")]),
+                "primary_key": ["TerritoryID"]},
+        },
+        "relationship_edges": [],
+        "declared_relationships": [
+            {"table_name": "Sales.SalesOrderDetail", "column_name": "SalesOrderID",
+             "references_table": "Sales.SalesOrderHeader", "references_column": "SalesOrderID"},
+            {"table_name": "Sales.SalesOrderDetail", "column_name": "ProductID",
+             "references_table": "Production.Product", "references_column": "ProductID"},
+            {"table_name": "Sales.SalesOrderHeader", "column_name": "CustomerID",
+             "references_table": "Sales.Customer", "references_column": "CustomerID"},
+            {"table_name": "Sales.SalesOrderHeader", "column_name": "TerritoryID",
+             "references_table": "Sales.SalesTerritory", "references_column": "TerritoryID"},
+            {"table_name": "Sales.Customer", "column_name": "PersonID",
+             "references_table": "Person.Person", "references_column": "BusinessEntityID"},
+            {"table_name": "Sales.Customer", "column_name": "TerritoryID",
+             "references_table": "Sales.SalesTerritory", "references_column": "TerritoryID"},
+        ],
+        "inferred_relationships": [],
+        "ambiguous_relationships": [],
+    }
+
+
+def _camel_agent(tmp_path, mapping=None):
+    from goal_agent import GoalAgent
+    m = mapping if mapping is not None else _camel_mapping()
+    p = tmp_path / "camel_schema.json"
+    p.write_text(json.dumps(m), encoding="utf-8")
+    return GoalAgent(schema_json_path=str(p),
+                     db_uri="postgresql://u:p@localhost:5432/nonexistent",
+                     provider=_NoLLM(), dialect="postgresql")
+
+
+def _bare(name):
+    return str(name or "").split(".")[-1].strip().strip("\"'`[]").lower()
+
+
+def test_11_header_total_preferred_over_line_synthesis(tmp_path):
+    """Monetary totals prefer the header-level total when both exist."""
+    ag = _camel_agent(tmp_path)
+    for q in ("total sales", "total revenue"):
+        ir = ag._build_goal_ir(q)
+        jp = ag._determine_join_path(ag._get_relevant_tables(q))
+        ir = ag._resolve_semantics(q, ir, jp)
+        sums = [m for m in ir["metrics"] if str(m.get("aggregation", "")).upper() == "SUM"]
+        assert sums, f"{q!r} resolved no SUM metrics"
+        for m in sums:
+            expr = str(m.get("resolved_expression") or "")
+            assert "*" not in expr, (
+                f"{q!r} synthesized qty*price {expr!r} instead of the header total")
+            assert _bare(m.get("resolved_table")) == "salesorderheader", (
+                f"{q!r} resolved to {m.get('resolved_table')} instead of the header table")
+            assert str(m.get("resolved_column") or "").lower() == "totaldue", (
+                f"{q!r} resolved to {m.get('resolved_column')} instead of the header total")
+
+
+def test_12_order_count_resolves_to_header(tmp_path):
+    """'how many orders' counts header rows, never territory/customer splits."""
+    ag = _camel_agent(tmp_path)
+    ir = ag._build_goal_ir("how many orders")
+    jp = ag._determine_join_path(ag._get_relevant_tables("how many orders"))
+    ir = ag._resolve_semantics("how many orders", ir, jp)
+    counts = [m for m in ir["metrics"] if str(m.get("aggregation", "")).upper() == "COUNT"]
+    assert counts, "no COUNT metric resolved"
+    for m in counts:
+        assert _bare(m.get("resolved_table")) in ("salesorderheader", "salesorderdetail"), (
+            f"order count resolved to {m.get('resolved_table')}")
+
+
+def test_13_customer_person_split_and_cross_schema_join(tmp_path):
+    """Customer counts stay on Customer; Customer<->Person spans schemas."""
+    ag = _camel_agent(tmp_path)
+    ir = ag._build_goal_ir("how many customers")
+    jp = ag._determine_join_path(ag._get_relevant_tables("how many customers"))
+    ir = ag._resolve_semantics("how many customers", ir, jp)
+    counts = [m for m in ir["metrics"] if str(m.get("aggregation", "")).upper() == "COUNT"]
+    assert counts
+    for m in counts:
+        assert _bare(m.get("resolved_table")) == "customer", (
+            f"customer count resolved to {m.get('resolved_table')}")
+    plan = ag._plan_joins(["Sales.Customer", "Person.Person"])
+    assert "Sales.Customer" in plan["nodes"] and "Person.Person" in plan["nodes"]
+    assert plan["edges"], "cross-schema Customer<->Person join has no edges"
+    # Bare + case-insensitive join path must also connect across schemas.
+    jp2 = ag._determine_join_path(["customer", "person.person"])
+    assert {_bare(t) for t in jp2} >= {"customer", "person"}, f"bare join failed: {jp2}"
+    jp3 = ag._determine_join_path(["SALES.SALESORDERHEADER", "sales.customer"])
+    assert {_bare(t) for t in jp3} >= {"salesorderheader", "customer"}, f"case join failed: {jp3}"
+
+
+def test_14_identifier_normalization_and_search_path(tmp_path):
+    """Generic identifier + multi-schema search_path fallback (no DB names)."""
+    from core.db import (normalize_identifier, bare_identifier, base_table,
+                         search_path_connect_args)
+    from schema_engine.lexical import (canonical_identifier, bare_identifier as lex_bare,
+                                       fold_identifier_tokens)
+    assert normalize_identifier('"TotalDue"') == "totaldue"
+    assert bare_identifier("Sales.SalesOrderHeader") == "salesorderheader"
+    assert base_table('"Sales"."SalesOrderHeader"') == "SalesOrderHeader"
+    assert canonical_identifier('"SalesOrderHeader"') == "salesorderheader"
+    assert lex_bare("Sales.SalesOrderHeader") == "salesorderheader"
+    assert set(fold_identifier_tokens("TotalDue")) >= {"total", "due"}
+    assert set(fold_identifier_tokens("SalesOrderHeader")) >= {"sales", "order", "header"}
+    ag = _camel_agent(tmp_path)
+    assert ag._resolve_table_key("sales.salesorderheader") == "Sales.SalesOrderHeader"
+    assert ag._resolve_table_key("SALESORDERHEADER") == "Sales.SalesOrderHeader"
+    assert ag._resolve_table_key('"SalesOrderHeader"') == "Sales.SalesOrderHeader"
+    opts = search_path_connect_args("postgresql", ["Sales", "Person", "Production"])
+    assert "options" in opts
+    assert all(s in opts["options"] for s in ("Sales", "Person", "Production", "public"))
+    assert search_path_connect_args("postgresql", ["public"]) == {}
+    assert search_path_connect_args("postgresql", ["PUBLIC"]) == {}
+
+
+def test_15_synthesis_fallback_without_header_total(tmp_path):
+    """Without any header/line total, revenue synthesizes qty*price generically."""
+    m = _camel_mapping()
+    m["tables"]["Sales.SalesOrderHeader"]["columns"] = _camel_typed([
+        ("SalesOrderID", "integer"), ("CustomerID", "integer"),
+        ("TerritoryID", "integer"), ("OrderDate", "timestamp")])
+    m["tables"]["Sales.SalesOrderDetail"]["columns"] = _camel_typed([
+        ("SalesOrderID", "integer"), ("ProductID", "integer"),
+        ("OrderQty", "integer"), ("UnitPrice", "numeric")])
+    ag = _camel_agent(tmp_path, m)
+    ir = ag._build_goal_ir("total sales")
+    jp = ag._determine_join_path(ag._get_relevant_tables("total sales"))
+    ir = ag._resolve_semantics("total sales", ir, jp)
+    exprs = [str(x.get("resolved_expression") or "") for x in ir["metrics"]]
+    assert any("*" in e for e in exprs), f"expected qty*price synthesis, got {exprs}"
+
+
+@pytest.fixture()
+def camel_conn():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript("""
+        CREATE TABLE "SalesOrderHeader" ("SalesOrderID" INTEGER PRIMARY KEY, "CustomerID" INTEGER, "TerritoryID" INTEGER, "OrderDate" TEXT, "TotalDue" REAL);
+        CREATE TABLE "SalesOrderDetail" ("SalesOrderID" INTEGER, "ProductID" INTEGER, "OrderQty" INTEGER, "UnitPrice" REAL, "LineTotal" REAL);
+    """)
+    conn.executemany("INSERT INTO SalesOrderHeader VALUES (?,?,?,?,?)",
+                     [(1, 1, 1, "2024-01-05", 100.0), (2, 2, 2, "2024-01-20", 200.0),
+                      (3, 1, 1, "2024-02-10", 150.0), (4, 3, 1, "2024-02-15", 400.0),
+                      (5, 4, 3, "2024-03-01", 50.0), (6, 2, 2, "2024-03-10", 150.0)])
+    conn.executemany("INSERT INTO SalesOrderDetail VALUES (?,?,?,?,?)",
+                     [(1, 101, 2, 50.0, 100.0), (2, 102, 1, 200.0, 200.0),
+                      (3, 101, 1, 50.0, 50.0), (3, 103, 4, 25.0, 100.0),
+                      (4, 102, 2, 200.0, 400.0), (5, 103, 2, 25.0, 50.0),
+                      (6, 101, 3, 50.0, 150.0)])
+    conn.commit()
+    yield conn
+    conn.close()
+
+
+def test_16_header_total_matches_line_rollup(camel_conn):
+    """Header TotalDue equals the detail qty*price rollup (no double count)."""
+    header = camel_conn.execute('SELECT SUM("TotalDue") FROM "SalesOrderHeader"').fetchone()[0]
+    detail = camel_conn.execute('SELECT SUM("OrderQty"*"UnitPrice") FROM "SalesOrderDetail"').fetchone()[0]
+    line = camel_conn.execute('SELECT SUM("LineTotal") FROM "SalesOrderDetail"').fetchone()[0]
+    assert header == pytest.approx(1050.0)
+    assert detail == pytest.approx(header)
+    assert line == pytest.approx(header)

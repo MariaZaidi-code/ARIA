@@ -78,6 +78,15 @@ class SemanticMixin:
         gb = self._synonym_bases(gt)
         if gb & self._synonym_bases(st):
             return True
+        # Compound schema names (countryregion, stateprovince, orderdetails):
+        # a goal word that is a leading substring of the schema token (or
+        # vice versa) means the same thing. Generic, no names; min length 4
+        # avoids noise ('or' vs 'order', 'tax' handled by exact/plural rules).
+        try:
+            if min(len(gt), len(st)) >= 4 and (st.startswith(gt) or gt.startswith(st)):
+                return True
+        except Exception:
+            pass
         for part in st.split("_"):
             if not part:
                 continue
@@ -97,7 +106,12 @@ class SemanticMixin:
         for table in self.tables:
             if self.tables[table].get("empty"):
                 continue
-            parts = set(table.lower().split("_"))
+            # Schema-qualified keys (sales.salesorderheader): match on every
+            # dot-segment, so 'sales' boosts the sales schema and 'employee'
+            # still finds humanresources.employee. Generic, no names.
+            parts = set()
+            for _seg in str(table).lower().split("."):
+                parts.update(_seg.split("_"))
             score = 0
             for tok in goal_tokens:
                 if tok in self._ANALYTICAL_GOAL_WORDS:
@@ -216,6 +230,21 @@ class SemanticMixin:
                 continue
             if low in vocab or (low + "s") in vocab or (low.endswith("s") and low[:-1] in vocab):
                 continue
+            # Never "correct" a word the schema already understands:
+            # 'country' resolves to countryregion (substring/synonym-aware),
+            # so fuzzy business-vocab targets ('count') must not hijack real
+            # dimension words on unseen schemas. A genuine typo that also
+            # matches stays uncorrected and clarifies honestly instead.
+            try:
+                _understood = False
+                for _vt in vocab:
+                    if self._schema_token_matches_goal(_vt, low):
+                        _understood = True
+                        break
+                if _understood:
+                    continue
+            except Exception:
+                pass
             prefix = low[:2] if len(low) >= 2 else low
             candidates = _vocab_index.get(prefix, vocab)
             best, score = None, 0.0
@@ -246,8 +275,11 @@ class SemanticMixin:
 
     def _natural_label(self, identifier):
         """Turn an identifier into a plain-English phrase: 'order_details'
-        -> 'order detail', 'unit_price' -> 'unit price'."""
-        words = [w for w in re.split(r"[^a-zA-Z0-9]+", str(identifier)) if w]
+        -> 'order detail', 'unit_price' -> 'unit price'. Schema-qualified
+        names use the table segment only ('sales.person' -> 'person'), so
+        schema prefixes never leak into user-facing prose."""
+        _bare = str(identifier).split(".")[-1]
+        words = [w for w in re.split(r"[^a-zA-Z0-9]+", _bare) if w]
         if not words:
             return str(identifier)
         return " ".join(singularize(w.lower()) for w in words)

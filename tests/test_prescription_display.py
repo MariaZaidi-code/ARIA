@@ -292,5 +292,48 @@ class RouteStripCase(unittest.TestCase):
                             for m in cm.output))
 
 
+class IntegrityGuardsCase(unittest.TestCase):
+    """Integrity: sanitized doc titles + always-on sampling provenance."""
+
+    def test_doc_title_strips_markup(self):
+        from prescription_engine.engine import _doc_title, analyze_document
+        t = _doc_title({"section": "<script>alert(1)</script> Section title",
+                        "content": "x", "id": "c1"})
+        self.assertNotIn("<script>", t)
+        self.assertNotIn(">", t.replace("…", ""))
+        out = analyze_document(
+            [{"id": "c1", "content": "risk of delay in shipments hurts delivery",
+              "page_number": 2, "section": "<img src=x onerror=alert(1)> Hi"}],
+            "delay risk", "<script>evil.doc</script> Report")
+        title = out["prescriptions"][0]["title"]
+        self.assertNotIn("<script>", title)
+        self.assertNotIn("<img", title)
+        self.assertNotIn("<script>", out["summary_plain"])
+
+    def test_sampling_provenance_always_disclosed(self):
+        from prescription_engine.engine import _details_for
+        rec = {"evidence": {"metric": "m", "n": 100, "p_value": 0.001,
+                            "effect_r": 0.5},
+               "impact": {"baseline": 1, "scenario": 2, "delta": 1,
+                          "rel_pct": 10},
+               "confidence": "high", "action_type": "investigate"}
+        d = _details_for(rec, sampling={"sampled": False, "sample_n": 42,
+                                        "table_n": 42})
+        self.assertIs(d.get("sampled"), False)
+        self.assertEqual(d.get("sample_n"), 42)
+        self.assertEqual(d.get("table_n"), 42)
+        d2 = _details_for(rec, sampling={"sampled": True, "sample_n": 5000,
+                                         "table_n": 20000})
+        self.assertIs(d2.get("sampled"), True)
+        self.assertEqual(d2.get("sample_n"), 5000)
+        self.assertEqual(d2.get("table_n"), 20000)
+        self.assertTrue(str(d2.get("sample_note") or "").strip())
+
+    def test_saved_question_sanitized(self):
+        from api.prescription_routes import _sanitize_saved_text
+        self.assertNotIn("<script>", _sanitize_saved_text(
+            "<script>alert(1)</script> hello", 500))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -39,14 +39,37 @@ class GroundingMixin:
         small bonus ON TOP of a name hit; a bare column match (e.g. the generic
         word 'company' hitting `company_name` on every table) must never outrank
         a table whose name actually matches the subject.
+
+        Generic multi-schema rules (no table names): identifiers fold
+        CamelCase/quotes/separators, and the bare table segment outranks the
+        schema prefix so a schema-synonym hit never ties a bare-entity hit.
         """
-        name_parts = set(self._normalize_tokens(table_name))
+        try:
+            _segs = [s for s in str(table_name or "").split(".") if s.strip()]
+            _bare_seg = _segs[-1] if _segs else str(table_name or "")
+            _schema_segs = _segs[:-1] if len(_segs) > 1 else []
+            try:
+                bare_parts = set(self._fold_ident_tokens(_bare_seg))
+            except Exception:
+                bare_parts = set(self._normalize_tokens(_bare_seg))
+            schema_parts = set()
+            for _s in _schema_segs:
+                try:
+                    schema_parts |= set(self._fold_ident_tokens(_s))
+                except Exception:
+                    schema_parts |= set(self._normalize_tokens(_s))
+        except Exception:
+            bare_parts = set(self._normalize_tokens(table_name))
+            schema_parts = set()
         name_hit = False
         for tok in user_goal_tokens:
-            for part in name_parts:
-                if self._schema_token_matches_goal(part, tok):
-                    name_hit = True
-                    break
+            for part in list(bare_parts) + list(schema_parts):
+                try:
+                    if self._schema_token_matches_goal(part, tok):
+                        name_hit = True
+                        break
+                except Exception:
+                    continue
             if name_hit:
                 break
         score = 0
@@ -54,25 +77,61 @@ class GroundingMixin:
             # Strong: the table's name means something mentioned in the goal.
             # An EXACT name token outranks a partial/synonym match so "orders"
             # picks `orders`, not `order_details` (which only matches because
-            # "order" is a prefix of "order_detail").
+            # "order" is a prefix of "order_detail"). Bare-segment hits
+            # outrank schema-prefix hits so multi-schema synonyms on the
+            # schema never tie a real entity match. Generic, no names.
             for tok in user_goal_tokens:
                 matched = False
-                for part in name_parts:
-                    if tok == part or (tok.endswith("s") and tok[:-1] == part):
+                for part in bare_parts:
+                    if tok == part or (tok.endswith("s") and tok[:-1] == part) \
+                            or (part.endswith("s") and part[:-1] == tok):
                         score += 55
                         matched = True
                         break
                 if matched:
                     continue
-                for part in name_parts:
-                    if self._schema_token_matches_goal(part, tok):
-                        score += 40
+                for part in bare_parts:
+                    try:
+                        if self._schema_token_matches_goal(part, tok):
+                            score += 40
+                            matched = True
+                            break
+                    except Exception:
+                        continue
+                if matched:
+                    continue
+                for part in schema_parts:
+                    if tok == part or (tok.endswith("s") and tok[:-1] == part) \
+                            or (part.endswith("s") and part[:-1] == tok):
+                        score += 10
+                        matched = True
                         break
+                if matched:
+                    continue
+                for part in schema_parts:
+                    try:
+                        if self._schema_token_matches_goal(part, tok):
+                            score += 5
+                            break
+                    except Exception:
+                        continue
+        try:
+            _col_fold = self._fold_ident_tokens
+        except Exception:
+            _col_fold = None
         for column_name in info.get("columns", {}).keys():
-            col_parts = set(self._normalize_tokens(column_name))
+            try:
+                col_parts = set(_col_fold(column_name)) if _col_fold else set(
+                    self._normalize_tokens(column_name))
+            except Exception:
+                col_parts = set(self._normalize_tokens(column_name))
             for tok in user_goal_tokens:
                 for part in col_parts:
-                    if self._schema_token_matches_goal(part, tok):
+                    try:
+                        hit = self._schema_token_matches_goal(part, tok)
+                    except Exception:
+                        hit = False
+                    if hit:
                         # Column matches are a bonus only on a name-matched
                         # table; otherwise they are a weak hint that must not
                         # outrank a subject-table name match.
@@ -170,14 +229,35 @@ class GroundingMixin:
     # ---- _find_join_hops (_find_join_hops) ----
 
     def _find_join_hops(self, start, target):
-        """BFS join path between two tables using the relationship graph."""
+        """BFS join path between two tables using the relationship graph.
+
+        Generic multi-schema resolution (no table names): endpoints are
+        resolved case-insensitively + bare-segment aware so `customer`,
+        `SALES.CUSTOMER` and `"Customer"` all bind the same node; the
+        database remains the final arbiter for ambiguous bare names.
+        """
+        try:
+            _rs = self._resolve_table_key(start) if hasattr(
+                self, "_resolve_table_key") else None
+            _rt = self._resolve_table_key(target) if hasattr(
+                self, "_resolve_table_key") else None
+        except Exception:
+            _rs, _rt = None, None
+        start = _rs or start
+        target = _rt or target
         if start == target:
             return [start]
+        if start not in self.tables or target not in self.tables:
+            return None
         queue = [[start]]
         visited = {start}
         while queue:
             path = queue.pop(0)
-            for neighbor in self.relationship_graph.get(path[-1], []):
+            try:
+                _nbrs = self.relationship_graph.get(path[-1], [])
+            except Exception:
+                _nbrs = []
+            for neighbor in _nbrs:
                 if neighbor not in self.tables:
                     continue
                 if neighbor == target:
@@ -197,11 +277,31 @@ class GroundingMixin:
         Only FK-reachable tables enter the path. Tables with NO join path are
         never forced in: inventing a JOIN where no relationship exists produces
         cartesian products, and a single-table question must run with NO JOIN.
+
+        Generic multi-schema resolution: inputs are bound case-insensitively
+        + bare-segment aware (search_path semantics) so `customer` and
+        `SALES.CUSTOMER` resolve to the same node; ambiguous bare names are
+        dropped so the database stays the final arbiter.
         """
         if not relevant_tables:
             return []
-        path = [relevant_tables[0]]
-        remaining = relevant_tables[1:]
+        resolved = []
+        try:
+            _res = self._resolve_table_key if hasattr(
+                self, "_resolve_table_key") else None
+        except Exception:
+            _res = None
+        for t in (relevant_tables or []):
+            try:
+                r = _res(t) if callable(_res) else (t if t in self.tables else None)
+            except Exception:
+                r = t if t in self.tables else None
+            if r is not None and r in self.tables and r not in resolved:
+                resolved.append(r)
+        if not resolved:
+            return []
+        path = [resolved[0]]
+        remaining = resolved[1:]
         while remaining:
             connected = None
             best_local = None
@@ -430,10 +530,17 @@ class GroundingMixin:
         for table in relevant:
             info = self.tables.get(table, {})
             cols = list(info.get("columns", {}))
+
+            def _fold(c):
+                try:
+                    return set(self._fold_ident_tokens(c))
+                except Exception:
+                    return {str(c or "").lower()}
+
             qty = next((c for c in cols if self._schema_token_matches_goal("quantity", c)
-                        or "qty" in c.lower()), None)
+                        or "qty" in _fold(c) or "quantity" in _fold(c)), None)
             price = next((c for c in cols if self._schema_token_matches_goal("price", c)
-                          or "price" in c.lower() or "amount" in c.lower()), None)
+                          or "price" in _fold(c) or "amount" in _fold(c)), None)
             if qty and price and qty != price:
                 if self._is_measure_column(table, qty) and self._is_measure_column(table, price):
                     disc = next((c for c in cols if "discount" in c.lower()), None)
@@ -493,13 +600,44 @@ class GroundingMixin:
         Entity tables are those whose NAME matches an entity token
         (non-metric, non-analytical; minus count/fact nouns when a metric is
         present). Pure-fact tables (order_details, ...) are never subjects.
-        Falls back to non-fact matched tables, then the strongest name match."""
+        Falls back to non-fact matched tables, then the strongest name match.
+
+        Generic multi-schema rules: CamelCase-folded bare-segment matching
+        outranks schema-prefix synonyms, so a schema word never ties a real
+        entity hit; ties break by bare exact/plural strength, then FK
+        connectivity, then name. No table names.
+        """
+        def _bare_folded(table):
+            try:
+                _seg = str(table or "").split(".")[-1]
+                return set(self._fold_ident_tokens(_seg))
+            except Exception:
+                try:
+                    return set(self._normalize_tokens(table))
+                except Exception:
+                    return {str(table or "").lower()}
+
+        def _bare_strength(table):
+            try:
+                parts = _bare_folded(table)
+            except Exception:
+                return 0
+            best = 0
+            for tok in (entity_tokens or set()):
+                for part in parts:
+                    if tok == part or (tok.endswith("s") and tok[:-1] == part) \
+                            or (part.endswith("s") and part[:-1] == tok):
+                        best = max(best, 2)
+                    else:
+                        try:
+                            if self._schema_token_matches_goal(part, tok):
+                                best = max(best, 1)
+                        except Exception:
+                            continue
+            return best
+
         def name_matches_entity(table):
-            parts = set(self._normalize_tokens(table))
-            return any(
-                self._schema_token_matches_goal(part, tok)
-                for tok in entity_tokens for part in parts
-            )
+            return _bare_strength(table) > 0
         subject_tables = [
             mt for mt in matched_tables
             if not self._is_pure_fact_table(mt[1]) and name_matches_entity(mt[1])
@@ -514,6 +652,7 @@ class GroundingMixin:
             t = mt[1]
             return (
                 self._table_keyword_score(t, self.tables[t], goal_tokens),
+                _bare_strength(t),
                 -len(self.tables[t].get("foreign_keys", [])),
                 t,
             )
@@ -620,13 +759,57 @@ class GroundingMixin:
                 continue
         return out
 
+    def _fold_ident_tokens(self, value):
+        """Lowercase word tokens folding CamelCase + separators + quotes."""
+        try:
+            s = str(value or "").strip()
+            while len(s) >= 2 and ((s[0] == '"' and s[-1] == '"')
+                                   or (s[0] == "'" and s[-1] == "'")
+                                   or (s[0] == "`" and s[-1] == "`")
+                                   or (s[0] == "[" and s[-1] == "]")):
+                s = s[1:-1].strip()
+            s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+            s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)
+            return {w for w in re.split(r"[^a-z0-9]+", s.lower()) if w} | \
+                {s.lower()} if s else set()
+        except Exception:
+            low = str(value or "").lower()
+            return {low} if low else set()
+
+    def _is_line_grain_table(self, table):
+        """True for line-grain tables (generic grain words only, no names)."""
+        try:
+            toks = self._fold_ident_tokens(str(table or "").split(".")[-1])
+            return bool(toks & {"line", "lines", "detail", "details",
+                                "item", "items", "entry", "entries"})
+        except Exception:
+            return False
+
+    def _is_parent_table(self, table, tables):
+        """True when another table in `tables` holds an FK referencing `table`."""
+        try:
+            for other in (tables or []):
+                if other == table:
+                    continue
+                info = self.tables.get(other, {}) or {}
+                for fk in info.get("foreign_keys", []) or []:
+                    if fk.get("referenced_table") == table:
+                        return True
+        except Exception:
+            pass
+        return False
+
     def _measure_name_tier(self, col_name, monetary_bias):
         """0 = money total, 1 = money line, 2 = neutral, 3 = quantity-like,
         10 = excluded for revenue-like (cost/fuel/id/count). Token-based so
         unit_price/fuel_price variants classify correctly."""
-        low = str(col_name or "").lower()
-        toks = set(re.split(r"[^a-z0-9]+", low)) | {low}
-        parts = set(low.split("_")) | toks
+        try:
+            toks = set(self._fold_ident_tokens(col_name))
+        except Exception:
+            toks = set()
+        low = str(col_name or "").strip().strip("\"'`[]").lower()
+        toks = set(toks) | {low}
+        parts = set(low.split("_")) | set(toks)
         if monetary_bias and (parts & self._REVENUE_EXCLUDED_TOKENS):
             return 10
         if monetary_bias and ("id" in parts or parts & {"count", "cnt"}):
@@ -746,12 +929,18 @@ class GroundingMixin:
                 quote = (lambda n: self._quote(n, getattr(self, "dialect", "postgresql")))
             except Exception:
                 quote = lambda n: f'"{n}"'  # noqa: E731
+            try:
+                from core.db import base_table as _bt
+            except Exception:
+                _bt = lambda n: str(n or "").split(".")[-1]  # noqa: E731
             for cand in cands:
                 if len(found) >= 2:
                     break
                 for (t, c) in cols:
                     try:
-                        sql = (f"SELECT DISTINCT {quote(c)} FROM {quote(t)} "
+                        # Bare segment: the engine search_path resolves
+                        # schema-qualified keys (sales.employee -> employee).
+                        sql = (f"SELECT DISTINCT {quote(c)} FROM {quote(_bt(t))} "
                                f"LIMIT 50")
                         with self.engine.connect() as conn:
                             rows = conn.execute(_text(sql)).fetchall()
@@ -797,7 +986,11 @@ class GroundingMixin:
                 quote = (lambda n: self._quote(n, getattr(self, "dialect", "postgresql")))
             except Exception:
                 quote = lambda n: f'"{n}"'  # noqa: E731
-            sql = (f"SELECT DISTINCT {quote(col)} FROM {quote(table)} "
+            try:
+                from core.db import base_table as _bt2
+            except Exception:
+                _bt2 = lambda n: str(n or "").split(".")[-1]  # noqa: E731
+            sql = (f"SELECT DISTINCT {quote(col)} FROM {quote(_bt2(table))} "
                    f"LIMIT {int(cap)}")
             with self.engine.connect() as conn:
                 rows = conn.execute(_text(sql)).fetchall()
@@ -807,14 +1000,14 @@ class GroundingMixin:
 
     def _is_geo_cat_like(self, col):
         try:
-            return bool(set(re.split(r"[^a-z0-9]+", str(col or "").lower()))
-                        & self._GEO_CAT_TOKENS)
+            toks = set(self._fold_ident_tokens(col))
+            return bool(toks & self._GEO_CAT_TOKENS)
         except Exception:
             return False
 
     def _is_person_name_like(self, table, col):
         try:
-            toks = set(re.split(r"[^a-z0-9]+", str(col or "").lower()))
+            toks = set(self._fold_ident_tokens(col))
             if not (toks & self._PERSON_NAME_TOKENS) and "name" not in toks:
                 return False
             # A bare *product/region/category* name is a legit breakdown;
@@ -1080,9 +1273,50 @@ class GroundingMixin:
                 _graph = getattr(self, "relationship_graph", {}) or {}
             except Exception:
                 _graph = {}
+            try:
+                _goal_toks = set(self._normalize_tokens(goal_l)) | set(breakdown_tokens or [])
+            except Exception:
+                _goal_toks = set()
+            try:
+                _bdn_toks = {str(_b).lower() for _b in (breakdown_tokens or set()) if str(_b or "")}
+            except Exception:
+                _bdn_toks = set()
             def _rank_key(d):
                 _t = d.get("resolved_table")
                 _c = d.get("resolved_column") or ""
+                # Goal-named dims win the cap: "by country" must keep the
+                # country table even when another table has fewer groups.
+                # Synonym/substring-aware so compounds match. Generic.
+                _named = 1
+                _direct = 1
+                try:
+                    _stm = getattr(self, "_schema_token_matches_goal", None)
+                    _parts = [p for seg in str(_t or "").split(".")
+                              for p in seg.split("_") if p]
+                    _parts += [p for p in str(_c or "").split("_") if p]
+                    if callable(_stm) and _goal_toks:
+                        for _p in _parts:
+                            for _gw in _goal_toks:
+                                if _stm(_p, _gw):
+                                    _named = 0
+                                    break
+                            if _named == 0:
+                                break
+                    # Direct breakdown-token hit outranks synonym-only hits:
+                    # 'country' is literally inside 'countryregion' but only
+                    # a synonym of 'location'. Generic (leading-substring
+                    # either way, min length 4).
+                    if _bdn_toks:
+                        for _p in _parts:
+                            for _bw in _bdn_toks:
+                                if len(_p) >= 4 and len(_bw) >= 4 and (
+                                        _p.startswith(_bw) or _bw.startswith(_p)):
+                                    _direct = 0
+                                    break
+                            if _direct == 0:
+                                break
+                except Exception:
+                    pass
                 try:
                     _geo = bool(self._is_geo_cat_like(_c))
                 except Exception:
@@ -1101,7 +1335,7 @@ class GroundingMixin:
                     _conf = float(d.get("confidence") or 0)
                 except Exception:
                     _conf = 0
-                return (_isolated, 0 if _geo else 1, _card_v,
+                return (_direct, _named, _isolated, 0 if _geo else 1, _card_v,
                         -_conf, str(_t or ""), str(_c or ""))
             try:
                 # Keep date dims required by trends outside the cap;
@@ -1175,7 +1409,7 @@ class GroundingMixin:
                     metric["confidence"] = 0.9
                 continue
             tokens = concept_tokens.get(concept, {concept})
-            best, best_key = None, (0, -1, "")
+            best, best_key = None, None
             # Aggregate-monetary concepts prefer a monetary total column
             # (amount/total/revenue/sales) over a per-line price or a
             # quantity/units fact column when match scores tie, so "overall
@@ -1217,8 +1451,11 @@ class GroundingMixin:
             _pool = _safe_pool or measures
             for m in _pool:
                 s = 0
-                col_tokens = self._normalize_tokens(m["column"])
-                col_name = m["column"].lower()
+                try:
+                    col_tokens = set(self._fold_ident_tokens(m["column"]))
+                except Exception:
+                    col_tokens = self._normalize_tokens(m["column"])
+                col_name = str(m["column"] or "").lower()
                 for tok in tokens:
                     if tok in col_tokens:
                         s += 2
@@ -1232,8 +1469,29 @@ class GroundingMixin:
                 tier = self._measure_name_tier(m["column"], monetary_bias)
                 if tier >= 10:
                     continue
-                key = (s, -tier, col_name)
-                if key > best_key:
+                # Header-vs-line disambiguation (generic): when both a
+                # header-level monetary total and a line-level total exist,
+                # prefer the header total (non-line table, FK-referenced
+                # parent). Line-grain tables and unreferenced children sort
+                # last so qty*price synthesis only wins when no header
+                # total exists. For monetary concepts the tier outranks the
+                # raw token score so a per-line price with an extra plural
+                # hit never beats a header total. No table/column literals.
+                try:
+                    _line_pen = 1 if self._is_line_grain_table(
+                        m.get("table")) else 0
+                except Exception:
+                    _line_pen = 0
+                try:
+                    _parent_bonus = 0 if self._is_parent_table(
+                        m.get("table"), relevant) else 1
+                except Exception:
+                    _parent_bonus = 1
+                if monetary_bias:
+                    key = (-tier, s, -_line_pen, -_parent_bonus, col_name)
+                else:
+                    key = (s, -tier, -_line_pen, -_parent_bonus, col_name)
+                if best_key is None or key > best_key:
                     best_key = key
                     best = m
             # Goal-name override: if the user explicitly names a column
@@ -1241,7 +1499,10 @@ class GroundingMixin:
             # concept-token match which may pick the wrong column. Never
             # overrides a revenue-like goal with a cost/fuel/id/count column.
             if not monetary_bias:
-                goal_words = {w for w in goal_l.split() if len(w) >= 3}
+                try:
+                    goal_words = {w for w in self._normalize_tokens(goal_l) if len(w) >= 3}
+                except Exception:
+                    goal_words = {w for w in goal_l.split() if len(w) >= 3}
                 for m in _pool:
                     col_lower = m["column"].lower()
                     col_base = col_lower.split("_")[0]
@@ -1260,7 +1521,10 @@ class GroundingMixin:
             if best:
                 best_tier = self._measure_name_tier(best["column"], monetary_bias)
                 # For monetary concepts, prefer computed expression over a bare
-                # price/line column (tier 1), since revenue = qty * price * (1-disc).
+                # price/line column (tier >= 1), since revenue = qty*price*(1-disc).
+                # A header-level monetary total (tier 0) always wins over the
+                # line-grain synthesis: header totals are already the
+                # qty*price rollup and re-multiplying lines double-counts.
                 if computed and best_tier >= 1 and monetary_bias:
                     metric["resolved_table"] = computed["table"]
                     metric["resolved_column"] = None

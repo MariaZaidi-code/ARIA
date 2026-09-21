@@ -133,9 +133,14 @@ class TemplateRequest(BaseModel):
 def _get_session_and_user(request: Request, user: dict = Depends(get_current_user)):
     """Resolve session + ownership for Intelligence endpoints."""
     session = get_session(user["user_id"])
-    provider = session.get("provider") or session.get("provider_name") or session.get("llm_provider")
+    provider = session.get("provider")
     if not provider:
-        raise HTTPException(status_code=400, detail="Choose an LLM provider and connect a source first.")
+        provider_error = session.get("_provider_error", "")
+        detail = "No LLM provider available."
+        if provider_error:
+            detail += f" ({provider_error})"
+        detail += " Connect a source or configure a provider in Settings."
+        raise HTTPException(status_code=400, detail=detail)
     if session.get("source_type") == "relational" and not session.get("db"):
         raise HTTPException(status_code=400, detail="Connect to a database first.")
     if session.get("source_type") == "semi-structured" and not session.get("db_uri"):
