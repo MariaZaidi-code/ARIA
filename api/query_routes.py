@@ -259,6 +259,26 @@ def _document_evidence(user_id, goal_text, limit: int = 3) -> list[dict]:
         return []
 
 
+def _attach_ask_verdict(resp, session):
+    """Best-effort Verification Agent hookup for ask answers (never blocks).
+
+    Attaches ``resp["verdict"]``. On any failure attaches an honest
+    not-verified verdict and still returns the data untouched.
+    """
+    try:
+        from verification.agent import verify_ask
+        verdict = verify_ask(resp if isinstance(resp, dict) else {},
+                             dict(session or {}))
+    except Exception:
+        verdict = {"verified": False, "checks": [],
+                   "warnings": ["verification unavailable"]}
+    try:
+        resp["verdict"] = verdict
+    except Exception:
+        pass
+    return resp
+
+
 def _check_consistency(chart_spec, result_data, why_block) -> dict:
     """§24: chart + result + explanation must describe the same outcome."""
     issues = []
@@ -353,7 +373,7 @@ def get_suggestions(request: Request, payload: dict | None = None, user: dict = 
             ][:limit]
         else:
             # Build suggestions from actual table/column names — fully dynamic.
-            from api.schema_intel import SchemaIntelligence, _is_id_like
+            from core.schema_intel import SchemaIntelligence, _is_id_like
             from core.analytical_result import natural_label as _nl, _plural as _pl
             intel = SchemaIntelligence(schema_data)
             suggestions = []
@@ -750,8 +770,8 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     try:
         _needs_fb = (not processed.get("data")) or (processed.get("status") == "query_failed")
         if _needs_fb:
-            from api.schema_intel import SchemaIntelligence as _SI
-            from api.schema_intel import _safe_name as _qn_fb
+            from core.schema_intel import SchemaIntelligence as _SI
+            from core.schema_intel import _safe_name as _qn_fb
             try:
                 from core.semantic import humanize as _hum_fb
             except Exception:
@@ -930,7 +950,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             if "(" in str(c) or "*" in str(c):
                 continue
             try:
-                from api.schema_intel import _is_id_like as _id_like
+                from core.schema_intel import _is_id_like as _id_like
                 if _id_like(str(c)):
                     continue
             except Exception:
@@ -951,7 +971,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     # connected schema, never a static generic list.
     general_suggestions = []
     try:
-        from api.schema_intel import SchemaIntelligence, _is_id_like as _id_like2
+        from core.schema_intel import SchemaIntelligence, _is_id_like as _id_like2
 
         _schema_path = Path(str(session.get("schema_path", "")))
         if _schema_path.exists():
@@ -1222,7 +1242,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
                     }
         _follow_dims = []
         try:
-            from api.schema_intel import _is_id_like as _env_id_like
+            from core.schema_intel import _is_id_like as _env_id_like
             for d in _dims:
                 if "(" in str(d) or "*" in str(d):
                     continue
@@ -1236,7 +1256,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         # Trend follow-ups only when a real datetime column with data exists.
         _has_dt = False
         try:
-            from api.schema_intel import SchemaIntelligence as _SI_env
+            from core.schema_intel import SchemaIntelligence as _SI_env
             _sp_env = Path(str(session.get("schema_path", "")))
             if _sp_env.exists():
                 _sd_env = json.loads(_sp_env.read_text(encoding="utf-8"))
@@ -1330,7 +1350,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             _t360 = _tables_360[0] if _tables_360 else None
             if _t360 and _metric_col:
                 from sqlalchemy import create_engine as _mk360
-                from api.schema_intel import SchemaIntelligence as _SI360
+                from core.schema_intel import SchemaIntelligence as _SI360
                 _sp360 = Path(str(session.get("schema_path", "")))
                 if _sp360.exists():
                     _sd360 = json.loads(_sp360.read_text(encoding="utf-8"))
@@ -1362,7 +1382,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         )
     except Exception:
         _b360 = None
-    return {
+    _resp = {
         "ok": True,
         "provider": session["provider_name"],
         "business360": _b360,
@@ -1404,6 +1424,12 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "provenance": provenance,
         **_analytics_envelope,
     }
+    # Verification verdict, best-effort: data is never blocked on failure.
+    try:
+        _attach_ask_verdict(_resp, session)
+    except Exception:
+        pass
+    return _resp
 
 
 @router.post("/api/insight")

@@ -19,7 +19,7 @@ from typing import Any
 
 # Imported lazily-safe: schema_intel only does pure type classification.
 try:
-    from api.schema_intel import classify_type
+    from core.schema_intel import classify_type
 except Exception:  # pragma: no cover - import path fallback
     def classify_type(data_type: str) -> str:
         dt = str(data_type or "").lower()

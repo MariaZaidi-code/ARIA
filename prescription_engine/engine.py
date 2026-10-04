@@ -397,7 +397,7 @@ def _exec(engine, sql, params=None):
 
 
 def _fetch_pairs(engine, dialect, table, col_a, col_b, filt=None, limit=SAMPLE_LIMIT):
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     where = (f"{_safe_name(col_a, dialect)} IS NOT NULL AND "
              f"{_safe_name(col_b, dialect)} IS NOT NULL")
     params = {}
@@ -946,7 +946,7 @@ def _stay_lengths(engine, dialect, table, c1, c2, metric, limit=SAMPLE_LIMIT):
     Returns (nights_list, metric_list) or (None, None) when unusable.
     """
     import pandas as pd
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     try:
         rows = _exec(engine,
                      f"SELECT {_safe_name(c1, dialect)}, {_safe_name(c2, dialect)}, "
@@ -1207,7 +1207,7 @@ def _monitor_cands(engine, dialect, intel, table, metric, m_h,
     if not dts:
         return []
     try:
-        from api.schema_intel import _safe_name
+        from core.schema_intel import _safe_name
         rows = _exec(engine,
                      f"SELECT {_safe_name(dts[0], dialect)}, {_safe_name(metric, dialect)} "
                      f"FROM {_safe_name(table, dialect)} "
@@ -1298,7 +1298,7 @@ def _monthly_buckets(engine, dialect, intel, table, metric):
     if not dts:
         return [], None
     try:
-        from api.schema_intel import _safe_name
+        from core.schema_intel import _safe_name
         rows = _exec(engine,
                      f"SELECT {_safe_name(dts[0], dialect)}, {_safe_name(metric, dialect)} "
                      f"FROM {_safe_name(table, dialect)} "
@@ -1636,7 +1636,7 @@ def _groups_bar_viz(top, m_h):
             _drv = (top.get("evidence", {}) or {}).get("driver", "")
             _title = f"{m_h} by {_hh2(_drv)}"
             try:
-                from api.insights_routes import _normalize_chart_spec as _norm
+                from services.insights_service import _normalize_chart_spec as _norm
                 _spec = _norm("bar", _rows[:200], _title)
                 if isinstance(_spec, dict) and not _spec.get("unsupported") \
                         and not _spec.get("insufficient") and _spec.get("data"):
@@ -1695,7 +1695,7 @@ def _review_period(engine, dialect, table, intel):
                 break
     if dts:
         try:
-            from api.schema_intel import _safe_name
+            from core.schema_intel import _safe_name
             rows = _exec(engine,
                          f"SELECT MIN({_safe_name(dts[0], dialect)}), "
                          f"MAX({_safe_name(dts[0], dialect)}) "
@@ -1740,7 +1740,7 @@ def _fetch_joined(engine, dialect, mtable, mcol, otable, ocol, self_col, other_c
     the local _qi quoter.
     """
     try:
-        from api.schema_intel import _safe_name as _qn
+        from core.schema_intel import _safe_name as _qn
     except Exception:
         _qn = None
 
@@ -3396,7 +3396,7 @@ def _why_text_for(rec: dict, tested=None, supporting=None) -> str:
 def _table_sampling(engine, dialect, table) -> dict:
     """Sampling provenance for LIMIT 5000 reads (additive details only)."""
     try:
-        from api.schema_intel import _safe_name
+        from core.schema_intel import _safe_name
         from sqlalchemy import text as _t
         with engine.connect() as conn:
             _n = conn.execute(_t(f"SELECT COUNT(*) FROM {_safe_name(table, dialect)}")).scalar()
@@ -3416,7 +3416,7 @@ def validate_segment_value(engine, dialect, table, field, value, limit=100) -> d
     substring matches, capped at 5.
     """
     try:
-        from api.schema_intel import _safe_name
+        from core.schema_intel import _safe_name
         rows = _exec(engine,
                      f"SELECT DISTINCT {_safe_name(field, dialect)} "
                      f"FROM {_safe_name(table, dialect)} "
@@ -3500,7 +3500,7 @@ def parse_question_intent(question, intel, table, engine=None, dialect=None) -> 
     if engine is not None and dialect is not None:
         for d in dims:
             try:
-                from api.schema_intel import _safe_name
+                from core.schema_intel import _safe_name
                 rows = _exec(engine,
                              f"SELECT DISTINCT {_safe_name(d, dialect)} "
                              f"FROM {_safe_name(table, dialect)} "

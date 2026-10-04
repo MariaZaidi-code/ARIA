@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import time
+from contextvars import ContextVar
 from urllib.parse import quote_plus
 
 try:
@@ -90,6 +91,76 @@ def _llm_rate_limit(key="default") -> None:
         )
     hits.append(now)
     _llm_buckets[bucket_key] = hits
+
+
+# ---------------------------------------------------------------------------
+# Per-question RAG LLM call budget (insight_rag RAG_MAX_LLM_CALLS_PER_QUERY)
+# ---------------------------------------------------------------------------
+# One user question must never loop the hosted provider: every RAG-scoped call
+# is charged against a per-question budget and denied once the budget is spent.
+# The counter is context-local (thread/task safe, never a process-global) and
+# is reset exactly once per user question by the RAG request entry point
+# (``insight_rag.scope_layer.chat``), so the summary retry that re-runs
+# ``_chat`` spends the same budget as the first attempt.
+
+class RagLLMBudgetExceeded(RuntimeError):
+    """A RAG question asked for more LLM calls than its per-query budget.
+
+    Raised *before* provider I/O. Every insight_rag call site already wraps its
+    RAG-scoped LLM calls in ``except Exception`` and degrades to a fallback
+    answer, refusal or clarification, so a budget denial takes the same
+    least-disruptive path and never surfaces as a request error.
+    """
+
+
+_RAG_BUDGET_ACTIVE = ContextVar("aria_rag_llm_budget_active", default=False)
+_RAG_BUDGET_LIMIT = ContextVar("aria_rag_llm_budget_limit", default=0)
+_RAG_BUDGET_USED = ContextVar("aria_rag_llm_budget_used", default=0)
+
+
+def is_rag_role(role) -> bool:
+    """True only for RAG-scoped roles (``rag`` / ``rag_*``).
+
+    Every other role (sql, story, suggest, semi, schema, vision — the
+    prescription, prediction, copilot, goal and schema agents) is never
+    counted, gated or slowed by the RAG budget.
+    """
+    name = str(role or "")
+    return name == "rag" or name.startswith("rag_")
+
+
+def begin_rag_llm_budget(max_calls: int):
+    """Reset and activate the per-question RAG budget; pair with ``end_rag_llm_budget``.
+
+    Returns the context token to hand back to :func:`end_rag_llm_budget`.
+    """
+    _RAG_BUDGET_USED.set(0)
+    _RAG_BUDGET_LIMIT.set(int(max_calls))
+    return _RAG_BUDGET_ACTIVE.set(True)
+
+
+def end_rag_llm_budget(token) -> None:
+    """Deactivate the budget and restore the previous context state."""
+    _RAG_BUDGET_ACTIVE.reset(token)
+
+
+def rag_llm_calls_used() -> int:
+    """RAG-scoped calls charged so far in the active request (diagnostics/tests)."""
+    return _RAG_BUDGET_USED.get()
+
+
+def charge_rag_llm_call(role) -> None:
+    """Charge one RAG-scoped LLM call; deny it once the per-question budget is spent."""
+    if not _RAG_BUDGET_ACTIVE.get() or not is_rag_role(role):
+        return
+    used = _RAG_BUDGET_USED.get()
+    limit = _RAG_BUDGET_LIMIT.get()
+    if used >= limit:
+        raise RagLLMBudgetExceeded(
+            f"RAG per-question LLM budget exhausted ({limit} calls). "
+            "Continuing on the existing degraded/fallback path."
+        )
+    _RAG_BUDGET_USED.set(used + 1)
 
 
 def _content_chars(messages) -> int:
@@ -438,6 +509,7 @@ class LLMProvider:
         The JSON Schema is injected as a system instruction that the caller's
         own validation enforces.
         """
+        charge_rag_llm_call(role)
         del reasoning_effort  # accepted for interface compatibility
         if self.provider == "local":
             raise RuntimeError("Structured output is available only on a hosted provider.")
@@ -501,7 +573,10 @@ class LLMProvider:
         the caller can fall back to a fast template instead of waiting indefinitely.
         Defaults: 15s cloud, 30s local, 120s max for local story (never 900s).
         A per-user rate-limit budget is enforced before any provider I/O.
+        RAG-scoped roles are additionally charged against the per-question
+        RAG budget (see ``charge_rag_llm_call``).
         """
+        charge_rag_llm_call(role)
         _llm_rate_limit(str(user_id or "default") + f":{role}")
         if timeout is None:
             if self.provider == "local" and role in ("story",):
@@ -540,8 +615,10 @@ class LLMProvider:
         template and just echoes the prompt when driven through `chat()`). For the
         cloud backend the prompt is sent as a single user message.
         Local timeouts are capped at 120s (never 900s); a per-user rate-limit
-        budget is enforced before any provider I/O.
+        budget is enforced before any provider I/O. RAG-scoped roles are
+        additionally charged against the per-question RAG budget.
         """
+        charge_rag_llm_call(role)
         _llm_rate_limit(str(user_id or "default") + f":{role}")
         if timeout is None:
             if self.provider == "local" and role == "sql":

@@ -670,7 +670,7 @@ No explanations, no markdown.
                         try:
                             _det = self._clean_sql(_det)
                             with self.engine.connect() as _c:
-                                _r = _c.execute(text(_det))
+                                _r = self._execute_guarded(_c, _det)
                                 _rows = _r.fetchmany(10_001)
                                 _cols = list(_r.keys())
                             if _rows:
@@ -750,7 +750,7 @@ No explanations, no markdown.
                             user_goal=user_goal)
                         safe_sql = _enforce(safe_sql)
                         with self.engine.connect() as conn:
-                            result = conn.execute(text(safe_sql))
+                            result = self._execute_guarded(conn, safe_sql)
                             rows = result.fetchmany(_MAX_ROWS + 1)
                             truncated = len(rows) > _MAX_ROWS
                             if truncated:

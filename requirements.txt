@@ -30,4 +30,11 @@ tbats==1.1.3
 # Optional: multi-worker shared rate-limit/session store needs Redis.
 # Install it with: pip install redis  (then set ARIA_REDIS_URL + ARIA_REQUIRE_SHARED_STORE=1)
 redis==5.2.1
+# Insight RAG + schema_agent imports (guarded at import; raise at use if missing).
+# Unpinned: not installed in the dev venv, so there is no verified == version —
+# pin from a clean-Linux `pip freeze` rather than guessing.
+fastembed
+pymupdf
+langchain-postgres
+mysql-connector-python
 

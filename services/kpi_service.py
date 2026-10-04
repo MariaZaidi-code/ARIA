@@ -19,7 +19,7 @@ from urllib.parse import quote_plus
 
 from sqlalchemy import create_engine, text
 
-from api.schema_intel import _safe_name
+from core.schema_intel import _safe_name
 from core.semantic import humanize, kpi_label
 
 from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, log_and_sanitize
@@ -40,7 +40,7 @@ def _measure_expr(intel, tname: str, col: str, dialect: str) -> str:
     Unparsable values become NULL (never invented). Native numerics and
     unknown dtypes keep the plain quoted column. Never raises.
     """
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     try:
         q = _safe_name(col, dialect)
     except Exception:
@@ -107,7 +107,7 @@ def _fmt(v, is_currency=False):
 
 
 def _is_currency_col(col_name: str) -> bool:
-    from api.schema_intel import AMOUNT_HINTS
+    from core.schema_intel import AMOUNT_HINTS
     cl = col_name.lower()
     return any(k in cl for k in AMOUNT_HINTS)
 

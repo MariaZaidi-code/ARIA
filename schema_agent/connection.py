@@ -21,12 +21,19 @@ try:
 except ImportError:
     MYSQL_AVAILABLE = False
 
+# Optional second driver: mysql-connector-python's connection pool. Its
+# availability is tracked SEPARATELY — MYSQL_AVAILABLE gates pymysql (used by
+# get_connection/_dict_cursor/_LEGACY_TIMEOUT_ERRORS below), so a missing
+# connector/pooling import must neither clear nor set that flag: the two
+# try-blocks guard different drivers. `pooling` consumers must check
+# MYSQL_POOL_AVAILABLE, not MYSQL_AVAILABLE.
 try:
     import mysql.connector
     from mysql.connector import pooling
-    MYSQL_AVAILABLE = True
+    MYSQL_POOL_AVAILABLE = True
 except ImportError:
     pooling = None
+    MYSQL_POOL_AVAILABLE = False
 
 try:
     import llm_provider as _llm_provider

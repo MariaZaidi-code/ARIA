@@ -54,7 +54,7 @@ def _suggest_questions(mapping: dict, session: dict | None = None) -> list[str]:
     Outlier / correlation / forecast / what-if questions are never emitted
     here — those need drivers/history and live on their own tabs.
     """
-    from api.schema_intel import SchemaIntelligence, _is_id_like
+    from core.schema_intel import SchemaIntelligence, _is_id_like
     from core.analytical_result import natural_label as _nl
     try:
         intel = SchemaIntelligence(mapping or {})
@@ -170,7 +170,7 @@ def _column_holds_data(session: dict, table: str, column: str, sample: int = 20,
     short-lived engine built from the session (password stays server-side).
     """
     try:
-        from api.schema_intel import _safe_name
+        from core.schema_intel import _safe_name
         from sqlalchemy import create_engine as _mk, text as _t
         db_type = session.get("db_type", "postgresql")
         dialect = session.get("dialect", db_type)

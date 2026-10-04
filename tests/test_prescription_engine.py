@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 from sqlalchemy import create_engine
 
-from api.schema_intel import SchemaIntelligence
+from core.schema_intel import SchemaIntelligence
 from prescription_engine import (
     analyze,
     analyze_document,

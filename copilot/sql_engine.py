@@ -887,7 +887,9 @@ class SqlEngine:
         # grain; fetchmany() still bounds returned rows.
         if not _LIMIT_RE.search(sql) and self.dialect in ("postgresql", "mysql", "sqlite"):
             if not (_GROUP_BY_RE.search(sql) or _AGG_RE.search(sql)):
-                safe_sql = f"{sql.rstrip(';')} LIMIT {self.max_rows}"
+                # Built from safe_sql: the LIMIT must not discard the
+                # text-cast/date rewrites applied above.
+                safe_sql = f"{safe_sql.rstrip(';')} LIMIT {self.max_rows}"
 
         try:
             engine = _get_engine(self.db_uri, self.schemas)

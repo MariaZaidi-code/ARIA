@@ -126,6 +126,30 @@ class TemplateRequest(BaseModel):
         extra = "allow"
 
 
+class DigestRequest(BaseModel):
+    name: str = "Daily Digest"
+    description: str = ""
+    frequency: str = "daily"
+    enabled: bool = True
+    template: str = "professional"
+    sections: list | None = None
+
+    class Config:
+        extra = "allow"
+
+
+class DigestPatch(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    frequency: str | None = None
+    enabled: bool | None = None
+    template: str | None = None
+    sections: list | None = None
+
+    class Config:
+        extra = "allow"
+
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
@@ -527,6 +551,133 @@ def get_report(report_id: str, request: Request, user: dict = Depends(get_curren
     if not item:
         raise HTTPException(status_code=404, detail="Report not found.")
     return {"ok": True, "item": item, "data": item}
+
+
+# ---------------------------------------------------------------------------
+# Reporting Agent (Phase 3, additive-only): styled HTML render + re-run.
+# PDF path is HTML download + print-to-PDF (pdfplumber is read-only).
+# ---------------------------------------------------------------------------
+
+@router.get("/reports/{report_id}/html")
+def get_report_html(report_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Render a stored report as styled, printable HTML (Reporting Agent)."""
+    from fastapi.responses import HTMLResponse
+
+    from reporting.agent import build_report, intel_report_to_payload
+
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    item = intel.get_report(user["user_id"], did, report_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Report not found.")
+    payload = intel_report_to_payload(item)
+    built = build_report("intelligence", payload)
+    return HTMLResponse(content=built["html"], media_type="text/html")
+
+
+@router.post("/reports/{report_id}/rerun")
+def rerun_report(report_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Re-run a stored report definition with fresh numbers (new history entry)."""
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    stored = intel.get_report(user["user_id"], did, report_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="Report not found.")
+    content = stored.get("content") or {}
+    definition = {
+        "name": stored.get("name") or "ARIA Report",
+        "description": stored.get("description") or "",
+        "date_range": stored.get("date_range"),
+        "sections": stored.get("sections") or [],
+        "template": stored.get("template") or "professional",
+    }
+    draft_items = content.get("draft_items") or stored.get("draft_items") or []
+    if draft_items:
+        definition["items"] = draft_items
+    report = intel.generate_report(user["user_id"], did, definition)
+    return {"ok": True, "item": report, "data": report}
+
+
+# ---------------------------------------------------------------------------
+# Scheduled digests (Phase 4, additive-only)
+#
+# Per-user daily/weekly configs stored as JSON per user
+# (reporting/digests.py). Background generation reuses the existing engines
+# (generate_report over live dashboard content + top insights, forecast
+# snapshot only where a saved forecast exists). Each run persists a normal
+# report so digest history carries its definition for re-run. The scheduler
+# is dependency-free (threading/timer, lazy start + atexit shutdown).
+# ---------------------------------------------------------------------------
+
+def _digests():
+    from reporting import digests as _d
+    try:
+        _d.ensure_started()
+    except Exception:
+        pass
+    return _d
+
+
+@router.get("/digests")
+def list_digests(request: Request, user: dict = Depends(get_current_user)):
+    """List this user's digest schedules with last-run status."""
+    items = _digests().list_digests(user["user_id"])
+    return {"ok": True, "items": items, "data": items, "total": len(items)}
+
+
+@router.post("/digests")
+def create_digest(req: DigestRequest, request: Request, user: dict = Depends(get_current_user)):
+    """Create a digest schedule (daily/weekly, enabled by default)."""
+    freq = str(req.frequency or "daily").strip().lower()
+    if freq not in ("daily", "weekly"):
+        raise HTTPException(status_code=422, detail="Frequency must be daily or weekly.")
+    item = _digests().create_digest(user["user_id"], req.model_dump())
+    return {"ok": True, "item": item, "data": item}
+
+
+@router.patch("/digests/{digest_id}")
+def update_digest(digest_id: str, req: DigestPatch, request: Request, user: dict = Depends(get_current_user)):
+    """Update a digest schedule (enable/disable, frequency, name, ...)."""
+    patch = req.model_dump(exclude_unset=True)
+    if "frequency" in patch and patch["frequency"] is not None:
+        freq = str(patch["frequency"]).strip().lower()
+        if freq not in ("daily", "weekly"):
+            raise HTTPException(status_code=422, detail="Frequency must be daily or weekly.")
+        patch["frequency"] = freq
+    updated = _digests().update_digest(user["user_id"], digest_id, patch)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Digest not found.")
+    return {"ok": True, "item": updated, "data": updated}
+
+
+@router.delete("/digests/{digest_id}")
+def delete_digest(digest_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Delete a digest schedule."""
+    if not _digests().delete_digest(user["user_id"], digest_id):
+        raise HTTPException(status_code=404, detail="Digest not found.")
+    return {"ok": True}
+
+
+@router.post("/digests/{digest_id}/run")
+def run_digest(digest_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """One-click digest run: generate now from live data (new history entry).
+
+    Failures record a failed run entry on the schedule and return
+    ok:False — never a crash.
+    """
+    from reporting import digests as _mod
+
+    _mod.ensure_started()
+    digest = _mod.get_digest(user["user_id"], digest_id)
+    if not digest:
+        raise HTTPException(status_code=404, detail="Digest not found.")
+    session = get_session(user["user_id"])
+    did = _dataset_id(session)
+    report = _mod.generate_digest_now(user["user_id"], digest, dataset_id=did)
+    if isinstance(report, dict) and report.get("ok") is False and not report.get("id"):
+        return {"ok": False, "detail": report.get("detail") or "Digest run failed.",
+                "code": report.get("code") or "DIGEST_FAILED"}
+    return {"ok": True, "item": report, "data": report}
 
 
 # ---------------------------------------------------------------------------

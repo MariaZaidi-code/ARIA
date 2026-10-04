@@ -1739,6 +1739,17 @@ function ReportsTab({ meta }: { meta: any }) {
   const [reports, setReports] = useState<any[]>([]);
   const [repLoading, setRepLoading] = useState(false);
   const [repError, setRepError] = useState("");
+  const [repBusyId, setRepBusyId] = useState<string | null>(null);
+  /* Scheduled digests (Phase 4): per-user daily/weekly configs with
+     enable/disable, last-run status, one-click re-run, View/Download via
+     the existing report HTML path. */
+  const [digests, setDigests] = useState<any[]>([]);
+  const [digLoading, setDigLoading] = useState(false);
+  const [digError, setDigError] = useState("");
+  const [digName, setDigName] = useState("");
+  const [digFreq, setDigFreq] = useState("daily");
+  const [digBusy, setDigBusy] = useState(false);
+  const [digBusyId, setDigBusyId] = useState<string | null>(null);
   /* Live preview data: latest verified outputs (analysis + hypotheses + goals). */
   const [pvAnalysis, setPvAnalysis] = useState<any>(null);
   const [pvHyps, setPvHyps] = useState<any[]>([]);
@@ -1810,6 +1821,109 @@ function ReportsTab({ meta }: { meta: any }) {
   }, []);
   useEffect(() => { loadReports(); }, [loadReports]);
 
+  /* ---- Scheduled digests (Phase 4) ---- */
+  const loadDigests = useCallback(async () => {
+    setDigLoading(true);
+    try {
+      const r: any = await apiFetch("/intelligence/digests", { method: "GET" });
+      setDigests(asList(r?.data ?? r?.items));
+      setDigError("");
+    } catch (e: any) {
+      setDigError(businessError(e?.message) || "ARIA couldn't load digest schedules.");
+    } finally {
+      setDigLoading(false);
+    }
+  }, []);
+  useEffect(() => { loadDigests(); }, [loadDigests]);
+
+  const createDigest = async () => {
+    if (digBusy) return;
+    setDigBusy(true);
+    setDigError("");
+    setActMsg("");
+    try {
+      await apiFetch("/intelligence/digests", {
+        method: "POST",
+        body: JSON.stringify({
+          name: digName.trim() || (digFreq === "weekly" ? "Weekly Digest" : "Daily Digest"),
+          frequency: digFreq,
+          template: templateId || "professional",
+          sections: sections.length ? sections : undefined,
+        }),
+      });
+      setDigName("");
+      setActMsg("Digest scheduled — it runs in the background and each run is kept in report history.");
+      loadDigests();
+    } catch (e: any) {
+      setDigError(businessError(e?.message) || "ARIA couldn't schedule this digest.");
+    } finally {
+      setDigBusy(false);
+    }
+  };
+
+  const toggleDigest = async (d: any) => {
+    const id = strOf(d?.id);
+    if (!id || digBusyId) return;
+    setDigBusyId(id);
+    try {
+      await apiFetch(`/intelligence/digests/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: !d?.enabled }),
+      });
+      loadDigests();
+    } catch (e: any) {
+      setDigError(businessError(e?.message) || "ARIA couldn't update this digest.");
+    } finally {
+      setDigBusyId(null);
+    }
+  };
+
+  const runDigestNow = async (d: any) => {
+    const id = strOf(d?.id);
+    if (!id || digBusyId) return;
+    setDigBusyId(id);
+    setActMsg("");
+    try {
+      await apiFetch(`/intelligence/digests/${encodeURIComponent(id)}/run`, { method: "POST" });
+      setActMsg("Digest ran with fresh numbers — see the newest report below.");
+      loadDigests();
+      loadReports();
+    } catch (e: any) {
+      setActMsg(businessError(e?.message) || "ARIA couldn't run this digest — the failed run was recorded.");
+      loadDigests();
+    } finally {
+      setDigBusyId(null);
+    }
+  };
+
+  const deleteDigest = async (d: any) => {
+    const id = strOf(d?.id);
+    if (!id || digBusyId) return;
+    setDigBusyId(id);
+    try {
+      await apiFetch(`/intelligence/digests/${encodeURIComponent(id)}`, { method: "DELETE" });
+      loadDigests();
+    } catch (e: any) {
+      setDigError(businessError(e?.message) || "ARIA couldn't delete this digest.");
+    } finally {
+      setDigBusyId(null);
+    }
+  };
+
+  const viewDigestHtml = (reportId: string) => {
+    if (!reportId) return;
+    try {
+      window.open(`/api/intelligence/reports/${encodeURIComponent(reportId)}/html`, "_blank", "noopener");
+    } catch { /* ignore */ }
+  };
+
+  const digestStatusTone = (s: string) => {
+    const t = String(s || "").toLowerCase();
+    if (t === "ok" || t === "success" || t === "generated") return "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25";
+    if (t === "failed" || t === "error") return "bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/25";
+    return "bg-secondary text-secondary-foreground border-border";
+  };
+
   const deleteReport = async (id: string) => {
     if (!id) return;
     try {
@@ -1817,6 +1931,50 @@ function ReportsTab({ meta }: { meta: any }) {
       loadReports();
     } catch (e: any) {
       setActMsg(businessError(e?.message) || "ARIA couldn't delete this report.");
+    }
+  };
+
+  /* Server-rendered HTML (Reporting Agent): styled report with findings,
+     charts/tables, evidence SQL, generated-at + fingerprint. Download the
+     HTML; print-to-PDF from the browser for a PDF copy. */
+  const downloadServerHtml = async (id: string, fallbackName: string) => {
+    if (!id || repBusyId) return;
+    setRepBusyId(id);
+    setActMsg("");
+    try {
+      const r = await intelligenceApi.getReportHtml(id);
+      const html = strOf((r as any)?.data ?? r);
+      if (!html) throw new Error("empty report");
+      const blob = new Blob([html], { type: "text/html" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${(fallbackName || "aria-report").replace(/[^a-z0-9-_]+/gi, "-").toLowerCase()}.html`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      setActMsg("Report downloaded as HTML — open it and Print → Save as PDF for a PDF copy.");
+    } catch (e: any) {
+      setActMsg(businessError(e?.message) || "ARIA couldn't download this report.");
+    } finally {
+      setRepBusyId(null);
+    }
+  };
+
+  /* Re-run: same definition, fresh numbers (new history entry, per user). */
+  const rerunOne = async (id: string) => {
+    if (!id || repBusyId) return;
+    setRepBusyId(id);
+    setActMsg("");
+    try {
+      await intelligenceApi.rerunReport(id);
+      setActMsg("Report re-ran with fresh numbers — see the newest entry.");
+      loadReports();
+    } catch (e: any) {
+      setActMsg(businessError(e?.message) || "ARIA couldn't re-run this report.");
+    } finally {
+      setRepBusyId(null);
     }
   };
 
@@ -2149,6 +2307,52 @@ function ReportsTab({ meta }: { meta: any }) {
         </div>
       </div>
       <Card className="p-4 md:p-5">
+        <CardHead title="Scheduled Digests" sub="Daily or weekly background runs — each run is kept in report history." right={digLoading ? <span className="text-[11px] text-muted-foreground">Loading…</span> : <button onClick={loadDigests} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline" aria-label="Refresh digests">Refresh</button>} />
+        <div className="mt-3 flex items-center gap-2 flex-wrap">
+          <label htmlFor="digest-name" className="sr-only">Digest name</label>
+          <input id="digest-name" value={digName} onChange={(e) => setDigName(e.target.value)} placeholder={digFreq === "weekly" ? "e.g. Weekly Digest" : "e.g. Daily Digest"} className={`${inputCls} !w-52`} aria-label="Digest name" />
+          <label htmlFor="digest-freq" className="sr-only">Digest frequency</label>
+          <select id="digest-freq" value={digFreq} onChange={(e) => setDigFreq(e.target.value)} className={`${selectCls} !w-auto`} aria-label="Digest frequency">
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+          </select>
+          <button onClick={createDigest} disabled={digBusy} className={btnPrimary} aria-label="Schedule digest">
+            <CalendarDays size={13} /> {digBusy ? "Scheduling…" : "Schedule digest"}
+          </button>
+        </div>
+        {digError && <p className="mt-2 text-[12px] text-rose-600 dark:text-rose-400" role="alert">{digError} <button onClick={loadDigests} className="font-semibold text-blue-700 dark:text-blue-400 hover:underline ml-1">Retry</button></p>}
+        <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {!digError && digests.length === 0 && !digLoading && <p className="text-[12px] text-muted-foreground">No digests yet — schedule a daily or weekly digest above.</p>}
+          {digests.map((d: any, i: number) => {
+            const did = strOf(d?.id || i);
+            const lastReportId = strOf(d?.last_report_id || "");
+            return (
+              <div key={did} className="rounded-xl border border-border p-3 flex items-center gap-2">
+                <CalendarDays size={14} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-[12.5px] font-medium text-foreground truncate">{strOf(d?.name || "Digest")} <span className="text-muted-foreground font-normal">· {strOf(d?.frequency || "daily")}</span></p>
+                  <p className="text-[11px] text-muted-foreground">
+                    {d?.last_run_at ? `Last run ${strOf(d.last_run_at).slice(0, 16).replace("T", " ")}` : "Never run yet"}
+                    {d?.enabled ? "" : " · paused"}
+                  </p>
+                  <span className={`inline-block mt-1 text-[10.5px] font-semibold px-2 py-0.5 rounded-full border ${digestStatusTone(strOf(d?.last_status || "never"))}`}>
+                    {strOf(d?.last_status || "never") === "never" ? "Not run yet" : strOf(d?.last_status)}
+                  </span>
+                  {strOf(d?.last_error) && <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1 truncate" title={strOf(d.last_error)}>{strOf(d.last_error)}</p>}
+                </div>
+                <div className="flex flex-col items-end gap-1 flex-shrink-0">
+                  <button onClick={() => runDigestNow(d)} disabled={digBusyId === did} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Run digest now ${strOf(d?.name || "")}`}>{digBusyId === did ? "Running…" : "Run now"}</button>
+                  <button onClick={() => toggleDigest(d)} disabled={digBusyId === did} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={d?.enabled ? `Pause digest ${strOf(d?.name || "")}` : `Enable digest ${strOf(d?.name || "")}`}>{d?.enabled ? "Pause" : "Enable"}</button>
+                  {lastReportId && <button onClick={() => viewDigestHtml(lastReportId)} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline" aria-label={`View last digest report ${strOf(d?.name || "")}`}>View</button>}
+                  {lastReportId && <button onClick={() => downloadServerHtml(lastReportId, strOf(d?.name || "digest"))} disabled={repBusyId === lastReportId} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Download last digest report ${strOf(d?.name || "")}`}>Download</button>}
+                  <button onClick={() => deleteDigest(d)} disabled={digBusyId === did} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 disabled:opacity-40" aria-label={`Delete digest ${strOf(d?.name || "")}`}>Delete</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+      <Card className="p-4 md:p-5">
         <CardHead title="Generated Reports" sub="Every report you generate is kept here." right={repLoading ? <span className="text-[11px] text-muted-foreground">Loading…</span> : <button onClick={loadReports} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline" aria-label="Refresh reports">Refresh</button>} />
         {repError && <p className="mt-2 text-[12px] text-rose-600 dark:text-rose-400" role="alert">{repError} <button onClick={loadReports} className="font-semibold text-blue-700 dark:text-blue-400 hover:underline ml-1">Retry</button></p>}
         <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -2161,6 +2365,8 @@ function ReportsTab({ meta }: { meta: any }) {
                 <p className="text-[11px] text-muted-foreground">{strOf(r?.generated_at || r?.created_at || "")}{asList(r?.sections).length ? ` · ${asList(r.sections).length} sections` : ""}</p>
               </div>
               <button onClick={() => viewReport(strOf(r?.id))} disabled={!r?.id} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`View report ${strOf(r?.name || "")}`}>View</button>
+              {strOf(r?.id) && <button onClick={() => downloadServerHtml(strOf(r.id), strOf(r?.name || "aria-report"))} disabled={repBusyId === strOf(r.id)} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Download report HTML ${strOf(r?.name || "")}`}>{repBusyId === strOf(r.id) ? "Working…" : "Download"}</button>}
+              {strOf(r?.id) && <button onClick={() => rerunOne(strOf(r.id))} disabled={repBusyId === strOf(r.id)} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Re-run report ${strOf(r?.name || "")}`}>Re-run</button>}
               {strOf(r?.id) && <button onClick={() => deleteReport(strOf(r.id))} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400" aria-label={`Delete report ${strOf(r?.name || "")}`}>Delete</button>}
             </div>
           ))}

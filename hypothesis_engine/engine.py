@@ -229,13 +229,13 @@ def _exec(engine, sql, params=None):
 
 
 def _table_count(engine, dialect, table):
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     rows = _exec(engine, f"SELECT COUNT(*) FROM {_safe_name(table, dialect)}")
     return int(rows[0][0] or 0)
 
 
 def _fetch_pairs(engine, dialect, table, col_a, col_b, limit=SAMPLE_LIMIT):
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     # Deterministic sample: ORDER BY the sampled columns so identical
     # requests analyze identical rows (bare LIMIT is return-order dependent).
     return _exec(
@@ -249,7 +249,7 @@ def _fetch_pairs(engine, dialect, table, col_a, col_b, limit=SAMPLE_LIMIT):
 
 
 def _fetch_single(engine, dialect, table, col, limit=SAMPLE_LIMIT):
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     return [r[0] for r in _exec(
         engine,
         f"SELECT {_safe_name(col, dialect)} FROM {_safe_name(table, dialect)} "
@@ -781,7 +781,7 @@ def analyze_question(engine, dialect, intel, tables, question, table_hint=None,
 
 
 def _distinct_count(engine, dialect, table, col):
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     rows = _exec(engine,
                  f"SELECT COUNT(DISTINCT {_safe_name(col, dialect)}) "
                  f"FROM {_safe_name(table, dialect)}")
@@ -1054,7 +1054,7 @@ def suggest_hypotheses(engine, dialect, intel, tables, limit=4):
 # --------------------------------------------------------------------------
 def _usable_count(engine, dialect, table, cols):
     """Rows where ALL listed columns are non-null (bounded, read-only)."""
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     conds = " AND ".join(f"{_safe_name(c, dialect)} IS NOT NULL" for c in cols)
     try:
         rows = _exec(engine,
@@ -1223,7 +1223,7 @@ def data_context(engine, dialect, intel, tables):
                 ctx["date_columns"].append({"table": t, "column": c})
         if dts and dts[0]:
             try:
-                from api.schema_intel import _safe_name
+                from core.schema_intel import _safe_name
                 rows = _exec(engine,
                              f"SELECT MIN({_safe_name(dts[0], dialect)}), "
                              f"MAX({_safe_name(dts[0], dialect)}) "

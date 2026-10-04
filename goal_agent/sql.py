@@ -166,7 +166,7 @@ class SqlMixin:
 
     @staticmethod
     def _quote(name, dialect=None):
-        """Quote an identifier (same pattern as api/schema_intel._safe_name).
+        """Quote an identifier (same pattern as core/schema_intel._safe_name).
 
         Escapes embedded double quotes; backticks for MySQL. Used for
         identifiers only — never for values (values always go via text()
@@ -230,6 +230,25 @@ class SqlMixin:
             for name, info in (getattr(self, "tables", {}) or {}).items()
         }
         return _enforce(sql, mapping)
+
+    def _execute_guarded(self, conn, sql, timeout_ms=30_000):
+        """Guard + timeout + execute: single choke point for every execution.
+
+        Applies ``_enforce_execution_guards`` (fail-closed read-only +
+        unknown table/column allowlist — the same call the main execution
+        path makes), then sets the same dialect-conditional statement
+        timeout the main execution path sets (PostgreSQL
+        ``statement_timeout`` / MySQL ``max_execution_time``; SQLite and
+        other dialects get no SET), then executes ``sql`` and returns the
+        SQLAlchemy Result. Raises from the guard before touching the DB.
+        """
+        guarded = self._enforce_execution_guards(sql)
+        dialect = getattr(self, "dialect", "")
+        if dialect == "postgresql":
+            conn.execute(text(f"SET statement_timeout = '{int(timeout_ms)}'"))
+        elif dialect == "mysql":
+            conn.execute(text(f"SET SESSION max_execution_time = {int(timeout_ms)}"))
+        return conn.execute(text(guarded))
 
     # ---- _goal_asks_for_aggregation (_goal_asks_for_aggregation) ----
 
@@ -1454,14 +1473,8 @@ Use date_trunc('quarter', date_col) for quarter filtering.
             qtab = self._qtab(table)
             sql = f"SELECT DISTINCT {qcol} FROM {qtab} LIMIT {int(limit)}"
             with self.engine.connect() as conn:
-                try:
-                    if getattr(self, "dialect", "") == "postgresql":
-                        conn.execute(text("SET statement_timeout = '5000'"))
-                    elif getattr(self, "dialect", "") == "mysql":
-                        conn.execute(text("SET SESSION max_execution_time = 5000"))
-                except Exception:
-                    pass
-                rows = conn.execute(text(sql)).fetchall()
+                rows = self._execute_guarded(
+                    conn, sql, timeout_ms=5000).fetchall()
             values = [r[0] for r in (rows or [])]
             record = dict(_diag(values) or {})
         except Exception:

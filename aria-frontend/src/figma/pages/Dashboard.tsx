@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { ArrowRight, ArrowUpRight, ArrowDownRight, Zap, Search, AlertTriangle, ChevronRight, RefreshCw, Database, DollarSign, Store, CalendarDays, Percent, TrendingUp, Users, ShoppingCart, RotateCcw, X, Sparkles, MessageSquare, Send, Lightbulb, Shield, BarChart3, GitBranch, Sun } from "lucide-react";
+import { ArrowRight, ArrowUpRight, ArrowDownRight, Zap, Search, AlertTriangle, ChevronRight, RefreshCw, Database, DollarSign, Store, CalendarDays, Percent, TrendingUp, Users, ShoppingCart, RotateCcw, X, Sparkles, MessageSquare, Send, Lightbulb, Shield, BarChart3, GitBranch, Sun, FileText } from "lucide-react";
 import { AreaChart, Area, Line, BarChart, Bar, Cell, PieChart, Pie, ResponsiveContainer, Tooltip, CartesianGrid, XAxis, YAxis, Brush, ReferenceDot, ScatterChart, Scatter, ZAxis } from "recharts";
 import type { Page } from "../App";
 import { useTheme } from "../App";
@@ -243,6 +243,7 @@ function storeDrillContext(ctx: Record<string, any>) {
 }
 
 function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy }: { kpi: any; index?: number; onDrill: (kpi: any) => void; onAsk?: (q: string) => void; onWhy?: (metric: string) => void }) {
+  const [draftMsg, setDraftMsg] = useState("");
   const tint = tintFor(kpi);
   const Icon = iconFor(kpi);
   const isText = kpi?.format === "text";
@@ -357,6 +358,30 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy }: { kpi: any; index
           Why did this move?
         </button>
       )}
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          try {
+            const key = "aria_report_draft";
+            const title = String(kpi?.label || "Dashboard metric");
+            const raw = localStorage.getItem(key);
+            const cur = Array.isArray(JSON.parse(raw || "[]")) ? JSON.parse(raw || "[]") : [];
+            const exists = cur.some((x: any) => String(x?.title || "") === title);
+            if (!exists) {
+              cur.push({ id: String(kpi?.id || ""), title });
+              localStorage.setItem(key, JSON.stringify(cur));
+              setDraftMsg("Added to the report draft.");
+            } else {
+              setDraftMsg("Already in the report draft.");
+            }
+          } catch { setDraftMsg("Couldn't update the report draft."); }
+        }}
+        className="self-start inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded -mt-1"
+        aria-label={`Add ${kpi?.label || "this metric"} to report`}
+      >
+        <FileText size={11} /> Add to report
+      </button>
+      {draftMsg && <p className="text-[11px] text-emerald-700 dark:text-emerald-400" role="status">{draftMsg}</p>}
     </div>
   );
 }
@@ -1627,6 +1652,26 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                 Data quality {qualityScore}%
               </span>
             )}
+            {(() => {
+              const v: any = (config as any)?.verdict;
+              if (!v) return null;
+              const ok = v.verified === true;
+              const fails = Array.isArray(v.checks) ? v.checks.filter((c: any) => !c?.pass).length : 0;
+              return (
+                <span
+                  title={ok
+                    ? "ARIA double-checked these numbers against your data. Everything lines up."
+                    : "ARIA couldn't fully double-check these numbers yet. Treat them as a guide, not the final answer."}
+                  className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${ok
+                    ? "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25"
+                    : "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25"}`}
+                >
+                  <Shield size={11} />
+                  {ok ? "Checked" : "Not fully checked"}
+                  {!ok && fails > 0 ? ` · ${fails} to review` : ""}
+                </span>
+              );
+            })()}
           </div>
           {analyzing ? (
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4" aria-busy="true">

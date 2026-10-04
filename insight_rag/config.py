@@ -75,6 +75,10 @@ RAG_VERIFY_TIMEOUT_S = int(os.getenv("ARIA_RAG_VERIFY_TIMEOUT_S", "12"))
 RAG_QUERY_TIMEOUT_S = int(os.getenv("ARIA_RAG_QUERY_TIMEOUT_S", "120"))
 RAG_CIRCUIT_BREAKER_FAILURES = int(os.getenv("ARIA_RAG_CIRCUIT_BREAKER_FAILURES", "5"))
 RAG_CIRCUIT_BREAKER_WINDOW_S = int(os.getenv("ARIA_RAG_CIRCUIT_BREAKER_WINDOW_S", "300"))
+# Per-user vector-store cache bound (LRU, storage.py). Each entry owns a
+# PGVector + SQLAlchemy pool, so the cache is capped instead of growing one
+# pool per user for the lifetime of the process.
+RAG_VECTOR_STORE_CACHE_MAX = int(os.getenv("ARIA_RAG_VECTOR_STORE_CACHE_MAX", "64"))
 # Lexical/BM25 corpus bounds: never score an unbounded whole corpus in memory.
 # 3000 docs max; per-doc text is truncated for scoring only (evidence text is
 # never mutated); paging + early-exit keep peak memory flat for any library.
@@ -152,6 +156,8 @@ def validate_rag_config() -> None:
         errors.append("ARIA_RAG_CIRCUIT_BREAKER_FAILURES must be >= 1")
     if RAG_CIRCUIT_BREAKER_WINDOW_S < 10:
         errors.append("ARIA_RAG_CIRCUIT_BREAKER_WINDOW_S must be >= 10")
+    if RAG_VECTOR_STORE_CACHE_MAX < 1:
+        errors.append("ARIA_RAG_VECTOR_STORE_CACHE_MAX must be >= 1")
     if RAG_BM25_MAX_DOCS < 100 or RAG_BM25_MAX_DOCS > 3000:
         errors.append("ARIA_RAG_BM25_MAX_DOCS must be between 100 and 3000")
     if RAG_BM25_MAX_CHARS_PER_DOC < 1000:

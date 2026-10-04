@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle, Bookmark, CalendarDays, Check, ChevronRight,
-  RefreshCw, Sparkles, User, X,
+  RefreshCw, Shield, Sparkles, User, X,
 } from "lucide-react";
 import { prescriptionApi } from "../../../services/api";
 import {
@@ -38,6 +38,7 @@ type FeedCard = {
   refusalHeadline: string;
   refusalAlternatives: any[];
   error: string;
+  verdict: any | null;
 };
 
 type RecheckState = {
@@ -293,6 +294,7 @@ export default function PrescriptionsFeed() {
           return {
             key, metric, driver, table, options: [], status: "error" as const,
             refusalHeadline: "", refusalAlternatives: [], error: "This opening had no measure attached.",
+            verdict: null,
           };
         }
         try {
@@ -309,6 +311,7 @@ export default function PrescriptionsFeed() {
               refusalHeadline: strOf(refusal?.headline || "Nothing here cleared the bar for an action — ARIA would rather say so than guess."),
               refusalAlternatives: asList(refusal?.alternatives).slice(0, 3),
               error: "",
+              verdict: (out as any)?.verdict || null,
             };
           }
           const withIds = list.slice(0, MAX_ACTIONS_PER_CARD).map((p: any, j: number) => ({
@@ -319,12 +322,14 @@ export default function PrescriptionsFeed() {
             key: strOf(withIds[0]?.id) || key,
             metric, driver, table, options: withIds, status: "ready" as const,
             refusalHeadline: "", refusalAlternatives: [], error: "",
+            verdict: (out as any)?.verdict || null,
           };
         } catch (e: any) {
           return {
             key, metric, driver, table, options: [], status: "error" as const,
             refusalHeadline: "", refusalAlternatives: [],
             error: businessError(e?.message) || "ARIA couldn't check this one just now.",
+            verdict: null,
           };
         }
       }));
@@ -511,13 +516,33 @@ export default function PrescriptionsFeed() {
             return (
               <Card
                 key={card.key}
-                className={`p-4 flex flex-col ${selectedId === card.key ? "!border-blue-400 ring-1 ring-blue-200" : "hover:border-blue-200 dark:hover:border-blue-500/25"} transition-colors`}
+                className={`p-4 flex flex-col ${selectedId === card.key ? "!border-blue-400 ring-1 ring-blue-200 dark:ring-blue-500/25" : "hover:border-blue-200 dark:hover:border-blue-500/25"} transition-colors`}
               >
                 <div id={`rx-card-${card.key}`}>
                   <div className="flex items-center gap-2">
                     <span className="text-[10.5px] font-bold text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 border border-blue-100 dark:border-blue-500/20 rounded-full px-2 py-0.5">
                       #{ci + 1} to look at
                     </span>
+                    {(() => {
+                      const v: any = (card as any)?.verdict;
+                      if (!v) return null;
+                      const ok = v.verified === true;
+                      const fails = Array.isArray(v.checks) ? v.checks.filter((c: any) => !c?.pass).length : 0;
+                      return (
+                        <span
+                          title={ok
+                            ? "ARIA double-checked this recommendation against your data. Everything lines up."
+                            : "ARIA couldn't fully double-check this recommendation yet. Treat it as a guide, not the final answer."}
+                          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${ok
+                            ? "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25"
+                            : "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25"}`}
+                        >
+                          <Shield size={11} />
+                          {ok ? "Checked" : "Not fully checked"}
+                          {!ok && fails > 0 ? ` · ${fails} to review` : ""}
+                        </span>
+                      );
+                    })()}
                     <span className="inline-flex items-center gap-1 ml-auto" title={`Confidence: ${conf.label}`}>
                       {[0, 1, 2].map((dot) => (
                         <span key={dot} className={`inline-block w-1.5 h-1.5 rounded-full ${dot < conf.filled ? "bg-blue-600" : "bg-border"}`} />

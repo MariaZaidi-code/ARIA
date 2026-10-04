@@ -22,7 +22,7 @@ from core.deps import require_data, get_current_user, reject_document_sql
 from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, log_and_sanitize
 from core.secret_box import decrypt as _decrypt_secret
 from core.semantic import humanize, kpi_label
-from api.schema_intel import SchemaIntelligence, _safe_name, _run_sql
+from core.schema_intel import SchemaIntelligence, _safe_name, _run_sql
 
 router = APIRouter()
 
@@ -60,6 +60,42 @@ def _sanitize_json_floats(value):
     except Exception:
         return None
     return value
+
+
+def _attach_verdict(config_dict, session, cached=False, cache_age_s=0.0):
+    """Best-effort Verification Agent hookup (never blocks the dashboard).
+
+    Attaches ``config_dict["verdict"]`` plus a ``_meta`` freshness envelope
+    (``cached``/``cache_age_s``/``ttl_s``) that the agent reads generically.
+    On any failure attaches ``{verified: False}`` and still returns data.
+    """
+    try:
+        import os as _os
+        from verification.agent import verify_dashboard
+        try:
+            _ttl = float(_os.getenv("ARIA_DASH_CACHE_TTL", "120"))
+        except (TypeError, ValueError):
+            _ttl = 120.0
+        try:
+            _meta = dict(config_dict.get("_meta") or {})
+        except Exception:
+            _meta = {}
+        _meta.update({"cached": bool(cached),
+                      "cache_age_s": float(cache_age_s or 0.0),
+                      "ttl_s": _ttl})
+        try:
+            config_dict["_meta"] = _meta
+        except Exception:
+            pass
+        verdict = verify_dashboard(config_dict, dict(session or {}))
+    except Exception:
+        verdict = {"verified": False, "checks": [],
+                   "warnings": ["verification unavailable"]}
+    try:
+        config_dict["verdict"] = verdict
+    except Exception:
+        pass
+    return config_dict
 
 
 def _build_engine(session):
@@ -838,9 +874,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
     session = get_session(user["user_id"])
     intel = _load_schema(session, user["user_id"])
     if not intel or not intel.tables:
-        return {
-            "ok": True,
-            "config": {
+        _empty_config = {
                 "summary": {"title": "No Data Connected", "description": "Connect a database or upload a file to start analyzing.", "tableCount": 0, "totalRows": 0},
                 "metrics": [],
                 "visualizations": [],
@@ -849,7 +883,17 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                 "anomalies": [],
                 "quality": {"score": 0, "issues": []},
                 "recommendations": [],
-            },
+            }
+        try:
+            _attach_verdict(_empty_config, session)
+        except Exception:
+            try:
+                _empty_config["verdict"] = {"verified": False, "checks": [], "warnings": ["verification unavailable"]}
+            except Exception:
+                pass
+        return {
+            "ok": True,
+            "config": _empty_config,
         }
 
     # Short-TTL cache (§40): keyed by schema file mtime so reconnects/uploads
@@ -866,7 +910,17 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
     _cache_key = (user["user_id"], session.get("db_name", ""), _schema_mtime)
     _cached = _DASH_CONFIG_CACHE.get(_cache_key)
     if _cached and _time.monotonic() - _cached[0] < float(os.getenv("ARIA_DASH_CACHE_TTL", "120")):
-        return {"ok": True, "config": _cached[1], "cached": True}
+        try:
+            _cached_age = _time.monotonic() - _cached[0]
+            _cached_config = dict(_cached[1])
+            _attach_verdict(_cached_config, session, cached=True, cache_age_s=_cached_age)
+        except Exception:
+            try:
+                _cached_config = dict(_cached[1])
+                _cached_config["verdict"] = {"verified": False, "checks": [], "warnings": ["verification unavailable"]}
+            except Exception:
+                return {"ok": True, "config": _cached[1], "cached": True}
+        return {"ok": True, "config": _cached_config, "cached": True}
     if len(_DASH_CONFIG_CACHE) > 200:
         _DASH_CONFIG_CACHE.clear()
 
@@ -1701,6 +1755,14 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
     # serialization into a 500 ("couldn't load this analysis"). Sanitize
     # recursively so the endpoint never fails on payload encoding.
     config = _sanitize_json_floats(config)
+    # Verification Agent hookup (best-effort, never blocks the dashboard).
+    try:
+        _attach_verdict(config, session)
+    except Exception:
+        try:
+            config["verdict"] = {"verified": False, "checks": [], "warnings": ["verification unavailable"]}
+        except Exception:
+            pass
     try:
         _DASH_CONFIG_CACHE[_cache_key] = (_time.monotonic(), config)
     except Exception:

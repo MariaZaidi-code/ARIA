@@ -205,7 +205,7 @@ class WalmartE2E(unittest.TestCase):
         parsed = pd.to_datetime(pd.Series(self.sqlite_dates), errors="coerce")
         self.assertGreaterEqual(parsed.notna().mean(), 0.99)
         # SchemaIntelligence falls back to date-like TEXT names.
-        from api.schema_intel import SchemaIntelligence
+        from core.schema_intel import SchemaIntelligence
 
         intel = SchemaIntelligence(self.mapping)
         self.assertEqual(intel.find_best_datetime("walmart"), "Date")
@@ -313,7 +313,7 @@ class WalmartE2E(unittest.TestCase):
         from sqlalchemy import create_engine
 
         from api.kpi_routes import _profile_numeric, _score_kpi
-        from api.schema_intel import SchemaIntelligence
+        from core.schema_intel import SchemaIntelligence
 
         intel = SchemaIntelligence(self.mapping)
         self.assertEqual(intel.find_best_measure("walmart"), "Weekly_Sales")

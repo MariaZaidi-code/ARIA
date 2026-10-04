@@ -709,7 +709,7 @@ def build_hypothesis(
 # ---------------------------------------------------------------------------
 
 def _followup_is_id_like(name: str) -> bool:
-    """Local ID-like check (mirrors api.schema_intel._is_id_like).
+    """Local ID-like check (mirrors core.schema_intel._is_id_like).
 
     Token equality — never substrings — so "country" is not an ID.
     Kept local so the analytics layer never imports API modules.

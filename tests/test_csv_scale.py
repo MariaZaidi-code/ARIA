@@ -264,7 +264,7 @@ def test_payload_bounds(tmp_path):
     from api.data_routes import MAX_PREVIEW_LIMIT, PreviewRequest
     from api.hypothesis_routes import _HYPOTHESIS_SAMPLE_MAX, _fetch_sample
     from api.insights_routes import _MAX_RAW_VALUES, _MAX_SPEC_ROWS, _sanitize_spec_rows
-    from api.schema_intel import _run_sql
+    from core.schema_intel import _run_sql
 
     # Preview caps (existing contract).
     assert PreviewRequest(table="t", limit=10**9, offset=0).limit == MAX_PREVIEW_LIMIT
@@ -316,3 +316,38 @@ def test_upload_guard_stays_100mb():
     expected_mb = int(os.getenv("ARIA_MAX_UPLOAD_CSV_MB", "512"))
     assert MAX_UPLOAD_BYTES_CSV == expected_mb * 1024 * 1024
     assert expected_mb >= 200  # 200MB+ datasets must be accepted
+
+
+def test_coercion_cache_bounded_lru():
+    """Text-numeric probe cache is capped with LRU eviction: one entry per
+    (db, table, column) triple must never grow past the cap, hits inside the
+    cap behave as before, and clear_coercion_cache() still empties it."""
+    from core import text_numeric as tn
+
+    tn.clear_coercion_cache()
+    try:
+        cap = tn._COERCED_CACHE_MAX
+        assert cap > 0
+        # cap+50 inserts: size stays bounded, the oldest entries evicted.
+        for i in range(cap + 50):
+            tn.set_coercion_cache(f"sqlite:///probe{i}.sqlite", "t", f"c{i}",
+                                  {"probe": i})
+        assert len(tn._COERCED_CACHE) <= cap
+        assert tn.get_coercion_cache("sqlite:///probe0.sqlite", "t", "c0") is None
+        assert tn.get_coercion_cache(f"sqlite:///probe{cap + 49}.sqlite",
+                                     "t", f"c{cap + 49}") == {"probe": cap + 49}
+        # Hit inside the cap is unchanged, and the read promotes the entry:
+        # after touching probe50, the next insert evicts probe51, not probe50.
+        assert tn.get_coercion_cache("sqlite:///probe50.sqlite", "t", "c50") == {
+            "probe": 50}
+        tn.set_coercion_cache("sqlite:///probe-last.sqlite", "t", "x",
+                              {"probe": "last"})
+        assert tn.get_coercion_cache("sqlite:///probe51.sqlite", "t", "c51") is None
+        assert tn.get_coercion_cache("sqlite:///probe50.sqlite", "t", "c50") == {
+            "probe": 50}
+        # Writes/reads run from request handlers and background threads.
+        import threading
+        assert isinstance(tn._COERCED_CACHE_LOCK, type(threading.Lock()))
+    finally:
+        tn.clear_coercion_cache()
+    assert len(tn._COERCED_CACHE) == 0

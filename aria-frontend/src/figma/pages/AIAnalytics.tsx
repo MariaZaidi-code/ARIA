@@ -8,7 +8,7 @@ import {
   ChevronRight, Plus, Bookmark, Clock, FlaskConical, SlidersHorizontal,
   Target, FileText, Sparkles, ArrowUpRight, ArrowDownRight, Database,
   Copy, MoreHorizontal, Brain, Lightbulb, GitCompareArrows, Zap,
-  Compass, Share2, X, Info, CheckCircle2,
+  Compass, Share2, X, Info, CheckCircle2, Shield,
 } from "lucide-react";
 import {
   BarChart, Bar, LineChart, Line, AreaChart, Area,
@@ -904,6 +904,7 @@ export default function AIAnalytics({
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState("");
+  const [reportMsg, setReportMsg] = useState("");
   const [followUpQuery, setFollowUpQuery] = useState("");
   const [history, setHistory] = useState<{ q: string; r: any }[]>([]);
   const abortRef = useRef<AbortController | null>(null);
@@ -1001,6 +1002,30 @@ export default function AIAnalytics({
     } catch { /* best-effort */ }
     gotoTab("explore");
   }, [hypothesisHandoff, gotoTab]);
+
+  /* One-click "Add to report": feeds the shared report draft
+     (localStorage `aria_report_draft`) consumed by Intelligence Reports. */
+  const addResultToReport = useCallback(() => {
+    setReportMsg("");
+    try {
+      const data: any = (result as any)?.data || result || {};
+      const title = strOf(askedQuestion)
+        || strOf(data?.title) || strOf(data?.display?.title) || "AI Analytics result";
+      const key = "aria_report_draft";
+      let cur: any[] = [];
+      try {
+        const v = JSON.parse(localStorage.getItem(key) || "[]");
+        if (Array.isArray(v)) cur = v;
+      } catch { cur = []; }
+      if (cur.some((x) => String(x?.title || "") === title)) {
+        setReportMsg("Already in the report draft. Open Intelligence → Reports to generate.");
+        return;
+      }
+      cur.push({ id: "", title });
+      localStorage.setItem(key, JSON.stringify(cur));
+      setReportMsg(`Added to the report draft (${cur.length}). Open Intelligence → Reports to generate.`);
+    } catch { setReportMsg("Couldn't update the report draft."); }
+  }, [result, askedQuestion]);
 
   /* ---- Run analysis on-page ---- */
   const runOnPage = useCallback(async (question: string) => {
@@ -1381,13 +1406,43 @@ export default function AIAnalytics({
                       </button>
                     </div>
                   )}
+                  {/* One-click report handoff — feeds the Intelligence Reports draft */}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      onClick={addResultToReport}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/25 hover:bg-blue-50 dark:hover:bg-blue-500/10"
+                      aria-label="Add this analysis to the report draft">
+                      <FileText size={13} /> Add to report
+                    </button>
+                    {reportMsg && <span className="text-[11.5px] text-secondary-foreground" role="status">{reportMsg}</span>}
+                  </div>
                   {/* Answer message */}
                   {answerMessage && (
                     <Card className="p-5">
                       <div className="flex items-start gap-3">
                         <span className="inline-flex items-center justify-center w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 text-white flex-shrink-0"><Sparkles size={15} /></span>
-                        <div>
+                        <div className="flex-1 min-w-0">
                           <p className="text-[13px] text-foreground leading-relaxed">{answerMessage}</p>
+                          {(() => {
+                            const v: any = (gd as any)?.verdict;
+                            if (!v) return null;
+                            const ok = v.verified === true;
+                            const fails = Array.isArray(v.checks) ? v.checks.filter((c: any) => !c?.pass).length : 0;
+                            return (
+                              <span
+                                title={ok
+                                  ? "ARIA double-checked this answer against your data. Everything lines up."
+                                  : "ARIA couldn't fully double-check this answer yet. Treat it as a guide, not the final answer."}
+                                className={`mt-2 inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${ok
+                                  ? "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25"
+                                  : "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25"}`}
+                              >
+                                <Shield size={11} />
+                                {ok ? "Checked" : "Not fully checked"}
+                                {!ok && fails > 0 ? ` · ${fails} to review` : ""}
+                              </span>
+                            );
+                          })()}
                         </div>
                       </div>
                     </Card>

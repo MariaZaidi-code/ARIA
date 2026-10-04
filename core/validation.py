@@ -105,6 +105,23 @@ _SQL_TABLE_RE = re.compile(
 )
 
 
+# PostgreSQL functions that read/write server files, kill sessions, change
+# server state or tunnel to another host. Matched only when CALLED (`name(`)
+# so a column such as `query_to_xml_count` or a bare mention of the name is
+# never rejected. Deliberately an explicit list (NOT a broad `pg_*` rule) so
+# legitimate catalog helpers like pg_typeof / pg_get_expr stay usable.
+_READONLY_DANGEROUS_FNS = (
+    "pg_read_file", "pg_read_binary_file", "pg_ls_dir", "pg_stat_file",
+    "pg_terminate_backend", "pg_cancel_backend", "pg_reload_conf",
+    "pg_read_server_files", "pg_write_server_files", "pg_ls_waldir",
+    "pg_ls_logicalrepdir", "pg_promote", "pg_create_restore_point",
+    "pg_switch_wal", "pg_execute_server_program", "pg_sleep",
+    "query_to_xml_and_xmlschema", "query_to_xml", "schema_to_xml",
+    "database_to_xml", "set_config", "lo_import", "lo_export", "lo_unlink",
+    "dblink_connect", "dblink_send_query", "dblink_exec", "dblink",
+)
+_DANGEROUS_FN_ALT = "|".join(_READONLY_DANGEROUS_FNS)
+
 _READONLY_DESTRUCTIVE_RE = re.compile(
     r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|DELETE\s+\w+\s+FROM"
     r"|DROP|ALTER|CREATE|TRUNCATE\s+(?:TABLE\s+)?|GRANT|REVOKE|CALL|EXEC(?:UTE)?\b|MERGE\s+INTO"
@@ -113,11 +130,34 @@ _READONLY_DESTRUCTIVE_RE = re.compile(
     r"|\bLISTEN\b|\bNOTIFY\b|\bLOAD\b|\bIMPORT\b|\bINTO\b"
     r"|\bPRAGMA\b|\bATTACH\b|\bDETACH\b|\bREINDEX\b|\bREPLACE\s+INTO\b|\bHANDLER\b"
     r"|\bDO\b|FOR\s+UPDATE\b|LOCK\s+IN\s+SHARE\s+MODE"
-    r"|pg_sleep\s*\(|pg_read_file\s*\(|dblink\s*\()",
+    rf"|\b(?:{_DANGEROUS_FN_ALT})\s*\()",
     re.IGNORECASE,
 )
 _READONLY_STRIP_STRINGS_RE = re.compile(r"'([^']|'')*'|\"([^\"]|\"\")*\"|`[^`]*`")
 _READONLY_STRIP_COMMENTS_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
+# Whitelisted scalar/aggregate helpers: the ONLY calls allowed in a statement
+# that references no table at all (see the FROM-less check below).
+_READONLY_SAFE_FNS = frozenset({
+    "count", "sum", "avg", "min", "max", "abs", "round", "floor", "ceil",
+    "length", "lower", "upper", "coalesce", "nullif", "cast", "extract",
+    "date_trunc", "now", "current_date", "current_timestamp", "substring",
+    "concat", "trim", "replace", "split_part", "to_char", "to_date",
+    "greatest", "least", "array_agg", "string_agg", "stddev", "variance",
+    "percentile_cont", "rank", "dense_rank", "row_number", "ntile", "lag",
+    "lead", "first_value", "last_value", "sqrt", "power", "mod", "trunc",
+    "sign", "strpos", "position", "initcap", "md5",
+})
+# SQL keywords that may legally precede `(` (aliases, window/predicate
+# syntax) but are NOT function calls.
+_READONLY_CALL_KEYWORDS = frozenset({
+    "as", "on", "and", "or", "not", "in", "is", "any", "all", "some",
+    "exists", "values", "using", "over", "filter", "partition", "by",
+    "when", "case", "between", "like", "ilike", "returning", "window",
+    "only", "into", "from", "select", "with", "where", "group", "order",
+    "having", "limit", "offset", "union", "except", "intersect", "table",
+})
+_READONLY_CALL_RE = re.compile(r"\b([A-Za-z_][\w$]*)\s*\(")
 
 
 def is_read_only_sql(sql) -> bool:
@@ -140,7 +180,19 @@ def is_read_only_sql(sql) -> bool:
         return False
     if _READONLY_DESTRUCTIVE_RE.search(stripped):
         return False
-    return bool(re.match(r"\s*(select|with)\b", stripped, re.IGNORECASE))
+    if not re.match(r"\s*(select|with)\b", stripped, re.IGNORECASE):
+        return False
+    # FROM-less statements: with no table to read from, the only legitimate
+    # calls are the whitelisted scalar/aggregate helpers. The denylist above
+    # cannot enumerate every file/session/server primitive, so any other
+    # function call in a statement that references no table fails closed.
+    if not sql_table_names(stripped):
+        for m in _READONLY_CALL_RE.finditer(stripped):
+            fn = m.group(1).lower()
+            if fn in _READONLY_SAFE_FNS or fn in _READONLY_CALL_KEYWORDS:
+                continue
+            return False
+    return True
 
 
 def strip_code_fences(text):
@@ -246,15 +298,80 @@ def _known_table_aliases(schema_tables):
     return known
 
 
+_CTE_HEAD_RE = re.compile(r"\s*with\s+(?:recursive\s+)?", re.IGNORECASE)
+_CTE_DEF_RE = re.compile(
+    r"\s*[\"`\[]?([A-Za-z_][\w$]*)[\]\"`]?"
+    r"\s*(?:\([^()]*\))?\s+AS\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _cte_names(sql) -> set:
+    """Names declared by a leading ``WITH [RECURSIVE] ... `` clause (CTEs).
+
+    Walks each ``name AS ( ... )`` definition with balanced parentheses (and
+    string/identifier quoting) so multi-CTE and column-list forms such as
+    ``c(i) AS (`` are recognised. Only a statement that STARTS with WITH can
+    yield names: a `name AS (` inside the main statement (or in plain SELECT
+    SQL) is never collected, so the unknown-table guard is not weakened.
+    """
+    text = sql or ""
+    head = _CTE_HEAD_RE.match(text)
+    if not head:
+        return set()
+    names: set = set()
+    pos = head.end()
+    while True:
+        m = _CTE_DEF_RE.match(text, pos)
+        if not m:
+            break
+        names.add(m.group(1).lower())
+        i = m.end() - 1  # index of the '(' that opens the CTE body
+        depth = 0
+        quote = ""
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == quote:
+                    if text[i + 1:i + 2] == quote:  # '' / "" escape
+                        i += 2
+                        continue
+                    quote = ""
+            elif ch in ("'", '"', "`"):
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        if depth != 0:  # unbalanced body: stop rather than guess
+            break
+        pos = i + 1
+        nxt = re.match(r"\s*,", text[pos:])
+        if not nxt:  # WITH clause finished; main statement follows
+            break
+        pos += nxt.end()
+    return names
+
+
 def unknown_sql_tables(sql, schema_tables):
     """Return referenced tables that do not exist in the schema.
 
     This catches hallucinations like `order_items` when the real table is
     `order_details` — deterministically, before a database round-trip.
     Schema-qualified keys also accept their bare segment (search_path).
+    Names defined by a leading WITH clause are CTE aliases, not tables, so
+    they are never reported as unknown (legitimate CTE SQL must not be
+    rejected); every other referenced name is still checked.
     """
     known = _known_table_aliases(schema_tables)
-    return sorted(n for n in sql_table_names(sql) if n.lower() not in known)
+    ctes = _cte_names(sql)
+    return sorted(
+        n for n in sql_table_names(sql)
+        if n.lower() not in known and n.lower() not in ctes
+    )
 
 
 def empty_sql_tables(sql, table_counts):

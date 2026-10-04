@@ -19,7 +19,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine
 
-from api.schema_intel import SchemaIntelligence
+from core.schema_intel import SchemaIntelligence
 from prescription_engine import analyze, run_scenario
 from prescription_engine.engine import _validate_prescriptions
 

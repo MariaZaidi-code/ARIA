@@ -38,7 +38,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 from core.config import STATIC_DIR, BASE_DIR  # noqa: E402
 from core.checks import run_checks  # noqa: E402
 from llm_provider import PROVIDERS  # noqa: E402
-from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, hypothesis_investigation_routes, settings_routes, feedback_routes, autocomplete_routes, data_routes, insight_rag_routes, insights_routes, predictive_routes, prescription_routes, rl_routes, intelligence_routes  # noqa: E402
+from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, hypothesis_investigation_routes, settings_routes, feedback_routes, autocomplete_routes, data_routes, insight_rag_routes, insights_routes, predictive_routes, prescription_routes, rl_routes, intelligence_routes, verification_routes  # noqa: E402
 from core.ratelimit import limit, limit_heavy, limit_ip, limit_llm  # noqa: E402
 from fastapi import Depends as _Depends  # noqa: E402
 
@@ -227,6 +227,7 @@ app.include_router(prescription_routes.router, dependencies=[_Depends(limit_heav
 app.include_router(hypothesis_investigation_routes.router, dependencies=[_Depends(limit_heavy())])
 app.include_router(rl_routes.router, dependencies=[_Depends(limit("rl", 60))])
 app.include_router(intelligence_routes.router, dependencies=[_Depends(limit_heavy())])
+app.include_router(verification_routes.router, dependencies=[_Depends(limit_heavy())])
 
 
 @app.exception_handler(HTTPException)
@@ -336,37 +337,69 @@ class _ImmutableStatic(StaticFiles):
 if (DIST_DIR / "assets").exists():
     app.mount("/assets", _ImmutableStatic(directory=str(DIST_DIR / "assets")), name="assets")
 # Also serve root files (favicon, index.html) via direct response
-@app.get("/")
-def index():
+def _request_id(request: Request) -> str:
+    return getattr(request.state, "request_id", None) or request.headers.get("X-Request-ID") or "unknown"
+
+
+def _serve_existing_file(rel_path: str):
+    """Return a FileResponse for rel_path if it exists under dist/ (first)
+    or static/, else None. Blocks path traversal; never returns a
+    directory. index.html gets no-store; hashed /assets get immutable."""
+    for base in (DIST_DIR, STATIC_DIR):
+        try:
+            root = base.resolve()
+            candidate = (root / rel_path).resolve()
+            if not candidate.is_relative_to(root) or not candidate.is_file():
+                continue
+        except Exception:
+            continue
+        headers = None
+        if candidate.name == "index.html":
+            headers = dict(_INDEX_NO_STORE)
+        elif rel_path.startswith("assets/"):
+            headers = {"Cache-Control": "public, max-age=31536000, immutable"}
+        return FileResponse(candidate, headers=headers)
+    return None
+
+
+def _frontend_index_response(request: Request):
+    """Serve the built SPA shell. dist/index.html only — if the build is
+    missing, return a clear 503 instead of broken/missing HTML."""
     prod_index = DIST_DIR / "index.html"
     if prod_index.exists():
         return FileResponse(prod_index, headers=dict(_INDEX_NO_STORE))
-    return FileResponse(STATIC_DIR / "index.html", headers=dict(_INDEX_NO_STORE))
+    return JSONResponse(status_code=503, content={
+        "ok": False, "success": False, "code": "SERVICE_UNAVAILABLE",
+        "detail": "frontend build missing", "request_id": _request_id(request)})
 
-# Fallback: any unmatched non-API route -> index.html (SPA routing).
+
+@app.get("/")
+def index(request: Request):
+    return _frontend_index_response(request)
+
+# Fallback: any unmatched non-API route -> SPA routing.
+# * existing file (dist first, then static) -> serve it (never index.html
+#   for an asset request)
+# * missing path WITH an extension -> 404 (never HTML in an asset slot)
+# * extensionless path -> SPA index (hash router uses /#/..., kept for
+#   robustness); if dist/ is absent -> 503 "frontend build missing"
 # /api/* must never silently return HTML; unknown API paths return the
 # canonical error shape (ok:false + request_id, never success-like).
 @app.get("/{full_path:path}")
 def catch_all(full_path: str, request: Request):
-    rid = getattr(request.state, "request_id", None) or request.headers.get("X-Request-ID") or "unknown"
+    rid = _request_id(request)
     if full_path == "api" or full_path.startswith("api/"):
         return JSONResponse(status_code=404, content={
             "ok": False, "success": False, "code": "NOT_FOUND",
             "detail": "Unknown API endpoint.", "request_id": rid})
-    # If the path looks like a static asset but doesn't exist, return 404
-    # instead of falling through to index.html.
-    static_file = DIST_DIR / full_path
-    if full_path.startswith("assets/") or full_path.endswith(('.js', '.css', '.png', '.jpg', '.svg', '.ico', '.woff', '.woff2')):
-        if not static_file.exists():
-            static_file = STATIC_DIR / full_path
-            if not static_file.exists():
-                return JSONResponse(status_code=404, content={
-                    "ok": False, "success": False, "code": "NOT_FOUND",
-                    "detail": "Static file not found.", "request_id": rid})
-    prod_index = DIST_DIR / "index.html"
-    if prod_index.exists():
-        return FileResponse(prod_index, headers=dict(_INDEX_NO_STORE))
-    return FileResponse(STATIC_DIR / "index.html", headers=dict(_INDEX_NO_STORE))
+    served = _serve_existing_file(full_path)
+    if served is not None:
+        return served
+    if Path(full_path).suffix:
+        return JSONResponse(status_code=404, content={
+            "ok": False, "success": False, "code": "NOT_FOUND",
+            "detail": "Static file not found.", "request_id": rid})
+    return _frontend_index_response(request)
 
 
 def _resolve_workers() -> int:

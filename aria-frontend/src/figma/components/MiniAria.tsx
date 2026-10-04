@@ -433,7 +433,7 @@ export default function MiniAria() {
             setTilt(Math.max(-8, Math.min(8, Math.round(raw))));
           }}
           onMouseLeave={() => setTilt(0)}
-          className={`group relative rounded-full bg-gradient-to-b from-white to-indigo-100 dark:to-indigo-500/10 p-2 shadow-2xl border-2 border-blue-300 dark:border-blue-500/25 hover:border-blue-500 transition-shadow ${happy ? "mini-aria-happy" : "mini-aria-ring"}`}
+          className={`group relative rounded-full bg-gradient-to-b from-white dark:from-zinc-900 to-indigo-100 dark:to-indigo-500/10 p-2 shadow-2xl border-2 border-blue-300 dark:border-blue-500/25 hover:border-blue-500 transition-shadow ${happy ? "mini-aria-happy" : "mini-aria-ring"}`}
           aria-label={open ? "Close Ask ARIA" : "Open Ask ARIA"}
           aria-expanded={open}
           style={{ transform: `rotate(${tilt}deg)`, transition: "transform 0.15s ease-out" }}
@@ -441,7 +441,7 @@ export default function MiniAria() {
           <span className="mini-aria-float block">
             <RobotFace waving={open || bubble} happy={happy} />
           </span>
-          <span className="absolute top-0.5 right-0.5 w-3 h-3 rounded-full bg-emerald-400 border-2 border-white" aria-hidden />
+          <span className="absolute top-0.5 right-0.5 w-3 h-3 rounded-full bg-emerald-400 border-2 border-white dark:border-zinc-900" aria-hidden />
         </button>
       </div>
     </>

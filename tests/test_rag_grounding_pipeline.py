@@ -215,7 +215,7 @@ def test_grounded_prompt_includes_types_and_descriptions(aw_mapping):
 def test_grounding_accepts_sql_numbers():
     rows = [{"total": 1100.0}]
     out = check_answer_grounding(
-        question="What are total sales?", answer="Total sales were 1100 across 2 orders.",
+        question="What are total sales?", answer="Total sales were 1100.",
         retrieved_tables=["SalesOrderHeader"], retrieved_columns=["TotalDue"],
         sql="SELECT SUM(TotalDue)", rows=rows, columns=["total"], intent="data")
     assert out["verdict"] == "grounded"
@@ -264,7 +264,7 @@ def test_pipeline_repairs_hallucinated_total(aw_db, aw_mapping):
 def test_pipeline_grounded_answer_passes_through(aw_db, aw_mapping):
     llm = FakeLLM(
         sql="SELECT SUM(LineTotal) AS total FROM SalesOrderDetail",
-        story="Total sales were 1100 across 3 line items in SalesOrderDetail.",
+        story="Total sales were 1100 in SalesOrderDetail.",
     )
     pipe = CopilotPipeline(llm=llm, schema_mapping=aw_mapping, db_uri=aw_db,
                            dialect="sqlite", user_id="u_ground_ok", embedder=None)

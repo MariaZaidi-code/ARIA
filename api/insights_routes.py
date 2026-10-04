@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 from core.deps import require_writable, reject_document_sql
 from core.config import get_session, save_session
-from api.schema_intel import SchemaIntelligence, _safe_name, _run_sql, AMOUNT_HINTS
+from core.schema_intel import SchemaIntelligence, _safe_name, _run_sql, AMOUNT_HINTS
 from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, log_and_sanitize, sanitize_error
 from core.semantic import humanize
 
@@ -107,7 +107,7 @@ def _fmtm(v, measure=None):
 class InsightsEngine:
     """Detect real insights from any connected database. Fully dynamic.
 
-    Uses shared SchemaIntelligence from api.schema_intel — no duplication.
+    Uses shared SchemaIntelligence from core.schema_intel — no duplication.
     Accepts either a raw DB-API connection (psycopg2/pymysql) or a
     SQLAlchemy engine for cross-table queries.
     """

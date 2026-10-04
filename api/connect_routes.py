@@ -344,25 +344,75 @@ def _is_num(value: str) -> bool:
 
 # ── Ingestion progress tracking ──────────────────────────────────────────
 # Maps user_id -> { "step": str, "progress": float 0-100, "message": str, "done": bool, "error": str|None }
+# Entries are written from background threads (large-CSV worker) and read from
+# the event loop, so every mutation/deletion runs under the lock; readers take
+# a shallow copy (snapshot) under the same lock and then work with it
+# lock-free — dict/str values are never mutated in place, so the snapshot the
+# consumer serializes is stable. The frontend contract (payload keys and SSE
+# event shape) is unchanged.
 _upload_progress: dict[int, dict] = {}
+_upload_progress_lock = threading.Lock()
+# Abandoned entries (client vanished before consuming the terminal state) are
+# dropped opportunistically on the next write, so `result` payloads never
+# accumulate for the lifetime of the process.
+_PROGRESS_TTL_S = 600.0
 
 
 def _set_progress(user_id: int, step: str, progress: float, message: str, done: bool = False, error: str | None = None, result: dict | None = None):
-    _upload_progress[user_id] = {
-        "step": step,
-        "progress": progress,
-        "message": message,
-        "done": done,
-        "error": error,
-        "result": result,
-        "timestamp": time.time(),
-    }
+    now = time.time()
+    with _upload_progress_lock:
+        # TTL sweep on write: drop entries nobody consumed within 10 minutes.
+        for _uid in [k for k, v in _upload_progress.items()
+                     if now - float((v or {}).get("timestamp") or 0.0)
+                     > _PROGRESS_TTL_S]:
+            _upload_progress.pop(_uid, None)
+        _upload_progress[user_id] = {
+            "step": step,
+            "progress": progress,
+            "message": message,
+            "done": done,
+            "error": error,
+            "result": result,
+            "timestamp": now,
+        }
+
+
+def _drop_progress(user_id: int, timestamp) -> None:
+    """Remove the entry only if it is still the generation that was consumed.
+
+    A fresh upload may already have overwritten it; never drop newer state.
+    """
+    with _upload_progress_lock:
+        cur = _upload_progress.get(user_id)
+        if cur is not None and cur.get("timestamp") == timestamp:
+            _upload_progress.pop(user_id, None)
+
+
+def _get_progress_snapshot(user_id: int, terminal: bool = False) -> dict | None:
+    """Copy of the user's progress entry (None when absent).
+
+    ``terminal=True`` means the caller is a consumer that just observed the
+    finished/failed state: the entry is removed so its ``result`` payload is
+    not held forever after it has been delivered.
+    """
+    with _upload_progress_lock:
+        prog = _upload_progress.get(user_id)
+        if not prog:
+            return None
+        snap = dict(prog)
+        if terminal and (snap.get("done") or snap.get("error")):
+            _upload_progress.pop(user_id, None)
+        return snap
 
 
 @router.get("/api/upload/progress")
 async def get_upload_progress(user: dict = Depends(get_current_user)):
-    """Return current ingestion progress for the user."""
-    prog = _upload_progress.get(user["user_id"])
+    """Return current ingestion progress for the user.
+
+    The terminal (done/error) payload is returned once, then the entry is
+    dropped — subsequent polls honestly report ``active: false``.
+    """
+    prog = _get_progress_snapshot(user["user_id"], terminal=True)
     if not prog:
         return {"ok": True, "active": False}
     return {"ok": True, "active": True, **prog}
@@ -374,14 +424,23 @@ async def stream_upload_progress(user: dict = Depends(require_writable)):
     async def event_stream():
         uid = user["user_id"]
         last_ts = 0
-        for _ in range(120):  # max 2 minutes (was 5 min, reduces connection exhaustion)
-            prog = _upload_progress.get(uid)
-            if prog and prog.get("timestamp", 0) > last_ts:
-                last_ts = prog["timestamp"]
-                yield f"data: {json.dumps({k: v for k, v in prog.items() if k != 'timestamp'})}\n\n"
-                if prog.get("done") or prog.get("error"):
-                    break
-            await asyncio.sleep(1)
+        consumed = False  # terminal event handed to the client -> drop entry
+        try:
+            for _ in range(120):  # max 2 minutes (was 5 min, reduces connection exhaustion)
+                prog = _get_progress_snapshot(uid)
+                if prog and prog.get("timestamp", 0) > last_ts:
+                    last_ts = prog["timestamp"]
+                    if prog.get("done") or prog.get("error"):
+                        # Mark before yielding so an abort mid-send still
+                        # cleans up in the finally below.
+                        consumed = True
+                    yield f"data: {json.dumps({k: v for k, v in prog.items() if k != 'timestamp'})}\n\n"
+                    if consumed:
+                        break
+                await asyncio.sleep(1)
+        finally:
+            if consumed:
+                _drop_progress(uid, last_ts)
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 

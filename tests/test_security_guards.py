@@ -157,6 +157,96 @@ class TestReadOnlyGuard(unittest.TestCase):
                 self.assertEqual(SqlMixin()._is_read_only_sql(sql), expected)
 
 
+class TestReadOnlyGuardPostgresHardening(unittest.TestCase):
+    """C1: dangerous PostgreSQL calls blocked; C2: CTE names are not tables."""
+
+    DANGEROUS_PROBES = (
+        "SELECT pg_read_binary_file('/etc/passwd', 0)",
+        "SELECT query_to_xml('SELECT 1', true, true, '')",
+        "SELECT lo_import('/etc/passwd')",
+        "SELECT pg_terminate_backend(42)",
+        "SELECT pg_ls_dir('/')",
+        "SELECT set_config('search_path','pg_catalog',false)",
+    )
+
+    def test_dangerous_pg_function_calls_blocked(self):
+        from core.validation import is_read_only_sql
+
+        for sql in self.DANGEROUS_PROBES:
+            with self.subTest(sql=sql):
+                self.assertFalse(is_read_only_sql(sql))
+
+    def test_enforce_readonly_guards_rejects_dangerous_probe(self):
+        from core.validation import enforce_readonly_guards
+
+        for sql in self.DANGEROUS_PROBES:
+            with self.subTest(sql=sql):
+                with self.assertRaises(RuntimeError):
+                    enforce_readonly_guards(sql, {"orders": ["order_id"]})
+
+    def test_plain_and_safe_fromless_selects_still_pass(self):
+        from core.validation import is_read_only_sql
+
+        for sql in (
+            "SELECT 1",
+            "SELECT 1 AS x",
+            "SELECT count(*)",
+            "SELECT SUM(TotalDue)",
+            "SELECT count(*) FROM orders",
+            "SELECT * FROM orders LIMIT 10",
+            "SELECT * FROM orders WHERE name = 'x'",
+        ):
+            with self.subTest(sql=sql):
+                self.assertTrue(is_read_only_sql(sql))
+
+    def test_unlisted_fromless_function_fails_closed(self):
+        from core.validation import is_read_only_sql
+
+        self.assertFalse(is_read_only_sql("SELECT nextval('seq')"))
+
+    def test_dangerous_name_without_call_is_not_blocked(self):
+        from core.validation import is_read_only_sql
+
+        for sql in (
+            "SELECT query_to_xml_count FROM orders",
+            "SELECT pg_typeof(id) FROM orders",
+            "SELECT pg_get_expr(id) FROM orders",
+        ):
+            with self.subTest(sql=sql):
+                self.assertTrue(is_read_only_sql(sql))
+
+    def test_cte_names_not_reported_as_unknown_tables(self):
+        from core.validation import unknown_sql_tables
+
+        cases = [
+            "WITH t AS (SELECT id FROM orders) SELECT * FROM t",
+            "WITH a AS (SELECT * FROM orders), b AS (SELECT * FROM a) SELECT * FROM b",
+            "WITH RECURSIVE c(i) AS (SELECT 1) SELECT * FROM c",
+            "WITH t AS (SELECT 1) SELECT 1",
+        ]
+        for sql in cases:
+            with self.subTest(sql=sql):
+                self.assertEqual(unknown_sql_tables(sql, ["orders"]), [])
+
+    def test_cte_support_does_not_weaken_unknown_table_guard(self):
+        from core.validation import unknown_sql_tables
+
+        self.assertEqual(
+            unknown_sql_tables(
+                "WITH t AS (SELECT 1) SELECT * FROM pg_catalog.pg_shadow",
+                ["orders"],
+            ),
+            ["pg_catalog.pg_shadow"],
+        )
+        self.assertEqual(
+            unknown_sql_tables(
+                "WITH t AS (SELECT * FROM order_items) SELECT * FROM t",
+                ["orders"],
+            ),
+            ["order_items"],
+        )
+
+
 class TestNameOnlyFKCap(unittest.TestCase):
     def test_name_only_never_probable(self):
         from schema_engine.classifier import classify
@@ -353,6 +443,116 @@ class TestBatch23Guards(unittest.TestCase):
         self.assertEqual(PrescriptionAgent._parse_actions(prose, 5), [])
         listed = "1. Cut waste\n2. Renegotiate supply\n3. Push top product"
         self.assertEqual(len(PrescriptionAgent._parse_actions(listed, 5)), 3)
+
+
+class TestExecuteGuarded(unittest.TestCase):
+    """`SqlMixin._execute_guarded` is the single guard + statement-timeout +
+    execute choke point that every Goal Agent execution path routes through
+    (fail-closed allowlist gate before EVERY execution)."""
+
+    DANGEROUS = (
+        "SELECT query_to_xml('SELECT 1', true, true, '')",
+        "DROP TABLE orders",
+        "SELECT * FROM orders; DROP TABLE orders",
+    )
+
+    @staticmethod
+    def _stub(dialect="sqlite"):
+        from goal_agent.sql import SqlMixin
+
+        m = SqlMixin()
+        m.tables = {"orders": {"columns": {"order_id": {}, "total": {}}}}
+        m.dialect = dialect
+        return m
+
+    @staticmethod
+    def _sqlite_engine():
+        from sqlalchemy import create_engine, text
+
+        eng = create_engine("sqlite://")
+        with eng.begin() as conn:
+            conn.execute(text("CREATE TABLE orders (order_id INTEGER)"))
+            conn.execute(text("INSERT INTO orders VALUES (1)"))
+        return eng
+
+    def test_dangerous_sql_blocked_before_execution(self):
+        from sqlalchemy import text
+
+        eng = self._sqlite_engine()
+        m = self._stub()
+        try:
+            for sql in self.DANGEROUS:
+                with self.subTest(sql=sql):
+                    with eng.connect() as conn:
+                        with self.assertRaises(RuntimeError):
+                            m._execute_guarded(conn, sql)
+            with eng.connect() as conn:
+                self.assertEqual(
+                    conn.execute(text("SELECT count(*) FROM orders")).scalar(), 1)
+        finally:
+            eng.dispose()
+
+    def test_normal_select_passes_and_returns_rows(self):
+        from sqlalchemy import text
+
+        eng = self._sqlite_engine()
+        m = self._stub()
+        try:
+            with eng.connect() as conn:
+                rows = m._execute_guarded(
+                    conn, "SELECT order_id FROM orders LIMIT 10").fetchall()
+            self.assertEqual(len(rows), 1)
+            with eng.connect() as conn:
+                self.assertEqual(
+                    conn.execute(text("SELECT count(*) FROM orders")).scalar(), 1)
+        finally:
+            eng.dispose()
+
+    def test_timeout_is_dialect_conditional_like_main_path(self):
+        class _Conn:
+            def __init__(self):
+                self.stmts = []
+
+            def execute(self, stmt):
+                self.stmts.append(str(stmt))
+                return None
+
+        for dialect, expect in (
+            ("postgresql", "SET statement_timeout = '30000'"),
+            ("mysql", "SET SESSION max_execution_time = 30000"),
+        ):
+            fc = _Conn()
+            self._stub(dialect)._execute_guarded(
+                fc, "SELECT order_id FROM orders LIMIT 10")
+            with self.subTest(dialect=dialect):
+                self.assertEqual(fc.stmts[0], expect)
+                self.assertIn("SELECT", fc.stmts[1])
+
+        fc = _Conn()
+        self._stub("postgresql")._execute_guarded(
+            fc, "SELECT order_id FROM orders LIMIT 10", timeout_ms=5000)
+        self.assertEqual(fc.stmts[0], "SET statement_timeout = '5000'")
+
+        fc = _Conn()
+        self._stub("sqlite")._execute_guarded(
+            fc, "SELECT order_id FROM orders LIMIT 10")
+        self.assertEqual(len(fc.stmts), 1)
+
+    def test_all_execution_sites_route_through_helper(self):
+        import inspect
+
+        from goal_agent.data import DataMixin
+        from goal_agent.intent import IntentMixin
+        from goal_agent.sql import SqlMixin
+
+        for cls, name in (
+            (DataMixin, "_execute_with_retry"),
+            (SqlMixin, "_probe_text_numeric_column"),
+            (IntentMixin, "_process_metrics_overview"),
+        ):
+            with self.subTest(site=f"{cls.__name__}.{name}"):
+                self.assertIn(
+                    "_execute_guarded(", inspect.getsource(getattr(cls, name)))
 
 
 if __name__ == "__main__":

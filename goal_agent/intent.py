@@ -636,7 +636,7 @@ class IntentMixin:
             with self.engine.connect() as conn:
                 for label, sql in metrics:
                     try:
-                        value = conn.execute(text(sql)).scalar()
+                        value = self._execute_guarded(conn, sql).scalar()
                         rows.append({"metric": label, "value": value})
                         sql_parts.append(sql)
                     except Exception as exc:

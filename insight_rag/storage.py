@@ -22,10 +22,20 @@ from pathlib import Path
 from langchain_core.documents import Document
 from filelock import FileLock
 
-from .config import RAG_COLLECTION_PREFIX, RAG_DATABASE_URL, user_dir, user_key
+from .config import (
+    RAG_COLLECTION_PREFIX,
+    RAG_DATABASE_URL,
+    RAG_VECTOR_STORE_CACHE_MAX,
+    user_dir,
+    user_key,
+)
 from .embeddings import FastBGEEmbeddings
 
 _LOCK = threading.RLock()
+# Bounded per-user LRU (isolation key stays user-only). Insertion order is
+# recency order: an entry is re-inserted on every hit, so the first key is
+# always the least-recently-used one. The lock is the module's existing lock
+# (already held for manifest access), so cache and metadata stay consistent.
 _VECTOR_STORE_CACHE: dict[str, object] = {}
 
 
@@ -204,21 +214,53 @@ class ConversationStore:
             _atomic_write(self._path(conversation_id), payload)
 
 
+def _close_vector_store(store) -> None:
+    """Best-effort release of an evicted cache entry; never raises.
+
+    ``UserPGVectorStore`` exposes no ``close()``/``dispose()``, so eviction
+    alone is the guaranteed action: dropping the last cache reference lets the
+    PGVector + SQLAlchemy pool go once idle. Store doubles (or future variants)
+    that do expose one are closed here, and cache housekeeping must never fail
+    a request, so any close error is ignored after the entry is already gone.
+    """
+    for target in (store, getattr(store, "store", None)):
+        close = getattr(target, "close", None) or getattr(target, "dispose", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+            return
+
+
 def get_user_vector_store(user_id: str | int):
     """Return a cached per-user PGVector store (isolation key = user_id).
 
     Reuse avoids reconstructing PGVector + connection overhead on every
     query. Cache key includes only the user so one user's vectors never
-    leak into another user's retrieval.
+    leak into another user's retrieval. The cache is a bounded LRU: at
+    ``RAG_VECTOR_STORE_CACHE_MAX`` entries the least-recently-used store is
+    evicted (and closed when it exposes ``close``/``dispose``) so a process
+    serving N users cannot hold N pools forever.
     """
     key = str(user_id)
-    with _LOCK:
-        cached = _VECTOR_STORE_CACHE.get(key)
-        if cached is not None:
-            return cached
-        store = UserPGVectorStore(user_id)
-        _VECTOR_STORE_CACHE[key] = store
-        return store
+    evicted = None
+    try:
+        with _LOCK:
+            cached = _VECTOR_STORE_CACHE.get(key)
+            if cached is not None:
+                # LRU touch: reinsert so eviction drops least-recently-used.
+                _VECTOR_STORE_CACHE.pop(key, None)
+                _VECTOR_STORE_CACHE[key] = cached
+                return cached
+            if len(_VECTOR_STORE_CACHE) >= RAG_VECTOR_STORE_CACHE_MAX:
+                evicted = _VECTOR_STORE_CACHE.pop(next(iter(_VECTOR_STORE_CACHE)))
+            store = UserPGVectorStore(user_id)
+            _VECTOR_STORE_CACHE[key] = store
+            return store
+    finally:
+        if evicted is not None:
+            _close_vector_store(evicted)
 
 
 class UserPGVectorStore:

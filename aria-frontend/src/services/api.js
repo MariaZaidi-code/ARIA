@@ -1352,6 +1352,36 @@ export const intelligenceApi = {
     return { success: true, data: data?.data || data || {} };
   },
 
+  // GET /api/intelligence/reports/:id/html -> styled printable HTML string
+  // (Reporting Agent). Uses raw fetch (not the JSON request helper) so the
+  // HTML body is preserved; throws a normalized Error on failure.
+  getReportHtml: async (id) => {
+    const res = await fetch(
+      `${API_BASE}/intelligence/reports/${encodeURIComponent(id)}/html`,
+      { credentials: "include" },
+    );
+    if (res.status === 401) handleUnauthorized();
+    if (!res.ok) {
+      let data = {};
+      try { data = await res.json(); } catch { /* HTML/empty error body */ }
+      const norm = normalizeApiError(data, res.status, res.headers);
+      const error = new Error(norm.message);
+      error.status = res.status;
+      error.code = norm.code;
+      error.requestId = norm.requestId;
+      throw error;
+    }
+    return { success: true, data: await res.text() };
+  },
+
+  // POST /api/intelligence/reports/:id/rerun -> same definition, fresh numbers.
+  rerunReport: async (id) => {
+    const data = await request(`/intelligence/reports/${encodeURIComponent(id)}/rerun`, {
+      method: "POST",
+    });
+    return { success: true, data: data?.data || data || {} };
+  },
+
   // ---- Coverage (which datasets/metrics the module can reason about) ----
   getCoverage: async () => {
     const data = await request("/intelligence/coverage");

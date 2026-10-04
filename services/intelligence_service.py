@@ -905,16 +905,14 @@ _EXPLORE_TOP_CATS = 50
 # Pooled engines per db_uri (bounded, thread-safe): creating a pool per
 # request wastes handshakes (esp. postgres). sqlite file DBs share one
 # pooled file connection set; credentials stay in the key only in memory.
+import threading
+
 _ENGINE_POOL: dict = {}
-_ENGINE_LOCK = None
+_ENGINE_LOCK = threading.Lock()
 
 
 def _pooled_engine(db_uri: str):
     """Return a cached SQLAlchemy engine for db_uri (pool_size=5)."""
-    global _ENGINE_LOCK
-    if _ENGINE_LOCK is None:
-        import threading as _th
-        _ENGINE_LOCK = _th.Lock()
     key = str(db_uri or "")
     with _ENGINE_LOCK:
         eng = _ENGINE_POOL.get(key)

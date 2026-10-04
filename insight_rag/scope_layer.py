@@ -11,9 +11,12 @@ import time
 import uuid
 from contextvars import ContextVar
 
+from llm_provider import begin_rag_llm_budget, end_rag_llm_budget
+
 from .config import (
     MAX_SELECTED_DOCUMENTS,
     RAG_LLM_MODEL,
+    RAG_MAX_LLM_CALLS_PER_QUERY,
     RAG_PIPELINE_VERSION,
     validate_rag_config,
 )
@@ -347,6 +350,10 @@ class InsightPDFRAG(FinalInsightPDFRAG):
 
         started = time.perf_counter()
         token = TRACE.set({"pipeline_version": RAG_PIPELINE_VERSION})
+        # Per-question LLM budget is reset here (the public entry), not inside
+        # _chat: the summary retry re-runs _chat and must spend the same budget
+        # as the first attempt instead of getting a fresh one.
+        budget_token = begin_rag_llm_budget(RAG_MAX_LLM_CALLS_PER_QUERY)
         try:
             with self.conversations.turn_lock(conversation_id):
                 if document_ids:
@@ -385,4 +392,5 @@ class InsightPDFRAG(FinalInsightPDFRAG):
                 result["pipeline_version"] = RAG_PIPELINE_VERSION
                 return result
         finally:
+            end_rag_llm_budget(budget_token)
             TRACE.reset(token)

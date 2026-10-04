@@ -31,8 +31,9 @@ _REQUIRED_PACKAGES = {
     "python-multipart": ("multipart", "python-multipart"),
     "pdfplumber": ("pdfplumber", "pdfplumber"),
     "python-dotenv": ("dotenv", "python-dotenv"),
-    "httpx": ("httpx", "httpx"),
     "pydantic": ("pydantic", "pydantic"),
+    "fastembed": ("fastembed", "fastembed"),
+    "PyMuPDF": ("fitz", "pymupdf"),
 }
 
 _OPTIONAL_PACKAGES = {
@@ -40,6 +41,10 @@ _OPTIONAL_PACKAGES = {
     "groq": ("groq", "groq"),                # only needed for the Cloud (Groq) provider
     "ollama": ("ollama", "ollama"),          # only needed for the Local (Ollama) provider
     "langgraph": ("langgraph", "langgraph"), # used by goal_agent; falls back to a linear flow
+    "langchain-postgres": ("langchain_postgres", "langchain-postgres"), # PDF RAG vector store; only needed when ARIA_RAG_DATABASE_URL is set
+    "scikit-learn": ("sklearn", "scikit-learn"), # tabular prediction; graceful fallback when absent
+    "statsmodels": ("statsmodels", "statsmodels"), # forecast models; skipped when absent
+    "httpx": ("httpx", "httpx"),             # dev/test only (FastAPI TestClient); no prod module imports it
 }
 
 

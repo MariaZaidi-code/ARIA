@@ -63,7 +63,7 @@ class TestScorecard(unittest.TestCase):
         cls._tmp.cleanup()
 
     def test_01_schema_measures_dates(self):
-        from api.schema_intel import SchemaIntelligence
+        from core.schema_intel import SchemaIntelligence
 
         intel = SchemaIntelligence(UNSEEN)
         check("schema", intel.find_best_measure("treatments") == "cost", "measure=cost")

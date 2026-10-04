@@ -17,6 +17,7 @@ from copilot.retriever import SchemaRetriever
 from copilot.conversation import ConversationMemory
 from copilot.sql_engine import SqlEngine, is_read_only, clean_sql
 from copilot.pipeline import CopilotPipeline, infer_chart
+from copilot.answer_grounding import check_answer_grounding
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
@@ -189,6 +190,21 @@ def test_engine_executes_real_query(sqlite_db, mapping):
     assert "total" in res.columns
 
 
+def test_limit_branch_keeps_text_cast_rewrite(sqlite_db, mapping):
+    """Plain-row query: the appended LIMIT must be built from safe_sql,
+    so the TEXT-cast rewrite (bare CAST crashes on '₹399'-style values)
+    survives in the SQL that actually executes."""
+    engine = SqlEngine(sqlite_db, dialect="sqlite", max_rows=1000)
+    res = engine.execute(
+        "SELECT order_id, CAST(order_date AS REAL) AS d FROM orders",
+        mapping["tables"],
+    )
+    assert res.ok, res.error
+    assert "NULLIF" in res.sql          # rewritten cast present
+    assert "LIMIT 1000" in res.sql      # LIMIT present
+    assert "CAST(order_date AS REAL)" not in res.sql  # original cast replaced
+
+
 # ── Chart inference (dynamic) ────────────────────────────────────────────
 
 def test_infer_chart_ranking_is_bar():
@@ -265,3 +281,51 @@ def test_dialect_rules_differ_by_database():
     assert "date_trunc" in pg
     assert "DATE_FORMAT" in my
     assert pg != my
+
+
+# ── Answer grounding: no magnitude exemption for invented numbers ────────
+
+def _ground(answer, rows, **kw):
+    base = dict(question="What is total sales?", answer=answer,
+                retrieved_tables=["sales"], retrieved_columns=["total"],
+                sql="SELECT SUM(total) AS total FROM sales",
+                rows=rows, columns=["total"], intent="data")
+    base.update(kw)
+    return check_answer_grounding(**base)
+
+
+def test_grounding_flags_small_invented_number():
+    out = _ground("Total sales is 999", [{"total": 50000}])
+    assert out["verdict"] == "ungrounded"
+    assert out["reason"] == "numeric_mismatch_vs_sql"
+    assert 999 in out["checks"]["unsupported_claims"]
+    assert out["checks"]["numeric_match_vs_sql"] is False
+
+
+def test_grounding_accepts_small_number_present_in_rows():
+    out = _ground("Total sales is 999", [{"total": 999}])
+    assert out["verdict"] == "grounded"
+    assert not out["checks"]["unsupported_claims"]
+
+
+def test_grounding_allows_plain_prose_year():
+    out = _ground("Total sales was 50,000 in 2024", [{"total": 50000}])
+    assert out["verdict"] == "grounded"
+    assert 2024 not in out["checks"]["unsupported_claims"]
+
+
+def test_grounding_money_looking_like_year_is_not_a_year():
+    out = _ground("Total sales was $1,999", [{"total": 50000}])
+    assert out["verdict"] == "ungrounded"
+
+
+def test_grounding_check4_never_auto_passes_on_invented_numbers():
+    # Numbers are present, but none is backed by the rows: check 4 must not
+    # short-circuit to True on "any number present".
+    out = _ground("999", [{"total": 50000}])
+    assert out["checks"]["answers_question"] is False
+    assert out["verdict"] == "ungrounded"
+    # The same shape with a row-backed number still auto-passes.
+    ok = _ground("50000", [{"total": 50000}])
+    assert ok["checks"]["answers_question"] is True
+    assert ok["verdict"] == "grounded"

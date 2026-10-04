@@ -141,9 +141,28 @@ class SaveRequest(BaseModel):
     question: str | None = None
 
 
+def _attach_prescription_verdict(out):
+    """Best-effort Verification Agent hookup for prescriptions (never blocks).
+
+    Attaches ``out["verdict"]``. On any failure attaches an honest
+    not-verified verdict and still returns the data untouched.
+    """
+    try:
+        from verification.agent import verify_prescription
+        verdict = verify_prescription(out if isinstance(out, dict) else {}, {})
+    except Exception:
+        verdict = {"verified": False, "checks": [],
+                   "warnings": ["verification unavailable"]}
+    try:
+        out["verdict"] = verdict
+    except Exception:
+        pass
+    return out
+
+
 def _setup(user):
     """Shared loader: mapping + tables + engine for any supported source."""
-    from api.schema_intel import SchemaIntelligence
+    from core.schema_intel import SchemaIntelligence
     session = get_session(user["user_id"])
     schema_path = session.get("schema_path")
     if not schema_path:
@@ -280,7 +299,7 @@ def _enrich_context(engine, dialect, intel, tables, session):
     opportunities, limitations = [], []
 
     def _count(table):
-        from api.schema_intel import _safe_name
+        from core.schema_intel import _safe_name
         try:
             with engine.connect() as conn:
                 return int(conn.execute(
@@ -366,6 +385,10 @@ def prescription_analyze(req: AnalyzeRequest, request: Request,
             return err if doc_err is None else doc_err
         chunks, doc_name, _ = doc
         out = _analyze_doc(chunks, (req.question or ""), doc_name)
+        try:
+            _attach_prescription_verdict(out)
+        except Exception:
+            pass
         return sanitize_json(out)
     mapping, tables, engine, dialect, intel, session = setup
     try:
@@ -480,6 +503,10 @@ def prescription_analyze(req: AnalyzeRequest, request: Request,
             if polished:
                 out["story"] = polished
         out, _ = _strip_prescription_response(out)
+        try:
+            _attach_prescription_verdict(out)
+        except Exception:
+            pass
         return sanitize_json(out)
     except Exception:
         import logging as _logging
@@ -609,6 +636,10 @@ def prescription_scenario(req: ScenarioRequest, request: Request,
         out = _scenario(engine, dialect, intel, req.table, req.metric, req.driver,
                         [c.model_dump() for c in req.changes], filt=filt, join=join)
         out, _ = _strip_prescription_response(out)
+        try:
+            _attach_prescription_verdict(out)
+        except Exception:
+            pass
         return sanitize_json(out)
     except Exception:
         import logging as _logging
@@ -788,7 +819,7 @@ def prescription_levers(request: Request, metric: str | None = None,
             metric = ms[0] if ms else None
         levers = []
         try:
-            from api.schema_intel import _safe_name as _qn
+            from core.schema_intel import _safe_name as _qn
             _cols = intel.get_numeric_cols(table)
             _counts = {}
             with engine.connect() as _conn:

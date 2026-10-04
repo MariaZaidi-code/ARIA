@@ -581,6 +581,34 @@ def _wave_period(values, season_period, period_code):
     return None
 
 
+def _projection_slope(values, wave_period):
+    """Trend slope of the generic trend+seasonal projection.
+
+    OLS over the whole window, falling back to first->last drift when the
+    history is shorter than two full seasons (OLS is phase-biased with a
+    single cycle). Shared by the projection and its in-sample fitted curve so
+    the two can never describe different trends.
+    """
+    v = np.asarray(values, dtype=float)
+    n = int(len(v))
+    try:
+        t = np.arange(n, dtype=float)
+        ols = float(np.polyfit(t, v, 1)[0]) if n >= 2 else 0.0
+    except Exception:
+        ols = 0.0
+    try:
+        drift = float((v[-1] - v[0]) / (n - 1)) if n > 1 else 0.0
+    except Exception:
+        drift = 0.0
+    if wave_period and n < 2 * int(wave_period):
+        slope = drift
+    else:
+        slope = ols
+    if not math.isfinite(slope):
+        slope = 0.0
+    return slope
+
+
 def _trend_seasonal_projection(values, steps, wave_period):
     """Generic trend + seasonal/periodic projection from actual history.
 
@@ -598,23 +626,15 @@ def _trend_seasonal_projection(values, steps, wave_period):
     steps = max(1, int(steps or 1))
     try:
         t = np.arange(n, dtype=float)
-        ols = float(np.polyfit(t, v, 1)[0]) if n >= 2 else 0.0
     except Exception:
-        ols = 0.0
-    try:
-        drift = float((v[-1] - v[0]) / (n - 1)) if n > 1 else 0.0
-    except Exception:
-        drift = 0.0
-    if wave_period and n < 2 * int(wave_period):
-        slope = drift
-    else:
-        slope = ols
-    if not math.isfinite(slope):
-        slope = 0.0
+        t = None
+    slope = _projection_slope(v, wave_period)
     p = max(2, int(wave_period)) if wave_period else 0
     if not p:
         return v[-1] + slope * np.arange(1, steps + 1, dtype=float), 0.0, slope
     try:
+        if t is None:
+            raise ValueError("time index unavailable")
         resid = v - slope * t
         s = np.zeros(p)
         for ph in range(p):
@@ -671,6 +691,93 @@ def _ensure_wavy_forecast(values, points, season_period, period_code):
     except Exception:
         log.debug("wave guard failed", exc_info=True)
         return points, None
+
+
+def _trend_seasonal_fitted(values, wave_period):
+    """In-sample curve of the trend+seasonal projection (same slope rule).
+
+    ``slope*t`` plus the mean detrended residual per phase — the exact
+    decomposition the projection continues from, so ``values - fitted`` is
+    the within-phase deviation around the trend the shipped points carry.
+    """
+    v = np.asarray(values, dtype=float)
+    n = int(len(v))
+    if not n:
+        return np.array([], dtype=float)
+    t = np.arange(n, dtype=float)
+    slope = _projection_slope(v, wave_period)
+    base = slope * t
+    p = max(2, int(wave_period)) if wave_period else 0
+    if not p:
+        return base + float(np.mean(v - base))
+    try:
+        resid = v - base
+        s = np.zeros(p)
+        for ph in range(p):
+            idx = [k for k in range(n) if k % p == ph]
+            s[ph] = float(np.mean([resid[k] for k in idx])) if idx else 0.0
+        return base + s[np.arange(n) % p]
+    except Exception:
+        return base + float(np.mean(v - base))
+
+
+def _wave_projection_cls(season_period, period_code):
+    """Model class for the projection the wave guard substitutes in.
+
+    Honors the ``BaseModel`` contract the walk-forward helpers expect
+    (``_make(cls, period).fit(train).predict(1)``) and is driven by the SAME
+    ``_wave_period``/``_trend_seasonal_projection`` functions that produced
+    the shipped points, so scoring it scores the forecast that actually
+    ships — never the winner whose points were discarded.
+    """
+
+    class _WaveProjection(M.BaseModel):
+        name = "trend_seasonal_projection"
+        min_points = 5
+        needs_period = False
+        needs_real_period = False
+
+        @classmethod
+        def available(cls):
+            return True
+
+        def __init__(self, period=None):
+            self.period = period or season_period
+
+        def fit(self, values):
+            v = np.asarray(values, dtype=float)
+            self.values = v
+            self.wave_period = _wave_period(v, self.period, period_code)
+            return self
+
+        def predict(self, steps):
+            proj, _, _ = _trend_seasonal_projection(
+                self.values, steps, self.wave_period)
+            return proj
+
+        def fitted(self):
+            return _trend_seasonal_fitted(self.values, self.wave_period)
+
+    return _WaveProjection
+
+
+def _wave_metrics(values, season_period, period_code):
+    """Walk-forward MAPE/MAE + in-sample residuals for the shipped projection.
+
+    Rebuild path used when the wave guard replaces ``points``: the same
+    ``one_step_ahead_*`` helpers the flat-line branch re-runs for a
+    substituted winner, applied to the projection that replaces it.
+    Returns ``(oos_mape, oos_mae, resid)`` (either out-of-sample value may
+    be ``None`` when walk-forward cannot run — accuracy then honestly reads
+    not-applicable instead of stale).
+    """
+    from .evaluate import one_step_ahead_mape as _oos_mape
+    from .evaluate import one_step_ahead_mae as _oos_mae
+    spec = _wave_projection_cls(season_period, period_code)
+    wave_mape = _oos_mape(spec, values, season_period)
+    wave_mae = _oos_mae(spec, values, season_period)
+    resid = np.asarray(spec().fit(values).residuals(values), dtype=float)
+    return wave_mape, wave_mae, resid
 
 
 def _widening_sigmas(sigma, steps, values):
@@ -1482,6 +1589,23 @@ class PredictionAgent:
                 points = np.asarray(_wavy, dtype=float)
                 _sub_note = ((_sub_note + " ") if _sub_note else "") + _wave_note
                 log.info("wave guard: %s", _wave_note)
+                # Points now come from the substituted projection, so the
+                # accuracy/band inputs computed for the original winner are
+                # stale. Rebuild oos_mape/oos_mae/resid/sigma from the
+                # projection that SHIPS (same one-step helpers the flat-line
+                # branch re-runs): validation.accuracy_pct and the 80/95%
+                # bands must never describe a model whose points were
+                # discarded. On rebuild failure accuracy becomes
+                # not-applicable rather than stale.
+                try:
+                    oos_mape, oos_mae, resid = _wave_metrics(
+                        values, season_period, period_code)
+                    std = float(np.std(resid)) if len(resid) > 1 else 0.0
+                    sigma = oos_mae / 0.8 if oos_mae else std
+                except Exception:
+                    log.debug("wave guard metric rebuild failed",
+                              exc_info=True)
+                    oos_mape = oos_mae = None
         except Exception:
             log.debug("wave guard failed", exc_info=True)
         last_actual = float(values[-1])

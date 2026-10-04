@@ -79,7 +79,7 @@ def _linked_hypothesis_setup(session):
     """
     try:
         from api.copilot_routes import _linked_context
-        from api.schema_intel import SchemaIntelligence
+        from core.schema_intel import SchemaIntelligence
         linked = _linked_context(session)
         mapping = linked.get("mapping") or {}
         tables = list(mapping.get("tables", {}).keys())
@@ -237,7 +237,7 @@ def suggest_hypotheses(user: dict = Depends(get_current_user)):
     Each card carries its evidence (computed live, pre-validated), so every
     suggestion is guaranteed testable — never a dead end.
     """
-    from api.schema_intel import SchemaIntelligence
+    from core.schema_intel import SchemaIntelligence
     from hypothesis_engine.engine import rank_prominent, suggest_hypotheses as _suggest
     session = get_session(user["user_id"])
     reject_document_sql(session)
@@ -274,7 +274,7 @@ def suggest_hypotheses(user: dict = Depends(get_current_user)):
 @router.post("/api/hypothesis/analyze")
 def analyze_hypothesis(req: AnalyzeRequest, request: Request, user: dict = Depends(require_writable)):
     """Full Hypothesis Engine pipeline: intent -> adequacy -> analysis -> verdict."""
-    from api.schema_intel import SchemaIntelligence
+    from core.schema_intel import SchemaIntelligence
     from hypothesis_engine import analyze_question
     from insight_agent import sanitize_json
     require_data(request)
@@ -316,7 +316,7 @@ def analyze_hypothesis(req: AnalyzeRequest, request: Request, user: dict = Depen
 
 def _hypothesis_setup(user):
     """Shared loader: mapping + tables + engine for any supported source."""
-    from api.schema_intel import SchemaIntelligence
+    from core.schema_intel import SchemaIntelligence
     session = get_session(user["user_id"])
     reject_document_sql(session)
     schema_path = session.get("schema_path")

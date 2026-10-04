@@ -25,7 +25,9 @@ import re
 log = logging.getLogger(__name__)
 
 _NUMBER_RE = re.compile(
-    r"\$?\s*(?P<num>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)"
+    # The thousands-group alternative must contain at least one ",ddd" group,
+    # otherwise "1100" parses as 110 + 0 and never matches the row value.
+    r"\$?\s*(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
     r"(?P<suffix>\s*[KMBkmb](?![a-zA-Z])|\s*%)?"
 )
 _STOPWORDS = {
@@ -47,24 +49,44 @@ def _norm_numbers(values: list[object]) -> set[float]:
     return out
 
 
-def _numbers_in_text(text: str) -> list[float]:
-    found: list[float] = []
+def _number_tokens(text: str) -> list[dict]:
+    """Every number in ``text`` with the metadata grounding needs.
+
+    Each token carries the parsed ``value`` (K/M/B suffixes scaled), the raw
+    digit string, the suffix, and whether it was written as currency — so
+    the check can tell a prose year ("in 2024") from a formatted measure
+    ("$1,999", which must never hide behind the year exemption).
+    """
+    out: list[dict] = []
     for match in _NUMBER_RE.finditer(text or ""):
+        raw = match.group("num")
         try:
-            num = float(match.group("num").replace(",", ""))
+            value = float(raw.replace(",", ""))
         except ValueError:
             continue
-        suffix = (match.group("suffix") or "").strip().upper()
-        if suffix == "K":
-            num *= 1_000
-        elif suffix == "M":
-            num *= 1_000_000
-        elif suffix == "B":
-            num *= 1_000_000_000
-        # Skip year-like / tiny integers that are clearly not measures
-        # (e.g. "top 10", "2024") unless the SQL actually returned them.
-        found.append(round(num, 2))
-    return found
+        suffix = (match.group("suffix") or "").strip()
+        scaled = suffix.upper()
+        if scaled == "K":
+            value *= 1_000
+        elif scaled == "M":
+            value *= 1_000_000
+        elif scaled == "B":
+            value *= 1_000_000_000
+        prefix = match.group(0)[:match.start("num") - match.start()]
+        out.append({"value": round(value, 2), "raw": raw, "suffix": suffix,
+                    "currency": "$" in prefix})
+    return out
+
+
+def _numbers_in_text(text: str) -> list[float]:
+    return [t["value"] for t in _number_tokens(text)]
+
+
+def _is_year_token(tok: dict) -> bool:
+    """Plain 4-digit year in prose ("in 2024") — never a formatted measure."""
+    return (len(tok["raw"]) == 4 and tok["raw"].isdigit()
+            and not tok["suffix"] and not tok["currency"]
+            and 1900 <= tok["value"] <= 2100)
 
 
 def _key_terms(question: str) -> set[str]:
@@ -122,21 +144,34 @@ def _check(*, question, answer, retrieved_tables, retrieved_columns,
 
     # 2/3. Numeric consistency vs SQL (SQL authoritative).
     row_nums = _row_numbers(rows)
-    ans_nums = _numbers_in_text(answer)
-    # Numbers that the SQL returned are authoritative; year-like/small ints in
-    # prose ("top 10", "2024") are only violations if no numeric row evidence
-    # exists at all and the answer states a measure as fact.
-    matched = [n for n in ans_nums if any(abs(n - r) <= max(0.01, abs(r) * 0.005) + 1e-9
-                                          for r in row_nums)]
-    small_prose = {n for n in ans_nums if abs(n) < 1000 and n not in matched}
-    invented = [n for n in ans_nums if n not in matched and n not in small_prose
-                and not (row_nums and any(abs(n - r) / max(1.0, abs(r)) < 0.05 for r in row_nums))]
+    # Result context: the values the query returned, the size of the result
+    # set, and every number literal in the executed SQL (LIMIT 50, ids,
+    # date literals).
+    ctx_nums = set(row_nums) | set(_numbers_in_text(sql or ""))
+    if rows:
+        ctx_nums.add(float(len(rows)))
+    ans_tokens = _number_tokens(answer)
+    ans_nums = [t["value"] for t in ans_tokens]
+
+    def _near(v: float, pool) -> bool:
+        return any(abs(v - p) <= max(0.01, abs(p) * 0.005) + 1e-9 for p in pool)
+
+    matched = [v for v in ans_nums if _near(v, row_nums)]
+    # Fail-closed: any number the result context cannot support is invented,
+    # at any magnitude — the old "<1000 is prose" exemption let "Total sales
+    # is 999" pass against rows of 50,000. Exempt: numbers present in the
+    # rows / row count / SQL text, and plain 4-digit prose years.
+    invented: list[float] = []
+    for tok in ans_tokens:
+        v = tok["value"]
+        if _near(v, ctx_nums) or _is_year_token(tok):
+            continue
+        if row_nums and any(abs(v - r) / max(1.0, abs(r)) < 0.05 for r in row_nums):
+            continue  # presentation rounding of a row value
+        if v not in invented:
+            invented.append(v)
     has_measure_numbers = bool(row_nums)
-    numeric_consistent = (
-        True if not has_measure_numbers and not invented
-        else True if has_measure_numbers and not invented
-        else False
-    )
+    numeric_consistent = not invented
     if not ans_nums:
         numeric_consistent = True  # qualitative answer over evidence: nothing to falsify
 
@@ -153,8 +188,10 @@ def _check(*, question, answer, retrieved_tables, retrieved_columns,
     else:
         ans_terms = set(re.findall(r"[a-z0-9]+", ans_low))
         # Numeric answers ("The result is 600.") legitimately cover the
-        # question via the number, not vocabulary.
-        if ans_nums and row_nums:
+        # question via the number, not vocabulary — but only when every
+        # number is backed by the result context: invented numbers must
+        # never auto-pass this check.
+        if ans_nums and row_nums and not invented:
             answers_question = True
         else:
             overlap = q_terms & ans_terms

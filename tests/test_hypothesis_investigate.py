@@ -9,7 +9,7 @@ import sqlite3
 import pytest
 from sqlalchemy import create_engine
 
-from api.schema_intel import SchemaIntelligence
+from core.schema_intel import SchemaIntelligence
 from hypothesis_engine.investigate import investigate_question
 
 
@@ -140,6 +140,49 @@ def test_auto_detect_finds_decline_and_investigates(sales_engine, mapping):
     assert 1 <= len(out["hypotheses"]) <= 4
 
 
+def test_zero_baseline_change_pct_is_not_fabricated(tmp_path):
+    """All-zero earlier baseline: percent change is undefined, so the
+    event reports change_pct None (displayed as 'n/a') — never a number
+    computed from a synthesized 1.0 denominator."""
+    from core.schema_intel import SchemaIntelligence
+    from hypothesis_engine.investigate import _scan_metric
+    path = tmp_path / "zerobase.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE sales (id INTEGER PRIMARY KEY, sale_date TEXT, amount REAL);
+    """)
+    rows = [(1, "2024-01-10", 0.0), (2, "2024-02-10", 0.0),
+            (3, "2024-03-10", 0.0), (4, "2024-04-10", 10.0),
+            (5, "2024-05-10", 10.0), (6, "2024-06-10", 50.0)]
+    conn.executemany("INSERT INTO sales VALUES (?,?,?)", rows)
+    conn.commit()
+    conn.close()
+    eng = create_engine(f"sqlite:///{path}")
+    mapping = {"database": "zb", "tables": {"sales": {
+        "columns": [{"column": "id", "data_type": "INTEGER"},
+                    {"column": "sale_date", "data_type": "TEXT"},
+                    {"column": "amount", "data_type": "REAL"}],
+        "primary_key": ["id"], "foreign_keys": [], "row_count": 6}}}
+    intel = SchemaIntelligence(mapping)
+    ev = _scan_metric(eng, "sqlite", intel, "sales", "amount")
+    assert ev is not None
+    assert ev["change_pct"] is None
+    # Non-zero baseline still reports a number.
+    ev2 = _scan_metric(eng, "sqlite", intel, "sales", "id")
+    assert ev2 is not None
+    assert isinstance(ev2["change_pct"], (int, float))
+
+
+def test_nonzero_baseline_change_pct_still_numeric(sales_engine, mapping):
+    from core.schema_intel import SchemaIntelligence
+    from hypothesis_engine.investigate import _scan_metric
+    intel = SchemaIntelligence(mapping)
+    ev = _scan_metric(sales_engine, "sqlite", intel, "orders", "amount")
+    assert ev is not None
+    assert isinstance(ev["change_pct"], (int, float))
+    assert ev["change_pct"] < 0
+
+
 def test_contribution_shares_sum_sensibly(sales_engine, mapping):
     from hypothesis_engine.investigate import _group_half_deltas
     parts = _group_half_deltas(sales_engine, "sqlite", "orders", "category",
@@ -189,3 +232,63 @@ def test_resolver_picks_targets_per_question(sales_engine, mapping):
                                  "Why are customers dropping?",
                                  E.parse_intent, E.fill_defaults)
     assert isinstance(c2, bool)
+
+
+# ── LLM polish: rewritten explanations must keep numbers exact ───────────
+
+class _ReplyLLM:
+    def __init__(self, reply):
+        self.reply = reply
+
+    def complete(self, role, prompt, temperature=0.2, num_predict=120, timeout=60):
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
+
+
+def _polish_candidate():
+    return {
+        "title": "Lower transaction volume contributed to the decline",
+        "strength": "Moderate evidence",
+        "explanation": ("Transaction volume fell about 12% while the average "
+                        "value stayed roughly steady (-3%), suggesting fewer "
+                        "transactions rather than lower prices."),
+        "supporting": ["Volume -12%", "Average value -3%", "1,100 observations"],
+        "metrics": {"volume_change_pct": -12.0, "avg_value_change_pct": -3.0},
+        "contradictory": [], "limitations": [], "needed_data": [], "chart": None,
+    }
+
+
+def test_polish_rejects_changed_numbers():
+    from hypothesis_engine.investigate import _polish
+    c = _polish_candidate()
+    original = c["explanation"]
+    _polish([c], {}, "Why did sales fall?", _ReplyLLM(
+        "Transaction volume fell about 24% while the average value dropped 9%."))
+    assert c["explanation"] == original
+
+
+def test_polish_rejects_invented_number():
+    from hypothesis_engine.investigate import _polish
+    c = _polish_candidate()
+    original = c["explanation"]
+    _polish([c], {}, "Why did sales fall?", _ReplyLLM(
+        "Volume fell 12% and value stayed at -3%, a hit of 50,000 dollars."))
+    assert c["explanation"] == original
+
+
+def test_polish_accepts_number_preserving_rewrite():
+    from hypothesis_engine.investigate import _polish
+    c = _polish_candidate()
+    reply = ("Transaction volume fell about 12% while the average value stayed "
+             "roughly steady at -3%, which may mean fewer transactions.")
+    _polish([c], {}, "Why did sales fall?", _ReplyLLM(reply))
+    assert c["explanation"] == reply
+
+
+def test_polish_keeps_original_when_llm_fails():
+    from hypothesis_engine.investigate import _polish
+    c = _polish_candidate()
+    original = c["explanation"]
+    _polish([c], {}, "Why did sales fall?", _ReplyLLM(RuntimeError("no model")))
+    assert c["explanation"] == original

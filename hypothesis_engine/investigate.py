@@ -541,7 +541,7 @@ def _segment_candidate(engine, dialect, table, metric, obs, dim,
 def _descriptive_top(engine, dialect, table, metric, obs, dim):
     """Descriptive top-groups comparison without statistical thresholds."""
     try:
-        from api.schema_intel import _safe_name
+        from core.schema_intel import _safe_name
         from .engine import _exec
         import pandas as _pd
         rows = _exec(engine,
@@ -601,7 +601,7 @@ def _volume_split(engine, dialect, table, metric, obs):
     if not obs.get("time_col") or obs.get("n", 0) < MIN_OBS:
         return []
     try:
-        from api.schema_intel import _safe_name
+        from core.schema_intel import _safe_name
         from .engine import _exec
         import pandas as _pd
         rows = _exec(engine,
@@ -719,7 +719,7 @@ def _contribution(engine, dialect, intel, table, metric, obs, _top_segments):
 
 def _group_half_deltas(engine, dialect, table, dim, time_col, metric):
     """Per-group (recent-half sum − earlier-half sum) with row-count halves."""
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     from .engine import _exec
     import pandas as _pd
     rows = _exec(engine,
@@ -901,7 +901,7 @@ def auto_detect(engine, dialect, intel, tables, documents=None, llm=None,
 
 def _monthly_series(engine, dialect, table, time_col, metric):
     """Bucket (count, sum) per month. Returns list of (label, n, total)."""
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     from .engine import _exec
     if dialect == "mysql":
         gexpr = f"DATE_FORMAT({_safe_name(time_col, dialect)}, '%Y-%m')"
@@ -971,8 +971,15 @@ def _scan_metric(engine, dialect, intel, table, metric):
     recent = months[-3:]
     earlier = months[:-3]
     rv = sum(m[2] for m in recent)
-    ev = sum(m[2] for m in earlier) or 1.0
-    change = (rv / len(recent) - ev / len(earlier)) / abs(ev / len(earlier)) * 100
+    ev = sum(m[2] for m in earlier)
+    if ev or rv:
+        base = ev / len(earlier)
+        # Zero baseline: percent change is undefined — never fabricate a
+        # denominator (None displays as "n/a"; only genuine movement from
+        # an all-zero baseline yields None, an all-zero series is 0.0).
+        change = (rv / len(recent) - base) / abs(base) * 100 if base else None
+    else:
+        change = 0.0
     rn = sum(m[1] for m in recent)
     en = sum(m[1] for m in earlier) or 1
     vol_change = (rn / 3 - en / max(1, len(earlier))) / abs(en / max(1, len(earlier))) * 100
@@ -989,10 +996,14 @@ def _scan_metric(engine, dialect, intel, table, metric):
                     anomaly = {"label": months[-1][0], "z": round(z, 2)}
         except _st.StatisticsError:
             pass
-    if abs(change) < 5 and not anomaly and (cp is None or abs(cp["change_pct"]) < 10):
+    # change is None only for a 0 -> non-zero transition (unbounded, not
+    # small), so it must not suppress the event the way < 5% would.
+    weak_change = abs(change) < 5 if change is not None else False
+    if weak_change and not anomaly and (cp is None or abs(cp["change_pct"]) < 10):
         return None
     return {"table": table, "metric": metric, "time_col": time_col,
-            "change_pct": round(change, 1), "volume_change_pct": round(vol_change, 1),
+            "change_pct": round(change, 1) if change is not None else None,
+            "volume_change_pct": round(vol_change, 1),
             "change_point": cp, "anomaly": anomaly,
             "periods": len(months), "last_period": months[-1][0]}
 
@@ -1016,22 +1027,75 @@ def auto_investigate(engine, dialect, intel, tables, documents=None, llm=None) -
     return out
 
 
+_EXPL_NUM_RE = re.compile(r"\$?-?\d[\d,]*(?:\.\d+)?(?:\s*[kKmMbB])?(?![a-zA-Z])%?")
+
+
+def _norm_num(tok: str) -> str:
+    """Canonical numeric token: strip ',' '$' '%' and spaces, case-fold."""
+    out = "".join(tok.replace(",", "").replace("$", "")
+                  .replace("%", "").split()).lower()
+    return out[:-2] if out.endswith(".0") else out
+
+
+def _num_tokens(text) -> list[str]:
+    """Normalized numeric tokens in ``text`` ('12.4%', '$1,234' -> '12.4', '1234')."""
+    return [t for t in (_norm_num(m.group(0))
+                        for m in _EXPL_NUM_RE.finditer(str(text or ""))) if t]
+
+
+def _rewrite_numbers_ok(orig: list[str], allowed: list[str], text: str) -> bool:
+    """Deterministic number check for an LLM rewrite.
+
+    Mirrors ``insight_agent.agent._validate_polished_story``'s "unmapped
+    numeric" rejection, scoped to this module's prose: every number of the
+    computed explanation must survive unchanged, and the rewrite may only
+    use numbers it was already shown (explanation + supporting evidence).
+    """
+    new = set(_num_tokens(text))
+    orig_set = set(orig)
+    if not orig_set <= new:
+        return False
+    return new <= (set(allowed) | orig_set)
+
+
 def _polish(candidates, obs, question, llm):
-    """LLM polishes wording only; measurements stay untouched."""
+    """LLM polishes wording only; measurements stay untouched.
+
+    Numbers are extracted from the original explanation and its supporting
+    fields BEFORE the call (the call replaces the explanation); a rewrite
+    that drops, changes, or invents a number is discarded and the computed
+    explanation is kept.
+    """
     for c in candidates:
         try:
+            original = c.get("explanation") or ""
+            orig_nums = _num_tokens(original)
+            allowed_nums = list(orig_nums)
+            for s in c.get("supporting") or []:
+                allowed_nums.extend(_num_tokens(s))
+            metrics = c.get("metrics")
+            if isinstance(metrics, dict):
+                for v in metrics.values():
+                    if isinstance(v, (int, float)) and v == v:
+                        allowed_nums.append(_norm_num(f"{float(v):g}"))
+                    else:
+                        allowed_nums.extend(_num_tokens(v))
             prompt = (
                 "You are ARIA, a business analyst. Rewrite the explanation below "
                 "in one plain-English sentence for a business owner. Keep every "
                 "number and fact exactly as written. Never add causes, never "
                 "claim certainty, use 'may'/'appears' language.\n\n"
-                f"EXPLANATION: {c['explanation']}\n"
+                f"EXPLANATION: {original}\n"
                 f"SUPPORT: {'; '.join(c.get('supporting', [])[:4])}"
             )
             text = llm.complete("story", prompt, temperature=0.2,
                                 num_predict=120, timeout=60)
             text = (text or "").strip()
             if text and len(text) >= 12:
+                if orig_nums and not _rewrite_numbers_ok(orig_nums, allowed_nums, text):
+                    log.info("Investigation polish rejected (numbers changed); "
+                             "keeping the computed explanation.")
+                    continue
                 c["explanation"] = text
         except Exception as exc:
             log.info("Investigation polish skipped (%s).", exc)

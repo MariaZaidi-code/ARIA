@@ -140,7 +140,7 @@ def _validate_forecast_filters(filters, tables, table):
 
 def _filter_where_clause(applied, dialect):
     """Build (WHERE fragment, params) for validated filters. Param-bound."""
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     if not applied:
         return "", {}
     parts: list[str] = []
@@ -289,7 +289,7 @@ def _coerced_ref(tables, tname, col, dialect):
     strings never raise ``function sum(text) does not exist``. Unparsable
     values become NULL. Native numerics keep the plain column. Never raises.
     """
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
     try:
         q = _safe_name(col, dialect)
     except Exception:
@@ -351,7 +351,7 @@ def _validate_time_dim(engine_or_conn, dialect, table, column, dtype):
     reconnects on wide multi-table databases).
     """
     from sqlalchemy import text as _t
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
 
     def _run(conn):
         row = conn.execute(_t(
@@ -410,6 +410,25 @@ def _validate_time_dim(engine_or_conn, dialect, table, column, dtype):
     }
 
 
+def _attach_forecast_verdict(payload):
+    """Best-effort Verification Agent hookup for forecasts (never blocks).
+
+    Attaches ``payload["verdict"]``. On any failure attaches an honest
+    not-verified verdict and still returns the data untouched.
+    """
+    try:
+        from verification.agent import verify_forecast
+        verdict = verify_forecast(payload if isinstance(payload, dict) else {}, {})
+    except Exception:
+        verdict = {"verified": False, "checks": [],
+                   "warnings": ["verification unavailable"]}
+    try:
+        payload["verdict"] = verdict
+    except Exception:
+        pass
+    return payload
+
+
 def _evidence_state_for_forecast(forecast, table_rows, table):
     """Additive canonical state for forecast payloads (never overrides)."""
     try:
@@ -442,7 +461,7 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
     observations, and recommends a valid default target + time dimension.
     """
     from api.kpi_routes import _build_engine as _kb
-    from api.schema_intel import SchemaIntelligence as _SI
+    from core.schema_intel import SchemaIntelligence as _SI
 
     session = get_session(user["user_id"])
     reject_document_sql(session)
@@ -469,7 +488,7 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
                 "tables": [], "recommended": None,
                 "reasons": ["This source type cannot be queried for forecasting yet."]}
     from sqlalchemy import text as _t
-    from api.schema_intel import _safe_name
+    from core.schema_intel import _safe_name
 
     # Short-TTL cache so remounts, StrictMode double-fetches and DB-switch
     # re-renders never rescan wide databases. Keyed by schema mtime so
@@ -655,7 +674,7 @@ def run_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(re
         raise HTTPException(status_code=400, detail="No tables found in schema.")
 
     from api.kpi_routes import _build_engine
-    from api.schema_intel import SchemaIntelligence, _safe_name
+    from core.schema_intel import SchemaIntelligence, _safe_name
     from sqlalchemy import text as _text
 
     intel = SchemaIntelligence(mapping)
@@ -902,7 +921,7 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
     # asking the GoalAgent to "forecast" one yields garbage like COUNT(*).
     # Exact-only resolution (no substring match): anything that is not a
     # genuine measure falls back to auto-select with substituted=True.
-    from api.schema_intel import SchemaIntelligence as _SI0
+    from core.schema_intel import SchemaIntelligence as _SI0
     from insight_agent import sanitize_json as _sj_shared
     _mapping0 = json.loads(Path(str(schema_path)).read_text(encoding="utf-8"))
     _intel0 = _SI0(_mapping0)
@@ -912,7 +931,7 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
     # (row-count gate + deterministic fallback share it; GoalAgent keeps
     # its own internal engine). Disposed in finally at each return site.
     from api.kpi_routes import _build_engine as _kb_shared
-    from api.schema_intel import _safe_name as _sn_shared
+    from core.schema_intel import _safe_name as _sn_shared
     _shared_engine, _shared_dialect = None, dialect
     try:
         _shared_engine, _shared_dialect_tmp, _ = _kb_shared(session)
@@ -1215,7 +1234,7 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
 
         def _deterministic_series():
             try:
-                from api.schema_intel import _safe_name as _sn
+                from core.schema_intel import _safe_name as _sn
                 from sqlalchemy import text as _t
 
                 if _shared_engine is None:
@@ -1470,6 +1489,10 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
         if _ev_uf is not None:
             _uf_payload["evidence_state"] = _ev_uf
         try:
+            _attach_forecast_verdict(_uf_payload)
+        except Exception:
+            pass
+        try:
             return sanitize_json(_uf_payload)
         finally:
             _dispose_shared()
@@ -1509,7 +1532,7 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
         or ("pointwise" if (forecast.get("points") or []) else None),
     }
     try:
-        return sanitize_json({
+        _ok_payload = {
             "ok": True,
             "question": question,
             "forecast": forecast,
@@ -1538,7 +1561,12 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
                 forecast, _fc_rows if _fc_known else None, valid_table),
             "horizon_info": _horizon_info(req.horizon, forecast),
             **contract,
-        })
+        }
+        try:
+            _attach_forecast_verdict(_ok_payload)
+        except Exception:
+            pass
+        return sanitize_json(_ok_payload)
     finally:
         _dispose_shared()
 

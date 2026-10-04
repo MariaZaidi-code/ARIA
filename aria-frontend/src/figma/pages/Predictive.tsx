@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { RefreshCw, Sparkles, Target, TrendingUp, TrendingDown, Crosshair, Lightbulb, Check } from "lucide-react";
+import { RefreshCw, Sparkles, Target, TrendingUp, TrendingDown, Crosshair, Lightbulb, Check, Shield } from "lucide-react";
 import { ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Brush } from "recharts";
 import { useTheme } from "../App";
 import Evidence from "../components/Evidence";
@@ -307,6 +307,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   // Request outcome: idle = no result yet, ok = plottable forecast,
   // unforecastable = backend answered ok:false (tailored empty card).
   const [forecastStatus, setForecastStatus] = useState<"idle" | "ok" | "unforecastable">("idle");
+  // Verification verdict attached best-effort by the backend (never blocks data).
+  const [forecastVerdict, setForecastVerdict] = useState<any>(null);
   // Single auto-fetch guard: one ref gates both auto-run effects so StrictMode
   // double-invoke and competing effects never fire two initial requests.
   const autoFetchRef = useRef<string>("");
@@ -376,7 +378,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
 
   useEffect(() => {
     if (connectionStatus === "connected") loadEligibility();
-    else { setElig(null); setForecast(null); setError(""); setForecastStatus("idle"); autoFetchRef.current = ""; }
+    else { setElig(null); setForecast(null); setError(""); setForecastStatus("idle"); setForecastVerdict(null); autoFetchRef.current = ""; }
   }, [connectionStatus, loadEligibility]);
   // Also re-fetch when DB name changes (user switched databases without disconnecting).
   const prevDbRef = useRef(dbName);
@@ -385,7 +387,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       prevDbRef.current = dbName;
       forecastAbort.current?.abort();
       setElig(null); setForecast(null); setError(""); setScenario(null);
-      setEligError(""); setLoading(false); setForecastStatus("idle"); autoFetchRef.current = "";
+      setEligError(""); setLoading(false); setForecastStatus("idle"); setForecastVerdict(null); autoFetchRef.current = "";
       setSelectedTarget(""); setSelectedTable(""); setSelectedTime("");
       setFilters([]); setSchemaCols([]); setRxItems([]); rxFor.current = "";
       if (connectionStatus === "connected") loadEligibility();
@@ -507,6 +509,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
         setForecastStatus("ok");
         setForecastInfo(data.info || null);
         setSelection(data.selection || null);
+        setForecastVerdict((data as any)?.verdict || null);
         setRevealKey((k) => k + 1);
         // Share context back (metric/dataset/date/filters preserved) so
         // cross-module consumers can preselect without re-analysis.
@@ -539,11 +542,13 @@ export default function Predictive({ insightResult = null, goalResult = null, co
         setForecastStatus("unforecastable");
         setForecastInfo(data.info || null);
         setSelection(data.selection || null);
+        setForecastVerdict((data as any)?.verdict || null);
         setError(data.reason || data.detail || "This selection can't be forecast from the available history.");
       } else {
         setError(data.detail || "Couldn't build a forecast. Try a different number above.");
         setForecast(null);
         setForecastStatus("idle");
+        setForecastVerdict((data as any)?.verdict || null);
       }
     } catch (e: any) {
       if (e?.name === "AbortError" || ctrl.signal.aborted) return; // superseded — not an error state
@@ -553,6 +558,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
         : (e.message || "Couldn't build a forecast. Check your connection and try again."));
       setForecast(null);
       setForecastStatus("idle");
+      setForecastVerdict(null);
     } finally {
       // Only the latest request clears loading (an aborted older one must
       // not flicker the spinner off while its replacement is in flight).
@@ -667,6 +673,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     setWin(null);
     setForecast(null);
     setForecastStatus("idle");
+    setForecastVerdict(null);
     autoFetchRef.current = "";
     setError("");
     setTimeout(() => fetchForecast(rec.measure, rec.time_dim, horizon, []), 50);
@@ -1104,7 +1111,29 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       `}</style>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-xl font-bold text-foreground tracking-tight">Forecast</h2>
+          <h2 className="text-xl font-bold text-foreground tracking-tight flex items-center gap-2">
+            Forecast
+            {(() => {
+              const v: any = forecastVerdict;
+              if (!v) return null;
+              const ok = v.verified === true;
+              const fails = Array.isArray(v.checks) ? v.checks.filter((c: any) => !c?.pass).length : 0;
+              return (
+                <span
+                  title={ok
+                    ? "ARIA double-checked this forecast against your data. Everything lines up."
+                    : "ARIA couldn't fully double-check this forecast yet. Treat it as a guide, not the final answer."}
+                  className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${ok
+                    ? "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25"
+                    : "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25"}`}
+                >
+                  <Shield size={11} />
+                  {ok ? "Checked" : "Not fully checked"}
+                  {!ok && fails > 0 ? ` · ${fails} to review` : ""}
+                </span>
+              );
+            })()}
+          </h2>
           <p className="text-sm text-muted-foreground mt-0.5">See where your business is heading.</p>
         </div>
         <div className="flex flex-col items-end gap-1">
@@ -1187,7 +1216,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                     setSelectedTarget((owner.measures || [])[0] || "");
                     setSelectedTime((owner.time_dims || [])[0]?.column || "");
                   }
-                  setFilters([]); setWin(null); setForecast(null); setForecastStatus("idle"); setError("");
+                  setFilters([]); setWin(null); setForecast(null); setForecastStatus("idle"); setForecastVerdict(null); setError("");
                 }}
                 className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none cursor-pointer"
               >
@@ -1202,7 +1231,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 value={selectedTarget}
                 onChange={(e) => {
                   setSelectedTarget(e.target.value);
-                  setForecast(null); setForecastStatus("idle"); setError("");
+                  setForecast(null); setForecastStatus("idle"); setForecastVerdict(null); setError("");
                 }}
                 className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none cursor-pointer"
               >
@@ -1216,7 +1245,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               <p className="text-xs font-medium text-muted-foreground">Date field</p>
               <select
                 value={selectedTime}
-                onChange={(e) => { setSelectedTime(e.target.value); setForecast(null); setForecastStatus("idle"); setError(""); }}
+                onChange={(e) => { setSelectedTime(e.target.value); setForecast(null); setForecastStatus("idle"); setForecastVerdict(null); setError(""); }}
                 className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none cursor-pointer"
               >
                 {activeTimes.length === 0 && <option value="">Auto-detect…</option>}
@@ -1737,10 +1766,10 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 <span
                   className="ml-auto text-[11px] font-bold px-2.5 py-1 rounded-full"
                   style={confidenceLevel === "High"
-                    ? { background: "rgba(5,150,105,0.12)", color: "#059669" }
+                    ? (isDark ? { background: "rgba(52,211,153,0.14)", color: "#34D399" } : { background: "rgba(5,150,105,0.12)", color: "#059669" })
                     : confidenceLevel === "Moderate"
-                      ? { background: "rgba(47,111,173,0.12)", color: "#2F6FAD" }
-                      : { background: "rgba(201,138,27,0.14)", color: "#C98A1B" }}
+                      ? (isDark ? { background: "rgba(123,167,217,0.14)", color: "#7BA7D9" } : { background: "rgba(47,111,173,0.12)", color: "#2F6FAD" })
+                      : (isDark ? { background: "rgba(251,191,36,0.14)", color: "#FBBF24" } : { background: "rgba(201,138,27,0.14)", color: "#C98A1B" })}
                 >
                   {confidenceLevel === "Limited" ? "Limited historical evidence" : confidenceLevel}
                 </span>

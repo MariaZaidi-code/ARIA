@@ -23,6 +23,7 @@ SUM/AVG/MIN/MAX wrap the coercion expression.
 from __future__ import annotations
 
 import re
+import threading
 
 # Currency symbols stripped both python-side and inside the SQL REPLACE
 # chains. Generic set only -- never table/column specific.
@@ -55,7 +56,14 @@ _REGEXP_SUPPORT: dict[str, bool] = {"postgresql": True, "mysql": True}
 _REGEXP_PROBED: set[str] = set()
 
 # In-memory probe cache for the process: (db_uri, table, column) -> record.
+# Key space is unbounded (one entry per probed triple, forever), so the dict is
+# capped LRU-style and guarded by a lock: probes run from request handlers and
+# background threads alike. Touch-on-read keeps hit behavior identical for
+# entries within the cap; only the least-recently-used entry is dropped when
+# full (house style: api/autocomplete_routes.py _INDEX_CACHE).
 _COERCED_CACHE: dict[tuple[str, str, str], dict] = {}
+_COERCED_CACHE_MAX = 500
+_COERCED_CACHE_LOCK = threading.Lock()
 
 
 def clean_text_numeric_value(value) -> tuple[str | None, bool, bool]:
@@ -240,15 +248,28 @@ def cache_key(db_uri, table, column) -> tuple[str, str, str]:
 
 def get_coercion_cache(db_uri, table, column):
     """Return the cached probe record, or None when never probed."""
-    return _COERCED_CACHE.get(cache_key(db_uri, table, column))
+    key = cache_key(db_uri, table, column)
+    with _COERCED_CACHE_LOCK:
+        rec = _COERCED_CACHE.get(key)
+        if rec is not None:
+            # LRU touch: reinsert so eviction drops least-recently-used.
+            _COERCED_CACHE.pop(key, None)
+            _COERCED_CACHE[key] = rec
+        return rec
 
 
 def set_coercion_cache(db_uri, table, column, record: dict) -> dict:
-    """Store a probe record and return it."""
-    _COERCED_CACHE[cache_key(db_uri, table, column)] = record
+    """Store a probe record (evicting the LRU entry at capacity) and return it."""
+    key = cache_key(db_uri, table, column)
+    with _COERCED_CACHE_LOCK:
+        _COERCED_CACHE.pop(key, None)
+        while len(_COERCED_CACHE) >= _COERCED_CACHE_MAX:
+            _COERCED_CACHE.pop(next(iter(_COERCED_CACHE)))
+        _COERCED_CACHE[key] = record
     return record
 
 
 def clear_coercion_cache() -> None:
-    """Drop all cached probe records (tests only)."""
-    _COERCED_CACHE.clear()
+    """Drop all cached probe records (tests / ops reset)."""
+    with _COERCED_CACHE_LOCK:
+        _COERCED_CACHE.clear()
