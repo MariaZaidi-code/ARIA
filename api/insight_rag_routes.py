@@ -14,7 +14,8 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from core.deps import require_writable
+from core.deps import get_current_user, require_writable
+from core.errors import sanitize_error
 from insight_agent.industry import IndustryInsightAgent as InsightAgent
 from insight_rag import InsightPDFRAG
 from insight_rag.config import (
@@ -59,6 +60,7 @@ def _capability(user_id: str | int) -> InsightPDFRAG:
     if _pname == "deepseek":
         provider = create_provider(
             "deepseek",
+            api_key=resolve_provider_key("deepseek", (_session.get("api_keys") or {})),
             models={
                 "rag": RAG_LLM_MODEL,
                 "rag_rewrite": RAG_LLM_MODEL,
@@ -67,18 +69,34 @@ def _capability(user_id: str | int) -> InsightPDFRAG:
             },
         )
     elif _pname == "local":
-        from llm_provider import PROVIDERS as _PROVIDERS
-        _chat_model = (_PROVIDERS["local"]["models"].get("semi")
-                       or _PROVIDERS["local"]["models"].get("suggest")
-                       or "aria-goal")
-        provider = create_provider("local")
-        provider.models.update({
-            "rag": _chat_model,
-            "rag_scope": _chat_model,
-            "rag_rewrite": _chat_model,
-            "rag_verify": _chat_model,
-            "rag_plan": _chat_model,
-        })
+        _ds_key = resolve_provider_key("deepseek", (_session.get("api_keys") or {}))
+        if _ds_key:
+            # Local Ollama models cannot run the hosted RAG pipeline
+            # (InsightPDFRAG requires a hosted LLM): DeepSeek is the
+            # documented fallback whenever a key is available.
+            provider = create_provider(
+                "deepseek",
+                api_key=_ds_key,
+                models={
+                    "rag": RAG_LLM_MODEL,
+                    "rag_rewrite": RAG_LLM_MODEL,
+                    "rag_verify": RAG_LLM_MODEL,
+                    "rag_plan": RAG_LLM_MODEL,
+                },
+            )
+        else:
+            from llm_provider import PROVIDERS as _PROVIDERS
+            _chat_model = (_PROVIDERS["local"]["models"].get("semi")
+                           or _PROVIDERS["local"]["models"].get("suggest")
+                           or "aria-goal")
+            provider = create_provider("local")
+            provider.models.update({
+                "rag": _chat_model,
+                "rag_scope": _chat_model,
+                "rag_rewrite": _chat_model,
+                "rag_verify": _chat_model,
+                "rag_plan": _chat_model,
+            })
     else:
         from llm_provider import PROVIDERS as _PROVIDERS
         _key = resolve_provider_key(_pname, (_session.get("api_keys") or {}))
@@ -97,7 +115,7 @@ def _capability(user_id: str | int) -> InsightPDFRAG:
 
 
 @router.get("/health")
-def pdf_rag_health(user: dict = Depends(require_writable)):
+def pdf_rag_health(user: dict = Depends(get_current_user)):
     """Authenticated readiness/quality snapshot without exposing secrets or PDF text."""
     config_error = None
     try:
@@ -110,7 +128,26 @@ def pdf_rag_health(user: dict = Depends(require_writable)):
         str((document.get("ingestion_quality") or {}).get("grade") or "unknown")
         for document in documents
     )
-    provider_configured = bool(os.getenv("DEEPSEEK_API_KEY", "").strip())
+    # Readiness must reflect the session's ACTUAL provider (local/cloud/...),
+    # not just an env DeepSeek key: _capability() attaches the selected
+    # provider and only falls back to DeepSeek when none is usable.
+    provider_configured = False
+    try:
+        from core.config import get_session, resolve_provider_key
+        _session = get_session(user["user_id"])
+        _pname = str(_session.get("provider_name") or "").strip().lower()
+        _keys = _session.get("api_keys") or {}
+        if _pname in ("cloud", "omniroute", "grok", "deepseek"):
+            provider_configured = bool(resolve_provider_key(_pname, _keys))
+        else:
+            # Local Ollama cannot run the hosted RAG pipeline; _capability
+            # (and readiness) fall back to DeepSeek when a key is available,
+            # else uploads/chat return a clear 503.
+            provider_configured = bool(resolve_provider_key("deepseek", _keys))
+    except Exception:
+        provider_configured = False
+    if not provider_configured:
+        provider_configured = bool(os.getenv("DEEPSEEK_API_KEY", "").strip())
     database_configured = bool(RAG_DATABASE_URL)
     ready = not config_error and provider_configured and database_configured
     return {
@@ -162,9 +199,9 @@ def upload_pdf(
     except HTTPException:
         raise
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=sanitize_error(exc))
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=sanitize_error(exc))
     except Exception:
         raise HTTPException(
             status_code=503,
@@ -180,7 +217,7 @@ def upload_pdf(
 
 
 @router.get("/documents")
-def list_pdf_documents(user: dict = Depends(require_writable)):
+def list_pdf_documents(user: dict = Depends(get_current_user)):
     """List local PDF metadata without requiring a cloud LLM call."""
     documents = RAGMetadataStore(user["user_id"]).list_documents()
     public_docs = [
@@ -220,9 +257,9 @@ def chat_with_pdfs(request: PDFChatRequest, user: dict = Depends(require_writabl
             document_ids=request.document_ids,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=sanitize_error(exc))
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=sanitize_error(exc))
     except Exception:
         # Never expose raw SDK/network/database exceptions to the user-facing chat.
         raise HTTPException(

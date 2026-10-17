@@ -151,9 +151,27 @@ class ScannedExtractor:
             # Group words into lines
             lines = self._group_ocr_words(ocr_data)
             
+            # Normalize pixel bboxes to 0-1 using the rendered image size,
+            # matching models.DocumentElement's bounding_box contract (and
+            # the HybridExtractor path).
+            img_width, img_height = (0, 0)
+            try:
+                img_width, img_height = image.size
+            except Exception:
+                pass
+            
             for line in lines:
                 if not line["text"].strip():
                     continue
+                
+                bbox = line["bbox"]
+                if img_width and img_height:
+                    bbox = {
+                        "x0": bbox["x0"] / img_width,
+                        "y0": bbox["y0"] / img_height,
+                        "x1": bbox["x1"] / img_width,
+                        "y1": bbox["y1"] / img_height,
+                    }
                 
                 # Create element
                 element = DocumentElement(
@@ -164,7 +182,7 @@ class ScannedExtractor:
                     section=None,
                     source_type="ocr",
                     confidence=line["confidence"] / 100.0,
-                    bounding_box=line["bbox"],
+                    bounding_box=bbox,
                     metadata={
                         "ocr_engine": "tesseract",
                         "language": self.lang,
@@ -209,8 +227,9 @@ class ScannedExtractor:
                 "y1": ocr_data["top"][i] + ocr_data["height"][i],
             })
         
-        # Build line objects
-        result = []
+            # Build line objects (bboxes are pixel-space; normalized by the
+            # caller using the rendered image dimensions)
+            result = []
         for key, data in sorted(lines.items()):
             # Calculate combined bbox
             bboxes = data["bboxes"]
@@ -222,8 +241,7 @@ class ScannedExtractor:
             else:
                 x0 = y0 = x1 = y1 = 0
             
-            # Normalize to 0-1 (assuming standard page size, will be corrected later)
-            # We'll use image dimensions for normalization
+            # Pixel-space bbox; _ocr_page normalizes it with image dims.
             text = " ".join(data["words"])
             avg_conf = sum(data["confidences"]) / len(data["confidences"]) if data["confidences"] else 0
             

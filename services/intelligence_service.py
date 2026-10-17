@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from core.config import SCHEMA_DIR, USERS_DIR
+from core.errors import sanitize_error
 from core.semantic import (
     classify_field_role,
     display_name,
@@ -64,12 +65,29 @@ def _dataset_id(session: dict) -> str:
 def _load_json(path: Path) -> dict | list:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        # Corrupt/unreadable JSON is surfaced in logs instead of silently
+        # resetting to empty with no trace of why data vanished.
+        log.warning("intelligence: unreadable JSON at %s (%s); treating as empty",
+                    path.name, exc)
         return {}
 
 
 def _save_json(path: Path, data) -> None:
-    path.write_text(json.dumps(data, default=str, ensure_ascii=False), encoding="utf-8")
+    """Atomic write: a reader never observes a torn/truncated file."""
+    payload = json.dumps(data, default=str, ensure_ascii=False)
+    tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex[:8]}")
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _load_user_items(user_id: int, kind: str) -> list:
@@ -2293,7 +2311,7 @@ def run_explore(session: dict, request: dict) -> dict:
                 _result["ok"] = False
                 _result["code"] = "VALIDATION_FAILED"
                 _result["detail"] = (
-                    f"Validation error (validator_error): {_vexc}. "
+                    f"Validation error (validator_error): {sanitize_error(_vexc)}. "
                     "Numbers withheld as unverified.")
             return _result
     except _NoJoinPath as njp:
@@ -2472,7 +2490,6 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                 engine = _pooled_engine(db_uri)
                 with engine.connect() as conn:
                     t, m, d = found["table"], found["metric"], found["dimension"]
-                    qm = "`" if db_uri and "mysql" in db_uri else '"'
                     # TEXT-stored measures (currency strings) need the shared
                     # numeric coercion — raw SUM(text) raises and the card
                     # silently loses its enrichment.
@@ -2481,7 +2498,7 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                         _hmap = _load_schema_mapping(session)
                         _hdt = _col_data_type(_hmap, t, m)
                         _hexpr = _nan_safe_sql(
-                            _numeric_metric_sql(f"{qm}{m}{qm}", _hdt, _hd),
+                            _numeric_metric_sql(_qident(_hd, m), _hdt, _hd),
                             _hdt, _hd)
                         if _hd == "sqlite":
                             try:
@@ -2491,8 +2508,10 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                             except Exception:
                                 pass
                     except Exception:
-                        _hexpr = f"{qm}{m}{qm}"
-                    sql = f"SELECT {qm}{d}{qm} AS c, SUM({_hexpr}) AS v FROM {qm}{t}{qm} GROUP BY {qm}{d}{qm} ORDER BY v DESC LIMIT 8"
+                        _hexpr = _qident(_hd, m)
+                    sql = (f"SELECT {_qident(_hd, d)} AS c, SUM({_hexpr}) AS v "
+                           f"FROM {_qident(_hd, t)} GROUP BY {_qident(_hd, d)} "
+                           f"ORDER BY v DESC LIMIT 8")
                     _r = conn.execute(sql_text(sql))
                     _c = list(_r.keys())
                     rows = _r.fetchall()
@@ -2559,12 +2578,11 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                 engine = _pooled_engine(db_uri)
                 with engine.connect() as conn:
                     t, m = found["table"], found["metric"]
-                    qm = "`" if db_uri and "mysql" in db_uri else '"'
                     _hd2 = _dialect_of(db_uri)
                     try:
                         _mdt = _col_data_type(_hmap2, t, m)
                         _mexpr = _nan_safe_sql(
-                            _numeric_metric_sql(f"{qm}{m}{qm}", _mdt, _hd2),
+                            _numeric_metric_sql(_qident(_hd2, m), _mdt, _hd2),
                             _mdt, _hd2)
                         if _hd2 == "sqlite":
                             try:
@@ -2574,12 +2592,14 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                             except Exception:
                                 pass
                     except Exception:
-                        _mdt, _mexpr = "", f"{qm}{m}{qm}"
+                        _mdt, _mexpr = "", _qident(_hd2, m)
                     _native_dt = _is_native_date_dtype(
                         _col_data_type(_hmap2, t, dt))
                     pts: list = []
                     if _native_dt and not _is_text_dtype(_mdt):
-                        sql = f"SELECT {qm}{dt}{qm} AS p, SUM({_mexpr}) AS v FROM {qm}{t}{qm} GROUP BY {qm}{dt}{qm} ORDER BY {qm}{dt}{qm} ASC LIMIT 24"
+                        sql = (f"SELECT {_qident(_hd2, dt)} AS p, SUM({_mexpr}) AS v "
+                               f"FROM {_qident(_hd2, t)} GROUP BY {_qident(_hd2, dt)} "
+                               f"ORDER BY {_qident(_hd2, dt)} ASC LIMIT 24")
                         _r = conn.execute(sql_text(sql))
                         _c = list(_r.keys())
                         rows = _r.fetchall()
@@ -2592,7 +2612,8 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                         # (DD-MM-YYYY scrambles), so bucket in SQL but sort
                         # by the shared tolerant parser in Python. Earliest
                         # 24 buckets mirrors the native LIMIT 24 ASC window.
-                        _sql2 = f"SELECT {qm}{dt}{qm} AS p, SUM({_mexpr}) AS v FROM {qm}{t}{qm} GROUP BY {qm}{dt}{qm}"
+                        _sql2 = (f"SELECT {_qident(_hd2, dt)} AS p, SUM({_mexpr}) AS v "
+                                 f"FROM {_qident(_hd2, t)} GROUP BY {_qident(_hd2, dt)}")
                         _r = conn.execute(sql_text(_sql2))
                         _c = list(_r.keys())
                         _pairs = []
@@ -2657,6 +2678,8 @@ def run_whatif(session: dict, request: dict) -> dict:
         change_type = "decrease"
     try:
         change_value = float(request.get("change_value", request.get("changeValue", 10)))
+        if not math.isfinite(change_value):
+            change_value = 10
     except Exception:
         change_value = 10
     apply_to = request.get("apply_to") or request.get("applyTo") or request.get("scope") or "All data"
@@ -2798,7 +2821,6 @@ def run_whatif(session: dict, request: dict) -> dict:
             try:
                 if date_col:
                     with engine.connect() as _c3:
-                        _qm = '`' if _wdialect == "mysql" else '"'
                         _mcol = rev_col or variable
                         if _mcol == COUNT_METRIC:
                             _mexpr = "COUNT(*)"
@@ -2806,9 +2828,10 @@ def run_whatif(session: dict, request: dict) -> dict:
                             # Table-qualified expr is valid in this
                             # single-table FROM (no alias), so keep it as-is.
                             _mexpr, _ = _wsum(_mcol, table)
-                        _msql = (f"SELECT {_qm}{date_col}{_qm} AS p, {_mexpr} AS v "
-                                 f"FROM {_qm}{table}{_qm} GROUP BY {_qm}{date_col}{_qm} "
-                                 f"ORDER BY {_qm}{date_col}{_qm} ASC LIMIT 6")
+                        _msql = (f"SELECT {_qident(_wdialect, date_col)} AS p, {_mexpr} AS v "
+                                 f"FROM {_qident(_wdialect, table)} "
+                                 f"GROUP BY {_qident(_wdialect, date_col)} "
+                                 f"ORDER BY {_qident(_wdialect, date_col)} ASC LIMIT 6")
                         _r3 = _c3.execute(sql_text(_msql))
                         _k3 = list(_r3.keys())
                         for _rr in _r3.fetchall():

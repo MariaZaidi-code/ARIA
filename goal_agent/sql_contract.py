@@ -40,22 +40,51 @@ class SqlContractMixin:
 
     # ---- _where_clause (_where_clause) ----
 
+    def _mask_quoted(self, sql):
+        """Length-preserving copy with quoted literals/identifiers blanked.
+
+        Structural scans (WHERE/GROUP/ORDER keys, semicolons) run over this
+        copy so text inside '...' or \"...\" never terminates a clause; slices
+        are always taken from the ORIGINAL string.
+        """
+        chars = list(sql)
+        n = len(sql)
+        i = 0
+        while i < n:
+            ch = sql[i]
+            if ch in ("'", '"'):
+                j = i + 1
+                while j < n:
+                    if sql[j] == ch:
+                        if j + 1 < n and sql[j + 1] == ch:
+                            j += 2
+                            continue
+                        break
+                    j += 1
+                for k in range(i, min(j + 1, n)):
+                    chars[k] = " "
+                i = j + 1
+            else:
+                i += 1
+        return "".join(chars)
+
     def _where_clause(self, sql):
         """Return the top-level WHERE clause text (best-effort, paren-aware)."""
         if not sql:
             return ""
+        scan = self._mask_quoted(sql)
         depth = 0
         n = len(sql)
         start = None
         i = 0
         while i < n:
-            ch = sql[i]
+            ch = scan[i]
             if ch == "(":
                 depth += 1
             elif ch == ")":
                 depth = max(0, depth - 1)
             if depth == 0:
-                m = re.match(r"\bWHERE\b", sql[i:], re.IGNORECASE)
+                m = re.match(r"\bWHERE\b", scan[i:], re.IGNORECASE)
                 if m:
                     start = i + m.end()
                     break
@@ -65,7 +94,7 @@ class SqlContractMixin:
         i = start
         depth = 0
         while i < n:
-            ch = sql[i]
+            ch = scan[i]
             if ch == "(":
                 depth += 1
             elif ch == ")":
@@ -73,7 +102,8 @@ class SqlContractMixin:
             elif ch == ";":
                 return sql[start:i]
             elif depth == 0:
-                k = re.match(r"\b(GROUP|ORDER|HAVING|LIMIT|OFFSET|UNION)\b", sql[i:], re.IGNORECASE)
+                k = re.match(r"\b(GROUP|ORDER|HAVING|LIMIT|OFFSET|UNION)\b",
+                             scan[i:], re.IGNORECASE)
                 if k:
                     return sql[start:i]
             i += 1
@@ -82,7 +112,11 @@ class SqlContractMixin:
     # ---- _split_top_level_and (_split_top_level_and) ----
 
     def _split_top_level_and(self, where):
-        """Split a WHERE clause on top-level AND (paren-aware, case-insensitive)."""
+        """Split a WHERE clause on top-level AND.
+
+        Paren-aware AND quote-aware: 'Smith AND Sons' inside a string
+        literal (or a quoted identifier) is never split.
+        """
         parts = []
         depth = 0
         n = len(where)
@@ -90,6 +124,18 @@ class SqlContractMixin:
         i = 0
         while i < n:
             ch = where[i]
+            if ch in ("'", '"'):
+                # Skip the full quoted literal/identifier ('' / "" escapes).
+                i += 1
+                while i < n:
+                    if where[i] == ch:
+                        if i + 1 < n and where[i + 1] == ch:
+                            i += 2
+                            continue
+                        break
+                    i += 1
+                i += 1
+                continue
             if ch == "(":
                 depth += 1
             elif ch == ")":
@@ -353,10 +399,18 @@ def sql_references_coerced_measure(sql, table, column, agg=None) -> bool:
     try:
         if not sql or not column:
             return False
+        sql_l = str(sql).lower()
         base = str(column).split(".")[-1].strip().strip("\"'`[]").lower()
-        if not base or base not in str(sql).lower():
+        if not base:
             return False
-        if "cast(" not in str(sql).lower():
+        # Find where the coercion expression starts (CAST(NULLIF(...)) and
+        # require the column to be referenced inside it. This validates the
+        # ACTUAL coercion shape instead of accepting any SQL that merely
+        # contains the column name and a cast somewhere.
+        m = re.search(r"cast\s*\(\s*nullif\s*\(", sql_l)
+        if not m:
+            return False
+        if base not in sql_l[m.start():]:
             return False
         if agg and f"{str(agg).upper()}(" not in str(sql).upper():
             return False

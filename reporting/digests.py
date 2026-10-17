@@ -81,10 +81,23 @@ def _load_schedules(user_id: int) -> list:
 
 def _save_schedules(user_id: int, items: list) -> None:
     try:
-        _schedules_path(user_id).write_text(
-            json.dumps(items or [], default=str, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        with _lock:
+            # Atomic replace: the scheduler thread and API CRUD never
+            # observe (or write) a half-written schedules file.
+            path = _schedules_path(user_id)
+            tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex[:8]}")
+            try:
+                tmp.write_text(
+                    json.dumps(items or [], default=str, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                tmp.replace(path)
+            except Exception:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
     except Exception as exc:
         log.warning("digest: could not persist schedules for user=%s (%s)", user_id, exc)
 
@@ -353,7 +366,11 @@ def _due(digest: dict, now_ts: float) -> bool:
         if not last:
             return True  # newly created / never run -> run on next tick
         try:
-            last_ts = datetime.fromisoformat(str(last)).timestamp()
+            last_dt = datetime.fromisoformat(str(last))
+            if last_dt.tzinfo is None:
+                # Legacy naive timestamps were written as UTC.
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            last_ts = last_dt.timestamp()
         except Exception:
             return True
         freq = str(digest.get("frequency") or "daily").lower()

@@ -29,7 +29,7 @@ from core.data_intelligence import (
     is_id_like_name as _is_id_like_name,
     name_tokens as _name_tokens,
 )
-from core.deps import get_current_user
+from core.deps import get_current_user, require_writable
 
 router = APIRouter()
 
@@ -657,7 +657,7 @@ def _autocomplete(partial: str, limit: int, user: dict):
 
 @router.post("/api/conversation/store")
 def store_conversation(request: Request, payload: dict,
-                       user: dict = Depends(get_current_user)):
+                       user: dict = Depends(require_writable)):
     """Persist a Q/A pair as the most recent conversation turn.
 
     The frontend calls this after rendering an Ask ARIA answer so that

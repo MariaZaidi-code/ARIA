@@ -21,7 +21,7 @@ def _safe_detail(prefix: str, exc: Exception, limit: int = 200) -> str:
     try:
         return f"{prefix}: {str(_sanitize_error(exc))[:limit]}"
     except Exception:
-        return f"{prefix}." if prefix.endswith(".") else f"{prefix}."
+        return f"{prefix}."
 
 
 # Bounded sample for correlation tests (spec §3, deterministic precedent):
@@ -440,7 +440,7 @@ def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depend
                 pass
 
     except Exception as e:
-        return {"ok": False, "detail": f"Hypothesis test failed: {str(e)}"}
+        return {"ok": False, "detail": _safe_detail("Hypothesis test failed", e)}
 
 
 def _run_test(engine, dialect, req, schema=None):
@@ -534,7 +534,7 @@ def _run_test(engine, dialect, req, schema=None):
                 "y_label": y_col,
             }
     except Exception as e:
-        return {"ok": False, "detail": f"Hypothesis test failed: {str(e)}"}
+        return {"ok": False, "detail": _safe_detail("Hypothesis test failed", e)}
 
 
 def _get_tables(conn, dialect, schema=None):

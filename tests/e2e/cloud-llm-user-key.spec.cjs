@@ -1,8 +1,9 @@
-"""Playwright end-to-end: user selects Cloud LLM → applies Groq API key in Settings → connects DB → asks question.
-
-Requires: .env GROQ_API_KEY set (system key) OR user pastes their own in Settings.
-Run: npx playwright test tests/e2e/cloud-llm-user-key.spec.js
-"""
+/*
+ * Playwright end-to-end: user selects Cloud LLM -> applies Groq API key in Settings -> connects DB -> asks question.
+ *
+ * Requires: .env GROQ_API_KEY set (system key) OR user pastes their own in Settings.
+ * Run: npx playwright test tests/e2e/cloud-llm-user-key.spec.cjs
+ */
 const { test, expect } = require('@playwright/test');
 
 // LLM-E2E gate: needs a real cloud key AND a live Postgres. Without both,

@@ -20,6 +20,7 @@ ARIA without modifying the Schema Agent or Goal Agent:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import sqlite3
@@ -530,7 +531,10 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
     try:
         sqlite_path.unlink(missing_ok=True)
     except PermissionError:
-        pass
+        # Windows can hold the file open (viewer / live connection); we log
+        # and continue, but never silently: reusing a stale DB hides failures.
+        _log.warning("Could not remove existing SQLite file %s (still open?); "
+                     "reusing it.", sqlite_path)
 
     column_logical_types = {
         column["name"]: column["inferred_type"]
@@ -575,6 +579,10 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
             conn.execute("PRAGMA cache_size=-64000")
         except Exception:
             pass
+        # The file may have been reused because Windows held the previous
+        # one open (unlink raised PermissionError): drop a stale table with
+        # the same name first so CREATE TABLE cannot fail.
+        conn.execute(f'DROP TABLE IF EXISTS {_quote_ident(table)}')
         conn.execute(f'CREATE TABLE {_quote_ident(table)} ({ddl_cols})')
         insert_sql = f'INSERT INTO {_quote_ident(table)} ({col_sql}) VALUES ({placeholders})'
         try:
@@ -619,7 +627,14 @@ def load_csv_to_sqlite(csv_path: str | Path, sqlite_path: str | Path,
         try:
             for _dc, _lt in column_logical_types.items():
                 if str(_lt).upper() in ("DATE", "DATETIME"):
-                    _in = f"idx_{table}_{_dc}"[:60].replace('"', '""')
+                    _base = f"idx_{table}_{_dc}"
+                    # Truncation alone can collide for long names: keep a
+                    # short SHA1 suffix so distinct columns get distinct
+                    # index names even past 60 chars.
+                    if len(_base) > 60:
+                        _base = _base[:50] + "_" + hashlib.sha1(
+                            _base.encode("utf-8")).hexdigest()[:8]
+                    _in = _base.replace('"', '""')
                     conn.execute(
                         f'CREATE INDEX IF NOT EXISTS "{_in}" '
                         f'ON {_quote_ident(table)} ({_quote_ident(_dc)})')
@@ -804,7 +819,8 @@ def load_multiple_csvs_to_sqlite(csv_paths: list[str | Path] | str | Path,
     try:
         sqlite_path.unlink(missing_ok=True)
     except PermissionError:
-        pass
+        _log.warning("Could not remove existing SQLite file %s (still open?); "
+                     "reusing it.", sqlite_path)
     tables: list[str] = []
     counts: dict[str, int] = {}
     conn = sqlite3.connect(str(sqlite_path))
@@ -856,6 +872,19 @@ def load_multiple_csvs_to_sqlite(csv_paths: list[str | Path] | str | Path,
             tables.append(table)
             counts[table] = streamed
         conn.commit()
+    except Exception:
+        # A half-written DB file would let callers "succeed" against a DB
+        # that is missing tables; remove it so a retry starts clean.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            sqlite_path.unlink(missing_ok=True)
+        except OSError:
+            _log.warning("Could not remove partial SQLite DB %s after failure.",
+                         sqlite_path)
+        raise
     finally:
         conn.close()
     return f"sqlite:///{sqlite_path}", tables, counts

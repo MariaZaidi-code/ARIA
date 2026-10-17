@@ -5,6 +5,11 @@ import statistics
 from typing import Any
 
 
+def _is_num(v: Any) -> bool:
+    """Numeric check that excludes bool (True/False are not measures)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def analyze_result_intelligence(data: list[dict], goal: str, message: str = "") -> dict:
     """Lightweight post-processing of Goal Agent results to surface
     proactive insights, anomalies, and data quality warnings."""
@@ -17,6 +22,14 @@ def analyze_result_intelligence(data: list[dict], goal: str, message: str = "") 
     }
 
     if not data or len(data) < 2:
+        # Too little data can never support "high" confidence; an empty
+        # frame additionally gets an explicit warning.
+        result["confidence"] = "low"
+        if not data:
+            result["data_quality_warnings"].append({
+                "issue": "no_rows",
+                "description": "No rows were returned, so no proactive checks could run.",
+            })
         return result
 
     columns = list(data[0].keys())
@@ -25,7 +38,7 @@ def analyze_result_intelligence(data: list[dict], goal: str, message: str = "") 
 
     # --- Anomaly detection (z-score based) ---
     for col in numeric_cols:
-        values = [row[col] for row in data if row.get(col) is not None and isinstance(row[col], (int, float))]
+        values = [row[col] for row in data if row.get(col) is not None and _is_num(row[col])]
         if len(values) < 4:
             continue
         try:
@@ -35,7 +48,7 @@ def analyze_result_intelligence(data: list[dict], goal: str, message: str = "") 
                 continue
             for i, row in enumerate(data):
                 val = row.get(col)
-                if val is not None and isinstance(val, (int, float)):
+                if val is not None and _is_num(val):
                     z = abs((val - mean) / stdev)
                     if z > 2.0:
                         dim = categorical_cols[0] if categorical_cols else f"Row {i + 1}"
@@ -83,7 +96,7 @@ def analyze_result_intelligence(data: list[dict], goal: str, message: str = "") 
         for row in data:
             key = str(row.get(dim, "Unknown"))
             val = row.get(metric)
-            if val is not None and isinstance(val, (int, float)):
+            if val is not None and _is_num(val):
                 groups.setdefault(key, []).append(val)
 
         if len(groups) >= 2:
@@ -141,10 +154,10 @@ def analyze_result_intelligence(data: list[dict], goal: str, message: str = "") 
 
 
 def _find_numeric_columns(data: list[dict], columns: list[str]) -> list[str]:
-    """Find columns that contain numeric values."""
+    """Find columns that contain numeric values (booleans excluded)."""
     numeric = []
     for col in columns:
         vals = [row.get(col) for row in data[:20] if row.get(col) is not None]
-        if vals and all(isinstance(v, (int, float)) for v in vals):
+        if vals and all(_is_num(v) for v in vals):
             numeric.append(col)
     return numeric

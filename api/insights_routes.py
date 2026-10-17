@@ -19,10 +19,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from core.deps import require_writable, reject_document_sql
+from core.deps import get_current_user, require_writable, reject_document_sql
 from core.config import get_session, save_session
 from core.schema_intel import SchemaIntelligence, _safe_name, _run_sql, AMOUNT_HINTS
-from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, log_and_sanitize, sanitize_error
+from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, sanitize_error
 from core.semantic import humanize
 
 router = APIRouter(tags=["insights"])
@@ -2000,11 +2000,16 @@ def get_insights(request: Request, user: dict = Depends(require_writable)):
 
 
 @router.get("/api/insights/saved")
-def get_saved_insights(request: Request, user: dict = Depends(require_writable)):
+def get_saved_insights(request: Request, user: dict = Depends(get_current_user)):
     """Return saved/bookmarked insights for this user."""
     session = get_session(user["user_id"])
     saved = session.get("saved_insights", [])
     return {"ok": True, "saved": saved}
+
+
+# Saved insights are session-persisted; keep the list bounded so a long-
+# lived session cannot grow the session file without limit. Oldest first-out.
+MAX_SAVED_INSIGHTS = 200
 
 
 @router.post("/api/insights/save")
@@ -2023,6 +2028,8 @@ def save_insight(req: SaveInsightRequest, request: Request, user: dict = Depends
         "created_at": datetime.now().isoformat(),
         "insight_payload": req.insight_payload,
     })
+    if len(saved) > MAX_SAVED_INSIGHTS:
+        saved = saved[-MAX_SAVED_INSIGHTS:]
     session["saved_insights"] = saved
     save_session(user["user_id"], session)
     return {"ok": True, "saved": saved}
@@ -2152,7 +2159,7 @@ def ask_about_insight(insight_id: str, req: AskInsightRequest, request: Request,
 
 
 @router.get("/api/insights/{insight_id}")
-def get_insight_detail(insight_id: str, request: Request, user: dict = Depends(require_writable)):
+def get_insight_detail(insight_id: str, request: Request, user: dict = Depends(get_current_user)):
     """Return one normalized insight + related ids (reuse generation, no duplicate).
 
     Regenerates the list via the existing InsightsEngine path, id-matches,

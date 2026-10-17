@@ -114,15 +114,13 @@ test.describe("ARIA QA - connected flow", () => {
     if (predictiveProblems.ce.length || predictiveProblems.pe.length || predictiveProblems.fr.length)
       console.log("PREDICTIVE_PROBLEMS=" + JSON.stringify(predictiveProblems));
 
-    // ---- Decision Center: recommendations integration (prescription contract) ----
+    // ---- Intelligence (explore / hypotheses / goals surface) ----
     sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /decision center/i }).first().click();
-    await page.waitForTimeout(40000);
-    const dcHtml = await page.locator("#root").innerHTML();
-    console.log("DECISION_HAS_CONTENT=" + /Decision Center|No decisions yet|No strong recommendations|Analyzing|Insufficient evidence|recommendation/i.test(dcHtml));
-    const decisionProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
-    if (decisionProblems.ce.length || decisionProblems.pe.length || decisionProblems.fr.length)
-      console.log("DECISION_PROBLEMS=" + JSON.stringify(decisionProblems));
+    await page.getByRole("button", { name: /^intelligence$/i }).first().click();
+    await page.waitForTimeout(15000);
+    const intelligenceProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
+    if (intelligenceProblems.ce.length || intelligenceProblems.pe.length || intelligenceProblems.fr.length)
+      console.log("INTELLIGENCE_PROBLEMS=" + JSON.stringify(intelligenceProblems));
 
     // ---- Hypothesis (embedded): Insights -> select -> "Investigate why" ->
     // contextual hypothesis in AI Analytics (Possible drivers) ----

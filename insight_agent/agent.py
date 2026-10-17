@@ -701,17 +701,14 @@ class InsightAgent:
         reflects how strongly the numbers support the claim.
         """
         hyps = []
-        score = 0.0
 
         def add(text, basis, confidence, pts):
-            nonlocal score
             hyps.append({
                 "hypothesis": text,
                 "basis": basis,
                 "confidence": confidence,
                 "score": float(pts),
             })
-            score += float(pts)
 
         # Identifier-like columns are keys, not measures: hypotheses must talk
         # about real business measures, never about row IDs or foreign keys.
@@ -848,7 +845,11 @@ class InsightAgent:
             )
 
         hyps.sort(key=lambda h: h["score"], reverse=True)
-        return hyps[:5], score
+        # The ranking score must describe what is actually returned: sum the
+        # top-N list only (previously it summed every candidate, including
+        # the ones truncated away, inflating hypothesis_ranking_score).
+        top_hyps = hyps[:5]
+        return top_hyps, sum(h["score"] for h in top_hyps)
 
     # ------------------------------------------------------------------
     # Business story via Mistral 7B
@@ -1168,8 +1169,10 @@ Rules:
                 return False, f"unmapped percent {token.strip()}"
             if abs(num) < 10 and not suffix:
                 continue  # counts / ranks / small prose numbers
-            if 1900 <= abs(num) <= 2100 and num.is_integer() and not suffix:
+            if _re.fullmatch(r"(?:19|20|21)\d{2}", token.strip()):
                 # Year-like periods must exist in evidence; otherwise invented.
+                # Match on the RAW token: "2,000" is a thousands-separated
+                # count, not a period (it previously false-rejected counts).
                 if str(int(num)) not in evidence_text:
                     return False, f"unmapped period {token.strip()}"
                 continue

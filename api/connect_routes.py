@@ -511,7 +511,8 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
             base_url=request.base_url,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {exc}")
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {_san(exc)}")
 
     # Validate hosted keys with a no-cost ping so a bad key fails here,
     # not pages later inside an analysis.
@@ -519,9 +520,10 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
         try:
             llm.ping(timeout=25)
         except Exception as exc:
+            from core.errors import sanitize_error as _san
             raise HTTPException(
                 status_code=400,
-                detail=f"The {request.provider} key was rejected or unreachable ({exc}). Check the key and try again.",
+                detail=f"The {request.provider} key was rejected or unreachable ({_san(exc)}). Check the key and try again.",
             )
 
     session["provider"] = llm
@@ -637,7 +639,8 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
     try:
         llm = create_provider(provider=request.provider, api_key=user_key or None)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {exc}")
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {_san(exc)}")
 
     # The provider in this connect request is an explicit user choice.
     session["provider"] = llm
@@ -671,8 +674,9 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
             else:
                 cur.execute("SELECT current_database(), current_schema();")
                 db_name, current_db_schema = cur.fetchone()
-    except SystemExit as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    except (SystemExit, schema_agent.SchemaConnectionError) as exc:
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=_san(exc))
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid port number.")
     except Exception as exc:
@@ -744,7 +748,7 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
                 )
         try:
             conn = schema_agent.get_connection(types.SimpleNamespace(**config))
-        except SystemExit as _sx:
+        except (SystemExit, schema_agent.SchemaConnectionError) as _sx:
             _conn_log.error("Schema extraction refused connection setup: %s", _sx)
             raise
         try:
@@ -837,7 +841,7 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
             save_session(user["user_id"], session)
             _conn_log.exception("Schema extraction failed for db '%s' (user %s).",
                                 db_name, user["user_id"])
-    except SystemExit:
+    except (SystemExit, schema_agent.SchemaConnectionError):
         pass
     except Exception as exc:
         session["schema_status"] = "failed"
@@ -901,7 +905,9 @@ def _finish_csv_connect(*, file_path, upload_dir, safe_name, stamp, filename,
         mapping = csv_orchestrator.build_csv_schema_mapping(
             file_path, table_name=table_name, profile=profile)
     except CsvValidationError as exc:
-        _set_progress(uid, "error", 0, f"Invalid CSV: {exc}", error=str(exc))
+        from core.errors import sanitize_error as _san
+        _safe_csv_err = _san(exc)
+        _set_progress(uid, "error", 0, f"Invalid CSV: {_safe_csv_err}", error=_safe_csv_err)
         try:
             file_path.unlink(missing_ok=True)
         except Exception:
@@ -910,8 +916,8 @@ def _finish_csv_connect(*, file_path, upload_dir, safe_name, stamp, filename,
             return None
         _msg = str(exc).lower()
         if "limit" in _msg or "too large" in _msg or "exceed" in _msg:
-            raise HTTPException(status_code=413, detail=f"CSV exceeds the {int(os.getenv('ARIA_MAX_UPLOAD_CSV_MB', '512'))} MB upload limit: {exc}")
-        raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}")
+            raise HTTPException(status_code=413, detail=f"CSV exceeds the {int(os.getenv('ARIA_MAX_UPLOAD_CSV_MB', '512'))} MB upload limit: {_safe_csv_err}")
+        raise HTTPException(status_code=400, detail=f"Invalid CSV: {_safe_csv_err}")
     except Exception as exc:
         from core.errors import sanitize_error as _san
         _set_progress(uid, "error", 0, "Validation failed", error=_san(exc))
@@ -986,39 +992,10 @@ def _finish_csv_connect(*, file_path, upload_dir, safe_name, stamp, filename,
         "db_file": sqlite_path.name,
     }
     _set_progress(uid, "ready", 100, "Ready", done=True, result=result)
-    # Warm the dashboard KPI cache while the data is fresh: the first
-    # dashboard visit then renders instantly instead of recomputing
-    # full-table aggregates. Best-effort, never fails the upload.
-    # (Runs for inline and background finishes alike.)
-    _warm_dashboard_cache(uid)
+    # Dashboard KPIs are computed on first dashboard visit (services.kpi_service
+    # derives them from the live connection; there is no separate cache to
+    # prime, so no warm-up thread is spawned here).
     return result
-
-
-def _warm_dashboard_cache(uid: int) -> None:
-    """Precompute dashboard KPIs for a freshly connected source (thread).
-
-    Best-effort, never fails the upload. Uses the in-process KPI service
-    directly — no self-HTTP and no minted bearer token (avoids internal
-    SSRF surface and token-mint-in-thread).
-    """
-    def _run():
-        try:
-            from core.config import get_session as _get_session
-            _session = _get_session(uid)
-        except Exception:
-            return
-        try:
-            # Prime the per-dataset KPI path without network I/O.
-            # services.kpi_service exposes pure helpers; full dashboard
-            # assembly stays on first-visit path (correct, just not pre-warmed
-            # when the service API changes — hence best-effort).
-            import services.kpi_service as _kpi_svc  # noqa: F401
-        except Exception:
-            pass
-    try:
-        threading.Thread(target=_run, name=f"kpi-warm-{uid}", daemon=True).start()
-    except Exception:
-        pass
 
 
 @router.post("/api/connect_file")
@@ -1060,7 +1037,8 @@ def connect_file(provider: str | None = Form(None), file: UploadFile = File(...)
     try:
         llm = create_provider(provider=provider, api_key=llm_api_key, base_url=llm_base_url)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {exc}")
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {_san(exc)}")
 
     uid = user["user_id"]
     _set_progress(uid, "uploading", 10, "Uploading file...")
@@ -1165,7 +1143,8 @@ def connect_pdf(
             base_url=llm_base_url,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {exc}")
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {_san(exc)}")
 
     # Keep raw PDFs within the owning user's upload directory (validated id).
     _pdf_upaths = get_user_artifact_paths(user["user_id"])

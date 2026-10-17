@@ -15,7 +15,7 @@ from typing import Any
 
 from core.config import get_session
 from core.data_intelligence import hint_hit as _hint_hit
-from core.deps import require_data, require_writable, get_current_user, reject_document_sql
+from core.deps import require_writable, get_current_user, reject_document_sql
 from core.secret_box import decrypt as _decrypt_secret
 
 log = logging.getLogger("aria.predictive_routes")
@@ -1190,7 +1190,13 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
         # No 500: fall through to the deterministic path, then return an
         # honest invalid forecast with the reason if nothing works.
         log.error("GoalAgent failed: %s\n%s", e, _tb.format_exc())
-        goal_error = str(e)[:300]
+        # This text can reach the client (`reason`); sanitize it like every
+        # other user-facing error (no creds/hosts/paths), never the raw exc.
+        try:
+            from core.errors import sanitize_error as _san_goal
+            goal_error = f"Data preparation issue: {_san_goal(e)}"[:300]
+        except Exception:
+            goal_error = "Data preparation failed."
 
     # Step 2: Run PredictionAgent (dicts in-memory; single shared engine;
     # single deterministic-fallback attempt; GROUP BY grain + LIMIT 2000).
@@ -1581,7 +1587,6 @@ def generate_prescription(req: PrescriptionRequest, request: Request, user: dict
     quality_gate) via /api/prescriptions/* or the Decision Center
     (/api/decision-center/*), which never calls PrescriptionAgent. DO NOT
     delete this endpoint (old clients still call it)."""
-    import traceback as _tb
     session = get_session(user["user_id"])
     reject_document_sql(session)
     schema_path = session.get("schema_path")

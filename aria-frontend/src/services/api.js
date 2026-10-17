@@ -70,8 +70,8 @@ const resolvePath = (path) => {
 
 // Unified client timeout: 60s floor / 120s ceiling (heavy LLM + forecast
 // calls need headroom; chatty reads stay snappy). Single knob for the
-// whole frontend — services/api.js and figma/lib/decisionCenterApi.ts
-// share it via apiFetch (VITE_API_TIMEOUT_MS overrides, then clamped).
+// whole frontend — every caller shares it via apiFetch
+// (VITE_API_TIMEOUT_MS overrides, then clamped).
 const RAW_TIMEOUT_MS = Number(import.meta?.env?.VITE_API_TIMEOUT_MS || 90000);
 const REQUEST_TIMEOUT_MS = Math.max(60000, Math.min(120000, RAW_TIMEOUT_MS));
 export const API_TIMEOUT_MS = REQUEST_TIMEOUT_MS;

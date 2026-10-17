@@ -380,8 +380,6 @@ def run_correlation(engine, dialect, table, driver, metric):
     rs, ps = _spearman(x, y)
     slope, intercept, r2, _ = _ols(x, y)
     n = len(x)
-    if n <= 3:
-        return None, [f"Only {n} usable rows for {driver} vs {metric} — at least {MIN_N} are needed."]
     z = 0.5 * math.log((1 + r) / (1 - r)) if abs(r) < 1 else 0.0
     se = 1.0 / math.sqrt(max(1, n - 3))
     if abs(r) < 1:

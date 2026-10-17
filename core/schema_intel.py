@@ -518,7 +518,7 @@ class SchemaIntelligence:
             )
         return " ".join(clauses)
 
-    def get_table_row_count(self, table: str) -> bool:
-        """Check if table has a row_count in metadata."""
+    def get_table_row_count(self, table: str) -> int | None:
+        """Return the recorded row_count for `table`, or None when unknown."""
         info = self.tables.get(table, {})
         return info.get("row_count", 0) if "row_count" in info else None

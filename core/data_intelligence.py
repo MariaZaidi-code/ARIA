@@ -515,20 +515,10 @@ def build_data_intelligence(mapping: Dict[str, Any]) -> Dict[str, Any]:
 
     duplicates = None
     quality = mapping.get("quality") or {}
-    for t in tables:
-        info = tables[t] or {}
-        csv_q = ((info.get("csv_profile") or {}).get("quality")
-                 or (mapping.get("semi_structured_sources") or {}))
-        _ = csv_q  # reserved: CSV dup counts surface via csv_profile when present
     if isinstance(quality.get("duplicate_rows"), int):
         duplicates = quality["duplicate_rows"]
 
     cardinality: Dict[str, Any] = {}
-    for t, p in profiles.items():
-        info = tables[t] or {}
-        for col in p["dimensions"]:
-            stats = (info.get("null_stats") or {}).get(col) or {}
-            _ = stats  # distinct counts surface here when profilers provide them
 
     table_count = len(tables)
     if total_rows == 0 and not usable:

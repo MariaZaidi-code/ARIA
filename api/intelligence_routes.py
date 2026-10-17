@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from core.config import get_session
-from core.deps import get_current_user, require_data, require_writable, get_request_id
+from core.deps import get_current_user, require_writable, get_request_id
 from services import intelligence_service as intel
 
 log = logging.getLogger("aria.intelligence.api")
@@ -209,7 +209,10 @@ def _explore_cache_get(key):
     try:
         ts, val = _EXPLORE_CACHE.get(key, (0, None))
         if val is not None and __import__("time").time() - ts < _EXPLORE_CACHE_TTL:
-            return val
+            # Hand out a copy: callers must never be able to mutate the
+            # cached payload for subsequent requests.
+            import copy as _copy
+            return _copy.deepcopy(val)
         _EXPLORE_CACHE.pop(key, None)
     except Exception:
         pass
@@ -236,7 +239,7 @@ def _schema_cache_tag(session: dict) -> str:
 
 
 @router.post("/explore")
-def run_explore(req: ExploreRequest, request: Request, user: dict = Depends(get_current_user)):
+def run_explore(req: ExploreRequest, request: Request, user: dict = Depends(require_writable)):
     """Run a server-side aggregation analysis."""
     try:
         session, user = _get_session_and_user(request, user)
@@ -279,6 +282,10 @@ def run_explore(req: ExploreRequest, request: Request, user: dict = Depends(get_
 @router.post("/hypotheses")
 def list_hypotheses(request: Request, user: dict = Depends(get_current_user)):
     """Return hypothesis candidates from the connected dataset."""
+    if request.method != "GET":
+        # POST shares this path with GET for convenience; it is a write
+        # (persists a refreshed list), so it obeys the mobile read-only rule.
+        user = require_writable(request, user)
     try:
         session, user = _get_session_and_user(request, user)
     except HTTPException:
@@ -319,7 +326,7 @@ def list_goals(request: Request, user: dict = Depends(get_current_user), status:
 
 
 @router.post("/goals")
-def create_goal(req: GoalRequest, request: Request, user: dict = Depends(get_current_user)):
+def create_goal(req: GoalRequest, request: Request, user: dict = Depends(require_writable)):
     session = get_session(user["user_id"])
     did = _dataset_id(session)
     data = req.model_dump(exclude_unset=True)
@@ -332,7 +339,7 @@ def create_goal(req: GoalRequest, request: Request, user: dict = Depends(get_cur
 
 
 @router.patch("/goals/{goal_id}")
-def update_goal(goal_id: str, req: GoalRequest, request: Request, user: dict = Depends(get_current_user)):
+def update_goal(goal_id: str, req: GoalRequest, request: Request, user: dict = Depends(require_writable)):
     """Update a goal's status or fields."""
     session = get_session(user["user_id"])
     did = _dataset_id(session)
@@ -343,7 +350,7 @@ def update_goal(goal_id: str, req: GoalRequest, request: Request, user: dict = D
 
 
 @router.delete("/goals/{goal_id}")
-def delete_goal(goal_id: str, request: Request, user: dict = Depends(get_current_user)):
+def delete_goal(goal_id: str, request: Request, user: dict = Depends(require_writable)):
     """Delete a goal."""
     session = get_session(user["user_id"])
     if not intel.delete_goal(user["user_id"], goal_id):
@@ -352,7 +359,7 @@ def delete_goal(goal_id: str, request: Request, user: dict = Depends(get_current
 
 
 @router.post("/goals/{goal_id}/refresh")
-def refresh_goal(goal_id: str, request: Request, user: dict = Depends(get_current_user)):
+def refresh_goal(goal_id: str, request: Request, user: dict = Depends(require_writable)):
     """Recompute one goal's current value from live data (auto-progress).
 
     Loads the stored goal, re-runs the run_explore-equivalent aggregation
@@ -388,7 +395,7 @@ def whatif_meta(request: Request, user: dict = Depends(get_current_user)):
 
 
 @router.post("/what-if/run")
-def run_whatif(req: WhatIfRequest, request: Request, user: dict = Depends(get_current_user)):
+def run_whatif(req: WhatIfRequest, request: Request, user: dict = Depends(require_writable)):
     """Run a What-If scenario."""
     try:
         session, user = _get_session_and_user(request, user)
@@ -428,7 +435,7 @@ def list_analyses(request: Request, user: dict = Depends(get_current_user)):
 
 
 @router.post("/analyses")
-def save_analysis(req: AnalysisRequest, request: Request, user: dict = Depends(get_current_user)):
+def save_analysis(req: AnalysisRequest, request: Request, user: dict = Depends(require_writable)):
     """Save an analysis."""
     session = get_session(user["user_id"])
     did = _dataset_id(session)
@@ -450,7 +457,7 @@ def list_scenarios(request: Request, user: dict = Depends(get_current_user)):
 
 
 @router.post("/what-if/scenarios")
-def save_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(get_current_user)):
+def save_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(require_writable)):
     session = get_session(user["user_id"])
     did = _dataset_id(session)
     item = intel.save_scenario(user["user_id"], did, req.model_dump())
@@ -464,13 +471,13 @@ def list_report_templates(request: Request, user: dict = Depends(get_current_use
 
 
 @router.post("/reports/templates")
-def save_report_template(req: TemplateRequest, request: Request, user: dict = Depends(get_current_user)):
+def save_report_template(req: TemplateRequest, request: Request, user: dict = Depends(require_writable)):
     item = intel.save_report_template(user["user_id"], req.model_dump())
     return {"ok": True, "item": item, "data": item}
 
 
 @router.post("/reports/schedule")
-def schedule_report(req: ReportRequest, request: Request, user: dict = Depends(get_current_user)):
+def schedule_report(req: ReportRequest, request: Request, user: dict = Depends(require_writable)):
     session = get_session(user["user_id"])
     did = _dataset_id(session)
     payload = req.model_dump(); payload["scheduled"] = True
@@ -479,7 +486,7 @@ def schedule_report(req: ReportRequest, request: Request, user: dict = Depends(g
 
 
 @router.post("/reports/share")
-def share_report(req: ReportRequest, request: Request, user: dict = Depends(get_current_user)):
+def share_report(req: ReportRequest, request: Request, user: dict = Depends(require_writable)):
     session = get_session(user["user_id"])
     did = _dataset_id(session)
     payload = req.model_dump(); payload["shared"] = True
@@ -488,7 +495,7 @@ def share_report(req: ReportRequest, request: Request, user: dict = Depends(get_
 
 
 @router.post("/reports/export")
-def export_report(request: Request, user: dict = Depends(get_current_user)):
+def export_report(request: Request, user: dict = Depends(require_writable)):
     session = get_session(user["user_id"])
     did = _dataset_id(session)
     item = intel.generate_report(user["user_id"], did, {"name": "Export", "template": "professional", "sections": []})
@@ -505,7 +512,7 @@ def list_reports(request: Request, user: dict = Depends(get_current_user)):
 
 
 @router.post("/reports/generate")
-def generate_report(req: ReportRequest, request: Request, user: dict = Depends(get_current_user)):
+def generate_report(req: ReportRequest, request: Request, user: dict = Depends(require_writable)):
     """Generate a structured report."""
     session = get_session(user["user_id"])
     did = _dataset_id(session)
@@ -519,7 +526,7 @@ def generate_report(req: ReportRequest, request: Request, user: dict = Depends(g
 
 
 @router.delete("/analyses/{analysis_id}")
-def delete_analysis(analysis_id: str, request: Request, user: dict = Depends(get_current_user)):
+def delete_analysis(analysis_id: str, request: Request, user: dict = Depends(require_writable)):
     """Delete a saved analysis."""
     if not intel.delete_analysis(user["user_id"], analysis_id):
         raise HTTPException(status_code=404, detail="Analysis not found.")
@@ -527,7 +534,7 @@ def delete_analysis(analysis_id: str, request: Request, user: dict = Depends(get
 
 
 @router.delete("/what-if/scenarios/{scenario_id}")
-def delete_scenario(scenario_id: str, request: Request, user: dict = Depends(get_current_user)):
+def delete_scenario(scenario_id: str, request: Request, user: dict = Depends(require_writable)):
     """Delete a saved scenario."""
     if not intel.delete_scenario(user["user_id"], scenario_id):
         raise HTTPException(status_code=404, detail="Scenario not found.")
@@ -535,7 +542,7 @@ def delete_scenario(scenario_id: str, request: Request, user: dict = Depends(get
 
 
 @router.delete("/reports/{report_id}")
-def delete_report(report_id: str, request: Request, user: dict = Depends(get_current_user)):
+def delete_report(report_id: str, request: Request, user: dict = Depends(require_writable)):
     """Delete a generated report."""
     if not intel.delete_report(user["user_id"], report_id):
         raise HTTPException(status_code=404, detail="Report not found.")
@@ -576,7 +583,7 @@ def get_report_html(report_id: str, request: Request, user: dict = Depends(get_c
 
 
 @router.post("/reports/{report_id}/rerun")
-def rerun_report(report_id: str, request: Request, user: dict = Depends(get_current_user)):
+def rerun_report(report_id: str, request: Request, user: dict = Depends(require_writable)):
     """Re-run a stored report definition with fresh numbers (new history entry)."""
     session = get_session(user["user_id"])
     did = _dataset_id(session)
@@ -626,7 +633,7 @@ def list_digests(request: Request, user: dict = Depends(get_current_user)):
 
 
 @router.post("/digests")
-def create_digest(req: DigestRequest, request: Request, user: dict = Depends(get_current_user)):
+def create_digest(req: DigestRequest, request: Request, user: dict = Depends(require_writable)):
     """Create a digest schedule (daily/weekly, enabled by default)."""
     freq = str(req.frequency or "daily").strip().lower()
     if freq not in ("daily", "weekly"):
@@ -636,7 +643,7 @@ def create_digest(req: DigestRequest, request: Request, user: dict = Depends(get
 
 
 @router.patch("/digests/{digest_id}")
-def update_digest(digest_id: str, req: DigestPatch, request: Request, user: dict = Depends(get_current_user)):
+def update_digest(digest_id: str, req: DigestPatch, request: Request, user: dict = Depends(require_writable)):
     """Update a digest schedule (enable/disable, frequency, name, ...)."""
     patch = req.model_dump(exclude_unset=True)
     if "frequency" in patch and patch["frequency"] is not None:
@@ -651,7 +658,7 @@ def update_digest(digest_id: str, req: DigestPatch, request: Request, user: dict
 
 
 @router.delete("/digests/{digest_id}")
-def delete_digest(digest_id: str, request: Request, user: dict = Depends(get_current_user)):
+def delete_digest(digest_id: str, request: Request, user: dict = Depends(require_writable)):
     """Delete a digest schedule."""
     if not _digests().delete_digest(user["user_id"], digest_id):
         raise HTTPException(status_code=404, detail="Digest not found.")
@@ -659,7 +666,7 @@ def delete_digest(digest_id: str, request: Request, user: dict = Depends(get_cur
 
 
 @router.post("/digests/{digest_id}/run")
-def run_digest(digest_id: str, request: Request, user: dict = Depends(get_current_user)):
+def run_digest(digest_id: str, request: Request, user: dict = Depends(require_writable)):
     """One-click digest run: generate now from live data (new history entry).
 
     Failures record a failed run entry on the schedule and return
@@ -699,7 +706,7 @@ def get_coverage(request: Request, user: dict = Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 
 @router.post("/refresh")
-def refresh(request: Request, user: dict = Depends(get_current_user)):
+def refresh(request: Request, user: dict = Depends(require_writable)):
     """Re-run analytics and return updated Intelligence state."""
     try:
         session, user = _get_session_and_user(request, user)

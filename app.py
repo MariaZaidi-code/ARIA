@@ -176,7 +176,12 @@ async def _request_id(request: Request, call_next):
     server-side against it; clients only ever see the ID."""
     import uuid as _uuid
 
-    rid = request.headers.get("X-Request-ID") or _uuid.uuid4().hex[:12]
+    rid = str(request.headers.get("X-Request-ID") or "").strip()
+    # Cap client-supplied IDs (log/header injection hygiene) and drop any
+    # character outside the safe token set before echoing/storing.
+    rid = "".join(c for c in rid if c.isalnum() or c in "._:-")[:128]
+    if not rid:
+        rid = _uuid.uuid4().hex[:12]
     request.state.request_id = rid
     resp = await call_next(request)
     resp.headers["X-Request-ID"] = rid

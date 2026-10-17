@@ -36,7 +36,7 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
                 detail="This source is a text document — use Document Chat "
                        "(Copilot) instead of schema analytics.",
             )
-        mapping = json.loads(_sp.read_text(encoding="utf-8"))
+        mapping = json.loads(Path(str(_sp)).read_text(encoding="utf-8"))
         return {
             "ok": True,
             "provider": session["provider_name"],
@@ -130,8 +130,9 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
             mapping["database"] = session["db_name"]
         finally:
             conn.close()
-    except SystemExit as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    except (SystemExit, schema_agent.SchemaConnectionError) as exc:
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=_san(exc))
     except HTTPException:
         raise
     except Exception as exc:

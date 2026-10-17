@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import auth
-from core.deps import get_current_user, is_mobile
+from core.deps import get_current_user, is_mobile, require_writable
 
 router = APIRouter()
 
@@ -219,8 +219,8 @@ def history_detail(history_id: int, user: dict = Depends(get_current_user)):
 
 
 @router.delete("/api/history/{history_id}")
-def history_delete(history_id: int, user: dict = Depends(get_current_user)):
-    """Delete a saved analysis."""
+def history_delete(history_id: int, user: dict = Depends(require_writable)):
+    """Delete a saved analysis (blocked on mobile: view history only)."""
     deleted = auth.delete_history(user["user_id"], history_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="History record not found.")

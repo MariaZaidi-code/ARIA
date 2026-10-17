@@ -154,7 +154,13 @@ class DocumentProcessor:
             document.document_type = DocumentType(doc_type)
             document.page_count = summary.get("total_pages", 0)
             document.metadata["detection"] = summary
-            document.metadata["page_types"] = [p.value for p in page_analyses] if hasattr(page_analyses[0], 'value') else page_analyses
+            page_types = []
+            if page_analyses:
+                if hasattr(page_analyses[0], 'value'):
+                    page_types = [p.value for p in page_analyses]
+                else:
+                    page_types = list(page_analyses)
+            document.metadata["page_types"] = page_types
             
             # Stage 3: Extract content (per page based on type)
             self._report_progress("Extracting content", 0.2)

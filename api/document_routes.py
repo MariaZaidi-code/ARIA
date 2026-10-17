@@ -18,8 +18,9 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from core.config import DATA_DIR, PROCESSED_DIR, get_session
+from core.config import DATA_DIR, PROCESSED_DIR
 from core.deps import require_writable, get_current_user
+from core.errors import sanitize_error
 
 logger = logging.getLogger(__name__)
 
@@ -275,30 +276,38 @@ def retry_document(
     if not file_path or not file_path.exists():
         raise HTTPException(status_code=404, detail="Original file not found for retry")
     
-    # Get session for LLM provider
-    session = get_session(user["user_id"])
-    llm = session.get("provider")
-    
-    # Create processor and reprocess (legacy extraction pipeline — the only
-    # consumer that still needs the FAISS document_processor for re-indexing).
-    from document_processor import create_document_processor
-    processor = create_document_processor(
-        upload_dir=upload_dir,
-        processed_dir=processed_dir,
-        llm_provider=llm,
-    )
-    
-    result = processor.process_document(
-        file_path=file_path,
-        document_id=document_id,
-        user_id=user["user_id"],
-        original_name=doc_data.get("original_name"),
-    )
-    
-    if not result.success:
-        raise HTTPException(status_code=500, detail=result.error or "Retry failed")
-    
+    # Re-ingest through the CANONICAL insight_rag pipeline: listing and
+    # search read the canonical manifest (RAGMetadataStore), so a retry that
+    # indexed only into the legacy FAISS store would never appear in the UI.
+    from api.insight_rag_routes import _capability
+    try:
+        result = _capability(user["user_id"]).ingest_pdf(
+            file_path,
+            original_filename=doc_data.get("original_name") or file_path.name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=sanitize_error(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=sanitize_error(exc))
+    except Exception:
+        logger.exception("Document retry failed for %s", document_id)
+        raise HTTPException(
+            status_code=503,
+            detail="I couldn't re-index that document right now. Please try again.",
+        )
+
+    # Keep the legacy record consistent so a retried document is not
+    # reported as failed forever (best effort — never fails the retry).
+    try:
+        if isinstance(result, dict) and result.get("ok"):
+            doc_data["status"] = "ready"
+            doc_file.write_text(json.dumps(doc_data), encoding="utf-8")
+    except Exception:
+        pass
+
+    document = result.get("document") if isinstance(result, dict) else None
     return {
         "ok": True,
-        "document": result.document.to_dict() if hasattr(result.document, 'to_dict') else result.document.__dict__,
+        "duplicate": bool(result.get("duplicate")) if isinstance(result, dict) else False,
+        "document": document,
     }

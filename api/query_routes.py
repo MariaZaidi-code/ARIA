@@ -863,6 +863,10 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     _shape = {"rows": len(result_data or []), "columns": list(columns or [])}
     _tables = processed.get("data_selection", {}).get("tables", []) or processed.get("join_path", [])
     _lat = round((_t0.time() - _start) * 1000)
+    # Privacy: log the SQL with string literals masked (data values belong to
+    # the user, not the ops log); structure stays readable for debugging.
+    import re as _re_log
+    _sql_masked = _re_log.sub(r"'[^']*'", "'?'", str(processed.get("sql_used") or ""))[:200]
     _qlog.info(
         "pipeline request_id=%s session_id=%s dataset_id=%s question=%r "
         "intent=%s tables=%s columns=%s sql=%.200s validation=%s "
@@ -872,7 +876,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         req.goal[:160],
         (processed.get("goal_ir") or {}).get("intent"),
         _tables, list(columns or [])[:10],
-        str(processed.get("sql_used") or "")[:200],
+        _sql_masked,
         {"valid": analysis.get("valid"), "repaired": analysis.get("repaired")},
         "ok" if _valid else "failed", _shape,
         {"chart": (analysis.get("chart_spec") or {}).get("chart_type")},

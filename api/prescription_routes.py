@@ -677,10 +677,15 @@ def prescription_save(req: SaveRequest, request: Request,
     """Persist the structured prescription — never prose alone (§28)."""
     session = get_session(user["user_id"])
     saved = session.get("saved_prescriptions", [])
-    entry = {"id": f"rxsv_{int(time.time() * 1000)}",
-             "created_at": datetime.now().isoformat(),
-             "question": _sanitize_saved_text(req.question, 500) or None,
-             **(req.prescription or {})}
+    # Server-controlled identity always wins: a client echo must not be able
+    # to override `id`/`created_at` (or collide with another saved entry).
+    payload = dict(req.prescription or {})
+    payload.pop("id", None)
+    payload.pop("created_at", None)
+    entry = {"question": _sanitize_saved_text(req.question, 500) or None,
+             **payload,
+             "id": f"rxsv_{int(time.time() * 1000)}",
+             "created_at": datetime.now().isoformat()}
     saved = [entry] + saved[:49]
     session["saved_prescriptions"] = saved
     save_session(user["user_id"], session)
@@ -688,7 +693,7 @@ def prescription_save(req: SaveRequest, request: Request,
 
 
 @router.get("/api/prescriptions/saved")
-def prescription_saved(user: dict = Depends(require_writable)):
+def prescription_saved(user: dict = Depends(get_current_user)):
     session = get_session(user["user_id"])
     return {"ok": True, "success": True,
             "saved": session.get("saved_prescriptions", [])}

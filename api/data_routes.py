@@ -46,8 +46,11 @@ def _get_db_config(session):
 def _get_schema_mapping(session, user_id):
     """Load the current schema mapping from disk."""
     path = session.get("schema_path")
-    if path and path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
+    if path:
+        # Session values round-trip through JSON as str; normalize to Path.
+        path = Path(str(path))
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
     return None
 
 
@@ -814,9 +817,9 @@ def apply_override(req: OverrideRequest, request: Request, user: dict = Depends(
         # Also update the mapping
         if req.table in mapping.get("tables", {}):
             mapping["tables"][req.table]["primary_key"] = [req.column]
-            path = session.get("schema_path")
-            if path:
-                path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+            _sp = session.get("schema_path")
+            if _sp:
+                Path(str(_sp)).write_text(json.dumps(mapping, indent=2), encoding="utf-8")
         return {"ok": True, "message": f"Primary key set to {req.table}.{req.column}"}
 
     elif req.action == "remove_pk":
@@ -825,9 +828,9 @@ def apply_override(req: OverrideRequest, request: Request, user: dict = Depends(
         _save_user_overrides(user["user_id"], db_name, overrides)
         if req.table in mapping.get("tables", {}):
             mapping["tables"][req.table]["primary_key"] = []
-            path = session.get("schema_path")
-            if path:
-                path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+            _sp = session.get("schema_path")
+            if _sp:
+                Path(str(_sp)).write_text(json.dumps(mapping, indent=2), encoding="utf-8")
         return {"ok": True, "message": f"Primary key removed from {req.table}"}
 
     elif req.action == "set_fk":

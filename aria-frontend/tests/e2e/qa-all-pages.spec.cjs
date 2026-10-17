@@ -8,11 +8,11 @@ const PAGES = [
   { id: "analytics", nav: "AI Analytics" },
   { id: "insights", nav: "Insights" },
   { id: "predictive", nav: "Forecast" },
-  { id: "decision-center", nav: "Decision Center" },
-  // No standalone prescription/hypothesis pages (removed): prescription is
-  // verified via Decision Center recommendations; hypothesis via Insights
-  // "Investigate why" -> AI Analytics Possible drivers (see
-  // qa-connected-flow.spec.cjs for the contextual coverage).
+  { id: "intelligence", nav: "Intelligence" },
+  // No standalone prescription/hypothesis/decision-center pages (removed):
+  // prescription is verified via the prescription APIs / Intelligence;
+  // hypothesis via Insights "Investigate why" -> AI Analytics Possible
+  // drivers (see qa-connected-flow.spec.cjs for the contextual coverage).
   // "data" intentionally skipped (out of scope)
   { id: "documents", nav: "Documents" },
   { id: "copilot", nav: "Copilot" },

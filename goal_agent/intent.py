@@ -423,7 +423,6 @@ class IntentMixin:
         #    column ("overall sales", "top brands by model year"). Only a vague
         #    goal with neither a grounded subject nor a resolvable metric
         #    concept + operation is ambiguous.
-        grounded_subject = bool(tables or columns)
         analytical = self._has_resolvable_analytical_structure(goal_l)
         if analytical:
             return False, None
@@ -442,40 +441,10 @@ class IntentMixin:
             if has_date:
                 return False, None
 
-        # 3-5) Anti-join / comparison / why patterns only bypass clarification
-        #    when SOMETHING is grounded. "why did sales drop" grounds via
-        #    sales->orders; but "explain the weather forecast" grounds to
-        #    nothing and must clarify instead of hallucinating SQL.
-        if not grounded_subject:
-            table_names = ", ".join(sorted(self.tables))[:300] if self.tables else "none"
-            return True, (
-                "I couldn't find a table or column in the connected database that "
-                "clearly corresponds to your question. Available data covers: "
-                f"{table_names}. Please rephrase using one of those areas (for "
-                "example 'total sales by month' or 'top products')."
-            )
-
-        # 3) Anti-join / existence patterns: "never", "without", "not", "no"
-        anti_patterns = ("never", "without", "not sold", "no orders",
-                         "no sales", "no records", "missing", "absent",
-                         "not present", "has not", "have not", "did not")
-        if any(p in goal_l for p in anti_patterns):
-            return False, None
-
-        # 4) Comparison patterns: "compare", "vs", "versus", "difference"
-        comparison_patterns = ("compare", " vs ", "versus", "difference between",
-                               "how does", "how do", "which is more", "which is less")
-        if any(p in goal_l for p in comparison_patterns):
-            return False, None
-
-        # 5) "Why" patterns: "why", "what caused", "reason for"
-        why_patterns = ("why", "what caused", "reason for", "explain",
-                        "what happened", "what made")
-        if any(p in goal_l for p in why_patterns):
-            return False, None
-
-        # 6) Nothing at all matched: graceful clarification that names what was
-        #    looked for, never a raw exception or matching failure.
+        # 3) Nothing grounded: clarify honestly. Anti-join / comparison / why
+        #    patterns are not whitelisted here — when no table or column was
+        #    matched there is nothing to anchor the SQL, so the user is asked
+        #    to rephrase instead of guessing.
         table_names = ", ".join(sorted(self.tables))[:300] if self.tables else "none"
         return True, (
             "I couldn't find a table or column in the connected database that "
@@ -675,7 +644,7 @@ class IntentMixin:
             success=True, message=output["message"], status="success",
             warnings=self._typo_warnings, execution_time_ms=execution_ms,
         ))
-        output["sql"] = sql_parts
+        output["sql"] = "; ".join(str(p) for p in sql_parts) if sql_parts else None
         output["data_selection"]["columns"] = [r["metric"] for r in rows]
         output["analysis_plan"]["measures"] = [r["metric"] for r in rows]
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -810,10 +779,12 @@ class IntentMixin:
         if year:
             return {"constraint": "year", "value": int(year.group(1)),
                     "column": None, "granularity": None}
-        for period in ("monthly", "quarterly", "yearly", "daily", "weekly"):
+        for period, gran in (("monthly", "month"), ("quarterly", "quarter"),
+                             ("yearly", "year"), ("daily", "day"),
+                             ("weekly", "week")):
             if period in g:
                 return {"constraint": "period", "value": None, "column": None,
-                        "granularity": period[:-2]}
+                        "granularity": gran}
         return None
 
     # ---- _extract_goal_filters (_extract_goal_filters) ----

@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from core.deps import get_current_user
+from core.deps import get_current_user, require_writable
 from core.config import get_session
 
 log = logging.getLogger("aria.copilot")
@@ -24,8 +24,8 @@ router = APIRouter(prefix="/api/copilot", tags=["copilot"])
 
 
 class CopilotRequest(BaseModel):
-    question: str
-    conversation_id: Optional[str] = None
+    question: str = Field(max_length=4000)
+    conversation_id: Optional[str] = Field(default=None, max_length=80)
     context: Optional[dict[str, Any]] = None
 
 
@@ -318,7 +318,7 @@ def _linked_context(session: dict) -> dict:
 # Allowed for wrong methods (e.g. GET) automatically via the router's
 # method routing; no explicit handler needed. Kept functional as-is.
 @router.post("")
-async def copilot_endpoint(body: CopilotRequest, user: dict = Depends(get_current_user)):
+async def copilot_endpoint(body: CopilotRequest, user: dict = Depends(require_writable)):
     """Answer an analytical question over the connected source via RAG."""
     session = get_session(user["user_id"])
     provider = session.get("provider")

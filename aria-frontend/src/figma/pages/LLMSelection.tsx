@@ -66,10 +66,15 @@ export default function LLMSelection({ onSelectLLM }: LLMSelectionProps) {
       const st = status["cloud"];
       if (st && !st.available && st.reason) {
         setError(st.reason);
+      } else if (st && st.available) {
+        // The server already holds a reachable key for Cloud AI (see
+        // providers/status). Forcing a re-paste here blocks a working
+        // provider, so switch keyless — handleLLMSelect omits api_key
+        // and the backend reuses its stored key.
       } else {
         setError("Paste your Groq API key to use Cloud AI — Local AI needs no key.");
       }
-      return;
+      // fall through: an available server-side key means no paste needed
     }
     const st = selected ? status[selected] : undefined;
     if (st && !st.available) {

@@ -7,8 +7,8 @@ Processes handwritten PDFs using vision-capable LLM models.
 from __future__ import annotations
 
 import base64
+import io
 import logging
-import tempfile
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -181,9 +181,12 @@ class HandwritingExtractor:
         
         try:
             # Convert image to base64
-            img_buffer = tempfile.BytesIO()
-            image.save(img_buffer, format="PNG")
-            img_base64 = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
+            img_buffer = io.BytesIO()
+            try:
+                image.save(img_buffer, format="PNG")
+                img_base64 = base64.b64encode(img_buffer.getvalue()).decode("utf-8")
+            finally:
+                img_buffer.close()
             
             # Call vision LLM
             response = self.llm_provider.vision(

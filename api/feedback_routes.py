@@ -10,10 +10,9 @@ import json
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from core.config import get_session, save_session
 from core.deps import get_current_user
 
 router = APIRouter()
@@ -84,6 +83,10 @@ def submit_feedback(req: GeneralFeedback, user: dict = Depends(get_current_user)
 @router.post("/api/feedback/insight")
 def rate_insight(payload: InsightRating, user: dict = Depends(get_current_user)):
     """Rate an insight as useful or not useful. Used for RL reward signal."""
+    if payload.rating not in ("useful", "not_useful"):
+        raise HTTPException(status_code=400, detail="rating must be 'useful' or 'not_useful'.")
+    if payload.category not in ("analytics", "insight", "prediction", "prescription"):
+        raise HTTPException(status_code=400, detail="Unsupported feedback category.")
     prefs = _load_prefs(user["user_id"])
     prefs["insight_ratings"].append({
         "question": payload.question,

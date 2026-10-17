@@ -174,8 +174,10 @@ def classify_analytics(question: str, schema_terms: set[str] | None = None) -> d
                 scores[intent] += 1
 
     if not scores:
-        # No signal at all: descriptive summary only when grounded or when
-        # the question is analytical in shape; otherwise no-match.
+        # No signal at all: descriptive_summary is the universal fallback
+        # (with low confidence when nothing grounds) — there is no separate
+        # "no-match" primary; callers judge ambiguity via `grounded` /
+        # `confidence` / schema_overlap.
         if grounded or (qtok & _ANALYTICAL_WORDS):
             primary = "descriptive_summary"
             capabilities = ["descriptive_summary", "aggregation"]
@@ -582,7 +584,12 @@ def build_hypothesis(
 
     top = tops[0]
     top_val = str(top.get("value") or "").strip() or "the leading segment"
-    top_dim = str(top.get("dimension") or (dimensions or [""])[0] if (dimensions or []) else (top.get("dimension") or "")).strip()
+    # Prefer the segment's own dimension label, else the first requested
+    # dimension (explicit if/else: keeps the precedence readable).
+    if dimensions:
+        top_dim = str(top.get("dimension") or dimensions[0] or "").strip()
+    else:
+        top_dim = str(top.get("dimension") or "").strip()
     top_share = _hyp_num(top.get("contribution_pct"))
     top_conf = str(top.get("confidence") or "low")
     second = tops[1] if len(tops) > 1 else None

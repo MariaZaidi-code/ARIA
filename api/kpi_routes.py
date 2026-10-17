@@ -218,8 +218,6 @@ def _load_schema(session, user_id=None):
                     user_path = user_dir_path / f"schema_mapping_{safe_db}_latest.json"
                     user_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
                     session["schema_path"] = user_path
-                    from core.config import save_session
-                    # We can't save here easily without user_id — skip persistence
                     return SchemaIntelligence(mapping)
             except Exception:
                 pass
@@ -250,7 +248,7 @@ def _load_schema(session, user_id=None):
                     try:
                         conn2 = sqlite3.connect(str(sqlite_path_obj))
                         cur2 = conn2.cursor()
-                        cur2.execute(f'PRAGMA table_info("{tname}")')
+                        cur2.execute(f'PRAGMA table_info("{str(tname).replace(chr(34), chr(34) * 2)}")')
                         col_rows = cur2.fetchall()
                         conn2.close()
                         columns = []

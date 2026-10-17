@@ -4,11 +4,12 @@ import asyncio
 import logging
 import os
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from core.config import get_session, save_session
-from core.deps import get_current_user
+from core.deps import get_current_user, require_writable
+from core.errors import sanitize_error
 from llm_provider import PROVIDERS, create_provider
 
 router = APIRouter()
@@ -58,7 +59,7 @@ async def get_providers(_user: dict = Depends(get_current_user)):
 
 
 @router.post("/api/settings/providers")
-async def save_provider(req: ProviderConfigRequest, _user: dict = Depends(get_current_user)):
+async def save_provider(req: ProviderConfigRequest, _user: dict = Depends(require_writable)):
     """Save an AI provider API key AND switch the session to it.
 
     The key is validated with a tiny bounded call first, so a typo'd key
@@ -79,7 +80,7 @@ async def save_provider(req: ProviderConfigRequest, _user: dict = Depends(get_cu
     try:
         llm = create_provider(provider=name, api_key=key or None)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not initialise '{name}': {exc}")
+        raise HTTPException(status_code=400, detail=f"Could not initialise '{name}': {sanitize_error(exc)}")
     if name != "local":
         try:
             await asyncio.to_thread(llm.ping, 25)
@@ -87,7 +88,7 @@ async def save_provider(req: ProviderConfigRequest, _user: dict = Depends(get_cu
             log.warning("Provider key validation failed for '%s': %s", name, exc)
             raise HTTPException(
                 status_code=400,
-                detail=f"The {name} key was rejected or unreachable ({exc}). Check the key and try again.",
+                detail=f"The {name} key was rejected or unreachable ({sanitize_error(exc)}). Check the key and try again.",
             )
 
     session = get_session(_user["user_id"])
@@ -142,7 +143,7 @@ async def providers_status(_user: dict = Depends(get_current_user)):
                 return {"provider": name, "available": True, "reason": "Ollama is running on this machine."}
             except Exception as exc:
                 return {"provider": name, "available": False,
-                        "reason": f"Ollama is not reachable ({exc}). Start Ollama and try again."}
+                        "reason": f"Ollama is not reachable ({sanitize_error(exc)}). Start Ollama and try again."}
         key = resolve_provider_key(name, saved)
         if not key:
             label = {"cloud": "Groq", "deepseek": "DeepSeek", "omniroute": "OmniRoute", "grok": "Grok"}.get(name, name)
@@ -153,7 +154,7 @@ async def providers_status(_user: dict = Depends(get_current_user)):
             return {"provider": name, "available": True, "reason": "API key verified and reachable."}
         except Exception as exc:
             return {"provider": name, "available": False,
-                    "reason": f"Key rejected or unreachable ({exc}). Check the key and retry."}
+                    "reason": f"Key rejected or unreachable ({sanitize_error(exc)}). Check the key and retry."}
 
     names = ["local", "cloud", "deepseek", "omniroute", "grok"]
     results = await _asyncio.gather(*[_check(n) for n in names])
@@ -299,7 +300,7 @@ def _ping_hosted(name: str, key: str, timeout: int) -> None:
 
 
 @router.post("/api/settings/general")
-async def save_general_settings(req: GeneralSettingsRequest, _user: dict = Depends(get_current_user)):
+async def save_general_settings(req: GeneralSettingsRequest, _user: dict = Depends(require_writable)):
     """Save general settings (theme, language)."""
     if req.language not in {"en", "ur"}:
         raise HTTPException(status_code=400, detail="Unsupported language.")

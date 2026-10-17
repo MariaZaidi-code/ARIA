@@ -954,6 +954,17 @@ class GroundingMixin:
                         sql = (f"SELECT DISTINCT {quote(c)} FROM {quote(_bt(t))} "
                                f"LIMIT 50")
                         with self.engine.connect() as conn:
+                            # Same dialect-conditional statement timeout the
+                            # main execution path sets: sampling probes must
+                            # never hang a request (bounded read-only SQL).
+                            try:
+                                _dl = getattr(self, "dialect", "")
+                                if _dl == "postgresql":
+                                    conn.execute(_text("SET statement_timeout = '5000'"))
+                                elif _dl == "mysql":
+                                    conn.execute(_text("SET SESSION max_execution_time = 5000"))
+                            except Exception:
+                                pass
                             rows = conn.execute(_text(sql)).fetchall()
                     except Exception:
                         continue
@@ -1004,6 +1015,14 @@ class GroundingMixin:
             sql = (f"SELECT DISTINCT {quote(col)} FROM {quote(_bt2(table))} "
                    f"LIMIT {int(cap)}")
             with self.engine.connect() as conn:
+                try:
+                    _dl = getattr(self, "dialect", "")
+                    if _dl == "postgresql":
+                        conn.execute(_text("SET statement_timeout = '5000'"))
+                    elif _dl == "mysql":
+                        conn.execute(_text("SET SESSION max_execution_time = 5000"))
+                except Exception:
+                    pass
                 rows = conn.execute(_text(sql)).fetchall()
             return len(rows or [])
         except Exception:

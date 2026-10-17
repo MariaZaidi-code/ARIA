@@ -82,6 +82,12 @@ def _llm_rate_limit(key="default") -> None:
         if getattr(exc, "status_code", None) in (429, 503):
             raise
     now = time.monotonic()
+    if len(_llm_buckets) > 512:
+        # Bound the fallback map: drop expired/empty buckets so one-shot
+        # keys cannot grow it without limit.
+        for _k in [k for k, v in _llm_buckets.items()
+                   if not v or now - v[-1] >= _LLM_BUCKET_WINDOW_S]:
+            _llm_buckets.pop(_k, None)
     hits = [t for t in _llm_buckets.get(bucket_key, []) if now - t < _LLM_BUCKET_WINDOW_S]
     if len(hits) >= _LLM_BUCKET_MAX:
         raise RuntimeError(

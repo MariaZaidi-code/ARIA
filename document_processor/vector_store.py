@@ -8,11 +8,9 @@ from __future__ import annotations
 
 import logging
 import json
-import os
 import sqlite3
-import uuid
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
 import numpy as np
@@ -111,6 +109,14 @@ class VectorStore:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_faiss_index ON chunks(faiss_index)
             """)
+            # Migration: embeddings back the SQLite-only fallback search
+            # (FAISS unavailable). Older DBs did not persist them.
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+            if "embedding" not in cols:
+                try:
+                    conn.execute("ALTER TABLE chunks ADD COLUMN embedding BLOB")
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
     
     def _load_index_mapping(self) -> None:
@@ -146,7 +152,17 @@ class VectorStore:
             return []
         
         if not FAISS_AVAILABLE or self.index is None:
-            logger.warning("FAISS not available, skipping vector indexing")
+            # No FAISS: persist chunk metadata + embeddings to SQLite so the
+            # numpy fallback search can still rank results.
+            logger.warning("FAISS not available, storing chunks in SQLite only (fallback search)")
+            valid = [c for c in chunks if c.get("embedding") is not None]
+            if self.db_path and valid:
+                try:
+                    self._save_chunks_to_db(
+                        [c["chunk_id"] for c in valid], valid, start_idx=None
+                    )
+                except Exception as exc:
+                    logger.warning("SQLite fallback persistence failed: %s", exc)
             return [c["chunk_id"] for c in chunks]
         
         # Prepare embeddings
@@ -200,17 +216,27 @@ class VectorStore:
         self, 
         chunk_ids: List[str], 
         metadatas: List[Dict], 
-        start_idx: int
+        start_idx: Optional[int]
     ) -> None:
-        """Save chunk metadata to SQLite."""
+        """Save chunk metadata to SQLite.
+
+        ``start_idx=None`` (FAISS unavailable) stores a NULL faiss_index.
+        """
         with sqlite3.connect(self.db_path) as conn:
             for i, (chunk_id, meta) in enumerate(zip(chunk_ids, metadatas)):
-                faiss_idx = start_idx + i
+                faiss_idx = None if start_idx is None else start_idx + i
+                embedding_blob = None
+                embedding = meta.get("embedding")
+                if embedding is not None:
+                    try:
+                        embedding_blob = np.asarray(embedding, dtype=np.float32).tobytes()
+                    except Exception:
+                        embedding_blob = None
                 conn.execute("""
                     INSERT OR REPLACE INTO chunks 
                     (chunk_id, document_id, content, page_number, section, 
-                     source_type, token_count, metadata, faiss_index)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     source_type, token_count, metadata, faiss_index, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     chunk_id,
                     meta.get("document_id", ""),
@@ -221,6 +247,7 @@ class VectorStore:
                     meta.get("token_count", 0),
                     json.dumps(meta.get("metadata", {})),
                     faiss_idx,
+                    embedding_blob,
                 ))
             conn.commit()
     
@@ -306,16 +333,22 @@ class VectorStore:
         document_ids: Optional[List[str]],
         min_score: float,
     ) -> List[SearchResult]:
-        """Fallback search using SQLite + numpy when FAISS unavailable."""
+        """Similarity search over SQLite-persisted embeddings.
+
+        Used only when FAISS is unavailable or empty. Since embeddings are
+        persisted with every chunk, this computes a real cosine ranking with
+        numpy and honors ``k``/``min_score``. Legacy rows without a stored
+        embedding keep score 0.0 and sort last (deterministic rowid order).
+        """
         if not self.db_path:
             return []
         
-        results = []
         query_vec = np.array(query_embedding, dtype=np.float32)
-        query_norm = np.linalg.norm(query_vec)
+        query_norm = float(np.linalg.norm(query_vec))
         
         if query_norm == 0:
             return []
+        query_vec = query_vec / query_norm
         
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -330,19 +363,42 @@ class VectorStore:
             
             rows = conn.execute(query, params).fetchall()
 
+            scored: list[tuple[float, sqlite3.Row]] = []
             for row in rows:
                 if row["chunk_id"] in self._deleted_chunk_ids:
                     continue
-                # Fallback: construct SearchResult from DB metadata only (no vector similarity)
-                results.append(SearchResult(
-                    chunk_id=row["chunk_id"],
-                    document_id=row["document_id"],
-                    content=row["content"],
-                    score=0.0,
-                    page_number=row["page_number"],
-                    section=row["section"],
-                    metadata=json.loads(row["metadata"]) if row["metadata"] else {},
-                ))
+                score = 0.0
+                try:
+                    blob = row["embedding"]
+                except (IndexError, KeyError):
+                    blob = None
+                if blob:
+                    try:
+                        vec = np.frombuffer(blob, dtype=np.float32)
+                        norm = float(np.linalg.norm(vec))
+                        if norm > 0 and vec.shape == query_vec.shape:
+                            score = float(np.dot(query_vec, vec / norm))
+                    except Exception:
+                        score = 0.0
+                if score < min_score:
+                    continue
+                scored.append((score, row))
+
+        # Stable sort: equal scores keep DB order (deterministic).
+        scored.sort(key=lambda item: item[0], reverse=True)
+        limit = max(0, int(k)) if k is not None else len(scored)
+
+        results = []
+        for score, row in scored[:limit]:
+            results.append(SearchResult(
+                chunk_id=row["chunk_id"],
+                document_id=row["document_id"],
+                content=row["content"],
+                score=score,
+                page_number=row["page_number"],
+                section=row["section"],
+                metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+            ))
         
         return results
     
@@ -397,20 +453,17 @@ class VectorStore:
         for fi in faiss_indices:
             self.index_to_chunk_id.pop(fi, None)
 
-        # Best-effort FAISS cleanup: native remove_ids when available,
-        # else rebuild a fresh IndexFlatIP from surviving vectors.
+        # Best-effort FAISS cleanup: rebuild a fresh IndexFlatIP from the
+        # surviving vectors. IndexFlatIP.remove_ids compacts positions but
+        # leaves our position->chunk mapping stale (wrong chunks returned),
+        # so we always rebuild via _rebuild_index_without, which reassigns
+        # dense positions and updates the mapping + _next_index. When the
+        # index cannot be reconstructed the tombstones above still filter
+        # every stale hit.
         if FAISS_AVAILABLE and self.index is not None and faiss_indices:
             try:
-                if hasattr(self.index, "remove_ids"):
-                    try:
-                        import numpy as _np
-
-                        ids = _np.array(sorted(set(faiss_indices)), dtype=_np.int64)
-                        self.index.remove_ids(ids)  # type: ignore[attr-defined]
-                    except Exception:
-                        self._rebuild_index_without(set(faiss_indices))
-                else:
-                    self._rebuild_index_without(set(faiss_indices))
+                self._rebuild_index_without(set(faiss_indices))
+                self._sync_index_mapping_to_db()
                 self.persist()
             except Exception as exc:
                 logger.warning("FAISS index cleanup skipped (%s); tombstone filter active.", exc)
@@ -455,6 +508,22 @@ class VectorStore:
             self._next_index = len(survivors)
         except Exception as exc:
             logger.warning("FAISS rebuild skipped (%s); tombstone filter active.", exc)
+
+    def _sync_index_mapping_to_db(self) -> None:
+        """Persist the in-memory faiss positions back to SQLite.
+
+        Keeps the metadata DB consistent with a remapped/compacted FAISS
+        index so restarts reload correct position->chunk mappings.
+        """
+        if not self.db_path:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            for chunk_id, idx in self.chunk_id_to_index.items():
+                conn.execute(
+                    "UPDATE chunks SET faiss_index = ? WHERE chunk_id = ?",
+                    (int(idx), chunk_id),
+                )
+            conn.commit()
     
     def get_document_chunks(self, document_id: str) -> List[Dict]:
         """Get all chunks for a document."""
