@@ -186,14 +186,16 @@ def _column_holds_data(session: dict, table: str, column: str, sample: int = 20,
             pwd = cfg.get("password")
             if isinstance(pwd, str) and pwd.startswith("enc1:"):
                 pwd = _dec(pwd)
+            from core.db import format_db_host
+            host = format_db_host(cfg.get("host"))
             if db_type == "mysql":
                 from urllib.parse import quote_plus as _qp
                 uri = (f"mysql+pymysql://{_qp(str(cfg.get('user', '')))}:{_qp(str(pwd))}"
-                       f"@{cfg.get('host')}:{cfg.get('port', 3306)}/{cfg.get('db', '')}")
+                       f"@{host}:{cfg.get('port', 3306)}/{cfg.get('db', '')}")
             else:
                 from urllib.parse import quote_plus as _qp2
                 uri = (f"postgresql+psycopg2://{_qp2(str(cfg.get('user', '')))}:{_qp2(str(pwd))}"
-                       f"@{cfg.get('host')}:{cfg.get('port', 5432)}/{cfg.get('db', '')}")
+                       f"@{host}:{cfg.get('port', 5432)}/{cfg.get('db', '')}")
         else:
             return True
         # No queryable URI (e.g. in-memory tests): trust the schema typing.

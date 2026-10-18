@@ -17,16 +17,42 @@ COOKIE_NAME = "aria_token"
 SECURE_COOKIE_NAME = "__Host-aria_token"
 
 
-def _cookie_secure() -> bool:
+def _is_loopback_http(request: Request | None = None) -> bool:
+    """Return true only for local plain-HTTP development origins.
+
+    Browsers reject Secure cookies over ordinary HTTP. Restrict the local
+    development exception to explicit loopback hosts so a proxied/public
+    deployment continues to use Secure cookies.
+    """
+    if request is None:
+        return False
+    try:
+        host = (request.url.hostname or "").strip("[]").lower()
+        return request.url.scheme.lower() == "http" and host in {
+            "localhost", "127.0.0.1", "::1",
+        }
+    except Exception:
+        return False
+
+
+def _cookie_secure(request: Request | None = None) -> bool:
     """Secure flag for the auth cookie. Default True (prod-safe).
 
-    Explicit opt-out for local HTTP dev only via ARIA_COOKIE_SECURE=0
-    (0/false/no/off). An explicit ARIA_ENV=dev/development/local also
-    opts out. Any other/unset value stays Secure so prod can never
-    accidentally disable it.
+    Plain HTTP on a loopback host uses a non-Secure cookie because browsers
+    discard Secure cookies there. Elsewhere, ARIA_COOKIE_SECURE or
+    ARIA_ENV=dev/development/local may opt out; any other/unset value stays
+    Secure so production does not accidentally weaken cookie transport.
     """
     explicit = (os.getenv("ARIA_COOKIE_SECURE") or "").strip().lower()
     if explicit in ("0", "false", "no", "off"):
+        return False
+    # Local ARIA is commonly opened at http://127.0.0.1:8000. Even if a
+    # machine-level environment variable was inherited by the server,
+    # issuing a Secure cookie on this plain-HTTP loopback origin makes the
+    # browser discard the session and causes protected actions to appear to
+    # log the user out. Loopback HTTP must use the plain cookie name; public
+    # hosts and HTTPS loopback remain Secure.
+    if _is_loopback_http(request):
         return False
     if explicit in ("1", "true", "yes", "on"):
         return True
@@ -35,26 +61,44 @@ def _cookie_secure() -> bool:
     return True
 
 
-def _cookie_name() -> str:
+def _cookie_name(request: Request | None = None) -> str:
     # __Host- prefix requires Secure, Path=/, and no Domain — all true
     # when secure. Use plain name for explicit local-HTTP dev.
-    return SECURE_COOKIE_NAME if _cookie_secure() else COOKIE_NAME
+    return SECURE_COOKIE_NAME if _cookie_secure(request) else COOKIE_NAME
 
 
-def _cookie_kwargs() -> dict:
+def _cookie_kwargs(request: Request | None = None) -> dict:
     return {
         "httponly": True,
         "samesite": "lax",
-        "secure": _cookie_secure(),
+        "secure": _cookie_secure(request),
         "path": "/",
         "max_age": auth.TOKEN_TTL_DAYS * 24 * 3600,
     }
 
 
-def _auth_response(token: str, username: str) -> JSONResponse:
+def _auth_response(
+    token: str,
+    username: str,
+    request: Request | None = None,
+    user_id: int | None = None,
+) -> JSONResponse:
     # HttpOnly cookie flow: never return the raw JWT in JSON.
-    resp = JSONResponse({"ok": True, "username": username})
-    resp.set_cookie(_cookie_name(), token, **_cookie_kwargs())
+    resp = JSONResponse({"ok": True, "username": username, "user_id": user_id})
+    cookie_name = _cookie_name(request)
+    cookie_kwargs = _cookie_kwargs(request)
+    resp.set_cookie(cookie_name, token, **cookie_kwargs)
+    # Remove a cookie issued under the other scheme when a client moves
+    # between HTTPS and local HTTP; otherwise an old token can shadow the new
+    # session in clients that choose the first cookie by name.
+    stale_cookie = SECURE_COOKIE_NAME if cookie_name == COOKIE_NAME else COOKIE_NAME
+    resp.delete_cookie(
+        stale_cookie,
+        path="/",
+        secure=stale_cookie == SECURE_COOKIE_NAME,
+        httponly=True,
+        samesite="lax",
+    )
     return resp
 
 # Brute-force guard: sliding-window per client IP (generous so real users
@@ -162,7 +206,9 @@ def register(auth_req: AuthRequest, request: Request):
         # Generic message: don't reveal whether the username is taken.
         raise HTTPException(status_code=400, detail="Could not create account. Try a different username.")
     username = auth_req.username.strip()
-    return _auth_response(auth.issue_token(user_id, username), username)
+    return _auth_response(
+        auth.issue_token(user_id, username), username, request, user_id=user_id,
+    )
 
 
 @router.post("/api/auth/login")
@@ -173,7 +219,9 @@ def login(auth_req: AuthRequest, request: Request):
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid username or password.")
     username = auth_req.username.strip()
-    return _auth_response(auth.issue_token(user_id, username), username)
+    return _auth_response(
+        auth.issue_token(user_id, username), username, request, user_id=user_id,
+    )
 
 
 @router.get("/api/auth/me")

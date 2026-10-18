@@ -16,6 +16,22 @@ def test_api_keys_encrypt_roundtrip():
     assert _decrypt_api_keys({"cloud": "plain"})["cloud"] == "plain"
 
 
+def test_database_uris_bracket_ipv6_hosts():
+    from sqlalchemy.engine import make_url
+    from core.db import build_db_uri
+
+    for db_type, port in (("postgresql", 5432), ("mysql", 3306)):
+        uri = build_db_uri(
+            {"user": "aria", "password": "secret", "host": "::1",
+             "port": port, "db": "northwind"},
+            db_type,
+        )
+        parsed = make_url(uri)
+        assert parsed.host == "::1"
+        assert parsed.port == port
+        assert parsed.database == "northwind"
+
+
 def test_no_query_token_fallback():
     src = (Path(__file__).resolve().parent.parent / "core" / "config.py").read_text()
     assert 'query_params.get("token")' not in src
@@ -90,6 +106,58 @@ def test_security_headers_and_limits():
     assert 'limit("feedback"' in src
     assert 'limit("rl"' in src
     assert "ARIA_ENABLE_DOCS" in src
+
+
+def test_unreadable_session_store_is_reported_and_not_overwritten(tmp_path, monkeypatch):
+    import core.config as config
+
+    monkeypatch.setenv("ARIA_WORKERS", "1")
+    monkeypatch.setattr(config, "SESSION_STORE_PATH", tmp_path / "session_store.json")
+    config.SESSION_STORE_PATH.write_text("{}", encoding="utf-8")
+    previous_status = config.session_store_status()
+    previous_mtime = config._SESSION_FILE_MTIME
+    previous_user = config.SESSION_STORE.pop(998877, None)
+    monkeypatch.setattr(config, "_ensure_user_paths", lambda session, user_id: None)
+
+    def unreadable(_path):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(config, "_read_text_locked", unreadable)
+    writes = []
+    monkeypatch.setattr(config, "_atomic_write_text", lambda *args: writes.append(args))
+    try:
+        config._load_session_store()
+        assert config.session_store_status() == {"ok": False, "error": "PermissionError"}
+        config.save_session(998877, dict(config.DEFAULT_SESSION))
+        assert writes == []
+    finally:
+        config.SESSION_STORE.pop(998877, None)
+        if previous_user is not None:
+            config.SESSION_STORE[998877] = previous_user
+        config._SESSION_STORE_STATUS.update(previous_status)
+        config._SESSION_FILE_MTIME = previous_mtime
+
+
+def test_required_multiworker_store_outage_fails_closed(monkeypatch):
+    import pytest
+    from fastapi import HTTPException
+
+    import core.config as config
+    import core.ratelimit as ratelimit
+
+    monkeypatch.setenv("ARIA_ENV", "production")
+    monkeypatch.setenv("ARIA_WORKERS", "2")
+    monkeypatch.setenv("ARIA_REDIS_URL", "redis://unavailable.invalid/0")
+    monkeypatch.setattr(config, "get_redis_client", lambda: None)
+    monkeypatch.setattr(ratelimit, "get_redis_client", lambda: None)
+
+    with pytest.raises(HTTPException) as session_error:
+        config.get_session(998878)
+    assert session_error.value.status_code == 503
+
+    with pytest.raises(HTTPException) as limit_error:
+        ratelimit.check_limit("test", "client", 10, 60)
+    assert limit_error.value.status_code == 503
 
 
 # ── hyp.txt remediation: redaction + backend consent ──────────────────────

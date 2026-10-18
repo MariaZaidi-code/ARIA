@@ -211,10 +211,32 @@ def test_suggestions_present_and_time_preferring(sales_engine, mapping):
     assert out.get("suggestions")
     # Suggestions reference the time-capable metric, not a dead end.
     assert any("amount" in s for s in out["suggestions"])
+    assert all("vary by" not in s.lower() for s in out["suggestions"])
+    assert all(("why did" in s.lower() or "changed over time" in s.lower())
+               for s in out["suggestions"])
     # Every suggestion runs without crashing the engine.
     for s in out["suggestions"][:2]:
         r = investigate_question(sales_engine, "sqlite", intel, ["orders"], s)
         assert r["ok"]
+
+
+def test_prominent_suggestions_focus_on_metric_change_over_time(sales_engine, mapping):
+    from hypothesis_engine.engine import rank_prominent, suggest_hypotheses
+
+    intel = SchemaIntelligence(mapping)
+    ranked = rank_prominent(sales_engine, "sqlite", intel, ["orders"])
+    assert all(item["kind"] == "trend" for item in ranked)
+    assert all("vary by" not in item["text"].lower()
+               and "differ across" not in item["text"].lower()
+               for item in ranked)
+
+    suggestions = suggest_hypotheses(sales_engine, "sqlite", intel, ["orders"])
+    assert suggestions
+    assert all("amount" in text.lower() for text in suggestions)
+    assert all("vary by" not in text.lower()
+               and "differ across" not in text.lower()
+               and "related?" not in text.lower()
+               for text in suggestions)
 
 
 def test_resolver_picks_targets_per_question(sales_engine, mapping):

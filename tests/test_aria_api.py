@@ -40,6 +40,7 @@ class TestAuthFlow(unittest.TestCase):
             body = r.json()
             self.assertTrue(body.get("ok"))
             self.assertEqual(body.get("username"), user)
+            self.assertIsInstance(body.get("user_id"), int)
             # HttpOnly cookie flow: raw JWT must NOT be exposed in JSON.
             self.assertNotIn("token", body)
 
@@ -49,6 +50,7 @@ class TestAuthFlow(unittest.TestCase):
 
             r = c.post("/api/auth/login", json={"username": user, "password": "Secret123!"})
             self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json().get("user_id"), body["user_id"])
             self.assertNotIn("token", r.json())
             token = c.cookies.get("aria_token") or c.cookies.get("__Host-aria_token")
             self.assertTrue(token)

@@ -2353,57 +2353,17 @@ def _hypothesis_items(session: dict) -> list:
     _h_db_uri = session.get("db_uri") if isinstance(session, dict) else None
     for tname, col_roles in roles.items():
         measures = [c for c, r in col_roles.items() if r in ("BUSINESS_MEASURE", "MEASURE", "DERIVED_METRIC")]
-        dims = [c for c, r in col_roles.items() if r in ("DIMENSION", "CATEGORY", "TEXT")]
         dates = [c for c, r in col_roles.items() if r == "DATE"]
-        if (not dims or not dates) and _h_db_uri:
-            # Same role-poor gap as meta (e.g. walmart: TEXT date + store
-            # held as IDENTIFIERs): value-verified extras so trend/segment
-            # hypotheses exist instead of an empty Hypotheses tab.
+        if not dates and _h_db_uri:
+            # Value-check unclassified columns for a date field so trend
+            # questions work across schemas with imperfect type metadata.
             try:
                 _he = _probe_table_extras(
                     mapping, tname, col_roles or {}, _h_db_uri)
-                if not dims:
-                    dims = [c for c in (_he.get("low_card_dims") or [])
-                            if c in (col_roles or {})][:3]
-                if not dates:
-                    dates = [c for c in (_he.get("date_cols") or [])
-                             if c in (col_roles or {})][:1]
+                dates = [c for c in (_he.get("date_cols") or [])
+                         if c in (col_roles or {})][:1]
             except Exception:
                 pass
-        for m in measures[:5]:
-            ml = display_name(m, m)
-            for d in dims[:3]:
-                dl = display_name(d, d)
-                hid = hashlib.sha256(f"{tname}:{m}:{d}".encode()).hexdigest()[:12]
-                items.append({
-                    "id": hid, "type": "segment", "metric": m, "dimension": d,
-                    "table": tname, "metric_label": ml, "dimension_label": dl,
-                    "title": f"Why does {ml.lower()} vary by {dl.lower()}?",
-                    "question": f"Why might {ml} have changed?",
-                    "period": "All data",
-                    "verdict": "Ready to investigate",
-                    "drivers": [{"driver": dl, "type": "Segment", "association": "Segment difference", "evidence_strength": "Moderate"}],
-                    "summary": f"Performance in {ml.lower()} differs across {dl.lower()} groups — ARIA can test which segments stand apart.",
-                    "description": f"Segment comparison of {ml} across {dl} in {display_name(tname, tname)}.",
-                    "evidence_strength": "Moderate", "strength": "Moderate", "status": "Ready to investigate",
-                    "observed_pattern": {
-                        "headline": f"{ml} is unevenly distributed across {dl.lower()}",
-                        "detail": f"Some {dl.lower()} groups contribute far more {ml.lower()} than others. Open this hypothesis to see the breakdown.",
-                    },
-                    "key_takeaways": [
-                        f"{ml} concentration differs meaningfully across {dl.lower()}.",
-                        "Focus follow-up on the top and bottom segments first.",
-                    ],
-                    "takeaways": [f"{ml} concentration differs across {dl.lower()}."],
-                    "associated_factors": [{"factor": dl, "name": dl, "type": "Segment", "kind": "Segment",
-                                            "association": f"Groups differ in {ml.lower()}", "relationship": "Segment difference",
-                                            "evidence_strength": "Moderate", "strength": "Moderate"}],
-                    "factors": [{"factor": dl, "type": "Segment", "association": "Segment difference", "evidence_strength": "Moderate"}],
-                    "evidence": [f"Grouped totals of {ml.lower()} by {dl.lower()} show a clear spread between leaders and laggards."],
-                    "evidence_points": [f"Grouped totals of {ml.lower()} by {dl.lower()} show spread."],
-                    "related": [], "next_steps": [f"Open Explore with {ml} broken down by {dl} to see the leaders.", "Test a scenario on the top segment."],
-                    "context": {"metric": ml, "breakdown": dl, "dimension": dl, "table": display_name(tname, tname), "period": "All data"},
-                })
         for m in measures[:3]:
             ml = display_name(m, m)
             for dt in dates[:1]:
@@ -2411,20 +2371,20 @@ def _hypothesis_items(session: dict) -> list:
                 items.append({
                     "id": hid, "type": "trend", "metric": m, "time": dt,
                     "table": tname, "metric_label": ml,
-                    "title": f"Is {ml.lower()} trending up or down over time?",
+                    "title": f"Why did {ml.lower()} change over time?",
                     "question": f"Why might {ml} have changed?",
                     "period": "All data",
                     "verdict": "Ready to investigate",
                     "drivers": [],
-                    "summary": f"ARIA can trace {ml.lower()} over time to describe momentum in plain language.",
+                    "summary": f"Investigate whether {ml.lower()} increased, declined, or held steady over time.",
                     "description": f"Trend of {ml} over {display_name(dt, dt)}.",
-                    "evidence_strength": "Moderate", "strength": "Moderate", "status": "Ready to investigate",
-                    "observed_pattern": {"headline": f"{ml} moves over time", "detail": f"Run Explore on {ml} to see whether momentum is building or softening."},
-                    "key_takeaways": [f"Direction of {ml.lower()} over time is testable from your history."],
-                    "takeaways": [f"Direction of {ml.lower()} is testable."],
+                    "evidence_strength": "Not tested", "strength": "Not tested", "status": "Ready to investigate",
+                    "observed_pattern": {"headline": "Change not tested yet", "detail": f"Open this question to measure whether {ml.lower()} increased, declined, or held steady."},
+                    "key_takeaways": [f"Historical change in {ml.lower()} can be tested using the available time field."],
+                    "takeaways": [f"Test whether {ml.lower()} changed over time."],
                     "associated_factors": [],
-                    "evidence": [f"Time-ordered totals of {ml.lower()} reveal the current direction."],
-                    "related": [], "next_steps": [f"Open Explore with {ml} over time."],
+                    "evidence": [],
+                    "related": [], "next_steps": [f"Measure how {ml} changed over time and investigate the largest movement."],
                     "context": {"metric": ml, "breakdown": "Time", "table": display_name(tname, tname), "period": "All data"},
                 })
     return items

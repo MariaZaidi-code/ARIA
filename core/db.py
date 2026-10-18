@@ -1,5 +1,6 @@
 """Small database / identifier helpers."""
 
+import ipaddress
 import re
 from urllib.parse import quote_plus
 
@@ -15,6 +16,21 @@ _URI_SCHEMES = {
 _SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def format_db_host(host):
+    """Format a database host for a SQLAlchemy URL authority.
+
+    IPv6 literals must be bracketed in URLs (for example, ``[::1]``).
+    Hostnames and IPv4 addresses are returned unchanged.
+    """
+    value = str(host or "").strip()
+    unwrapped = value[1:-1] if value.startswith("[") and value.endswith("]") else value
+    try:
+        address = ipaddress.ip_address(unwrapped)
+    except ValueError:
+        return value
+    return f"[{address}]" if address.version == 6 else str(address)
+
+
 def build_db_uri(config, db_type="postgresql"):
     """Build a SQLAlchemy connection URI for the given database type.
 
@@ -22,9 +38,10 @@ def build_db_uri(config, db_type="postgresql"):
     scheme is ``mysql+pymysql`` (needs pymysql installed).
     """
     scheme = _URI_SCHEMES.get(db_type, "postgresql")
+    host = format_db_host(config["host"])
     return (
         f"{scheme}://{quote_plus(config['user'])}:{quote_plus(config['password'])}"
-        f"@{config['host']}:{config['port']}/{quote_plus(config['db'])}"
+        f"@{host}:{config['port']}/{quote_plus(config['db'])}"
     )
 
 

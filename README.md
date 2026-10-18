@@ -98,8 +98,17 @@ ARIA_REQUIRE_SHARED_STORE=1
 UVICORN_WORKERS=4   # or WEB_CONCURRENCY / ARIA_WORKERS
 ```
 
-Without `ARIA_REDIS_URL`, >1 workers diverge per-process. Startup then
-fails fast (`RuntimeError`) and requests fail closed (`503`) when
+With >1 workers, production (or `ARIA_REQUIRE_SHARED_STORE=1`) requires
+reachable Redis for both sessions and rate limits. Startup fails fast
+(`RuntimeError`) if Redis is missing or unreachable, and requests fail closed
+(`503`) if Redis becomes unavailable; they never fall back to per-process
+state. Without Redis, >1 workers diverge per-process in development. Startup
+then fails fast (`RuntimeError`) and requests fail closed (`503`) when
 `ARIA_REQUIRE_SHARED_STORE=1`, or when `ARIA_ENV=production` without an
 explicit `ARIA_REQUIRE_SHARED_STORE=0` opt-out. Single-worker runs never
 fail this check.
+
+The local `data/session_store.json` is loaded at startup. If it is unreadable,
+ARIA reports the degraded state in authenticated `/api/health` and pauses
+disk writes until it can successfully read the existing store, avoiding an
+incomplete snapshot overwriting persisted sessions.

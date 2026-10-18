@@ -214,6 +214,8 @@ def _engine_for_session(session):
             password = _decrypt_secret(password)
         except Exception:
             pass
+    from core.db import format_db_host
+    host = format_db_host(host)
     if driver == "mysql":
         engine_url = f"mysql+pymysql://{quote_plus(str(user_name))}:{quote_plus(str(password))}@{host}:{port}/{db}"
     else:
@@ -422,6 +424,8 @@ def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depend
                 password = _decrypt_secret(password)
             except Exception:
                 pass
+        from core.db import format_db_host
+        host = format_db_host(host)
         if driver == "mysql":
             engine_url = f"mysql+pymysql://{quote_plus(str(user_name))}:{quote_plus(str(password))}@{host}:{port}/{db}"
         else:

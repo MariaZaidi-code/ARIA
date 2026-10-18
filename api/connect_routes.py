@@ -1444,10 +1444,12 @@ async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depen
             except Exception:
                 pass
 
+        from core.db import format_db_host
+        host = format_db_host(req.host)
         if req.dbType == "mysql":
-            url = f"mysql+pymysql://{quote_plus(str(req.user))}:{quote_plus(str(password))}@{req.host}:{req.port}/{req.db}"
+            url = f"mysql+pymysql://{quote_plus(str(req.user))}:{quote_plus(str(password))}@{host}:{req.port}/{req.db}"
         else:
-            url = f"postgresql+psycopg2://{quote_plus(str(req.user))}:{quote_plus(str(password))}@{req.host}:{req.port}/{req.db}"
+            url = f"postgresql+psycopg2://{quote_plus(str(req.user))}:{quote_plus(str(password))}@{host}:{req.port}/{req.db}"
 
         engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
         try:
@@ -1461,6 +1463,5 @@ async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depen
         from core.errors import sanitize_error
 
         return {"ok": False, "message": f"Connection failed: {sanitize_error(e)}"}
-
 
 

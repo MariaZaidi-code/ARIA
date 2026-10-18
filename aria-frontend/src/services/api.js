@@ -38,6 +38,7 @@ export const handleUnauthorized = () => {
   try {
     localStorage.removeItem("aria_auth_token"); // legacy JWT, cookie auth now
     localStorage.removeItem("aria_auth_user");
+    localStorage.removeItem("aria.v1.auth.user");
   } catch { /* ignore */ }
   try {
     window.dispatchEvent(new Event("aria:unauthorized"));
@@ -104,9 +105,15 @@ const getLLMMode = () => {
 // login/register. No Authorization header is sent (omitted entirely —
 // never `Bearer null`/empty); every request uses credentials:include so
 // the cookie travels automatically. On 401 the session is cleared and the
-// app is asked to return to login.
+// app is asked to return to login. Advisory probes may suppress that global
+// side effect while still receiving the normal rejected-response error.
 const request = async (path, options = {}) => {
-  const { signal: externalSignal, timeoutMs, ...rest } = options || {};
+  const {
+    signal: externalSignal,
+    timeoutMs,
+    suppressUnauthorized = false,
+    ...rest
+  } = options || {};
   // Per-request timeout override (clamped 1s–10min): cold local LLM calls
   // can take minutes on first load; the 90s default would abort them.
   const limitMs = Math.max(
@@ -197,8 +204,9 @@ const request = async (path, options = {}) => {
 
   if (!response.ok) {
     // Never turn failures into empty dashboards: surface a real Error.
-    // 401 clears the cookie session and routes back to login.
-    if (response.status === 401) {
+    // 401 clears the cookie session and routes back to login by default;
+    // advisory probes opt out so stale background checks cannot unmount UI.
+    if (response.status === 401 && !suppressUnauthorized) {
       handleUnauthorized();
     }
     const norm = normalizeApiError(data, response.status, response.headers);

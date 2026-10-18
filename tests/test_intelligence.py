@@ -329,6 +329,12 @@ class TestHypotheses:
         result = generate_hypotheses(SESSION, {})
         assert result["ok"] is True
         assert "candidates" in result
-        # Should have segment + trend candidates
-        types = {c["type"] for c in result["candidates"]}
-        assert "segment" in types or "trend" in types
+        # Hypothesis prompts should investigate metric movement over time,
+        # not manufacture arbitrary metric-by-dimension relationships.
+        assert result["candidates"]
+        assert {c["type"] for c in result["candidates"]} == {"trend"}
+        for candidate in result["candidates"]:
+            assert "change over time" in candidate["title"].lower()
+            assert "vary by" not in candidate["title"].lower()
+            assert candidate["evidence_strength"] == "Not tested"
+            assert candidate["evidence"] == []

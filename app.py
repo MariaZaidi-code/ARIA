@@ -106,6 +106,28 @@ async def lifespan(app: FastAPI):
                 "single worker. Set ARIA_REQUIRE_SHARED_STORE=1 to fail closed.",
                 _workers,
             )
+        if _workers > 1 and _redis_url:
+            _require_env = os.getenv("ARIA_REQUIRE_SHARED_STORE")
+            _require_raw = (_require_env or "").strip().lower()
+            _explicit_opt_out = _require_raw in {"0", "false", "no", "off"}
+            _require_shared = _require_raw in {"1", "true", "yes", "on"}
+            _is_prod = (os.getenv("ARIA_ENV", "") or "").strip().lower() == "production"
+            if _require_shared or (_is_prod and not _explicit_opt_out):
+                from core.config import get_redis_client as _get_session_redis
+                from core.ratelimit import (
+                    get_redis_client as _get_rate_limit_redis,
+                    store_backend as _rate_limit_backend,
+                )
+
+                if (
+                    _rate_limit_backend() != "redis"
+                    or _get_session_redis() is None
+                    or _get_rate_limit_redis() is None
+                ):
+                    raise RuntimeError(
+                        "Multi-worker production requires a reachable Redis "
+                        "store for both sessions and rate limits."
+                    )
     except RuntimeError:
         raise
     except Exception as exc:

@@ -36,7 +36,6 @@ const LEGACY_FALLBACK = {
   [KEYS.theme]: ["aria_theme"],
   [KEYS.llmMode]: ["aria_llm_mode"],
   [KEYS.avatar]: ["aria_avatar"],
-  [KEYS.authUser]: ["aria_auth_user"],
   [KEYS.forecastContext]: ["aria_forecast_context"],
   [KEYS.analysisContext]: ["aria_analysis_context"],
   [KEYS.history]: ["aria_analysis_history"],
@@ -203,7 +202,7 @@ export const storage = {
    * @returns {string}
    */
   scoped(base, user) {
-    const id = user?.username || user?.email || "anon";
+    const id = user?.user_id || user?.username || user?.email || "anon";
     return `${base}.${id}`;
   },
 };

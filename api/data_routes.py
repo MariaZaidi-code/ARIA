@@ -42,10 +42,12 @@ def _get_db_config(session):
             )
     driver = "mysql" if db_type == "mysql" else "postgresql"
     dialect = "mysql" if driver == "mysql" else "postgresql"
+    from core.db import format_db_host
+    host = format_db_host(config.get("host", "localhost"))
     if driver == "mysql":
-        engine_url = f"mysql+pymysql://{quote_plus(str(config.get('user', '')))}:{quote_plus(str(config.get('password', '')))}@{config.get('host', 'localhost')}:{config.get('port', 3306)}/{config.get('db', '')}"
+        engine_url = f"mysql+pymysql://{quote_plus(str(config.get('user', '')))}:{quote_plus(str(config.get('password', '')))}@{host}:{config.get('port', 3306)}/{config.get('db', '')}"
     else:
-        engine_url = f"postgresql+psycopg2://{quote_plus(str(config.get('user', '')))}:{quote_plus(str(config.get('password', '')))}@{config.get('host', 'localhost')}:{config.get('port', 5432)}/{config.get('db', '')}"
+        engine_url = f"postgresql+psycopg2://{quote_plus(str(config.get('user', '')))}:{quote_plus(str(config.get('password', '')))}@{host}:{config.get('port', 5432)}/{config.get('db', '')}"
     return config, db_type, engine_url
 
 

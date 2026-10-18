@@ -165,6 +165,8 @@ def _build_engine(session):
     _db = db_config.get("db")
     if not all([_user, _pw, _host, _db]):
         return None, db_type, db_type
+    from core.db import format_db_host
+    _host = format_db_host(_host)
     if db_type == "mysql":
         uri = (f"mysql+pymysql://{quote_plus(str(_user))}:{quote_plus(str(_pw))}"
                f"@{_host}:{db_config.get('port', 3306)}/{_db}")

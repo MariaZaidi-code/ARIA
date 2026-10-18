@@ -144,11 +144,13 @@ def _build_engine(session):
     except Exception:
         _cargs = {}
     if db_type == "mysql":
+        from core.db import format_db_host
         uri = (f"mysql+pymysql://{user}:{password}"
-               f"@{host}:{port}/{db}")
+               f"@{format_db_host(host)}:{port}/{db}")
     else:
+        from core.db import format_db_host
         uri = (f"postgresql://{user}:{password}"
-               f"@{host}:{port}/{db}")
+               f"@{format_db_host(host)}:{port}/{db}")
     return create_engine(uri, pool_pre_ping=True,
                          **({"connect_args": _cargs} if _cargs else {})), session.get("dialect", "postgresql"), db_type
 

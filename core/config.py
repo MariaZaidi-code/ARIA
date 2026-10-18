@@ -166,11 +166,12 @@ def _ensure_relational_uri(session):
                 pwd = _plain
         if not pwd:
             return session
-        from urllib.parse import quote_plus as _qp, quote as _q
+        from urllib.parse import quote_plus as _qp
+        from core.db import format_db_host as _format_db_host
         scheme = "mysql+pymysql" if session.get("db_type") == "mysql" else "postgresql+psycopg2"
         session["db_uri"] = (
             f"{scheme}://{_qp(str(cfg.get('user', '')))}:{_qp(str(pwd))}"
-            f"@{_q(str(cfg.get('host', '')), safe='')}:{cfg.get('port')}/{_qp(str(cfg.get('db', '')))}"
+            f"@{_format_db_host(cfg.get('host', ''))}:{cfg.get('port')}/{_qp(str(cfg.get('db', '')))}"
         )
     except Exception:
         pass
@@ -597,6 +598,31 @@ SESSION_LOCK = threading.RLock()
 # disk or Redis I/O.
 _SESSION_PERSIST_LOCK = threading.Lock()
 _SESSION_FILE_MTIME: float | None = None
+_SESSION_STORE_STATUS = {"ok": True, "error": None}
+
+
+def session_store_status() -> dict:
+    """Return whether the local session store was read successfully."""
+    return dict(_SESSION_STORE_STATUS)
+
+
+def _shared_store_required() -> bool:
+    """Whether multi-worker operation must fail closed without Redis."""
+    workers = 1
+    for name in ("UVICORN_WORKERS", "WEB_CONCURRENCY", "ARIA_WORKERS"):
+        try:
+            workers = max(workers, int(os.getenv(name, "1") or 1))
+        except (TypeError, ValueError):
+            continue
+    if workers <= 1:
+        return False
+    require_raw = (os.getenv("ARIA_REQUIRE_SHARED_STORE") or "").strip().lower()
+    if require_raw in {"0", "false", "no", "off"}:
+        return False
+    return (
+        require_raw in {"1", "true", "yes", "on"}
+        or (os.getenv("ARIA_ENV") or "").strip().lower() == "production"
+    )
 
 # Load persisted sessions from disk (survives server restarts).
 def _session_to_disk_dict(session: dict) -> dict:
@@ -633,27 +659,23 @@ def _disk_dict_to_session(loaded: dict) -> dict:
     return _decrypt_session_keys(loaded)
 
 
-def _redis_save_one(user_id: int, created: float, session: dict) -> None:
-    """Best-effort write-through of one session to Redis (never raises)."""
+def _redis_save_one(user_id: int, created: float, session: dict) -> bool:
+    """Write one session to Redis and report whether the write succeeded."""
     try:
         client = get_redis_client()
         if client is None:
-            return
+            return False
         import json as _json
 
         payload = _json.dumps(
             {"created": float(created), "session": _session_to_disk_dict(session)},
             default=str,
         )
-        try:
-            client.setex(_redis_session_key(user_id), int(SESSION_TTL_SECONDS), payload)
-        except Exception as exc:
-            _logger.warning(
-                "Redis session save failed (%s); file store remains authoritative.",
-                type(exc).__name__,
-            )
-    except Exception:
-        pass
+        client.setex(_redis_session_key(user_id), int(SESSION_TTL_SECONDS), payload)
+        return True
+    except Exception as exc:
+        _logger.warning("Redis session save failed (%s).", type(exc).__name__)
+        return False
 
 
 def _redis_load_one(user_id: int):
@@ -661,6 +683,12 @@ def _redis_load_one(user_id: int):
     try:
         client = get_redis_client()
         if client is None:
+            if _shared_store_required():
+                from fastapi import HTTPException
+                raise HTTPException(
+                    status_code=503,
+                    detail="Shared session store is unavailable. Retry shortly.",
+                )
             return None
         raw = client.get(_redis_session_key(user_id))
         if not raw:
@@ -671,25 +699,44 @@ def _redis_load_one(user_id: int):
         created = float(data.get("created", 0) or 0)
         session = _disk_dict_to_session(dict(data.get("session") or {}))
         return (created, session)
-    except Exception:
+    except Exception as exc:
+        if _shared_store_required():
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=503,
+                detail="Shared session store is unavailable. Retry shortly.",
+            ) from exc
         return None
 
 
 def _load_session_store():
     """Load persisted session store from disk (locked read; file fallback)."""
+    global _SESSION_FILE_MTIME
     try:
         import json as _json
-        if SESSION_STORE_PATH.exists():
-            data = _json.loads(_read_text_locked(SESSION_STORE_PATH))
-            for uid_str, (created, session) in data.items():
-                uid = int(uid_str)
-                loaded = _disk_dict_to_session(dict(session))
-                SESSION_STORE[uid] = (float(created), loaded)
+        if not SESSION_STORE_PATH.exists():
+            _SESSION_STORE_STATUS.update(ok=True, error=None)
+            return
+        data = _json.loads(_read_text_locked(SESSION_STORE_PATH))
+        loaded_sessions = {}
+        for uid_str, (created, session) in data.items():
+            uid = int(uid_str)
+            loaded_sessions[uid] = (
+                float(created),
+                _disk_dict_to_session(dict(session)),
+            )
+        with SESSION_LOCK:
+            SESSION_STORE.update(loaded_sessions)
+        try:
+            _SESSION_FILE_MTIME = SESSION_STORE_PATH.stat().st_mtime
+        except OSError:
+            _SESSION_FILE_MTIME = None
+        _SESSION_STORE_STATUS.update(ok=True, error=None)
     except Exception as exc:
-        # A corrupt/unreadable store silently resetting users is worse than a
-        # logged warning: leave a trail with the failure mode and path.
+        _SESSION_STORE_STATUS.update(ok=False, error=type(exc).__name__)
         _logger.warning(
-            "session store load failed (%s): %s — users fall back to defaults",
+            "session store load failed (%s): %s; persisted sessions are "
+            "unavailable and disk writes are paused until the store can be read",
             type(exc).__name__, SESSION_STORE_PATH,
         )
 
@@ -755,6 +802,12 @@ SESSION_TTL_SECONDS = 4 * 60 * 60  # 4 hours
 
 def check_session_store_shared() -> None:
     """Fail closed when workers > 1 without a shared session/rate-limit store."""
+    if _shared_store_required() and get_redis_client() is None:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=503,
+            detail="Multi-worker deployment requires an available shared session store.",
+        )
     try:
         from core.ratelimit import _check_shared_store
         _check_shared_store()
@@ -842,9 +895,12 @@ def get_session(user_id=None):
     # Redis is network I/O: fetch outside SESSION_LOCK so one slow shared
     # store doesn't serialize every concurrent request (only dict/CPU work
     # runs under the lock).
+    _shared_required = _shared_store_required()
     try:
         _redis_hit = _redis_load_one(user_id)
     except Exception:
+        if _shared_required:
+            raise
         _redis_hit = None
     with SESSION_LOCK:
         # Redis-first when configured: shared store is authoritative across
@@ -862,6 +918,17 @@ def get_session(user_id=None):
                     return _copy_session(_sess)
             except Exception:
                 pass
+        if _shared_required:
+            # Redis is authoritative in required multi-worker deployments.
+            # Never revive a potentially stale per-process or file copy,
+            # including when an expired Redis entry is present.
+            SESSION_STORE.pop(user_id, None)
+            fresh = dict(DEFAULT_SESSION)
+            _ensure_user_paths(fresh, user_id)
+            SESSION_STORE[user_id] = (now, fresh)
+            _ensure_relational_uri(fresh)
+            _ensure_provider(fresh)
+            return _copy_session(fresh)
         # mtime-gated reconcile: avoid re-reading/parsing session_store.json
         # on every request. Only reload when the file actually changed.
         # save_session updates _SESSION_FILE_MTIME so our own writes never
@@ -940,6 +1007,11 @@ def save_session(user_id, session):
     # atomic replace itself takes the sidecar file lock, which is what
     # actually serializes writers across processes.
     with _SESSION_PERSIST_LOCK:
+        if not _SESSION_STORE_STATUS["ok"]:
+            # Re-read before writing: otherwise a permission/corruption
+            # failure at startup could cause an incomplete snapshot to
+            # replace the user's existing session file.
+            _load_session_store()
         with SESSION_LOCK:
             SESSION_STORE[user_id] = (now, session)
             _entry_created, _entry_sess = SESSION_STORE[user_id]
@@ -954,6 +1026,20 @@ def save_session(user_id, session):
             payload = _json.dumps(disk_store, default=str)
         except Exception as exc:
             _logger.warning("session store serialization failed (%s)", type(exc).__name__)
+            return
+        if _shared_store_required():
+            if not _redis_save_one(user_id, _entry_created, _entry_sess):
+                from fastapi import HTTPException
+                raise HTTPException(
+                    status_code=503,
+                    detail="Shared session store is unavailable. Retry shortly.",
+                )
+            return
+        if not _SESSION_STORE_STATUS["ok"]:
+            _logger.error(
+                "session store write skipped because persisted state could not "
+                "be loaded (%s)", _SESSION_STORE_STATUS["error"],
+            )
             return
         # Slow I/O stays outside SESSION_LOCK. The persistence lock orders
         # snapshots and writes, preventing a stale concurrent snapshot from
@@ -999,19 +1085,31 @@ def get_session_for_request(request):
         # Guard against frontend sending literal "null"/"undefined"/empty.
         if candidate and candidate.lower() not in ("null", "undefined", "none"):
             token = candidate
-    if not token:
+    import auth
+    payload = None
+    if token and isinstance(token, str):
+        try:
+            payload = auth.verify_token(token)
+        except Exception:
+            payload = None
+    elif not token:
         try:
             cookies = getattr(request, "cookies", {}) or {}
-            token = cookies.get("aria_token") or cookies.get("__Host-aria_token") or None
+            # Validate both supported cookie names instead of letting an
+            # expired cookie mask a valid session issued under the other name.
+            for cookie_name in ("aria_token", "__Host-aria_token"):
+                candidate = cookies.get(cookie_name)
+                if not candidate or not isinstance(candidate, str):
+                    continue
+                try:
+                    payload = auth.verify_token(candidate)
+                except Exception:
+                    payload = None
+                if payload:
+                    token = candidate
+                    break
         except Exception:
-            token = None
-    if not token or not isinstance(token, str):
-        raise HTTPException(status_code=401, detail="Not authenticated. Provide a valid Bearer token.")
-    try:
-        import auth
-        payload = auth.verify_token(token)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Not authenticated. Provide a valid Bearer token.")
+            payload = None
     if not payload:
         raise HTTPException(status_code=401, detail="Not authenticated. Provide a valid Bearer token.")
     try:
