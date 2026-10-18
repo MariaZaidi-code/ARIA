@@ -18,12 +18,24 @@ export default function Login({ onLogin }: LoginProps) {
     e.preventDefault();
     setError("");
 
-    if (email.trim() === "" || password.trim() === "") {
-      setError("Please enter your email and password.");
+    const identity = email.trim();
+    if (identity === "" || password.trim() === "") {
+      setError(mode === "login"
+        ? "Please enter your email or username and password."
+        : "Please enter your email and password.");
       return;
     }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+    const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(identity);
+    if (mode === "register" && !isEmail) {
       setError("Please enter a valid email address.");
+      return;
+    }
+    if (mode === "login" && identity.includes("@") && !isEmail) {
+      setError("Please enter a valid email address or workspace username.");
+      return;
+    }
+    if (mode === "login" && !identity.includes("@") && identity.length < 3) {
+      setError("Workspace usernames must be at least 3 characters.");
       return;
     }
 
@@ -54,9 +66,6 @@ export default function Login({ onLogin }: LoginProps) {
       const result = await authenticateLocalUser(email, password);
       if (!result.success) {
         setError(result.message || "Unable to sign in.");
-        if (result.code === "USER_NOT_FOUND") {
-          setMode("register");
-        }
         return;
       }
       onLogin();
@@ -168,14 +177,16 @@ export default function Login({ onLogin }: LoginProps) {
             )}
 
             <div className="login-form-group">
-              <label htmlFor="login-email">Email Address</label>
+              <label htmlFor="login-email">
+                {mode === "login" ? "Email Address or Username" : "Email Address"}
+              </label>
               <input
                 id="login-email"
-                type="email"
+                type={mode === "login" ? "text" : "email"}
                 value={email}
                 onChange={(e) => { setEmail(e.target.value); setError(""); }}
-                placeholder="you@company.com"
-                autoComplete="email"
+                placeholder={mode === "login" ? "you@company.com or username" : "you@company.com"}
+                autoComplete={mode === "login" ? "username" : "email"}
                 aria-invalid={error ? "true" : undefined}
               />
             </div>

@@ -45,7 +45,12 @@ export default function LLMSelection({ onSelectLLM }: LLMSelectionProps) {
     try {
       // Single client: apiFetch handles API_BASE + credentials:include +
       // X-Request-ID + 401. Throws on error; status stays advisory.
-      const data = await apiFetch(`/providers/status`);
+      // Availability is advisory. A stale/expired session must not let this
+      // background probe fire the global unauthorized handler and unmount
+      // the sign-in/selection flow without giving the user feedback.
+      const data = await apiFetch(`/providers/status`, {
+        suppressUnauthorized: true,
+      });
       if (Array.isArray(data.providers)) {
         const map: Record<string, { available: boolean; reason: string }> = {};
         for (const p of data.providers) {

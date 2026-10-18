@@ -8,6 +8,7 @@ import auth
 from core.config import get_session
 
 
+
 def get_current_user(request: Request, authorization: str | None = Header(default=None)) -> dict:
     """Resolve the Bearer token into a {user_id, username} dict or 401.
 
@@ -19,18 +20,27 @@ def get_current_user(request: Request, authorization: str | None = Header(defaul
     back to a default/anonymous session.
     """
     token = None
+    user = None
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
-    if not token or token.lower() in ("null", "undefined", '""', "''", "none"):
-        token = None
+        if token and token.lower() not in ("null", "undefined", '""', "''", "none"):
+            user = auth.verify_token(token)
+        else:
+            token = None
     if not token:
-        # Prefer __Host- prefixed cookie; fall back to legacy plain name.
+        # Try both cookie names and select the first valid session. A browser
+        # can retain an expired __Host cookie alongside a newer local-dev
+        # aria_token; choosing by name alone lets the stale cookie mask the
+        # valid one on every protected request.
         for _name in ("__Host-aria_token", "aria_token"):
-            _tok = request.cookies.get(_name)
-            if _tok and _tok.strip() and _tok.strip().lower() not in ("null", "undefined", '""', "''", "none"):
-                token = _tok.strip()
+            _candidate = (request.cookies.get(_name) or "").strip()
+            if not _candidate or _candidate.lower() in ("null", "undefined", '""', "''", "none"):
+                continue
+            _user = auth.verify_token(_candidate)
+            if _user:
+                token = _candidate
+                user = _user
                 break
-    user = auth.verify_token(token) if token else None
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated. Provide a valid Bearer token.")
     return user

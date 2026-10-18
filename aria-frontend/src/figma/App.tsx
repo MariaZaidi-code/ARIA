@@ -95,6 +95,7 @@ export default function App() {
   const [appStage, setAppStage] = useState<AppStage>("login");
   const [currentUser, setCurrentUser] = useState<{ email?: string } | null>(null);
   const [selectedLLM, setSelectedLLM] = useState("");
+  const bootSessionCheckRef = useRef<AbortController | null>(null);
 
   // ---- Theme ----
   const [isDark, setIsDark] = useState(() => {
@@ -138,15 +139,21 @@ export default function App() {
     window.addEventListener("aria:unauthorized", onUnauthorized);
     (async () => {
       const ctrl = new AbortController();
+      bootSessionCheckRef.current = ctrl;
       const t = setTimeout(() => ctrl.abort(), 10000);
       try {
-        // Single client: apiFetch carries credentials + 401 cleanup.
-        // A 10s caller signal keeps the boot probe snappy; slower
-        // failures stay AbortErrors so blips never log the user out.
-        const body: any = await apiFetch("/session/status", { signal: ctrl.signal }).catch((e: any) => {
+        // A boot-time 401 describes the session at the moment the probe
+        // started; it must not emit a global logout event after a user has
+        // successfully signed in. The probe is explicitly aborted by
+        // handleLogin and handles its own 401 below.
+        const body: any = await apiFetch("/session/status", {
+          signal: ctrl.signal,
+          suppressUnauthorized: true,
+        }).catch((e: any) => {
           if (e?.status === 401) throw e;
           return null;
         });
+        if (ctrl.signal.aborted) return;
         if (!body) return;
         // Restore connection state from the live server session so a page
         // reload does not drop every page to "Connect a data source" while
@@ -166,12 +173,18 @@ export default function App() {
       } catch (e: any) {
         // 401 returns to login; blips/offline keep the current stage so
         // a flaky network does not log the user out. Pages retry.
+        if (ctrl.signal.aborted) return;
         if (e?.status === 401) toLogin();
       } finally {
         clearTimeout(t);
+        if (bootSessionCheckRef.current === ctrl) bootSessionCheckRef.current = null;
       }
     })();
-    return () => window.removeEventListener("aria:unauthorized", onUnauthorized);
+    return () => {
+      bootSessionCheckRef.current?.abort();
+      bootSessionCheckRef.current = null;
+      window.removeEventListener("aria:unauthorized", onUnauthorized);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -222,6 +235,10 @@ export default function App() {
   // =========================================================
 
   const handleLogin = () => {
+    // Do not let a session probe started before authentication overwrite a
+    // successful login with its stale unauthenticated result.
+    bootSessionCheckRef.current?.abort();
+    bootSessionCheckRef.current = null;
     const user = getAuthUser();
     setCurrentUser(user ? { email: user.email || user.username } : { email: "user" });
     setAppStage("llm-selection");

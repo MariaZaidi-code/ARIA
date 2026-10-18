@@ -373,10 +373,60 @@ class TestBatch23Guards(unittest.TestCase):
 
         scope = {
             "type": "http",
-            "headers": [(b"cookie", f"{COOKIE_NAME}={token}".encode())],
+            "headers": [(
+                b"cookie",
+                f"__Host-aria_token=expired-token; {COOKIE_NAME}={token}".encode(),
+            )],
         }
-        user = get_current_user(Request(scope), authorization=None)
+        request = Request(scope)
+        user = get_current_user(request, authorization=None)
         self.assertEqual(user["user_id"], uid)
+        from core.config import get_session_for_request
+
+        self.assertIsInstance(get_session_for_request(request), dict)
+
+    def test_local_http_uses_browser_compatible_auth_cookie(self):
+        import os
+        from starlette.requests import Request
+
+        from api.auth_routes import _cookie_secure
+
+        old_env = os.environ.get("ARIA_ENV")
+        old_secure = os.environ.get("ARIA_COOKIE_SECURE")
+        os.environ["ARIA_ENV"] = "production"
+        os.environ["ARIA_COOKIE_SECURE"] = "1"
+        try:
+            local_http = Request({
+                "type": "http",
+                "scheme": "http",
+                "server": ("127.0.0.1", 8000),
+                "path": "/api/auth/login",
+                "query_string": b"",
+                "headers": [(b"host", b"127.0.0.1:8000")],
+            })
+            public_https = Request({
+                "type": "http",
+                "scheme": "https",
+                "server": ("example.com", 443),
+                "path": "/api/auth/login",
+                "query_string": b"",
+                "headers": [(b"host", b"example.com")],
+            })
+            self.assertFalse(
+                _cookie_secure(local_http),
+                f"loopback request was parsed as {local_http.url!s} "
+                f"(scheme={local_http.url.scheme!r}, host={local_http.url.hostname!r})",
+            )
+            self.assertTrue(_cookie_secure(public_https))
+        finally:
+            if old_env is None:
+                os.environ.pop("ARIA_ENV", None)
+            else:
+                os.environ["ARIA_ENV"] = old_env
+            if old_secure is None:
+                os.environ.pop("ARIA_COOKIE_SECURE", None)
+            else:
+                os.environ["ARIA_COOKIE_SECURE"] = old_secure
 
     def test_unauth_ip_throttle_trips(self):
         from fastapi import HTTPException
