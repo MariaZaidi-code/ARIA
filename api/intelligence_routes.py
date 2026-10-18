@@ -10,7 +10,7 @@ import logging
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from core.config import get_session
 from core.deps import get_current_user, require_writable, get_request_id
@@ -39,8 +39,7 @@ class ExploreRequest(BaseModel):
     dateRange: dict | str | None = None
     filters: list | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class WhatIfRequest(BaseModel):
@@ -55,8 +54,7 @@ class WhatIfRequest(BaseModel):
     applyTo: str | None = None
     scope: str | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class GoalRequest(BaseModel):
@@ -74,8 +72,7 @@ class GoalRequest(BaseModel):
     due: str | None = None
     status: str | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class ReportRequest(BaseModel):
@@ -86,8 +83,7 @@ class ReportRequest(BaseModel):
     sections: list | None = None
     template: str = "professional"
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class AnalysisRequest(BaseModel):
@@ -100,8 +96,7 @@ class AnalysisRequest(BaseModel):
     result_summary: str | None = None
     summary: str | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class ScenarioRequest(BaseModel):
@@ -112,8 +107,7 @@ class ScenarioRequest(BaseModel):
     change_type: str | None = None
     result: dict | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class TemplateRequest(BaseModel):
@@ -122,8 +116,7 @@ class TemplateRequest(BaseModel):
     sections: list | None = None
     template: str | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class DigestRequest(BaseModel):
@@ -134,8 +127,7 @@ class DigestRequest(BaseModel):
     template: str = "professional"
     sections: list | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class DigestPatch(BaseModel):
@@ -146,8 +138,7 @@ class DigestPatch(BaseModel):
     template: str | None = None
     sections: list | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 # ---------------------------------------------------------------------------
@@ -241,10 +232,9 @@ def _schema_cache_tag(session: dict) -> str:
 @router.post("/explore")
 def run_explore(req: ExploreRequest, request: Request, user: dict = Depends(require_writable)):
     """Run a server-side aggregation analysis."""
-    try:
-        session, user = _get_session_and_user(request, user)
-    except HTTPException as exc:
-        return {"ok": False, "detail": exc.detail, "code": "NO_DATA"}
+    # No connected dataset is a client-side precondition, not a success
+    # body: raise so normalizeApiError-based clients see a real error.
+    session, user = _get_session_and_user(request, user)
     payload = req.model_dump()
     # normalize frontend aliases for service
     if not payload.get("time") and (payload.get("time_grain") or payload.get("timeGrain")):
@@ -300,10 +290,7 @@ def list_hypotheses(request: Request, user: dict = Depends(get_current_user)):
 @router.get("/hypotheses/{hypothesis_id}")
 def get_hypothesis(hypothesis_id: str, request: Request, user: dict = Depends(get_current_user)):
     """Single hypothesis detail for the Hypotheses tab."""
-    try:
-        session, user = _get_session_and_user(request, user)
-    except HTTPException as exc:
-        return {"ok": False, "detail": exc.detail, "code": "NO_DATA"}
+    session, user = _get_session_and_user(request, user)
     detail = intel.get_hypothesis_detail(session, hypothesis_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Hypothesis not found.")
@@ -397,10 +384,7 @@ def whatif_meta(request: Request, user: dict = Depends(get_current_user)):
 @router.post("/what-if/run")
 def run_whatif(req: WhatIfRequest, request: Request, user: dict = Depends(require_writable)):
     """Run a What-If scenario."""
-    try:
-        session, user = _get_session_and_user(request, user)
-    except HTTPException as exc:
-        return {"ok": False, "detail": exc.detail, "code": "NO_DATA"}
+    session, user = _get_session_and_user(request, user)
     payload = req.model_dump()
     if not payload.get("variable"):
         payload["variable"] = payload.get("metric") or payload.get("column")

@@ -29,9 +29,12 @@ const LLM_OPTIONS = [
   },
 ];
 
+const isConnectionIssue = (message: string) =>
+  /connection error|apiconnectionerror|connecterror|timeout|timed out|network is unreachable/i.test(message);
+
 export default function LLMSelection({ onSelectLLM }: LLMSelectionProps) {
   const [selected, setSelected] = useState<string | null>(null);
-  const [groqKey, setGroqKey] = useState("");
+  const [apiKey, setApiKey] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<Record<string, { available: boolean; reason: string }>>({});
@@ -62,30 +65,17 @@ export default function LLMSelection({ onSelectLLM }: LLMSelectionProps) {
   const confirm = async () => {
     if (!selected || busy) return;
     setError("");
-    if (selected === "cloud" && !groqKey.trim()) {
-      const st = status["cloud"];
-      if (st && !st.available && st.reason) {
-        setError(st.reason);
-      } else if (st && st.available) {
-        // The server already holds a reachable key for Cloud AI (see
-        // providers/status). Forcing a re-paste here blocks a working
-        // provider, so switch keyless — handleLLMSelect omits api_key
-        // and the backend reuses its stored key.
-      } else {
-        setError("Paste your Groq API key to use Cloud AI — Local AI needs no key.");
-      }
-      // fall through: an available server-side key means no paste needed
-    }
-    const st = selected ? status[selected] : undefined;
-    if (st && !st.available) {
-      setError(`${st.reason} You can retry the status check or choose the other engine.`);
-      return;
-    }
+    // Provider status is advisory and can fail on a transient network error.
+    // Let the backend validate the saved/env key during the switch; that check
+    // has a longer timeout and returns the actionable error.
     setBusy(true);
     try {
-      await onSelectLLM(selected, selected === "cloud" ? groqKey.trim() : undefined);
+      await onSelectLLM(selected, selected === "cloud" ? apiKey.trim() || undefined : undefined);
     } catch (err: any) {
-      setError(err?.message || "Could not switch provider. Check the key and try again.");
+      const message = err?.message || "Could not switch provider. Check the key and try again.";
+      setError(isConnectionIssue(message)
+        ? "Could not verify the Cloud AI connection just now. This does not confirm the key is invalid; please retry shortly."
+        : message);
     } finally {
       setBusy(false);
     }
@@ -197,7 +187,7 @@ export default function LLMSelection({ onSelectLLM }: LLMSelectionProps) {
                       style={{ background: status[opt.id].available ? "var(--positive)" : "var(--negative)" }}
                     />
                     <span style={{ color: "var(--muted-foreground)" }}>
-                      {status[opt.id].available ? "Available" : "Unavailable"} — {status[opt.id].reason}
+                      {status[opt.id].available ? "Available" : isConnectionIssue(status[opt.id].reason) ? "Could not verify" : "Unavailable"} — {status[opt.id].reason}
                     </span>
                   </>
                 ) : null}
@@ -208,14 +198,14 @@ export default function LLMSelection({ onSelectLLM }: LLMSelectionProps) {
 
         {selected === "cloud" && (
           <div className="mb-4 animate-fade-in">
-            <label htmlFor="llm-groq-key" className="block text-xs font-semibold mb-1.5" style={{ color: "var(--foreground)" }}>
+            <label htmlFor="llm-api-key" className="block text-xs font-semibold mb-1.5" style={{ color: "var(--foreground)" }}>
               Groq API key (used only for Cloud AI)
             </label>
             <input
-              id="llm-groq-key"
+              id="llm-api-key"
               type="password"
-              value={groqKey}
-              onChange={(e) => setGroqKey(e.target.value)}
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
               placeholder="gsk_..."
               autoComplete="off"
               className="w-full px-4 py-2.5 rounded-xl text-sm outline-none"

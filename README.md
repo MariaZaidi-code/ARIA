@@ -30,7 +30,7 @@ python -m pytest tests/ -q    # backend suite must stay green
 
 | Layer | Location | Role |
 |---|---|---|
-| API | `app.py`, `api/` (19 routers) | FastAPI routes, auth, CORS, static serving |
+| API | `app.py`, `api/` (23 routers) | FastAPI routes, auth, CORS, static serving |
 | Auth | `auth.py`, `api/auth_routes.py` | PBKDF2 passwords, HS256 JWT, per-user history |
 | Shared | `core/` | config+DPAPI secrets, session store, guards, semantic helpers (`semantic.py`), RL (`rl.py`) |
 | NL→SQL | `goal_agent/` | intent → semantic grounding → SQL contract → execution + validation |
@@ -67,6 +67,14 @@ encrypted `db` config on restart). Rotate provider keys in their dashboards if e
 - `POST /api/ask` → answer + `provenance {sql, tables, methodology, confidence, timestamp}`
 - `POST /api/predictive/forecast`, `POST /api/prescription/generate`, `POST /api/hypothesis`
 - `POST /api/rl/event`, `GET /api/rl/events` — RL telemetry (summaries only, never raw datasets)
+- `POST /api/rl/feedback` (random popup reward, 1-5 stars -> [-1, +1]), `GET /api/rl/status` (policy/observability), `POST /api/rl/rank` (replaceable policy ranks pre-validated candidates)
+- `GET/POST/PATCH/DELETE /api/workspace/monitors[/{id}[/check]]`, `POST /api/workspace/monitors/preview` (plain English -> condition + cadence)
+- `GET/PUT /api/workspace/targets`, `GET/PUT /api/workspace/glossary` (`{term, maps_to}`; matched terms rewrite `/api/ask` questions, echoed as `glossary_applied`)
+- `GET /api/workspace/notifications`, `POST /api/workspace/notifications/read`, `DELETE /api/workspace/notifications`
+- `GET/POST/DELETE /api/workspace/webhooks[/{id}[/test]]` (Slack/Teams URLs get native payload shapes)
+- `GET/POST /api/workspace/integrations` (Slack command token: masked on GET, full only on regenerate)
+- `POST /api/export/story` — `format: pptx|xlsx|html` renders the exact in-app envelope (no recomputation); pptx needs `python-pptx`, xlsx `openpyxl`
+- `POST /api/integrations/slack/command?token=…` — Slack slash command; resolves the workspace token to the ARIA user and answers via the same `/api/ask` pipeline, optionally deferring through `response_url` (hooks.slack.com only)
 
 ## Honesty rules (enforced)
 

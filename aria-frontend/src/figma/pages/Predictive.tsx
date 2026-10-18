@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { RefreshCw, Sparkles, Target, TrendingUp, TrendingDown, Crosshair, Lightbulb, Check, Shield } from "lucide-react";
-import { ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Brush } from "recharts";
+import { ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
 import { useTheme } from "../App";
 import Evidence from "../components/Evidence";
 import { ChartFrame, useSeriesToggle, ToggleLegend } from "../components/charts";
+import { ChartBrush } from "../components/ChartBrush";
 import { CATEGORY_COLORS } from "../lib/charts";
 import AIProcessingIndicator from "../components/AIProcessingIndicator";
 import { loadAnalysisContext, readHashParams, saveAnalysisContext } from "../lib/analysisContext";
@@ -1538,8 +1539,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                       <Line type="monotone" dataKey="act" stroke="#8B5CF6" strokeWidth={2} strokeDasharray="2 3" dot={false} connectNulls name="If we act (estimate)" isAnimationActive={true} animationBegin={200} animationDuration={900} />
                     )}
                     {chartRows.length > 5 && (
-                      <Brush
-                        dataKey="short" height={24} stroke="var(--primary)" travellerWidth={10}
+                      <ChartBrush
+                        dataKey="short"
                         startIndex={win ? Math.max(0, win.s) : undefined}
                         endIndex={win ? Math.min(chartRows.length - 1, win.e) : undefined}
                         onChange={(r: any) => {

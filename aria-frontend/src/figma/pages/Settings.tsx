@@ -1,16 +1,18 @@
 import { useState, useEffect } from "react";
-import { User, Palette, Brain, Database, Bell, Shield, Monitor, ChevronRight } from "lucide-react";
+import { User, Palette, Brain, Database, Bell, Shield, Monitor, ChevronRight, Boxes } from "lucide-react";
 import { useTheme } from "../App";
 import { apiFetch } from "../../services/api";
 import { KEYS, storage } from "../../utils/storage";
+import WorkspacePanels from "../components/WorkspacePanels";
 
-type Tab = "profile" | "appearance" | "ai" | "datasources" | "notifications" | "privacy" | "application";
+type Tab = "profile" | "appearance" | "ai" | "datasources" | "workspace" | "notifications" | "privacy" | "application";
 
 const tabs: { id: Tab; label: string; icon: React.ElementType }[] = [
   { id: "profile", label: "Profile", icon: User },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "ai", label: "AI Configuration", icon: Brain },
   { id: "datasources", label: "Data Sources", icon: Database },
+  { id: "workspace", label: "Workspace", icon: Boxes },
   { id: "notifications", label: "Notifications", icon: Bell },
   { id: "privacy", label: "Privacy", icon: Shield },
   { id: "application", label: "Application", icon: Monitor },
@@ -107,6 +109,8 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
           <div className="mb-4 text-sm text-positive bg-positive/10 border border-positive/20 rounded-lg px-3 py-2">{saveMsg}</div>
         )}
 
+        {tab === "workspace" && <WorkspacePanels />}
+
         {tab === "profile" && (
           <div className="space-y-6">
             <div>
@@ -197,6 +201,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
                 <select value={selectedProvider} onChange={(e) => setSelectedProvider(e.target.value)}
                   className="bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none w-40">
                   <option value="cloud">Cloud (Groq)</option>
+                  <option value="grok">Grok (xAI)</option>
                   <option value="deepseek">DeepSeek</option>
                   <option value="omniroute">Universal (OmniRoute)</option>
                   <option value="local">Local (Ollama)</option>
@@ -226,7 +231,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
               <div className="pt-3 border-t border-border">
                 <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-2">Current AI Mode</p>
                 <div className="flex items-center justify-between py-2 px-3 bg-primary/5 border border-primary/20 rounded-lg">
-                  <span className="text-sm font-medium text-primary capitalize">{selectedLLM === "local" ? "Local LLM (Ollama)" : selectedLLM === "cloud" ? "Cloud LLM (Groq)" : selectedLLM === "deepseek" ? "DeepSeek" : selectedLLM === "omniroute" ? "Universal (OmniRoute)" : selectedLLM}</span>
+                  <span className="text-sm font-medium text-primary capitalize">{selectedLLM === "local" ? "Local LLM (Ollama)" : selectedLLM === "cloud" ? "Cloud LLM (Groq)" : selectedLLM === "grok" ? "Grok (xAI)" : selectedLLM === "deepseek" ? "DeepSeek" : selectedLLM === "omniroute" ? "Universal (OmniRoute)" : selectedLLM}</span>
                   {onChangeLLM && (
                     <button onClick={onChangeLLM} className="text-[11px] text-primary hover:underline">Change</button>
                   )}
@@ -302,7 +307,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
             </div>
             <div className="py-3 border-t border-border">
               <p className="text-sm text-foreground">API Key Security</p>
-              <p className="text-xs text-muted-foreground mt-1">All API keys are stored encrypted. Keys are never sent to our servers.</p>
+              <p className="text-xs text-muted-foreground mt-1">API keys are sent to ARIA for verification and encrypted storage, then used only with the selected hosted provider.</p>
             </div>
           </div>
         )}

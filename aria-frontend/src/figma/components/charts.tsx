@@ -1,12 +1,14 @@
 import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   ResponsiveContainer, ComposedChart, LineChart, Line, AreaChart, Area,
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Brush,
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   ScatterChart, Scatter, PieChart, Pie, Cell,
 } from "recharts";
 import { fmtBiz } from "../lib/format";
 import { colorForName, CATEGORY_COLORS } from "../lib/charts";
+import { ChartBrush } from "./ChartBrush";
 
 /* =====================================================================
    Shared chart library (s.txt §§7–10, §17): ONE reusable pattern.
@@ -333,6 +335,7 @@ export const INSIGHT_CHART_VOCAB = [
 ] as const;
 
 export type InsightChartType = (typeof INSIGHT_CHART_VOCAB)[number];
+const INSIGHT_OVERLAY_KEYS = new Set(["expected", "bandlower", "bandupper"]);
 
 export interface InsightChartSpec {
   type: InsightChartType;
@@ -419,8 +422,11 @@ export function InsightChart({
     setHidden((h) => (h.includes(s) ? h.filter((x) => x !== s) : [...h, s]));
 
   const seriesKeys = useMemo(() => {
-    if (spec.series?.length) return spec.series.filter((s) => !hidden.includes(s));
-    return spec.y ? [spec.y] : [];
+    return [spec.y, ...(spec.series || [])]
+      .filter((s): s is string => Boolean(s))
+      .filter((s, i, all) => all.indexOf(s) === i)
+      .filter((s) => !INSIGHT_OVERLAY_KEYS.has(s.toLowerCase()))
+      .filter((s) => !hidden.includes(s));
   }, [spec.series, spec.y, hidden]);
 
   const pick = (row: any): DrillSelection => {
@@ -435,7 +441,16 @@ export function InsightChart({
     onDrillDown?.(sel);
   };
 
-  const legendItems = spec.series?.length ? spec.series : [];
+  const hasExpected = spec.data.some((r) => typeof r?.expected === "number" && !isNaN(r.expected));
+  const hasBandLower = spec.data.some((r) => typeof r?.bandLower === "number" && !isNaN(r.bandLower));
+  const hasBandUpper = spec.data.some((r) => typeof r?.bandUpper === "number" && !isNaN(r.bandUpper));
+  const hasMultiSeries = Boolean(spec.series?.length || hasExpected || hasBandLower || hasBandUpper);
+  const legendItems = hasMultiSeries ? [
+    ...seriesKeys,
+    ...(hasExpected ? ["expected"] : []),
+    ...(hasBandLower ? ["bandLower"] : []),
+    ...(hasBandUpper ? ["bandUpper"] : []),
+  ] : [];
   const colors: Record<string, string> = {};
   [...legendItems, spec.y || ""].forEach((s) => { if (s) colors[s] = colorForName(s); });
 
@@ -484,7 +499,7 @@ export function InsightChart({
                 />
               ))}
             </Scatter>
-            <Brush dataKey="__x" height={22} travellerWidth={10} />
+            <ChartBrush dataKey="__x" />
           </ScatterChart>
         </ResponsiveContainer>
       );
@@ -525,16 +540,16 @@ export function InsightChart({
     // bandLower, bandUpper, outlier) are detected at runtime — no hardcoded
     // field assumptions beyond these keys, no invented values.
     const rows: Record<string, any>[] = Array.isArray(spec.data) ? spec.data : [];
-    const hasExpected = rows.some((r) => typeof r?.expected === "number" && !isNaN(r.expected));
-    const hasBandLower = rows.some((r) => typeof r?.bandLower === "number" && !isNaN(r.bandLower));
-    const hasBandUpper = rows.some((r) => typeof r?.bandUpper === "number" && !isNaN(r.bandUpper));
+    const hasExpectedRows = rows.some((r) => typeof r?.expected === "number" && !isNaN(r.expected));
+    const hasBandLowerRows = rows.some((r) => typeof r?.bandLower === "number" && !isNaN(r.bandLower));
+    const hasBandUpperRows = rows.some((r) => typeof r?.bandUpper === "number" && !isNaN(r.bandUpper));
     const isFlaggedRow = (r: any): boolean => r?.anomaly === true || r?.outlier === true;
     // Per-point anomaly coloring for line/area: flagged rows draw rose,
     // everything else keeps the series color. White/navy/indigo theme kept.
     const anomalyDot =
       (baseColor: string) =>
       (p: any): ReactNode => {
-        const flagged = p?.payload?.anomaly === true;
+        const flagged = p?.payload?.anomaly === true || p?.payload?.outlier === true;
         if (p?.cx == null || p?.cy == null) return <g />;
         if (flagged) {
           return <circle cx={p.cx} cy={p.cy} r={5} fill="#E11D48" stroke="#ffffff" strokeWidth={1.5} />;
@@ -572,16 +587,16 @@ export function InsightChart({
               </Bar>
             )
           )}
-          {hasExpected && (
+          {hasExpectedRows && !hidden.includes("expected") && (
             <Line type="monotone" dataKey="expected" stroke="#1E3A8A" strokeDasharray="6 4" strokeWidth={1.5} dot={false} activeDot={{ r: 3 }} name="Expected" />
           )}
-          {hasBandLower && (
+          {hasBandLowerRows && !hidden.includes("bandLower") && (
             <Line type="monotone" dataKey="bandLower" stroke="#6366F1" strokeDasharray="4 4" strokeWidth={1} dot={false} activeDot={{ r: 3 }} name="Lower bound" />
           )}
-          {hasBandUpper && (
+          {hasBandUpperRows && !hidden.includes("bandUpper") && (
             <Line type="monotone" dataKey="bandUpper" stroke="#6366F1" strokeDasharray="4 4" strokeWidth={1} dot={false} activeDot={{ r: 3 }} name="Upper bound" />
           )}
-          <Brush dataKey={spec.x as string} height={22} travellerWidth={10} />
+          <ChartBrush dataKey={spec.x as string} />
         </Chart>
       </ResponsiveContainer>
     );
@@ -627,8 +642,8 @@ export function InsightChart({
           <span className="text-muted-foreground"> — click another mark to inspect, or drill down below.</span>
         </div>
       )}
-      {expanded && (
-        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label="Expanded chart">
+      {expanded && typeof document !== "undefined" && createPortal(
+        <div className="fixed inset-0 z-[1000] bg-black/60 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label="Expanded chart">
           <div className="bg-card border border-border rounded-xl p-4 w-full max-w-4xl">
             <div className="flex items-center justify-between mb-2">
               <p className="text-sm font-semibold text-foreground truncate">{spec.title || "Evidence chart"}</p>
@@ -638,7 +653,8 @@ export function InsightChart({
             </div>
             {body(440)}
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

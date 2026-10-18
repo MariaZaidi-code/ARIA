@@ -507,6 +507,15 @@ def _run_test(engine, dialect, req, schema=None):
                 except Exception:
                     continue
             comparisons.sort(key=lambda c: abs(c["r"]), reverse=True)
+            primary = next(
+                (c for c in comparisons
+                 if (c["x"], c["y"], c["table"]) == best_pair),
+                None,
+            )
+            if primary is not None:
+                comparisons = [primary] + [
+                    c for c in comparisons if c is not primary
+                ]
 
             return {
                 "ok": True,
@@ -518,7 +527,10 @@ def _run_test(engine, dialect, req, schema=None):
                     "Link found": ("Strong link" if abs(stats['r']) > 0.7
                                    else "Moderate link" if abs(stats['r']) > 0.4
                                    else "Weak or no link"),
-                    "Direction": ("Move together" if stats['r'] > 0 else "Move apart"),
+                    "Direction": (
+                        ("Move together" if stats["r"] > 0 else "Move apart")
+                        if supported else "No clear direction"
+                    ),
                     "Confidence": _confidence_word(stats['p_value']),
                 },
                 "data_quality": {

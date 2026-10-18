@@ -899,7 +899,9 @@ class InsightAgent:
             "kpis": kpis[:6],
             "trends": trends[:3],
             "anomalies": anomalies[:5],
-            "hypotheses": hypotheses,
+            # Same bounded slicing as every other section — an unbounded
+            # hypotheses list let large-schema runs inflate prompt size.
+            "hypotheses": (hypotheses or [])[:3],
         }
         if predictions and predictions.get("valid") and predictions.get("points"):
             context["prediction"] = {

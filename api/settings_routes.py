@@ -83,7 +83,8 @@ async def save_provider(req: ProviderConfigRequest, _user: dict = Depends(requir
         raise HTTPException(status_code=400, detail=f"Could not initialise '{name}': {sanitize_error(exc)}")
     if name != "local":
         try:
-            await asyncio.to_thread(llm.ping, 25)
+            from core.provider_health import ping_with_retry
+            await asyncio.to_thread(ping_with_retry, llm, 25)
         except Exception as exc:
             log.warning("Provider key validation failed for '%s': %s", name, exc)
             raise HTTPException(
@@ -295,8 +296,9 @@ def _ping_ollama(timeout: int) -> None:
 def _ping_hosted(name: str, key: str, timeout: int) -> None:
     """Verify a hosted provider key with a no-cost models.list call."""
     from llm_provider import create_provider
+    from core.provider_health import ping_with_retry
     llm = create_provider(provider=name, api_key=key)
-    llm.ping(timeout=timeout)
+    ping_with_retry(llm, timeout=timeout)
 
 
 @router.post("/api/settings/general")

@@ -927,26 +927,40 @@ import threading
 
 _ENGINE_POOL: dict = {}
 _ENGINE_LOCK = threading.Lock()
+_ENGINE_POOL_MAX = 32
 
 
 def _pooled_engine(db_uri: str):
-    """Return a cached SQLAlchemy engine for db_uri (pool_size=5)."""
+    """Return a cached SQLAlchemy engine for db_uri (pool_size=5).
+
+    Engines are evicted FIFO when the bounded pool is full. SQLAlchemy's
+    ``Engine.dispose()`` leaves checked-out connections alive until callers
+    return them; subsequent work uses a fresh pool. Pool keys hold the full
+    connection URI (credentials) — never log them.
+    """
     key = str(db_uri or "")
+    doomed: list = []  # engines to dispose outside the lock
     with _ENGINE_LOCK:
         eng = _ENGINE_POOL.get(key)
         if eng is None:
             from sqlalchemy import create_engine as _ce
             eng = _ce(key or "sqlite://", pool_pre_ping=True,
                       pool_size=5, max_overflow=10, pool_recycle=1800)
-            if len(_ENGINE_POOL) >= 32:
-                try:
-                    _old_k, _old_e = next(iter(_ENGINE_POOL.items()))
-                    _ENGINE_POOL.pop(_old_k, None)
-                    _old_e.dispose()
-                except Exception:
-                    pass
+            while len(_ENGINE_POOL) >= _ENGINE_POOL_MAX:
+                # Dicts preserve insertion order. Dispose outside the lock so
+                # concurrent borrowers are not blocked by pool cleanup.
+                victim_k = next(iter(_ENGINE_POOL), None)
+                if victim_k is not None:
+                    doomed.append(_ENGINE_POOL.pop(victim_k))
+                else:
+                    break
             _ENGINE_POOL[key] = eng
-        return eng
+    for old_engine in doomed:
+        try:
+            old_engine.dispose()
+        except Exception:
+            pass
+    return eng
 
 
 def run_explore(session: dict, request: dict) -> dict:
@@ -1644,7 +1658,11 @@ def run_explore(session: dict, request: dict) -> dict:
                             _p = dict(_params)
                         _res = _exec(_sql, _p)
                         _cols = list(_res.keys())
-                        for _row in _res.fetchall():
+                        # Streamed, never fetchall(): on the non-native path
+                        # this cursor is the whole table (no SQL date filter),
+                        # so materializing every row scaled memory/latency
+                        # with table size on every explore.
+                        for _row in _res.yield_per(1000):
                             _d = dict(zip(_cols, _row))
                             _dt = _to_date(_d.get("_d"))
                             if _dt is None:
@@ -2682,6 +2700,9 @@ def run_whatif(session: dict, request: dict) -> dict:
             change_value = 10
     except Exception:
         change_value = 10
+    # Docstring promises "with backend range": clamp the scenario to the
+    # advertised supported_range so arbitrary multipliers never hit the DB.
+    change_value = max(-50.0, min(100.0, change_value))
     apply_to = request.get("apply_to") or request.get("applyTo") or request.get("scope") or "All data"
 
     if not variable:
@@ -2836,7 +2857,13 @@ def run_whatif(session: dict, request: dict) -> dict:
                         _k3 = list(_r3.keys())
                         for _rr in _r3.fetchall():
                             _dd = dict(zip(_k3, _rr))
-                            _lbl = str(_dd.get("p") or "")[:7] or "Period"
+                            # Label honestly: only trim to YYYY-MM when the
+                            # stored value IS that shape; raw text dates
+                            # ("9/2024", "3/14/97") keep their full label
+                            # instead of a lexicographic-truncated garbage.
+                            _lbl = str(_dd.get("p") or "") or "Period"
+                            if not re.fullmatch(r"\d{4}-\d{2}", _lbl) and len(_lbl) > 24:
+                                _lbl = _lbl[:24]
                             _bv = float(_dd.get("v") or 0)
                             monthly.append({"label": _lbl, "baseline": _bv,
                                             "scenario": _bv * (1 + sign * factor)})

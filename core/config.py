@@ -325,14 +325,31 @@ def _lock_handle(fh, exclusive: bool) -> None:
     try:
         if os.name == "nt":
             import msvcrt
+            import time as _time
 
             # msvcrt.locking locks a byte range; lock the first byte.
+            # LK_NBLCK fails fast instead of hanging; short retry loop keeps
+            # contention tolerable. On Windows all byte-range locks are
+            # exclusive, so "shared" mode is really mutual exclusion too —
+            # both modes use the same lock so readers and writers serialize.
             fh.seek(0)
-            mode = msvcrt.LK_LOCK if exclusive else msvcrt.LK_LOCK
-            try:
-                msvcrt.locking(fh.fileno(), mode, 1)
-            except OSError:
-                pass
+            mode = msvcrt.LK_NBLCK
+            for attempt in range(40):
+                try:
+                    msvcrt.locking(fh.fileno(), mode, 1)
+                    return
+                except PermissionError:
+                    _time.sleep(0.025)
+                except OSError as exc:
+                    _logger.warning(
+                        "file lock contention on %s (attempt %d): %s",
+                        getattr(fh, "name", "?"), attempt + 1, exc,
+                    )
+                    _time.sleep(0.025)
+            # Last resort: fall back to the blocking lock (up to ~10 retry
+            # bursts inside the C runtime, then raises).
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
         else:
             import fcntl
 
@@ -576,6 +593,9 @@ DEFAULT_SESSION = {
 SESSION = deepcopy(DEFAULT_SESSION)
 SESSION_STORE: dict[int, tuple[float, dict]] = {}
 SESSION_LOCK = threading.RLock()
+# Orders full-store snapshots and writes without holding SESSION_LOCK during
+# disk or Redis I/O.
+_SESSION_PERSIST_LOCK = threading.Lock()
 _SESSION_FILE_MTIME: float | None = None
 
 # Load persisted sessions from disk (survives server restarts).
@@ -665,8 +685,13 @@ def _load_session_store():
                 uid = int(uid_str)
                 loaded = _disk_dict_to_session(dict(session))
                 SESSION_STORE[uid] = (float(created), loaded)
-    except Exception:
-        pass
+    except Exception as exc:
+        # A corrupt/unreadable store silently resetting users is worse than a
+        # logged warning: leave a trail with the failure mode and path.
+        _logger.warning(
+            "session store load failed (%s): %s — users fall back to defaults",
+            type(exc).__name__, SESSION_STORE_PATH,
+        )
 
 _load_session_store()
 
@@ -814,14 +839,18 @@ def get_session(user_id=None):
 
     now = time.time()
     global _SESSION_FILE_MTIME
+    # Redis is network I/O: fetch outside SESSION_LOCK so one slow shared
+    # store doesn't serialize every concurrent request (only dict/CPU work
+    # runs under the lock).
+    try:
+        _redis_hit = _redis_load_one(user_id)
+    except Exception:
+        _redis_hit = None
     with SESSION_LOCK:
         # Redis-first when configured: shared store is authoritative across
         # workers. Fall back to file/memory when Redis is unset/unreachable
-        # (backward compat for local/dev single-process runs).
-        try:
-            _redis_hit = _redis_load_one(user_id)
-        except Exception:
-            _redis_hit = None
+        # (backward compat for local/dev single-process runs). The redis hit
+        # was already fetched to avoid holding the lock during network I/O.
         if _redis_hit is not None:
             try:
                 _created, _sess = _redis_hit
@@ -849,8 +878,11 @@ def get_session(user_id=None):
                             loaded = _disk_dict_to_session(dict(session))
                             SESSION_STORE[uid] = (float(created), loaded)
                     _SESSION_FILE_MTIME = mtime
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.warning(
+                "session store reconcile failed (%s): %s",
+                type(exc).__name__, SESSION_STORE_PATH,
+            )
 
         # Opportunistic cleanup of expired sessions.
         if len(SESSION_STORE) >= SESSION_MAX_USERS or (len(SESSION_STORE) > 10 and len(SESSION_STORE) % 5 == 0):
@@ -876,14 +908,17 @@ def get_session(user_id=None):
             SESSION_STORE[user_id] = (now, entry[1])
         _ensure_relational_uri(entry[1])
         _ensure_provider(entry[1])
-        # Warm the shared store on file/memory hits so the next worker
-        # finds this session in Redis (best-effort, never raises).
-        try:
-            if redis_url():
-                _redis_save_one(user_id, SESSION_STORE[user_id][0], SESSION_STORE[user_id][1])
-        except Exception:
-            pass
-        return _copy_session(entry[1])
+        _warm_created = SESSION_STORE[user_id][0]
+        _warm_sess = SESSION_STORE[user_id][1]
+    # Warm the shared store on file/memory hits so the next worker
+    # finds this session in Redis (best-effort, never raises) — network
+    # I/O stays outside the session lock.
+    try:
+        if redis_url():
+            _redis_save_one(user_id, _warm_created, _warm_sess)
+    except Exception:
+        pass
+    return _copy_session(entry[1])
 
 
 def save_session(user_id, session):
@@ -893,32 +928,53 @@ def save_session(user_id, session):
     on-disk JSON copy carries encrypted `api_keys`. When ARIA_REDIS_URL is
     configured the session is also written through to Redis (preferred for
     multi-worker); Redis failures fall back to the file store. File writes
-    are atomic (.tmp + replace) with 0600 perms and a sidecar lock.
+    are atomic (.tmp + replace) with 0600 perms and a sidecar lock. The
+    consistency snapshot is taken under SESSION_LOCK, but the slow disk and
+    Redis I/O happen outside it so one save never serializes every request.
     """
     user_id = _coerce_user_id(user_id)
     _ensure_user_paths(session, user_id)
     now = time.time()
-    with SESSION_LOCK:
-        SESSION_STORE[user_id] = (now, session)
-        # Also write to disk so sessions survive server restarts.
+    import json as _json
+    # Snapshot the full store under the lock (CPU-only deep copies); the
+    # atomic replace itself takes the sidecar file lock, which is what
+    # actually serializes writers across processes.
+    with _SESSION_PERSIST_LOCK:
+        with SESSION_LOCK:
+            SESSION_STORE[user_id] = (now, session)
+            _entry_created, _entry_sess = SESSION_STORE[user_id]
+            try:
+                disk_store = {}
+                for uid, (created, sess) in SESSION_STORE.items():
+                    disk_store[str(uid)] = (created, _session_to_disk_dict(sess))
+            except Exception as exc:
+                _logger.warning("session store snapshot failed (%s)", type(exc).__name__)
+                return
         try:
-            import json as _json
-            disk_store = {}
-            for uid, (created, sess) in SESSION_STORE.items():
-                disk_store[str(uid)] = (created, _session_to_disk_dict(sess))
-            _atomic_write_text(
-                SESSION_STORE_PATH, _json.dumps(disk_store, default=str)
-            )
+            payload = _json.dumps(disk_store, default=str)
+        except Exception as exc:
+            _logger.warning("session store serialization failed (%s)", type(exc).__name__)
+            return
+        # Slow I/O stays outside SESSION_LOCK. The persistence lock orders
+        # snapshots and writes, preventing a stale concurrent snapshot from
+        # overwriting newer session state on disk.
+        try:
+            _atomic_write_text(SESSION_STORE_PATH, payload)
+        except Exception as exc:
+            # The in-memory session was already updated. Keep the request
+            # working on transient filesystem failures and retry on a later
+            # save rather than turning unrelated API mutations into 500s.
+            _logger.warning("session store write failed (%s): %s",
+                            type(exc).__name__, SESSION_STORE_PATH)
+        else:
             try:
                 global _SESSION_FILE_MTIME
                 _SESSION_FILE_MTIME = SESSION_STORE_PATH.stat().st_mtime
             except Exception:
                 pass
-        except Exception:
-            pass
         # Write-through to the shared store (best-effort; file remains fallback).
         try:
-            _redis_save_one(user_id, now, session)
+            _redis_save_one(user_id, _entry_created, _entry_sess)
         except Exception:
             pass
 

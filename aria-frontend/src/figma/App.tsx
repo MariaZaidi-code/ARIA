@@ -1,10 +1,10 @@
 import { createContext, useContext, useState, useEffect, useRef, lazy, Suspense } from "react";
 import type { ReactNode } from "react";
-import "./index.css";
 import "../aria-enhance.css";
 import AppShell from "./components/AppShell";
 import ErrorBoundary from "./components/ErrorBoundary";
 import MiniAria from "./components/MiniAria";
+import FeedbackPopup from "./components/FeedbackPopup";
 import Login from "./pages/Login";
 // Route pages are code-split: each hash route loads its own chunk on
 // first visit (vendor/charts/motion stay in shared manualChunks — see
@@ -228,17 +228,17 @@ export default function App() {
   };
 
   const handleLLMSelect = async (mode: string, apiKey?: string) => {
-    setSelectedLLM(mode);
-    storage.set(KEYS.llmMode, mode);
     // Materialize the choice server-side so the session provider matches
     // the UI immediately (prevents "choose an LLM provider" right after).
-    // Provider isolation: the Groq key is sent ONLY when Cloud is selected;
+    // Provider isolation: the key is sent only to its selected hosted provider;
     // Local AI switches keyless and never touches stored keys.
     try {
       await apiFetch("/provider/switch", {
         method: "POST",
-        body: JSON.stringify(mode === "cloud" && apiKey ? { provider: mode, api_key: apiKey } : { provider: mode }),
+        body: JSON.stringify(apiKey ? { provider: mode, api_key: apiKey } : { provider: mode }),
       });
+      setSelectedLLM(mode);
+      storage.set(KEYS.llmMode, mode);
     } catch (err: any) {
       if (err?.status === 401) {
         clearAuthSession();
@@ -711,6 +711,8 @@ export default function App() {
       </AppShell>
       {/* Mini ARIA robot: every page except the Copilot page itself. */}
       {page !== "copilot" && <MiniAria />}
+      {/* Random RL feedback popup (probability + cooldown; /api/rl/feedback) */}
+      <FeedbackPopup page={page} />
       </ToastProvider>
     </ThemeContext.Provider>
   );

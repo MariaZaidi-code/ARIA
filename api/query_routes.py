@@ -580,6 +580,20 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
 
     _is_convo = _is_conversational_text(req.goal)
 
+    # Business glossary: rewrite recognized terms to their canonical wording
+    # before any planning happens (never for conversational turns), so every
+    # downstream stage — planner, SQL, story — speaks the business language.
+    _glossary_applied: list = []
+    try:
+        if not _is_convo:
+            from services.workspace_service import apply_glossary as _apply_glossary
+            _rw_goal, _glossary_applied = _apply_glossary(
+                user["user_id"], req.goal)
+            if _glossary_applied and _rw_goal.strip():
+                req.goal = _rw_goal
+    except Exception:
+        _glossary_applied = []
+
     # Build goal with multi-turn context (conversational turns skip history
     # so 'hi' never inherits previous tables).
     full_goal = req.goal
@@ -1128,6 +1142,8 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             resolve_comparison as _resolve_cmp,
             map_visualization as _map_viz,
             compute_possible_drivers as _drivers,
+            compute_change_drivers as _change_drivers,
+            build_change_hypothesis as _build_change_hyp,
             build_followups as _followups,
             decide_status as _decide,
             graceful_message as _grace_msg,
@@ -1158,23 +1174,105 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             (processed.get("data_selection", {}) or {}).get("tables", []) or [])
         _main_table = _tables_used[0] if _tables_used else None
         # Possible drivers from REAL aggregates (best-effort, never fatal).
+        # Why/change questions get a period-over-period decomposition first —
+        # a structural "share of the total" view cannot explain a *change*.
         _drivers_list: list = []
-        try:
-            if _main_table and _metric_col and result_data:
+        _change_ctx: dict | None = None
+        _is_why = (_primary in ("explanation", "root_cause", "hypothesis")
+                   or any(_c in ("explanation", "root_cause")
+                          for _c in (_capabilities or [])))
+        if (_is_why and result_data and len(result_data) >= 2
+                and len(columns) >= 2 and processed.get("sql_used")):
+            try:
                 from sqlalchemy import create_engine as _mk
                 _eng = _mk(session["db_uri"])
                 try:
-                    _drivers_list = _drivers(
-                        _eng, session.get("dialect", "postgresql"),
-                        _main_table, _metric_col, _dims,
-                        period_label=_cmp.get("granularity", ""))
+                    _ir_dims: list = []
+                    try:
+                        from core.schema_intel import _is_id_like as _env_id_like2
+                        for _d in ((processed.get("goal_ir") or {})
+                                   .get("dimensions") or []):
+                            try:
+                                if isinstance(_d, dict):
+                                    _dt = str(_d.get("resolved_table") or "")
+                                    _dc = str(_d.get("resolved_column") or "")
+                                else:
+                                    _dt, _dc = "", str(_d or "")
+                            except Exception:
+                                continue
+                            _dcl = _dc.lower()
+                            if (not _dc or _env_id_like2(_dc)
+                                    or "date" in _dcl or "time" in _dcl
+                                    or _dc == _metric_col):
+                                continue
+                            _pair = (_dt, _dc)
+                            if _pair not in _ir_dims:
+                                _ir_dims.append(_pair)
+                    except Exception:
+                        _ir_dims = []
+                    if _ir_dims:
+                        _tcol0 = columns[0]
+                        _mcol0 = (_metric_col if _metric_col in columns
+                                  else columns[-1])
+                        _series = []
+                        for _r in result_data or []:
+                            try:
+                                _vv = _r.get(_mcol0)
+                                if _vv is None or str(_vv).strip() == "":
+                                    continue
+                                _series.append(
+                                    (str(_r.get(_tcol0)), float(_vv)))
+                            except (TypeError, ValueError):
+                                continue
+                        _chg = _change_drivers(
+                            _eng, session.get("dialect", "postgresql"),
+                            str(processed.get("sql_used") or ""),
+                            _series, dims=_ir_dims,
+                            measure_alias=str(_mcol0),
+                            time_alias=str(_tcol0),
+                            question=req.goal,
+                            metric_label=_metric_label)
+                        if isinstance(_chg, dict):
+                            _change_ctx = _chg.get("change")
+                            if _chg.get("drivers"):
+                                _drivers_list = _chg["drivers"]
+                            if _change_ctx:
+                                _cmp = dict(_cmp or {})
+                                _cmp["current"] = {
+                                    "label": _change_ctx.get("current")}
+                                _cmp["previous"] = {
+                                    "label": _change_ctx.get("previous")}
+                                _cmp["description"] = (
+                                    f"Compared {_change_ctx.get('current')} vs "
+                                    f"{_change_ctx.get('previous')} "
+                                    f"(period-over-period on "
+                                    f"{_cmp.get('granularity', 'month')} "
+                                    f"granularity).")
                 finally:
                     try:
                         _eng.dispose()
                     except Exception:
                         pass
-        except Exception:
-            _drivers_list = []
+            except Exception:
+                _drivers_list = []
+                _change_ctx = None
+        if not _drivers_list:
+            try:
+                if _main_table and _metric_col and result_data:
+                    from sqlalchemy import create_engine as _mk
+                    _eng = _mk(session["db_uri"])
+                    try:
+                        _drivers_list = _drivers(
+                            _eng, session.get("dialect", "postgresql"),
+                            _main_table, _metric_col, _dims,
+                            period_label=_cmp.get("granularity", ""))
+                    finally:
+                        try:
+                            _eng.dispose()
+                        except Exception:
+                            pass
+            except Exception:
+                _drivers_list = []
         _viz_type = _map_viz(_primary, chart_spec)
         _evidence = [{
             "tables": _tables_used,
@@ -1209,20 +1307,31 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         if _primary in ("explanation", "root_cause", "hypothesis",
                         "change_detection", "anomaly") or _drivers_list:
             try:
-                from goal_agent.analytics_intent import build_hypothesis as _build_hyp
-                _top_period = ""
-                try:
-                    _top_period = str((_drivers_list[0] or {}).get("period") or "")
-                except Exception:
+                if _change_ctx:
+                    _hypothesis = _build_change_hyp(
+                        _change_ctx, _drivers_list,
+                        metric_label=_metric_label,
+                        metric_col=_metric_col,
+                        observation_count=len(result_data or []),
+                        dimensions=_dims,
+                    )
+                else:
+                    from goal_agent.analytics_intent import (
+                        build_hypothesis as _build_hyp,
+                    )
                     _top_period = ""
-                _hypothesis = _build_hyp(
-                    _drivers_list,
-                    metric_label=_metric_label,
-                    metric_col=_metric_col,
-                    period_label=_top_period or _cmp.get("granularity", ""),
-                    observation_count=len(result_data or []),
-                    dimensions=_dims,
-                )
+                    try:
+                        _top_period = str((_drivers_list[0] or {}).get("period") or "")
+                    except Exception:
+                        _top_period = ""
+                    _hypothesis = _build_hyp(
+                        _drivers_list,
+                        metric_label=_metric_label,
+                        metric_col=_metric_col,
+                        period_label=_top_period or _cmp.get("granularity", ""),
+                        observation_count=len(result_data or []),
+                        dimensions=_dims,
+                    )
             except Exception:
                 if _drivers_list:
                     _top = _drivers_list[0]
@@ -1297,6 +1406,43 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
                 _rstatus = "partial"
             else:
                 _rstatus = "backend-failure" if _rstatus == "success" else _rstatus
+        # Auto "why" annotation for trend views: a one-line, grounded note of
+        # the decomposed period-over-period change (feature: annotations on
+        # trend charts). Rendered as a caption under the chart in the UI.
+        try:
+            if _change_ctx and (result_data or []):
+                _an_dir = str(_change_ctx.get("direction") or "")
+                _an_word = "fall" if _an_dir == "drop" else "rise"
+                _an_cur = str(_change_ctx.get("current") or "").strip()
+                _an_prev = str(_change_ctx.get("previous") or "").strip()
+                _an_pct = _change_ctx.get("change_pct")
+                _an_text = (_an_cur or "Latest period") + (
+                    " fell" if _an_dir == "drop" else " rose")
+                if isinstance(_an_pct, (int, float)):
+                    _an_text += f" {abs(round(float(_an_pct), 1))}%"
+                if _an_prev:
+                    _an_text += f" vs {_an_prev}"
+                _an_top = _drivers_list[0] if _drivers_list else None
+                if isinstance(_an_top, dict):
+                    _an_label = str(_an_top.get("label")
+                                    or _an_top.get("driver")
+                                    or _an_top.get("dimension") or "").strip()
+                    _an_cp = _an_top.get("contribution_pct")
+                    if _an_label:
+                        _an_text += f" — mostly {_an_label}"
+                        if isinstance(_an_cp, (int, float)):
+                            _an_text += (f" ({abs(round(float(_an_cp), 1))}%"
+                                         f" of the {_an_word})")
+                chart_spec = dict(chart_spec or {})
+                chart_spec["annotation"] = {
+                    "text": _an_text[:300],
+                    "direction": _an_dir,
+                    "current": _an_cur,
+                    "previous": _an_prev,
+                    "pct": _an_pct,
+                }
+        except Exception:
+            pass
         _analytics_envelope = {
             "interpreted_intent": {"primary": _primary,
                                    "capabilities": _capabilities,
@@ -1416,6 +1562,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "why": why_block,
         "story": story_text,
         "chart_spec": chart_spec,
+        "glossary_applied": _glossary_applied,
         "display": display,
         "consistency": consistency,
         "analysis": analysis.get("analysis"),

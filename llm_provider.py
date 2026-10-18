@@ -36,7 +36,11 @@ except ImportError:
 # Load .env centrally (in core.config) before any module-level os.getenv below.
 import core.config  # noqa: E402,F401
 
-logging.basicConfig(level=logging.INFO)
+# Library module: never grab root logging config at import (app.py configures
+# logging); module-level loggers only.
+logger = logging.getLogger("aria.llm_provider")
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
 
 # ---------------------------------------------------------------------------
 # DeepSeek (OpenAI-compatible) configuration
@@ -236,6 +240,74 @@ def _require_cloud_consent(provider: str, consent=None):
         )
 
 
+def validate_llm_base_url(base_url: str, provider: str = "cloud") -> str:
+    """Validate a hosted LLM ``base_url`` override (single source of truth).
+
+    Rules for hosted providers (cloud/deepseek/omniroute/grok):
+      - must be https://, no userinfo/credentials in the URL;
+      - hostname must not be a literal internal IP (private/loopback/
+        link-local/metadata/decimal-hex-octal forms);
+      - DNS names must not resolve to those ranges (resolve-then-check at
+        creation time — the SSRF guard for SDK-driven HTTP clients).
+
+    ``provider == "local"`` keeps dev-local semantics: http and loopback
+    allowed (Ollama on 127.0.0.1 is the normal setup).
+    Raises ValueError on any violation; returns the validated URL string.
+    """
+    try:
+        from urllib.parse import urlsplit as _urlsplit
+        import ipaddress as _ip
+
+        parsed = _urlsplit(str(base_url or ""))
+        if provider != "local" and parsed.scheme != "https":
+            raise ValueError("Provider base URL must use https.")
+        if provider == "local" and parsed.scheme not in ("http", "https"):
+            raise ValueError("Provider base URL must be http(s).")
+        if parsed.username or parsed.password:
+            raise ValueError("Provider base URL must not embed credentials.")
+        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+        if not hostname or len(hostname) > 253 or not re.fullmatch(r"[A-Za-z0-9_.-]+", hostname):
+            raise ValueError("Invalid provider base URL host.")
+
+        def _blocked(ir) -> bool:
+            return (
+                ir.is_private or ir.is_loopback or ir.is_link_local
+                or ir.is_multicast or ir.is_reserved or ir.is_unspecified
+            )
+
+        # Literal-form bypasses first (decimal/octal/hex/integer IPs).
+        host_raw = hostname
+        norm_ip = None
+        try:
+            norm_ip = _ip.ip_address(host_raw)
+        except Exception:
+            try:
+                if host_raw.isdigit() or host_raw.lower().startswith("0x"):
+                    norm_ip = _ip.ip_address(int(host_raw, 0 if host_raw.lower().startswith("0x") else 10))
+            except Exception:
+                norm_ip = None
+        is_local_provider = provider == "local"
+        if norm_ip is not None:
+            if _blocked(norm_ip):
+                if not (is_local_provider and norm_ip.is_loopback):
+                    raise ValueError("Provider base URL host is blocked.")
+        else:
+            import socket as _sock
+            infos = _sock.getaddrinfo(host_raw, None, family=_sock.AF_UNSPEC, type=_sock.SOCK_STREAM)
+            for _fam, _typ, _proto, _canon, sockaddr in infos:
+                try:
+                    ir = _ip.ip_address(str(sockaddr[0]))
+                except Exception:
+                    continue
+                if _blocked(ir) and not (is_local_provider and ir.is_loopback):
+                    raise ValueError("Provider base URL host resolves to a blocked address.")
+        return str(base_url)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Invalid provider base URL: {exc}")
+
+
 _SECRET_PATTERNS = [
     re.compile(r"(gsk_[A-Za-z0-9]{8,})"),
     re.compile(r"(xai-[A-Za-z0-9\-_]{8,})"),
@@ -406,15 +478,18 @@ class LLMProvider:
         # provider without backend consent fails closed (no network touched).
         if provider != "local":
             _require_cloud_consent(provider)
+        if base_url:
+            # Single shared SSRF validator: hosted clients must not point at
+            # internal hosts; local (Ollama) keeps http/loopback semantics.
+            base_url = validate_llm_base_url(base_url, provider)
         self.provider = provider
         self.base_url = base_url
         self.models = dict(PROVIDERS[provider]["models"])
         if models:
             self.models.update(models)
 
-        # Unified cloud client used by all hosted providers (Groq "cloud" and
-        # DeepSeek "deepseek"). Kept as a single attribute so every cloud path
-        # shares the same retry/error handling.
+        # Hosted clients use ARIA's bounded retry handling; SDK retries are
+        # disabled to prevent nested backoff from extending request timeouts.
         self._cloud_client = None
         if provider == "cloud":
             if not GROQ_AVAILABLE:
@@ -429,6 +504,7 @@ class LLMProvider:
             self._cloud_client = OpenAI(
                 api_key=api_key or os.getenv("DEEPSEEK_API_KEY"),
                 base_url=base_url or DEEPSEEK_BASE_URL,
+                max_retries=0,
             )
             if not self._cloud_client.api_key:
                 raise RuntimeError("Missing DEEPSEEK_API_KEY. Set it in .env or pass api_key.")
@@ -437,6 +513,7 @@ class LLMProvider:
             self._cloud_client = OpenAI(
                 api_key=api_key or os.getenv("OMNIROUTE_API_KEY"),
                 base_url=base_url or OMNIROUTE_BASE_URL,
+                max_retries=0,
             )
             if not self._cloud_client.api_key:
                 raise RuntimeError("Missing OMNIROUTE_API_KEY. Set it in .env or pass api_key.")
@@ -445,6 +522,7 @@ class LLMProvider:
             self._cloud_client = OpenAI(
                 api_key=api_key or os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY"),
                 base_url=base_url or GROK_BASE_URL,
+                max_retries=0,
             )
             if not self._cloud_client.api_key:
                 raise RuntimeError("Missing GROK_API_KEY (or XAI_API_KEY). Set it in .env or pass api_key.")
@@ -821,6 +899,9 @@ class LLMProvider:
                 "with a vision model. Switch backend and retry."
             )
         _require_cloud_consent(self.provider)
+        # Cap the request like chat(): an unbounded image list lets one call
+        # blow up payload size / token spend with no budget.
+        images = list(images or [])[:10]
         prompt = _minimize_for_cloud(prompt)
         content = [{"type": "text", "text": prompt}]
         for b64 in images:
@@ -884,6 +965,8 @@ def create_provider(provider=_UNSET, api_key=None, models=None, base_url=None,
     # client construction, or network I/O for hosted providers).
     if provider != "local":
         _require_cloud_consent(provider)
+    if base_url:
+        base_url = validate_llm_base_url(base_url, provider)
     if provider == "cloud":
         if not GROQ_AVAILABLE:
             raise RuntimeError(

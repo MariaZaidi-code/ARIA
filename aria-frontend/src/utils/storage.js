@@ -26,6 +26,9 @@ export const KEYS = {
   history: `${NS}history.sessions`,
   dashboardDrill: `${NS}dashboard.drill`,
   sidebarCollapsed: `${NS}ui.sidebar_collapsed`,
+  // RL feedback popup: timestamp of the last interaction, stored with a TTL
+  // so the popup's shared cooldown expires without any bookkeeping.
+  feedbackPopup: `${NS}ui.feedback_popup`,
 };
 
 // Legacy (unversioned) keys still honored as read-fallbacks.

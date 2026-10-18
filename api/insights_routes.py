@@ -12,16 +12,16 @@ import sqlite3
 import math
 import statistics
 import time
+from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from core.deps import get_current_user, require_writable, reject_document_sql
 from core.config import get_session, save_session
-from core.schema_intel import SchemaIntelligence, _safe_name, _run_sql, AMOUNT_HINTS
+from core.schema_intel import SchemaIntelligence, _is_id_like, _safe_name, _run_sql, AMOUNT_HINTS
 from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, sanitize_error
 from core.semantic import humanize
 
@@ -123,9 +123,17 @@ class InsightsEngine:
         # SQL FROM clauses go through self._t(). TEMP tables die with the
         # connection, so no cleanup bookkeeping is needed.
         self._sqlt: dict = {}
+        self.dim_suggest_cache: dict = {}
         self.sample_info: dict = {"sampled": False, "tables": {}}
+        # Guarantees unique `id`s in one run (frontend keys + saved/lookup
+        # use the id; deterministic ids like f"og_{table}_{dim}_{dv}" can
+        # collide when the same detector fires for repeated candidates).
+        self._used_ids: set = set()
 
-    _SAMPLE_ROWS_CAP = 100_000
+    # Keep moderate datasets exact: insights are SQL aggregates, and the
+    # previous 100k cutoff made 120k-row tables report under-counted sums.
+    # Only sample tables that are genuinely large enough to warrant it.
+    _SAMPLE_ROWS_CAP = 1_000_000
 
     def _dialect(self) -> str:
         """Connection dialect for date math (generic, never per-database)."""
@@ -318,7 +326,12 @@ class InsightsEngine:
                 cur.close()
             self._sqlt[table] = sname
             self.sample_info["sampled"] = True
-            self.sample_info["tables"][table] = {"sample_rows": self._SAMPLE_ROWS_CAP,
+            _count_result = _run_sql(self.conn,
+                                     f"SELECT COUNT(*) AS n FROM {_safe_name(sname)}",
+                                     limit=1)
+            _count_rows = _count_result[1] if isinstance(_count_result, tuple) else []
+            _sample_rows = int(_count_rows[0].get("n", 0) or 0) if _count_rows else 0
+            self.sample_info["tables"][table] = {"sample_rows": _sample_rows,
                                                  "total_rows": rc, "method": _method}
         except Exception as exc:
             log.debug("insights sampling skipped for %s: %s", table, exc)
@@ -329,6 +342,91 @@ class InsightsEngine:
             self.conn.rollback()
         except Exception:
             pass
+
+    def _measure_candidates(self, table: str) -> list[str]:
+        """Return numeric fields that behave like measures, not encoded categories.
+
+        Uses schema key metadata, separator-agnostic identifier semantics, the
+        declared numeric type, and observed cardinality. No table/column names
+        are special-cased. If profiling fails, integer fields without a clear
+        quantitative name are excluded rather than summed as arbitrary codes.
+        """
+        numeric = list(self.intel.get_numeric_cols(table) or [])
+        if not numeric:
+            return []
+        primary = {str(c).strip().lower() for c in self.intel.get_pk(table)}
+        foreign = {str(edge[0]).strip().lower() for edge in self.intel.get_fks(table) if edge}
+        candidates = [
+            c for c in numeric
+            if str(c).strip().lower() not in primary | foreign and not _is_id_like(c)
+        ]
+        if not candidates:
+            return []
+
+        # Keep fields whose names carry broadly applicable quantitative
+        # semantics (amounts, quantities, rates, scores, durations, etc.).
+        quantitative_tokens = {
+            "amount", "price", "cost", "total", "sum", "revenue", "sales",
+            "income", "expense", "profit", "value", "quantity", "qty", "count",
+            "discount", "freight", "tax", "payment", "balance", "weight", "margin",
+            "turnover", "billing", "charge", "fee", "wage", "salary", "score",
+            "rating", "rate", "duration", "age", "days", "hours", "minutes",
+            "seconds", "distance", "temperature", "volume", "height", "length",
+            "speed", "capacity", "stock", "units", "percent", "percentage",
+        }
+
+        def has_measure_semantics(column: str) -> bool:
+            tokens = {t for t in __import__("re").split(r"[^a-z0-9]+", column.lower()) if t}
+            return bool(tokens & (quantitative_tokens | set(AMOUNT_HINTS)))
+
+        integer_types = ("smallint", "bigint", "integer", "tinyint", "int2", "int4", "int8", "serial")
+        profile_sql = "SELECT COUNT(*) AS __row_count, " + ", ".join(
+            f"COUNT(DISTINCT {_safe_name(c)}) AS __distinct_{i}"
+            for i, c in enumerate(candidates)
+        ) + f" FROM {_safe_name(self._t(table))}"
+        profile = None
+        try:
+            result = _run_sql(self.conn, profile_sql, limit=1)
+            rows = result[1] if isinstance(result, tuple) else []
+            profile = rows[0] if rows else None
+        except DB_ERRORS as exc:
+            log.debug("measure profiling skipped for %s: %s", table, exc)
+            self._rollback()
+
+        usable = []
+        for i, column in enumerate(candidates):
+            dtype = (self.intel.dtype_of(table, column) or "").lower()
+            integer_like = any(t in dtype for t in integer_types)
+            quantitative_name = has_measure_semantics(str(column))
+            if integer_like:
+                # A small integer domain is usually an ordinal/category code.
+                # Preserve explicitly quantitative fields such as quantity or
+                # score; otherwise require observed cardinality to support it.
+                distinct = profile.get(f"__distinct_{i}") if profile else None
+                row_count = profile.get("__row_count") if profile else None
+                try:
+                    distinct = int(distinct) if distinct is not None else None
+                    row_count = int(row_count) if row_count is not None else None
+                except (TypeError, ValueError):
+                    distinct = row_count = None
+                low_cardinality = (
+                    distinct is not None and row_count is not None and row_count >= 20
+                    and distinct <= 12 and distinct / max(row_count, 1) <= 0.10
+                )
+                near_unique = (
+                    distinct is not None and row_count is not None and row_count >= 20
+                    and distinct / max(row_count, 1) >= 0.80
+                )
+                profiling_unavailable = profile is None
+                if not quantitative_name and (low_cardinality or near_unique or profiling_unavailable):
+                    continue
+            usable.append(column)
+
+        if not usable:
+            return []
+        preferred = self.intel.find_best_measure(table)
+        ordered = ([preferred] if preferred in usable else []) + [c for c in usable if c != preferred]
+        return ordered[:3]
 
     def generate_all_insights(self, max_insights: int = 20):
         """Run all detectors, return ranked insights."""
@@ -362,48 +460,12 @@ class InsightsEngine:
             self._maybe_sample(tname)
 
             # Skip tables with no meaningful numeric measures (dimension-only tables)
-            measure = self.intel.find_best_measure(tname)
-            if not measure:
+            measures = self._measure_candidates(tname)
+            if not measures:
                 continue
-            # Weak mappings can label text columns as measures; only real
-            # numerics reach SQL aggregates (a text SUM would poison the
-            # shared transaction for every later detector).
-            if measure not in self.intel.get_numeric_cols(tname):
-                continue
-            # Coverage across measures (generic): the best measure plus up
-            # to 2 more numeric non-key columns, so wide tables surface
-            # more than one story. Identifier-like columns (PK flags, or
-            # data-driven: distinct == row count, e.g. Transaction_ID) never
-            # qualify — summing an ID is meaningless.
-            _pks = {str(c).lower() for c in (
-                (tinfo.get("primary_key") or []) + (tinfo.get("inferred_primary_key") or []))}
-            _id_name = __import__("re").compile(r"(^|_)(id|key|code|no|number|guid|uuid)($|_)").search
-            _col_flags = {}
-            for _cc in (tinfo.get("columns") or []):
-                if isinstance(_cc, dict) and _cc.get("column"):
-                    if _cc.get("is_primary_key"):
-                        _pks.add(str(_cc.get("column")).lower())
-            def _looks_identifier(_c):
-                if str(_c).lower() in _pks:
-                    return True
-                if not _id_name(str(_c).lower()):
-                    return False
-                try:
-                    _ir = _run_sql(self.conn, f"SELECT COUNT(*) AS n, COUNT(DISTINCT {_safe_name(self._t(tname))}.{_safe_name(_c)}) AS d FROM {_safe_name(self._t(tname))}", limit=1)
-                    _rows = _ir[1] if isinstance(_ir, tuple) else []
-                    if _rows:
-                        _n, _d = _rows[0].get("n"), _rows[0].get("d")
-                        return bool(_n and _d == _n)
-                except Exception:
-                    pass
-                return False
-            _measures = [measure]
-            for _c in self.intel.get_numeric_cols(tname):
-                if _c != measure and len(_measures) < 3 and not _looks_identifier(_c):
-                    _measures.append(_c)
 
             def _run(det, *a):
-                for _m in _measures:
+                for _m in measures:
                     try:
                         insights.extend(det(tname, _m))
                     except DB_ERRORS as exc:
@@ -517,7 +579,7 @@ class InsightsEngine:
             return []
 
         impact_value = current_val - previous_val
-        dims = self.intel.get_text_cols(table)[:3]
+        dims = self._suggested_dims(table)
         _move_word = "up" if change_pct > 0 else "down"
 
         insights.append(self._build_insight(
@@ -638,7 +700,7 @@ class InsightsEngine:
                          "expected": _trend_expected, "bandLower": _lo, "bandUpper": _hi} for v in values]
         else:
             viz_data = [{"period": str(v[0])[:7], "value": v[1], "anomaly": _is_unusual(v[1])} for v in values]
-        dims = self.intel.get_text_cols(table)[:3]
+        dims = self._suggested_dims(table)
 
         insights.append(self._build_insight(
             insight_id=f"tr_{table}_{measure}",
@@ -758,7 +820,7 @@ class InsightsEngine:
             f"{humanize(r['measure'])} {r['slope_pct']:+.1f}%/period" for r in ranked
         )
         viz_data = [{"name": humanize(r["measure"]), "value": r["slope_pct"]} for r in ranked]
-        dims = self.intel.get_text_cols(table)[:3]
+        dims = self._suggested_dims(table)
 
         return [self._build_insight(
             insight_id=f"tl_{table}",
@@ -853,7 +915,7 @@ class InsightsEngine:
                 period_str = period.strftime('%b %Y') if hasattr(period, 'strftime') else str(period)
                 viz_data = [{"period": str(v[0])[:7], "value": v[1], "anomaly": v[0] == period,
                              "expected": expected_val, "bandLower": lower_bound, "bandUpper": upper_bound} for v in values]
-                dims = self.intel.get_text_cols(table)[:3]
+                dims = self._suggested_dims(table)
 
                 insights.append(self._build_insight(
                     insight_id=f"an_{table}_{measure}_{period_str.replace(' ', '_')}",
@@ -878,8 +940,10 @@ class InsightsEngine:
                     baseline=mean_val,
                     current_value=val,
                     change_pct=((val - mean_val) / abs(mean_val) * 100) if mean_val != 0 else 0,
-                    impact_value=val - mean_val,
-                    impact_direction="positive" if val > mean_val else "negative",
+                    # Statistical deviation is not a business/financial impact.
+                    # Keep it in the anomaly evidence, not the impact field.
+                    impact_value=None,
+                    impact_direction="neutral",
                     impact_explanation=f"The {direction} normal {humanize(measure).lower()} of {_fmtm(val, measure)} in {period_str} may indicate {'an exceptional opportunity' if val > mean_val else 'a potential issue worth investigating'}.",
                     next_question=f"What caused {humanize(measure).lower()} to be {direction} normal in {period_str}?",
                     next_dims=dims,
@@ -925,6 +989,61 @@ class InsightsEngine:
                 continue
         ranked.sort(key=lambda x: x[0])
         return ranked[0][1] if ranked else None
+
+    def _suggested_dims(self, table: str, limit: int = 3) -> list:
+        """Explore-safe breakdown recommendations for ``next_dims`` (cached).
+
+        Text/category columns that actually re-run cleanly: drops foreign
+        keys (explore refuses FK breakdowns), identifier-like columns,
+        near-unique one-value-per-row columns, and constants. Compact
+        cardinality ranks first. Never raises; returns [] on failure.
+        """
+        cache_key = (table, limit)
+        if cache_key in self.dim_suggest_cache:
+            return self.dim_suggest_cache[cache_key]
+
+        foreign = {str(e[0]).strip().lower()
+                   for e in (self.intel.get_fks(table) or []) if e and e[0]}
+        primary = {str(c).strip().lower()
+                   for c in (self.intel.get_pk(table) or [])}
+        candidates = []
+        best = self.intel.find_best_dimension(table)
+        if best:
+            candidates.append(best)
+        for col in self.intel.get_text_cols(table):
+            if col not in candidates:
+                candidates.append(col)
+
+        ranked = []
+        try:
+            cur = self.conn.cursor()
+            for dim in candidates[:8]:
+                low = str(dim).strip().lower()
+                if low in (foreign | primary) or _is_id_like(dim):
+                    continue
+                cur.execute(
+                    f"SELECT COUNT(*), COUNT(DISTINCT {_safe_name(dim)})"
+                    f" FROM {_safe_name(self._t(table))}"
+                )
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    continue
+                rows_n = float(row[0] or 0)
+                distinct = float(row[1] or 0)
+                if distinct <= 1 or distinct / rows_n > 0.5:
+                    continue
+                ranked.append((distinct, dim))
+            cur.close()
+        except DB_ERRORS as exc:
+            log.debug("suggested dims skipped for %s: %s", table, exc)
+            self._rollback()
+            self.dim_suggest_cache[cache_key] = []
+            return []
+
+        ranked.sort(key=lambda x: x[0])
+        out = [d for _, d in ranked[:limit]]
+        self.dim_suggest_cache[cache_key] = out
+        return out
 
     def _detect_opportunities(self, table: str, measure: str | None = None):
         insights = []
@@ -1119,7 +1238,7 @@ class InsightsEngine:
             severity = "high" if declining_streak >= 4 else "medium"
             period_label = self._period_label(values[-1][0], values[0][0])
             viz_data = [{"period": str(v[0])[:7], "value": v[1]} for v in values]
-            dims = self.intel.get_text_cols(table)[:3]
+            dims = self._suggested_dims(table)
 
             insights.append(self._build_insight(
                 insight_id=f"rk_{table}_{measure}",
@@ -1164,7 +1283,7 @@ class InsightsEngine:
                     confidence = min(75, max(30, int(80 - cv * 10)))
                     period_label = self._period_label(values[-1][0], values[0][0])
                     viz_data = [{"period": str(v[0])[:7], "value": v[1]} for v in values]
-                    dims = self.intel.get_text_cols(table)[:3]
+                    dims = self._suggested_dims(table)
 
                     insights.append(self._build_insight(
                         insight_id=f"rks_{table}_{measure}",
@@ -1289,7 +1408,7 @@ class InsightsEngine:
                         impact_direction="neutral",
                         impact_explanation=f"The {strength} link may reflect shared underlying drivers. This does not prove causation.",
                         next_question=f"What shared factors could explain the link between {humanize(tdesc1).lower()} and {humanize(tdesc2).lower()}?",
-                        next_dims=[t1, t2],
+                        next_dims=self._suggested_dims(t1),
                         viz_type="scatter",
                         viz_data=viz_data,
                         source_tables=[t1, t2],
@@ -1304,7 +1423,8 @@ class InsightsEngine:
         """Detect row-level outliers on numeric columns using IQR."""
         insights = []
         tdesc = self.intel.tables[table].get("description", table)
-        num_cols = self.intel.get_numeric_cols(table)
+        candidates = self._measure_candidates(table)
+        num_cols = [measure] if measure in candidates else candidates if measure is None else []
         if not num_cols:
             return []
 
@@ -1369,7 +1489,7 @@ class InsightsEngine:
                 impact_direction="negative" if direction == "above" else "neutral",
                 impact_explanation=f"{pct:.1f}% of rows have unusual {humanize(col).lower()} values.",
                 next_question=f"What drives the unusual {humanize(col).lower()} values near {_fmt(max(outliers))}?",
-                next_dims=[col],
+                next_dims=self._suggested_dims(table),
                 viz_type="histogram",
                 viz_data=_viz,
                 source_tables=[table],
@@ -1444,7 +1564,7 @@ class InsightsEngine:
                 impact_direction="negative",
                 impact_explanation=f"High concentration means {humanize(dim).lower()} diversification is limited.",
                 next_question=f"What makes {top_entities} so dominant?",
-                next_dims=[dim, measure],
+                next_dims=[dim],
                 viz_type="pie",
                 viz_data=_conc_viz,
                 source_tables=[table],
@@ -1543,7 +1663,7 @@ class InsightsEngine:
                     impact_direction="negative",
                     impact_explanation="High variability may indicate inconsistent quality or pricing.",
                     next_question=f"What drives the wide variation in {humanize(col).lower()}?",
-                    next_dims=[col],
+                    next_dims=self._suggested_dims(table),
                     viz_type="histogram",
                     viz_data=_dist_viz,
                     source_tables=[table],
@@ -1582,7 +1702,7 @@ class InsightsEngine:
                         impact_direction="neutral",
                         impact_explanation=f"Most {humanize(col).lower()} values are {'below' if direction == 'right' else 'above'} average, so the typical value differs from the overall level.",
                         next_question=f"What is the typical {humanize(col).lower()}?",
-                        next_dims=[col],
+                        next_dims=self._suggested_dims(table),
                         viz_type="histogram",
                         viz_data=_skew_viz,
                         source_tables=[table],
@@ -1662,7 +1782,7 @@ class InsightsEngine:
                     impact_direction="positive",
                     impact_explanation=f"The gap between segments suggests potential for targeted optimization.",
                     next_question=f"What drives the high {humanize(measure).lower()} in {humanize(top_seg[0]).lower()}?",
-                    next_dims=[dim, measure],
+                    next_dims=[dim],
                     viz_type="bar",
                     viz_data=_seg_viz,
                     source_tables=[table],
@@ -1722,8 +1842,16 @@ class InsightsEngine:
         except (TypeError, ValueError):
             _conf = 50
         _ev_sample = kw.get("sample_size")
+        _base_id = str(kw.get("insight_id") or f"ins_{now}")
+        _ins_id = _base_id
+        _n = 0
+        while _ins_id in self._used_ids:
+            _n += 1
+            _ins_id = f"{_base_id}-{_n}"
+        if len(self._used_ids) < 5000:
+            self._used_ids.add(_ins_id)
         _out = {
-            "id": kw.get("insight_id", f"ins_{now}"),
+            "id": _ins_id,
             "type": kw.get("insight_type", "Trend"),
             "severity": kw.get("severity", "low"),
             "title": kw.get("title", ""),
@@ -1839,12 +1967,14 @@ class AskInsightRequest(BaseModel):
 
 
 @router.get("/api/insights")
-def get_insights(request: Request, user: dict = Depends(require_writable)):
+def get_insights(request: Request, user: dict = Depends(get_current_user)):
     """Generate real insights from the connected database."""
     import json as _json
     session = get_session(user["user_id"])
     reject_document_sql(session)
-    schema_path = session.get("schema_path")
+    # Session values are JSON-backed and may be strings after a reload.
+    schema_value = session.get("schema_path")
+    schema_path = Path(str(schema_value)) if schema_value else None
     if not schema_path or not schema_path.exists():
         raise HTTPException(status_code=400, detail="No database connected. Please connect first.")
     mapping = _json.loads(schema_path.read_text(encoding="utf-8"))
@@ -1923,20 +2053,58 @@ def get_insights(request: Request, user: dict = Depends(require_writable)):
         # row counts the mapping (csv_handler/csv_orchestrator contract)
         # exposes; fall back to a live COUNT(*) only when the mapping has no
         # counts. rows < 10 -> honest insufficient state, never LLM content.
-        _row_total, _row_known = 0, False
-        for _t, _ti in (mapping.get("tables") or {}).items():
+        _mapped_tables = mapping.get("tables") or {}
+        _row_total, _row_counts_complete = 0, bool(_mapped_tables)
+        for _t, _ti in _mapped_tables.items():
             _rc = (_ti or {}).get("row_count")
             if isinstance(_rc, int):
-                _row_known = True
                 _row_total += max(0, _rc)
+            else:
+                _row_counts_complete = False
+        if not _row_counts_complete:
+            _row_total = 0
+            _row_counts_complete = bool(_mapped_tables)
+            _count_dialect = (
+                "mysql" if db_type == "mysql"
+                else "sqlite" if db_type in ("sqlite", "document")
+                else "postgresql"
+            )
+            for _table in _mapped_tables:
+                _cursor = None
+                try:
+                    _cursor = conn.cursor()
+                    _cursor.execute(
+                        f"SELECT COUNT(*) FROM {_safe_name(_table, _count_dialect)}"
+                    )
+                    _count_row = _cursor.fetchone()
+                    if not _count_row:
+                        raise RuntimeError("The database did not return a row count.")
+                    _row_total += max(0, int(_count_row[0]))
+                except Exception as _count_exc:
+                    _row_counts_complete = False
+                    log.warning(
+                        "insights row count failed for table=%s request_id=%s: %s",
+                        _table, get_request_id(request), _count_exc,
+                    )
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    if _cursor is not None:
+                        try:
+                            _cursor.close()
+                        except Exception:
+                            pass
+        _row_known = _row_counts_complete
         try:
             from core.evidence import assess_evidence as _assess2
             from core.evidence import dataset_facts as _facts2
-            if _row_known:
-                _ev = _assess2(_row_total, "insights",
-                               dataset_name=session.get("db_name"))
-            else:
-                _ev = None
+            _ev = _assess2(
+                _row_total if _row_known else None,
+                "insights",
+                dataset_name=session.get("db_name"),
+            )
         except (ValueError, KeyError, TypeError, AttributeError, ImportError) as exc:
             log.debug("insights evidence pre-gate skipped: %s", exc)
             _ev = None
@@ -1978,20 +2146,17 @@ def get_insights(request: Request, user: dict = Depends(require_writable)):
             try:
                 from core.evidence import assess_evidence as _assess3
                 _payload["evidence_state"] = _assess3(
-                    _row_total if _row_known else max(0, len(insights)),
+                    _row_total if _row_known else None,
                     "insights", dataset_name=session.get("db_name"))
             except Exception:
                 pass
         return _payload
     except Exception as e:
-        # Honest failure shape: ok:false + sanitized detail (no secrets/paths).
-        # Full traceback stays server-side. Frontend shows its error branch
-        # (Insights.tsx error state reads `detail`) instead of an empty page.
+        # Honest failure shape: sanitized detail (no secrets/paths).
+        # Full traceback stays server-side. Standard HTTPException so every
+        # error site in this router shares one shape: {"detail": "..."}.
         log.exception("insights failed user=%s", user.get("user_id"))
-        return JSONResponse(status_code=500, content={
-            "ok": False, "detail": sanitize_error(e),
-            "insights": [], "count": 0,
-        })
+        raise HTTPException(status_code=500, detail=str(sanitize_error(e)))
     finally:
         try:
             conn.close()
@@ -2239,9 +2404,7 @@ def get_insight_detail(insight_id: str, request: Request, user: dict = Depends(g
         insights = engine.generate_all_insights(max_insights=20)
     except Exception as e:
         log.exception("insights detail failed user=%s", user.get("user_id"))
-        return JSONResponse(status_code=500, content={
-            "ok": False, "detail": sanitize_error(e),
-        })
+        raise HTTPException(status_code=500, detail=str(sanitize_error(e)))
     finally:
         try:
             conn.close()
@@ -2254,10 +2417,8 @@ def get_insight_detail(insight_id: str, request: Request, user: dict = Depends(g
             target = _ins
             break
     if target is None:
-        return JSONResponse(status_code=404, content={
-            "ok": False, "code": "NOT_FOUND",
-            "detail": f"Insight '{insight_id}' not found.",
-        })
+        raise HTTPException(status_code=404,
+                            detail=f"Insight '{insight_id}' not found.")
     # related_ids: generic — same type or overlapping source tables, max 5.
     try:
         _t_type = str(target.get("type", "")).lower()

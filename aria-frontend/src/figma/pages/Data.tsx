@@ -1124,6 +1124,7 @@ export default function Data({
     const issues = quality?.issues || [];
     const metrics = quality?.metrics || {};
     const overall = quality?.overall ?? 0;
+    const showPrimaryKeyCoverage = metrics.primary_key_applicable !== false;
 
     const severityColor = (s: string) => s === "high" ? "text-negative bg-negative/10" : s === "medium" ? "text-amber-600 dark:text-amber-400 bg-amber-500/10" : "text-muted-foreground bg-secondary";
 
@@ -1179,9 +1180,9 @@ export default function Data({
                   </p>
                 </div>
               </div>
-              <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className={`mt-4 grid grid-cols-2 ${showPrimaryKeyCoverage ? "sm:grid-cols-4" : "sm:grid-cols-3"} gap-3`}>
                 <MetricCard label="Completeness" value={metrics.completeness} suffix="%" />
-                <MetricCard label="PK Coverage" value={metrics.pk_coverage} suffix="%" />
+                {showPrimaryKeyCoverage && <MetricCard label="PK Coverage" value={metrics.pk_coverage} suffix="%" />}
                 <MetricCard label="Avg Null %" value={metrics.avg_null_percentage} suffix="%" invert />
                 <MetricCard label="Empty Tables" value={metrics.empty_tables} suffix={` / ${metrics.total_tables}`} />
               </div>

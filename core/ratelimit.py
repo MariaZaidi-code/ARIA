@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections import defaultdict
 
@@ -25,6 +26,7 @@ from fastapi import Depends, HTTPException, Request
 from core.deps import get_current_user
 
 _hits: dict[tuple[str, str], list[float]] = defaultdict(list)
+_HITS_LOCK = threading.Lock()
 _warned_multi_worker = False
 _last_cleanup: float = 0.0
 _redis_client = None
@@ -235,22 +237,26 @@ def check_limit(bucket: str, key: str, max_calls: int, window_s: int) -> None:
         pass
     now = time.monotonic()
     k = (bucket, key)
-    hits = [t for t in _hits[k] if now - t < window_s]
-    if len(hits) >= max_calls:
-        raise HTTPException(
-            status_code=429,
-            detail="Too many requests. Slow down and try again shortly.",
-        )
-    hits.append(now)
-    _hits[k] = hits
-    # Bound memory: drop buckets idle past 2x the longest window and cap total keys.
-    # Only run cleanup periodically (every ~60 s) to avoid O(n) scan on every request.
-    global _last_cleanup
-    if len(_hits) > 5000 and (now - _last_cleanup) > 60:
-        _last_cleanup = now
-        stale = [kk for kk, vv in _hits.items() if not vv or now - vv[-1] > window_s * 2]
-        for kk in stale[:1000]:
-            _hits.pop(kk, None)
+    # Mutate atomically: the FastAPI threadpool runs requests concurrently,
+    # so a read-filter-append here can lose hits and overshoot the budget.
+    with _HITS_LOCK:
+        hits = [t for t in _hits[k] if now - t < window_s]
+        if len(hits) >= max_calls:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests. Slow down and try again shortly.",
+            )
+        hits.append(now)
+        _hits[k] = hits
+        # Bound memory: drop buckets idle past 2x the longest window and cap
+        # total keys. Only run cleanup periodically (every ~60 s) to avoid
+        # an O(n) scan on every request.
+        global _last_cleanup
+        if len(_hits) > 5000 and (now - _last_cleanup) > 60:
+            _last_cleanup = now
+            stale = [kk for kk, vv in _hits.items() if not vv or now - vv[-1] > window_s * 2]
+            for kk in stale[:1000]:
+                _hits.pop(kk, None)
 
 
 def limit(bucket: str, max_calls: int, window_s: int = 60):

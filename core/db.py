@@ -8,6 +8,12 @@ _URI_SCHEMES = {
     "mysql": "mysql+pymysql",
 }
 
+# A valid (unquoted) SQL identifier. Schema names flow into a libpq
+# ``-csearch_path=`` option string, so each segment must be strictly
+# validated — a comma/whitespace-bearing name would otherwise alter the
+# resolved search path.
+_SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 
 def build_db_uri(config, db_type="postgresql"):
     """Build a SQLAlchemy connection URI for the given database type.
@@ -40,6 +46,10 @@ def search_path_connect_args(db_type, schemas):
         for s in (schemas or []):
             norm = _strip_identifier_quotes(s)
             if not norm:
+                continue
+            # Reject anything that is not a bare identifier (no commas,
+            # quotes, spaces, operators) before it reaches the option string.
+            if not _SAFE_IDENT_RE.match(norm):
                 continue
             key = norm.lower()
             if key not in seen:

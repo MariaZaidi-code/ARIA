@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 import csv_orchestrator
 import schema_agent
-from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session, save_session, get_user_artifact_paths
+from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session, save_session, get_user_artifact_paths, _atomic_write_text
 from core.db import build_db_uri
 from core.deps import require_writable, get_current_user
 from core.secret_box import decrypt as _decrypt_secret
@@ -192,7 +192,8 @@ def _host_is_numeric(host: str) -> bool:
         return False
 
 
-def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql") -> int:
+def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql",
+                          pin_to=None) -> int:
     """Shared SSRF/host validation for database connect + test paths.
 
     Used by both the real connect path and /api/database/test so probing
@@ -201,6 +202,11 @@ def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql") 
     Loopback (localhost/127.0.0.1/::1) stays allowed for local-dev DBs;
     cloud-metadata (169.254.169.254 in any numeric form), private ranges,
     link-local/multicast/reserved, and DNS names resolving to them are blocked.
+
+    When ``pin_to`` carries a ``host`` attribute (the connect request model),
+    a hostname is replaced with its first validated resolved IP: the actual
+    connection then uses the same address that was checked, closing the
+    DNS-rebind window (resolve→check→connect re-resolution).
     """
     host = (host or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", host) or len(host) > 253:
@@ -219,9 +225,17 @@ def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql") 
         if ".nip.io" in low or ".sslip.io" in low:
             # e.g. 169.254.169.254.nip.io — resolves to the embedded IP
             raise HTTPException(status_code=400, detail="Host is blocked.")
-        for rip in _resolve_host_ips(host):
+        resolved = _resolve_host_ips(host)
+        for rip in resolved:
             if _ip_is_blocked(rip, allow_loopback=True):
                 raise HTTPException(status_code=400, detail="Host resolves to a blocked address.")
+        if pin_to is not None and getattr(pin_to, "host", None) == host and resolved:
+            # All resolved IPs passed the blocklist — pin the first so the
+            # connect cannot re-resolve to a different (attacker-chosen) IP.
+            try:
+                pin_to.host = resolved[0]
+            except Exception:
+                pass
     try:
         port_int = int(port)
     except (TypeError, ValueError):
@@ -518,7 +532,8 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
     # not pages later inside an analysis.
     if request.provider != "local" and (request.api_key or request.provider in ("cloud", "deepseek", "omniroute", "grok")):
         try:
-            llm.ping(timeout=25)
+            from core.provider_health import ping_with_retry
+            ping_with_retry(llm, timeout=25)
         except Exception as exc:
             from core.errors import sanitize_error as _san
             raise HTTPException(
@@ -631,7 +646,7 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
         if not (request.db and request.user and request.password):
             raise HTTPException(status_code=400, detail="Relational source requires db, user, and password.")
         request.port = _validate_db_endpoint(
-            request.host, request.port, request.db, request.user, db_type
+            request.host, request.port, request.db, request.user, db_type, pin_to=request
         )
 
     # Use user's saved API key for hosted providers if available
@@ -826,8 +841,8 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
                                       type(o).__name__)
                     return str(o)
 
-                user_path.write_text(json.dumps(mapping, indent=2, default=_json_safe),
-                                     encoding="utf-8")
+                _atomic_write_text(user_path,
+                                   json.dumps(mapping, indent=2, default=_json_safe))
                 session["schema_path"] = user_path
                 session["schema_status"] = "ok"
                 save_session(user["user_id"], session)
@@ -955,7 +970,9 @@ def _finish_csv_connect(*, file_path, upload_dir, safe_name, stamp, filename,
     _set_progress(uid, "profiling", 65, f"Profiling {row_count} rows...")
     safe_db_name = mapping["database"]
     schema_path = _upaths["schema_dir"] / f"schema_mapping_{safe_db_name}_latest.json"
-    schema_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+    # Atomic: a crash mid-write must not corrupt _latest.json (insights + {
+    # intelligence meta 500 on a truncated store).
+    _atomic_write_text(schema_path, json.dumps(mapping, indent=2))
 
     _set_progress(uid, "understanding", 80, "Understanding data structure...")
     session = get_session(uid)
@@ -1256,10 +1273,10 @@ def connect_pdf(
         if _pdf_uri and _pdf_mapping:
             _safe_db = re.sub(r"[^a-zA-Z0-9_-]+", "_", f"pdf_{safe_name}")[:64] or "pdf_doc"
             _schema_path = _pdf_upaths["schema_dir"] / f"schema_mapping_{_safe_db}_latest.json"
-            _schema_path.write_text(json.dumps({
+            _atomic_write_text(_schema_path, json.dumps({
                 "database": _safe_db,
                 "tables": _pdf_mapping,
-            }, indent=2), encoding="utf-8")
+            }, indent=2))
             session["source_type"] = "semi-structured"
             session["db"] = {"document_tables": _pdf_uri}
             session["db_type"] = "sqlite"
@@ -1294,7 +1311,16 @@ def connect_pdf(
             "document_id": document.id,
             "filename": filename,
             "original_filename": filename,
+            "size_bytes": document.file_size,
+            "pages": document.page_count,
+            "total_chunks": len(document.chunks),
+            "text_chars": sum(len(c.content or "") for c in (document.chunks or [])),
+            "element_count": len(document.elements),
+            "tables": len(document.tables),
             "document_type": document.document_type.value if document.document_type else "unknown",
+            "status": document.status.value,
+            "processing_method": document.processing_method,
+            "sha256": document.sha256,
             "page_count": document.page_count,
             "chunk_count": len(document.chunks),
             "created_at": document.created_at,
@@ -1404,8 +1430,9 @@ class DatabaseTestRequest(BaseModel):
 @router.post("/api/database/test")
 async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depends(require_writable)):
     """Test a database connection before actually connecting (writable sessions only)."""
-    # Shared SSRF/host validation (same as real connect path).
-    port = _validate_db_endpoint(req.host, req.port, req.db, req.user, req.dbType)
+    # Shared SSRF/host validation (same as real connect path); also pins the
+    # validated IP so the connect below cannot re-resolve (DNS rebind).
+    port = _validate_db_endpoint(req.host, req.port, req.db, req.user, req.dbType, pin_to=req)
     try:
         from sqlalchemy import create_engine, text
         from core.secret_box import decrypt as _decrypt_secret

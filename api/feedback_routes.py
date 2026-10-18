@@ -7,7 +7,9 @@ layer only.
 """
 
 import json
+import os
 import time
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -20,10 +22,22 @@ router = APIRouter()
 # ── Preference storage path ─────────────────────────────────────────────
 _PREFS_DIR = Path(__file__).resolve().parent.parent / "data" / "preferences"
 
+# Bounded telemetry: arbitrary client text keys must not grow the prefs
+# store forever (two concurrent posts / repeated UI events add keys).
+_MAX_TEXT_KEYS = 200
+_MAX_TEXT_KEY_LEN = 160
+_MAX_CHART_CONTEXTS = 100
+
 
 def _prefs_path(user_id: str) -> Path:
     _PREFS_DIR.mkdir(parents=True, exist_ok=True)
-    return _PREFS_DIR / f"user_{user_id}_prefs.json"
+    # user id is always a validated int from get_current_user; still keep
+    # digits-only in the filename for belt-and-braces path safety.
+    try:
+        safe_id = int(str(user_id).strip())
+    except (TypeError, ValueError):
+        safe_id = 0
+    return _PREFS_DIR / f"user_{safe_id}_prefs.json"
 
 
 def _load_prefs(user_id: str) -> dict:
@@ -31,8 +45,11 @@ def _load_prefs(user_id: str) -> dict:
     if p.exists():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger("uvicorn.error").warning(
+                "prefs load failed for user %s (%s) — defaults returned",
+                str(user_id)[:3], type(exc).__name__)
     return {
         "chart_preferences": {},
         "suggestion_clicks": {},
@@ -43,9 +60,45 @@ def _load_prefs(user_id: str) -> dict:
     }
 
 
+def load_preferences(user_id: str) -> dict:
+    """Public accessor for the per-user preferences store.
+
+    The RL routes reuse this store for integrity checks/ranking context
+    without reaching into the private loader.
+    """
+    return _load_prefs(user_id)
+
+
 def _save_prefs(user_id: str, prefs: dict):
+    # Atomic write like the workspace stores: a crash mid-write must not
+    # destroy the file (load then silently fell back to defaults).
     p = _prefs_path(user_id)
-    p.write_text(json.dumps(prefs, indent=2, default=str), encoding="utf-8")
+    tmp = p.with_name(f"{p.name}.tmp-{uuid.uuid4().hex[:8]}")
+    tmp.write_text(json.dumps(prefs, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, p)
+    try:
+        if os.name != "nt":
+            os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+
+def _bound_text_keys(mapping: dict, cap: int = _MAX_TEXT_KEYS) -> dict:
+    """Keep only the most-clicked keys, truncated, under a cap."""
+    if not isinstance(mapping, dict):
+        return {}
+    bounded = {}
+    for k, v in list(mapping.items())[: cap * 2]:
+        key = str(k).strip()[:_MAX_TEXT_KEY_LEN] or "unlabeled"
+        cur = bounded.get(key, 0)
+        try:
+            bounded[key] = int(cur) + int(v or 0)
+        except (TypeError, ValueError):
+            bounded[key] = int(cur) + 1
+    if len(bounded) > cap:
+        bounded = dict(sorted(bounded.items(), key=lambda kv: int(kv[1]),
+                              reverse=True)[:cap])
+    return bounded
 
 
 # ── Models ──────────────────────────────────────────────────────────────
@@ -104,10 +157,10 @@ def rate_insight(payload: InsightRating, user: dict = Depends(get_current_user))
 def track_suggestion_click(payload: SuggestionClick, user: dict = Depends(get_current_user)):
     """Track when user clicks a suggestion. Used for suggestion ranking."""
     prefs = _load_prefs(user["user_id"])
-    text = payload.suggestion_text.strip()
-    clicks = prefs.get("suggestion_clicks", {})
+    text = payload.suggestion_text.strip()[:_MAX_TEXT_KEY_LEN]
+    clicks = _bound_text_keys(prefs.get("suggestion_clicks", {}))
     clicks[text] = clicks.get(text, 0) + 1
-    prefs["suggestion_clicks"] = clicks
+    prefs["suggestion_clicks"] = _bound_text_keys(clicks)
     _save_prefs(user["user_id"], prefs)
     return {"ok": True}
 
@@ -117,10 +170,18 @@ def track_chart_preference(payload: ChartPreference, user: dict = Depends(get_cu
     """Track chart type selection. Used for chart recommendation."""
     prefs = _load_prefs(user["user_id"])
     history = prefs.get("chart_type_history", {})
-    key = payload.context or "general"
+    key = (payload.context or "general").strip()[:_MAX_TEXT_KEY_LEN] or "general"
     if key not in history:
         history[key] = {}
     history[key][payload.chart_type] = history[key].get(payload.chart_type, 0) + 1
+    # Bound both the context subset and the total history size.
+    if len(history) > _MAX_CHART_CONTEXTS:
+        flatten = [(c, t, n) for c, per in history.items() for t, n in (per or {}).items()]
+        flatten.sort(key=lambda x: x[2], reverse=True)
+        rebuilt: dict = {}
+        for c, t, _n in flatten[: _MAX_CHART_CONTEXTS * 5]:
+            rebuilt.setdefault(c, {})[t] = _n
+        history = rebuilt
     prefs["chart_type_history"] = history
     _save_prefs(user["user_id"], prefs)
     return {"ok": True}

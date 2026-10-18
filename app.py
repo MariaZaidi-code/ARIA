@@ -38,7 +38,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 from core.config import STATIC_DIR, BASE_DIR  # noqa: E402
 from core.checks import run_checks  # noqa: E402
 from llm_provider import PROVIDERS  # noqa: E402
-from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, hypothesis_investigation_routes, settings_routes, feedback_routes, autocomplete_routes, data_routes, insight_rag_routes, insights_routes, predictive_routes, prescription_routes, rl_routes, intelligence_routes, verification_routes  # noqa: E402
+from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, hypothesis_investigation_routes, settings_routes, feedback_routes, autocomplete_routes, data_routes, insight_rag_routes, insights_routes, predictive_routes, prescription_routes, rl_routes, intelligence_routes, verification_routes, workspace_routes, export_routes, integrations_routes  # noqa: E402
 from core.ratelimit import limit, limit_heavy, limit_ip, limit_llm  # noqa: E402
 from fastapi import Depends as _Depends  # noqa: E402
 
@@ -108,8 +108,10 @@ async def lifespan(app: FastAPI):
             )
     except RuntimeError:
         raise
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("uvicorn.error").warning(
+            "ARIA worker/shared-store check skipped (%s).", type(exc).__name__,
+        )
     logging.getLogger("uvicorn.error").info("ARIA startup checks complete.")
     try:
         _eff_workers = _resolve_workers()
@@ -231,6 +233,9 @@ app.include_router(predictive_routes.router, dependencies=[_Depends(limit_llm())
 app.include_router(prescription_routes.router, dependencies=[_Depends(limit_heavy())])
 app.include_router(hypothesis_investigation_routes.router, dependencies=[_Depends(limit_heavy())])
 app.include_router(rl_routes.router, dependencies=[_Depends(limit("rl", 60))])
+app.include_router(workspace_routes.router, dependencies=[_Depends(limit("workspace", 120))])
+app.include_router(export_routes.router, dependencies=[_Depends(limit("export", 30))])
+app.include_router(integrations_routes.router, dependencies=[_Depends(limit_ip("slack_integration", 120))])
 app.include_router(intelligence_routes.router, dependencies=[_Depends(limit_heavy())])
 app.include_router(verification_routes.router, dependencies=[_Depends(limit_heavy())])
 
@@ -302,8 +307,25 @@ async def unhandled_exception(request: Request, exc: Exception):
 
 
 @app.get("/api/health", dependencies=[_Depends(limit_ip("health", 120))])
-def health():
-    """Live dependency/health status for ops and the UI."""
+def health(request: Request = None):
+    """Live dependency/health status for ops and the UI.
+
+    Anonymous callers get only a boolean liveness status; the detailed
+    dependency report (python/package inventory, env flags, DB details)
+    requires authentication to avoid leaking recon to unauthenticated
+    traffic.
+    """
+    detail_ok = False
+    if request is not None:
+        try:
+            from core.config import get_session_for_request
+
+            get_session_for_request(request)
+            detail_ok = True
+        except Exception:
+            detail_ok = False
+    if not detail_ok:
+        return {"ok": True, "status": "healthy"}
     return run_checks()
 
 

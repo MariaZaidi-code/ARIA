@@ -1,6 +1,7 @@
 """Authentication and per-user history routes."""
 
 import os
+import threading
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -63,6 +64,7 @@ def _auth_response(token: str, username: str) -> JSONResponse:
 # core/ratelimit._check_shared_store); otherwise each worker enforces its
 # own per-process login budget.
 _LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+_LOGIN_LOCK = threading.Lock()
 _LOGIN_WINDOW_S = 300
 _LOGIN_MAX = 30
 # Bound for the per-process login map: prune entries idle past the window
@@ -129,17 +131,20 @@ def _check_login_rate_limit(request: Request) -> None:
             pass
     except Exception:
         pass
-    hits = [t for t in _LOGIN_ATTEMPTS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
-    if len(hits) >= _LOGIN_MAX:
-        raise HTTPException(status_code=429, detail="Too many login attempts. Try again in a few minutes.")
-    hits.append(now)
-    _LOGIN_ATTEMPTS[ip] = hits
-    # Opportunistic global prune: cheap per-request for this IP is already
-    # done above; run the full sweep periodically or when over the cap so
-    # the map cannot grow unbounded across many distinct IPs.
-    global _LOGIN_LAST_PRUNE
-    if len(_LOGIN_ATTEMPTS) > _LOGIN_MAX_IPS or (now - _LOGIN_LAST_PRUNE) > 60:
-        _prune_login_attempts(now)
+    # Mutations on _LOGIN_ATTEMPTS must be atomic: the threadpool runs
+    # concurrent requests, and read-filter-append loses attempts under load.
+    with _LOGIN_LOCK:
+        hits = [t for t in _LOGIN_ATTEMPTS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
+        if len(hits) >= _LOGIN_MAX:
+            raise HTTPException(status_code=429, detail="Too many login attempts. Try again in a few minutes.")
+        hits.append(now)
+        _LOGIN_ATTEMPTS[ip] = hits
+        # Opportunistic global prune: cheap per-request for this IP is already
+        # done above; run the full sweep periodically or when over the cap so
+        # the map cannot grow unbounded across many distinct IPs.
+        global _LOGIN_LAST_PRUNE
+        if len(_LOGIN_ATTEMPTS) > _LOGIN_MAX_IPS or (now - _LOGIN_LAST_PRUNE) > 60:
+            _prune_login_attempts(now)
 
 
 class AuthRequest(BaseModel):

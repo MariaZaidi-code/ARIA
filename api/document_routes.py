@@ -59,14 +59,20 @@ class _CanonicalRAGAdapter:
         document_ids: list[str] | None = None,
         k: int = 10,
     ) -> list[dict]:
-        """Hybrid retrieval across the canonical PGVector index."""
+        """Search the canonical vector index, with an offline lexical fallback."""
+        results = []
         try:
             store = self._get_vector_store(self.user_id)
             results = store.search(query, k=k, document_ids=document_ids)
         except Exception as exc:
             logger.warning("Canonical RAG search failed: %s", type(exc).__name__)
-            return []
-        out: list[dict] = []
+        if results:
+            out: list[dict] = []
+        else:
+            out = self._search_local_chunks(query, document_ids=document_ids, k=k)
+            if out:
+                return out
+        out = []
         for doc, score in results:
             meta = doc.metadata if hasattr(doc, "metadata") else {}
             out.append({
@@ -80,6 +86,47 @@ class _CanonicalRAGAdapter:
                 "filename": meta.get("filename"),
             })
         return out
+
+    def _search_local_chunks(
+        self,
+        query: str,
+        document_ids: list[str] | None = None,
+        k: int = 10,
+    ) -> list[dict]:
+        """Rank saved chunks lexically when the remote vector store is absent."""
+        query_terms = set(re.findall(r"[\w]+", (query or "").casefold(), flags=re.UNICODE))
+        if not query_terms:
+            return []
+        from insight_rag.storage import RAGMetadataStore
+
+        metadata = RAGMetadataStore(self.user_id)
+        allowed_ids = set(document_ids or []) if document_ids is not None else None
+        ranked: list[dict] = []
+        for record in metadata.list_documents():
+            document_id = str(record.get("document_id") or "")
+            if not document_id or (allowed_ids is not None and document_id not in allowed_ids):
+                continue
+            for chunk in metadata.load_chunks(document_id):
+                content = chunk.page_content or ""
+                content_terms = set(re.findall(r"[\w]+", content.casefold(), flags=re.UNICODE))
+                matched = len(query_terms & content_terms)
+                phrase_match = (query or "").strip().casefold() in content.casefold()
+                if not matched and not phrase_match:
+                    continue
+                score = matched / len(query_terms) + (1.0 if phrase_match else 0.0)
+                chunk_meta = chunk.metadata or {}
+                ranked.append({
+                    "chunk_id": chunk_meta.get("chunk_id", ""),
+                    "document_id": document_id,
+                    "content": content[:500],
+                    "score": round(score, 6),
+                    "page_number": chunk_meta.get("page", chunk_meta.get("page_number")),
+                    "section": chunk_meta.get("section"),
+                    "content_type": chunk_meta.get("content_type", "text"),
+                    "filename": record.get("filename"),
+                })
+        ranked.sort(key=lambda item: item["score"], reverse=True)
+        return ranked[:max(1, int(k))]
 
     def search_single_document(
         self,
@@ -154,7 +201,7 @@ def list_documents(
             "status": doc.get("status", "ready"),
             "created_at": doc.get("created_at"),
             "completed_at": doc.get("created_at"),
-            "element_count": doc.get("text_chars", 0),
+                "element_count": doc.get("element_count", 0),
             "chunk_count": doc.get("total_chunks", 0),
             "table_count": doc.get("tables", 0),
             "processing_method": doc.get("processing_method"),

@@ -45,6 +45,16 @@ def test_cloud_provider_metadata_uses_deepseek():
     assert cloud["models"]["sql"].startswith("deepseek-")
 
 
+@pytest.mark.parametrize("provider", ["deepseek", "omniroute", "grok"])
+def test_openai_compatible_clients_disable_sdk_retries(monkeypatch, provider):
+    monkeypatch.setenv("ARIA_CLOUD_ALLOWED", "1")
+    monkeypatch.setenv("ARIA_CLOUD_CONSENT", "1")
+
+    llm = LLMProvider(provider, api_key="test-key")
+
+    assert llm._cloud_client.max_retries == 0
+
+
 def test_rich_router_normalises_null_arrays_to_empty_lists():
     parsed = SemanticRouter._validate_rich(_rich_route(document_keys=None))
     assert parsed.document_keys == []

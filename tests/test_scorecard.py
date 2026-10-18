@@ -153,6 +153,36 @@ class TestScorecard(unittest.TestCase):
         check("insights", bool(kinds & {"Anomaly", "Growth", "Decline", "Trend"}), f"known kinds {kinds}")
         check("insights", all(x.get("evidence") for x in out), "every insight has evidence")
 
+    def test_06b_insight_measure_selection_excludes_integer_codes(self):
+        import sqlite3 as _sq
+        from api.insights_routes import InsightsEngine, _SQLiteCompatConnection
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        conn = _sq.connect(tmp.name)
+        conn.execute("CREATE TABLE facts (row_id INTEGER PRIMARY KEY, group_code INTEGER, quantity INTEGER, net_amount REAL)")
+        conn.executemany(
+            "INSERT INTO facts (row_id, group_code, quantity, net_amount) VALUES (?, ?, ?, ?)",
+            [(i, i % 4, i % 7 + 1, float(i * 2)) for i in range(1, 61)],
+        )
+        conn.commit()
+        mapping = {"schema": "public", "tables": {"facts": {"columns": [
+            {"column": "row_id", "data_type": "integer"},
+            {"column": "group_code", "data_type": "integer"},
+            {"column": "quantity", "data_type": "integer"},
+            {"column": "net_amount", "data_type": "real"},
+        ], "primary_key": ["row_id"]}}, "relationship_edges": []}
+        engine = InsightsEngine(_SQLiteCompatConnection(conn), mapping)
+        try:
+            measures = engine._measure_candidates("facts")
+            check("insights", "group_code" not in measures, "low-cardinality integer code excluded")
+            check("insights", "row_id" not in measures, "declared key excluded")
+            check("insights", "quantity" in measures and "net_amount" in measures,
+                  "quantitative integer and continuous measures retained")
+        finally:
+            engine.conn.close()
+            Path(tmp.name).unlink(missing_ok=True)
+
     def test_07_prediction_gating(self):
         from prediction.agent import PredictionAgent
 

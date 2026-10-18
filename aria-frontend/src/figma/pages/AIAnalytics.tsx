@@ -9,6 +9,7 @@ import {
   Target, FileText, Sparkles, ArrowUpRight, ArrowDownRight, Database,
   Copy, MoreHorizontal, Brain, Lightbulb, GitCompareArrows, Zap,
   Compass, Share2, X, Info, CheckCircle2, Shield,
+  BellPlus, FileDown, Code2, TrendingDown,
 } from "lucide-react";
 import {
   BarChart, Bar, LineChart, Line, AreaChart, Area,
@@ -28,7 +29,7 @@ import {
   CountUp, Sparkline, selectCls, inputCls, btnPrimary, btnGhost,
 } from "./intelligence/cards";
 import { useExplore, RANGE_OPTIONS, type RangeKey } from "./intelligence/useExplore";
-import { intelligenceApi, analyzeQuestion, normalizeApiError, apiFetch } from "../../services/api";
+import { intelligenceApi, analyzeQuestion, normalizeApiError, apiFetch, workspaceApi, downloadStoryExport } from "../../services/api";
 import EvidenceDrawer, { type EvidenceContext } from "./intelligence/EvidenceDrawer";
 
 /* ------------------------------------------------------------------ */
@@ -909,6 +910,17 @@ export default function AIAnalytics({
   const [history, setHistory] = useState<{ q: string; r: any }[]>([]);
   const abortRef = useRef<AbortController | null>(null);
 
+  /* ---- Workspace actions: show SQL / monitors / export / drill trail ---- */
+  const [showSql, setShowSql] = useState(false);
+  const [monitorOpen, setMonitorOpen] = useState(false);
+  const [monitorText, setMonitorText] = useState("");
+  const [monitorMsg, setMonitorMsg] = useState("");
+  const [monitorBusy, setMonitorBusy] = useState(false);
+  const [exportMsg, setExportMsg] = useState("");
+  /* One-click drill chains: every run pushes its question; breadcrumbs let
+     the user step back up the chain and re-run any earlier link. */
+  const [drillTrail, setDrillTrail] = useState<string[]>([]);
+
   /* ---- Autocomplete ---- */
   const [acOptions, setAcOptions] = useState<string[]>([]);
   const [acOpen, setAcOpen] = useState(false);
@@ -945,6 +957,8 @@ export default function AIAnalytics({
       setResult(null); setError(""); setHistory([]); setAskedQuestion("");
       setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(false);
       setSidebarCtx({});
+      setDrillTrail([]); setShowSql(false); setMonitorOpen(false);
+      setMonitorMsg(""); setExportMsg("");
     }
     prevDatasetRef.current = datasetKey;
   }, [connectionStatus, datasetKey, loadSuggestions]);
@@ -1034,6 +1048,8 @@ export default function AIAnalytics({
     setAskedQuestion(q);
     setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(false);
     setRunning(true); setError(""); setResult(null);
+    setShowSql(false); setMonitorMsg(""); setExportMsg("");
+    setDrillTrail((t) => (t[t.length - 1] === q ? t : [...t.slice(-5), q]));
     abortRef.current?.abort();
     const ctrl = new AbortController(); abortRef.current = ctrl;
     try {
@@ -1081,7 +1097,11 @@ export default function AIAnalytics({
   };
 
   /* ---- Back to home ---- */
-  const goHome = () => { setResult(null); setError(""); setHistory([]); setAskedQuestion(""); };
+  const goHome = () => {
+    setResult(null); setError(""); setHistory([]); setAskedQuestion("");
+    setDrillTrail([]); setShowSql(false); setMonitorOpen(false);
+    setMonitorMsg(""); setExportMsg("");
+  };
 
   /* ---- Result normalization (analyzeQuestion returns {success, data: goalData}) ---- */
   const gd = result?.data || result;  // goalData or raw
@@ -1218,6 +1238,74 @@ export default function AIAnalytics({
   const showChart = hasChartData && hasAxes && isChartType;
   /* Is the answer text-only (no chart, no findings, just narrative)? */
   const isTextOnly = !showChart && visibleFindings.length === 0 && !story;
+
+  /* Auto "why" annotation attached by the backend to trend chart specs
+     (period-over-period change decomposition). Rendered as a caption. */
+  const chartAnnotation = strOf((_cs as any)?.annotation?.text || "");
+  /* The SQL behind this answer (asked SQL first, then first evidence block). */
+  const sqlUsed = strOf(gd?.generatedSql || (gd as any)?.sql_used || (gd as any)?.evidence?.[0]?.sql || "");
+
+  /* ------------------------------------------------------------------ */
+  /*  Workspace actions (monitor / export) — server storage only         */
+  /* ------------------------------------------------------------------ */
+
+  /* The exact envelope this page displays, posted to /api/export/story so
+     the deck/spreadsheet can never drift from the on-screen numbers. */
+  const storyEnvelope = (): any => ({
+    question: strOf(askedQuestion) || strOf(gd?.interpretedGoal),
+    answer: answerMessage,
+    story,
+    why: strOf((gd as any)?.why?.what_happened || ""),
+    hypothesis: hypothesis ? strOf(hypothesis?.text || hypothesis) : "",
+    drivers: drivers.slice(0, 12),
+    columns: vizData.length
+      ? Object.keys(vizData[0] || {}).filter((k) => k !== "_idx")
+      : columns,
+    rows: vizData.slice(0, 500),
+    sql: sqlUsed,
+    as_of: new Date().toISOString(),
+    include_sql: true,
+  });
+
+  const createMonitorFromResult = async () => {
+    const text = monitorText.trim();
+    if (!text || monitorBusy) return;
+    setMonitorBusy(true); setMonitorMsg("");
+    try {
+      const env = storyEnvelope();
+      if (!env.sql) throw new Error("This answer has no stored query to monitor.");
+      const r = await workspaceApi.createMonitor({
+        name: text.slice(0, 80),
+        question: env.question,
+        sql: env.sql,
+        condition_text: text,
+        measure_column: chartMetric,
+      });
+      const cond = r.data?.condition || {};
+      setMonitorMsg(`Monitor created (${strOf(cond.type)} ${strOf(cond.value)}, ${strOf(r.data?.cadence) || "daily"}). Alerts land in the bell.`);
+      setMonitorText("");
+      setMonitorOpen(false);
+    } catch (e: any) {
+      setMonitorMsg(e?.message || "Couldn't create the monitor.");
+    } finally { setMonitorBusy(false); }
+  };
+
+  const exportStory = async (format: "pptx" | "xlsx" | "html") => {
+    setExportMsg("");
+    try {
+      const r = await downloadStoryExport(storyEnvelope(), format);
+      setExportMsg(`Saved ${r.filename}`);
+    } catch (e: any) {
+      setExportMsg(e?.message || "Export failed.");
+    }
+  };
+
+  /* Drill-chain breadcrumbs: re-run an earlier question and truncate the
+     trail (the run itself re-pushes the question as the new tail). */
+  const replayDrill = (q: string) => {
+    setDrillTrail((t) => (t.includes(q) ? t.slice(0, t.indexOf(q) + 1) : t));
+    runOnPage(q);
+  };
 
   /* ------------------------------------------------------------------ */
   /*  Not connected / Loading / Error / No dataset                       */
@@ -1393,6 +1481,27 @@ export default function AIAnalytics({
               {/* Answer + Chart + Insights */}
               {!running && !error && result && (
                 <div className="space-y-4 chart-reveal">
+                  {/* Drill chain — step back up through this analysis thread */}
+                  {drillTrail.length > 1 && (
+                    <div className="flex items-center gap-1 flex-wrap text-[11.5px]">
+                      <button onClick={goHome} className="font-medium text-muted-foreground hover:text-foreground transition-colors">Home</button>
+                      {drillTrail.map((q, i) => {
+                        const last = i === drillTrail.length - 1;
+                        return (
+                          <span key={q + i} className="flex items-center gap-1">
+                            <ChevronRight size={11} className="text-muted-foreground flex-shrink-0" />
+                            <button
+                              onClick={() => { if (!last) replayDrill(q); }}
+                              disabled={last}
+                              className={`max-w-[220px] truncate ${last ? "font-semibold text-foreground" : "text-blue-700 dark:text-blue-400 hover:underline"}`}
+                              title={q}>
+                              {q.length > 32 ? `${q.slice(0, 32)}…` : q}
+                            </button>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
                   {/* Asked question — stays until the user dismisses it */}
                   {askedQuestion && (
                     <div className="flex items-start gap-2.5 rounded-xl border border-border bg-secondary/70 px-4 py-3">
@@ -1414,8 +1523,68 @@ export default function AIAnalytics({
                       aria-label="Add this analysis to the report draft">
                       <FileText size={13} /> Add to report
                     </button>
+                    <button
+                      onClick={() => setShowSql((v) => !v)}
+                      disabled={!sqlUsed}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold border transition-colors disabled:opacity-50 ${showSql ? "text-white bg-blue-700 border-blue-700 hover:bg-blue-800" : "text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/25 hover:bg-blue-50 dark:hover:bg-blue-500/10"}`}
+                      aria-label="Show the SQL behind this answer"
+                      aria-pressed={showSql}>
+                      <Code2 size={13} /> {showSql ? "Hide SQL" : "Show SQL"}
+                    </button>
+                    <button
+                      onClick={() => { setMonitorOpen((v) => !v); setMonitorMsg(""); }}
+                      disabled={!sqlUsed}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold border transition-colors disabled:opacity-50 ${monitorOpen ? "text-white bg-blue-700 border-blue-700 hover:bg-blue-800" : "text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/25 hover:bg-blue-50 dark:hover:bg-blue-500/10"}`}
+                      aria-label="Create an alert for this question"
+                      aria-pressed={monitorOpen}>
+                      <BellPlus size={13} /> Monitor
+                    </button>
+                    <span className="inline-flex items-center gap-1">
+                      <FileDown size={13} className="text-muted-foreground" />
+                      <button onClick={() => exportStory("pptx")} className="px-2 py-1.5 rounded-lg text-[11.5px] font-semibold text-secondary-foreground border border-border hover:bg-secondary" aria-label="Export as PowerPoint">PPTX</button>
+                      <button onClick={() => exportStory("xlsx")} className="px-2 py-1.5 rounded-lg text-[11.5px] font-semibold text-secondary-foreground border border-border hover:bg-secondary" aria-label="Export as Excel">Excel</button>
+                      <button onClick={() => exportStory("html")} className="px-2 py-1.5 rounded-lg text-[11.5px] font-semibold text-secondary-foreground border border-border hover:bg-secondary" aria-label="Export a printable page">Print</button>
+                    </span>
                     {reportMsg && <span className="text-[11.5px] text-secondary-foreground" role="status">{reportMsg}</span>}
+                    {exportMsg && <span className="text-[11.5px] text-secondary-foreground" role="status">{exportMsg}</span>}
                   </div>
+                  {/* Natural-language monitor creator (server-parsed condition) */}
+                  {monitorOpen && (
+                    <Card className="p-4">
+                      <p className="text-[12px] font-semibold text-foreground">Tell ARIA when to alert you</p>
+                      <p className="mt-0.5 text-[11.5px] text-muted-foreground">
+                        Plain words — e.g. “alert me when this drops more than 10%” or “when it goes above 5K”.
+                      </p>
+                      <div className="mt-2 flex items-center gap-2 flex-wrap">
+                        <input
+                          value={monitorText}
+                          onChange={(e) => setMonitorText(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === "Enter") createMonitorFromResult(); }}
+                          placeholder="alert me when revenue drops more than 10%"
+                          className="flex-1 min-w-[240px] rounded-lg border border-border bg-secondary/60 px-3 py-2 text-[12.5px] text-foreground outline-none focus:border-blue-400"
+                          aria-label="Monitor condition in plain words"
+                        />
+                        <button
+                          onClick={createMonitorFromResult}
+                          disabled={monitorBusy || !monitorText.trim()}
+                          className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12px] font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-60">
+                          <BellPlus size={13} /> {monitorBusy ? "Creating…" : "Create monitor"}
+                        </button>
+                        <button onClick={() => { setMonitorOpen(false); setMonitorMsg(""); }} className="px-3 py-2 rounded-lg text-[12px] font-medium text-secondary-foreground border border-border hover:bg-secondary">Cancel</button>
+                      </div>
+                      {monitorMsg && <p className="mt-2 text-[11.5px] text-secondary-foreground" role="status">{monitorMsg}</p>}
+                    </Card>
+                  )}
+                  {/* Show SQL / explain toggle: the exact query that ran */}
+                  {showSql && sqlUsed && (
+                    <Card className="p-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-[12px] font-semibold text-foreground flex items-center gap-1.5"><Code2 size={13} className="text-blue-700 dark:text-blue-400" /> SQL behind this answer</p>
+                        <span className="text-[11px] text-muted-foreground">Read-only · exactly what ran against your data</span>
+                      </div>
+                      <pre className="mt-2 max-h-[260px] overflow-auto rounded-lg bg-secondary/70 border border-border px-3 py-2 text-[11.5px] leading-relaxed text-secondary-foreground whitespace-pre-wrap break-words">{sqlUsed}</pre>
+                    </Card>
+                  )}
                   {/* Answer message */}
                   {answerMessage && (
                     <Card className="p-5">
@@ -1470,6 +1639,12 @@ export default function AIAnalytics({
                       <div className="h-[260px] mt-3">
                         <DynamicChart data={vizData} chartSpec={chartSpec} metric={chartMetric} />
                       </div>
+                      {chartAnnotation && (
+                        <div className="mt-3 flex items-start gap-1.5 text-[11.5px] text-secondary-foreground bg-amber-50/70 dark:bg-amber-500/10 border border-amber-100 dark:border-amber-500/20 rounded-lg px-2.5 py-2">
+                          <TrendingDown size={12} className="text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+                          <span>{chartAnnotation}</span>
+                        </div>
+                      )}
                     </Card>
                   )}
 
@@ -1538,7 +1713,7 @@ export default function AIAnalytics({
                                       <span className="text-muted-foreground"> ({identLabel(d?.dimension)})</span>
                                     )}
                                     {share !== null && (
-                                      <span> — about <span className="font-semibold text-foreground tabular-nums">{Math.round(share)}%</span> of the total</span>
+                                      <span> — about <span className="font-semibold text-foreground tabular-nums">{Math.round(share)}%</span> of the {strOf(d?.basis) === "change" ? "change" : "total"}</span>
                                     )}
                                   </span>
                                 </li>

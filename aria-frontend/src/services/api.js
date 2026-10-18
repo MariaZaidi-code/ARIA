@@ -269,19 +269,12 @@ export const normalizeApiError = (data, status = 0, headers = null) => {
 // empty arrays, errors, and partial results all render as "—" or a useful
 // empty state, never undefined/null/NaN/blank/raw exceptions.
 
-export const safeList = (v) => (Array.isArray(v) ? v : []);
-
 export const safeText = (v, fallback = "—") => {
   if (v === null || v === undefined) return fallback;
   const s = String(v).trim();
   return s === "" || s.toLowerCase() === "undefined" || s.toLowerCase() === "null" || s.toLowerCase() === "nan"
     ? fallback
     : String(v);
-};
-
-export const safeNumberText = (v, fallback = "—") => {
-  const n = toNumber(v);
-  return n === null || Number.isNaN(n) ? fallback : formatValue(n);
 };
 
 const toNumber = (value) => {
@@ -1168,10 +1161,14 @@ export const intelligenceApi = {
   // POST /api/intelligence/explore { metric, breakdown, secondary_breakdown,
   //   time_grain, comparison, date_range, filters } -> { trend, observation,
   //   breakdown_rows, ... } — all numbers computed server-side.
-  runExplore: async (payload = {}) => {
+  // opts: { signal, timeoutMs } forwarded to the request layer so callers
+  // (focus-insight race guard) can abort in-flight explores on unmount.
+  runExplore: async (payload = {}, opts = {}) => {
     const data = await request("/intelligence/explore", {
       method: "POST",
       body: JSON.stringify(payload || {}),
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+      ...(opts?.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}),
     });
     return { success: true, data: data?.data || data || {} };
   },
@@ -1589,8 +1586,9 @@ export const prescriptionApi = {
 // DAY 8 - FEEDBACK AGENT
 // =========================================================
 //
-// The backend has no feedback endpoint yet; feedback is recorded
-// in the local history session so it is not lost.
+// General feedback posts to the legacy /api/feedback endpoint. RL-grade
+// feedback (the random popup's star rating, used as a reward signal for
+// future ranking) goes to /api/rl/feedback — see submitRlFeedback below.
 // =========================================================
 
 export const submitFeedback = async (feedbackData = {}) => {
@@ -1607,4 +1605,234 @@ export const submitFeedback = async (feedbackData = {}) => {
     console.warn("Feedback submit failed (non-blocking):", error?.message);
     return { success: false, message: error?.message || "Feedback could not be sent." };
   }
+};
+
+// =========================================================
+// RL FEEDBACK (random popup + observability) — /api/rl/*
+// =========================================================
+//
+// The popup sends 1-5 stars + an optional comment; the backend maps the
+// rating to a reward in [-1, +1] and appends a
+// (state, action, outcome, reward) event (core/rl.py). Submission is
+// non-blocking: a failure must never interrupt the page.
+
+/**
+ * @param {{ rating: number, comment?: string, page?: string, context?: Record<string, any> }} [payload]
+ * @returns {Promise<{ success: boolean, data?: any, message?: string }>}
+ */
+export const submitRlFeedback = async ({ rating, comment = "", page = "", context = {} } = {}) => {
+  try {
+    const data = await request("/rl/feedback", {
+      method: "POST",
+      body: JSON.stringify({ rating, comment, page, context }),
+    });
+    return { success: true, data };
+  } catch (error) {
+    console.warn("RL feedback submit failed (non-blocking):", error?.message);
+    return { success: false, message: error?.message || "Feedback could not be sent." };
+  }
+};
+
+// =========================================================
+// WORKSPACE API — /api/workspace/* (monitors, targets, glossary,
+// inbox, webhooks, integrations) + /api/export/story
+// =========================================================
+//
+// Per-user storage lives server-side (data/users/user_<id>/workspace/).
+// Monitors re-run their stored read-only SQL on a cadence; triggers land in
+// the in-app inbox and optionally fan out to Slack/Teams webhooks. The UI
+// only renders these payloads — no metric math lives here. Writes fail on
+// read-only (mobile) sessions via the backend's require_writable guard.
+
+const wsList = (data) => (Array.isArray(data?.items) ? data.items : (Array.isArray(data?.data) ? data.data : []));
+
+export const workspaceApi = {
+  // ---- Monitors (natural-language alerts) ----
+  listMonitors: async () => {
+    const data = await request("/workspace/monitors");
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  previewMonitor: async (text) => {
+    const data = await request("/workspace/monitors/preview", {
+      method: "POST",
+      body: JSON.stringify({ text: String(text || "") }),
+    });
+    return { success: true, data };
+  },
+
+  createMonitor: async (payload = {}) => {
+    const data = await request("/workspace/monitors", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data?.item || data?.data || {} };
+  },
+
+  patchMonitor: async (id, patch = {}) => {
+    const data = await request(`/workspace/monitors/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch || {}),
+    });
+    return { success: true, data: data?.item || data?.data || {} };
+  },
+
+  deleteMonitor: async (id) => {
+    const data = await request(`/workspace/monitors/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    return { success: true, data };
+  },
+
+  checkMonitor: async (id) => {
+    const data = await request(`/workspace/monitors/${encodeURIComponent(id)}/check`, {
+      method: "POST",
+    });
+    return { success: true, data };
+  },
+
+  // ---- KPI targets ----
+  getTargets: async () => {
+    const data = await request("/workspace/targets");
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  putTargets: async (targets = []) => {
+    const data = await request("/workspace/targets", {
+      method: "PUT",
+      body: JSON.stringify({ targets: Array.isArray(targets) ? targets : [] }),
+    });
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  // ---- Business glossary ----
+  getGlossary: async () => {
+    const data = await request("/workspace/glossary");
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  putGlossary: async (entries = []) => {
+    const data = await request("/workspace/glossary", {
+      method: "PUT",
+      body: JSON.stringify({ entries: Array.isArray(entries) ? entries : [] }),
+    });
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  // ---- Notification inbox ----
+  listNotifications: async (unreadOnly = false) => {
+    const data = await request(`/workspace/notifications${unreadOnly ? "?unread_only=true" : ""}`);
+    return { success: true, data: wsList(data), unread: data?.unread ?? 0 };
+  },
+
+  markNotificationsRead: async ({ ids = [], all = false } = {}) => {
+    const data = await request("/workspace/notifications/read", {
+      method: "POST",
+      body: JSON.stringify({ ids, all }),
+    });
+    return { success: true, unread: data?.unread ?? 0, changed: data?.changed ?? 0 };
+  },
+
+  clearNotifications: async () => {
+    const data = await request("/workspace/notifications", { method: "DELETE" });
+    return { success: true, data };
+  },
+
+  // ---- Outbound webhooks (Slack / Teams / generic) ----
+  listWebhooks: async () => {
+    const data = await request("/workspace/webhooks");
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  createWebhook: async (payload = {}) => {
+    const data = await request("/workspace/webhooks", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data?.item || data?.data || {} };
+  },
+
+  deleteWebhook: async (id) => {
+    const data = await request(`/workspace/webhooks/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    return { success: true, data };
+  },
+
+  testWebhook: async (id) => {
+    const data = await request(`/workspace/webhooks/${encodeURIComponent(id)}/test`, {
+      method: "POST",
+    });
+    return { success: data?.ok !== false, data };
+  },
+
+  // ---- Integrations (Slack slash command) ----
+  getIntegrations: async () => {
+    const data = await request("/workspace/integrations");
+    return { success: true, data: data?.data || {} };
+  },
+
+  regenerateSlackToken: async () => {
+    const data = await request("/workspace/integrations", {
+      method: "POST",
+      body: JSON.stringify({ regenerate_slack_token: true }),
+    });
+    return { success: true, data: data?.data || {} };
+  },
+
+  clearSlackToken: async () => {
+    const data = await request("/workspace/integrations", {
+      method: "POST",
+      body: JSON.stringify({ clear_slack_token: true }),
+    });
+    return { success: true, data: data?.data || {} };
+  },
+};
+
+// Downloads a story export (pptx | xlsx | html) using the exact in-app
+// envelope (question/answer/story/why/drivers rows sql as_of). Raw fetch so
+// the binary body is preserved; triggers the browser download.
+export const downloadStoryExport = async (envelope = {}, format = "pptx") => {
+  const res = await fetch(resolvePath("/export/story"), {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Request-ID": newRequestId(),
+    },
+    body: JSON.stringify({ ...(envelope || {}), format }),
+  });
+  if (res.status === 401) handleUnauthorized();
+  if (!res.ok) {
+    let data = {};
+    try { data = await res.json(); } catch { /* empty error body */ }
+    const norm = normalizeApiError(data, res.status, res.headers);
+    const error = new Error(norm.message);
+    error.status = res.status;
+    error.code = norm.code;
+    error.requestId = norm.requestId || "";
+    throw error;
+  }
+  const blob = await res.blob();
+  let filename = `aria-story.${format}`;
+  try {
+    const cd = res.headers.get("content-disposition") || "";
+    const m = cd.match(/filename="?([^";]+)"?/i);
+    if (m && m[1]) filename = m[1];
+  } catch { /* keep default */ }
+  try {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+      try { a.remove(); } catch { /* ignore */ }
+    }, 0);
+  } catch {
+    throw new Error("The export was generated but the download could not start.");
+  }
+  return { success: true, filename };
 };

@@ -11,6 +11,8 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -44,7 +46,11 @@ def _token_ttl_days() -> int:
 
 
 TOKEN_TTL_DAYS = _token_ttl_days()
-PBKDF2_ITERATIONS = 120_000
+# New hashes use the current stronger work factor. Existing hashes carry
+# their iteration count in the stored format and are transparently upgraded
+# after a successful login (see authenticate), so deployments do not need a
+# password-reset event to migrate existing users.
+PBKDF2_ITERATIONS = 600_000
 
 _USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]+")
 
@@ -218,21 +224,88 @@ def authenticate(username: str, password: str) -> int | None:
     finally:
         conn.close()
     if row and _verify_password(password, row["password_hash"]):
+        # Upgrade weaker legacy hashes only after the password has already
+        # verified. Compare-and-swap prevents a concurrent password update
+        # from being overwritten with a hash of the older credential.
+        try:
+            stored = str(row["password_hash"] or "")
+            _parts = stored.split("$")
+            _stored_iters = int(_parts[1]) if len(_parts) == 4 else PBKDF2_ITERATIONS
+            if _stored_iters < PBKDF2_ITERATIONS:
+                conn = _get_db()
+                try:
+                    conn.execute(
+                        "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+                        (_hash_password(password), row["id"], stored),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception:
+            # Authentication must remain available if a best-effort hash
+            # migration encounters a transient database error.
+            pass
         return row["id"]
     # Dummy hash to reduce user-enumeration timing oracle.
-    _verify_password("dummy-password-for-timing", "pbkdf2_sha256$120000$" + "00" * 16 + "$" + "00" * 32)
+    _verify_password(
+        "dummy-password-for-timing",
+        f"pbkdf2_sha256${PBKDF2_ITERATIONS}$" + "00" * 16 + "$" + "00" * 32,
+    )
     return None
 
 
-def issue_token(user_id: int, username: str) -> str:
+def issue_token(user_id: int, username: str, ttl_days: float | None = None) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
         "username": username,
         "iat": now,
-        "exp": now + timedelta(days=TOKEN_TTL_DAYS),
+        "exp": now + timedelta(days=float(ttl_days) if ttl_days is not None
+                               else TOKEN_TTL_DAYS),
     }
     return jwt.encode(payload, SECRET, algorithm=JWT_ALGO)
+
+
+# In-memory revocation cache: verify_token runs on EVERY request; without a
+# cache each check pays a fresh SQLite connection + query. Entries are
+# (expires_at_monotonic, revoked_bool). All revocations go through
+# revoke_token, which writes through to the cache, so negatives stay
+# consistent in-process; cross-process revocation lag is bounded by TTL.
+_REVOKE_CACHE_TTL_SECONDS = 15.0
+_REVOKE_CACHE: dict[str, tuple] = {}
+_REVOKE_CACHE_LOCK = threading.Lock()
+
+def _token_revoked_cached(token_hash: str) -> bool | None:
+    now = time.monotonic()
+    with _REVOKE_CACHE_LOCK:
+        cached = _REVOKE_CACHE.get(token_hash)
+        if cached is not None and now < cached[0]:
+            return cached[1]
+        if len(_REVOKE_CACHE) > 10_000:
+            _REVOKE_CACHE.clear()
+    return _token_revoked_db(token_hash)
+
+def _token_revoked_db(token_hash: str) -> bool | None:
+    """Return revocation state, or None when the store is unavailable.
+
+    Store failures are deliberately not cached: callers fail closed for this
+    request, while a recovered database can be checked again immediately.
+    """
+    try:
+        conn = _get_db()
+        try:
+            revoked = conn.execute(
+                "SELECT 1 FROM revoked_tokens WHERE token_hash = ?", (token_hash,)
+            ).fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    with _REVOKE_CACHE_LOCK:
+        _REVOKE_CACHE[token_hash] = (
+            time.monotonic() + _REVOKE_CACHE_TTL_SECONDS, revoked,
+        )
+    return revoked
 
 
 def verify_token(token: str) -> dict | None:
@@ -241,14 +314,9 @@ def verify_token(token: str) -> dict | None:
             return None
         payload = _decode_token(token)
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        conn = _get_db()
-        try:
-            revoked = conn.execute(
-                "SELECT 1 FROM revoked_tokens WHERE token_hash = ?", (token_hash,)
-            ).fetchone()
-        finally:
-            conn.close()
-        if revoked:
+        # Only a successful negative DB lookup authorizes this token. A store
+        # outage must never be interpreted as "not revoked".
+        if _token_revoked_cached(token_hash) is not False:
             return None
         # Strict `sub` validation: accept only a positive int user id or a
         # digit string (never bool/float/None/injection strings). int(True)
@@ -279,16 +347,23 @@ def revoke_token(token: str) -> None:
     except (jwt.PyJWTError, KeyError, TypeError, ValueError):
         return
     conn = _get_db()
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     try:
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("DELETE FROM revoked_tokens WHERE expires_at <= ?", (now,))
         conn.execute(
             "INSERT OR REPLACE INTO revoked_tokens (token_hash, expires_at) VALUES (?, ?)",
-            (hashlib.sha256(token.encode("utf-8")).hexdigest(), expires_at),
+            (token_hash, expires_at),
         )
         conn.commit()
     finally:
         conn.close()
+    # Write-through so an immediately-following verify_token sees the
+    # revocation even though the DB positive entry is now cached.
+    with _REVOKE_CACHE_LOCK:
+        _REVOKE_CACHE[token_hash] = (
+            time.monotonic() + _REVOKE_CACHE_TTL_SECONDS, True,
+        )
 
 
 def add_history(user_id: int, *, goal: str, sql_used=None, row_count=None,

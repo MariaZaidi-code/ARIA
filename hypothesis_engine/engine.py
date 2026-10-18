@@ -621,18 +621,45 @@ def analyze_question(engine, dialect, intel, tables, question, table_hint=None,
     intent = parse_intent(question, intel, tables)
     intent = fill_defaults(intent, intel, tables)
     if metric_override:
+        metric_matches = []
         for t in tables:
-            if metric_override in (intel.get_numeric_cols(t) + intel.get_text_cols(t)):
-                intent["metric"], intent["metric_table"] = metric_override, t
-                intent["metric_explicit"] = True
-                break
+            metric_matches.extend(
+                (t, c) for c in intel.get_numeric_cols(t) + intel.get_text_cols(t)
+                if c == metric_override
+            )
+        if not metric_matches:
+            return dict(_fail(
+                "NOT TESTABLE", CODE_COLUMN_NOT_FOUND,
+                f"The selected metric '{metric_override}' is not available in this data.",
+                hypothesis=build_hypothesis_text(question, intent),
+            ))
+        metric_table, metric_column = metric_matches[0]
+        if metric_column not in intel.get_numeric_cols(metric_table):
+            return dict(_fail(
+                "NOT TESTABLE", CODE_INCOMPATIBLE_DATA_TYPE,
+                f"The selected metric '{metric_override}' is not numeric.",
+                hypothesis=build_hypothesis_text(question, intent),
+            ))
+        intent["metric"], intent["metric_table"] = metric_column, metric_table
+        intent["metric_explicit"] = True
     if driver_override:
+        driver_matches = []
         for t in tables:
-            if driver_override in (intel.get_numeric_cols(t) + intel.get_text_cols(t)
-                                   + intel.get_datetime_cols(t)):
-                intent["driver"], intent["driver_table"] = driver_override, t
-                intent["driver_explicit"] = True
-                break
+            driver_matches.extend(
+                (t, c) for c in (intel.get_numeric_cols(t)
+                                 + intel.get_text_cols(t)
+                                 + intel.get_datetime_cols(t))
+                if c == driver_override
+            )
+        if not driver_matches:
+            return dict(_fail(
+                "NOT TESTABLE", CODE_COLUMN_NOT_FOUND,
+                f"The selected driver '{driver_override}' is not available in this data.",
+                hypothesis=build_hypothesis_text(question, intent),
+            ))
+        driver_table, driver_column = driver_matches[0]
+        intent["driver"], intent["driver_table"] = driver_column, driver_table
+        intent["driver_explicit"] = True
     metric, mtable = intent["metric"], intent["metric_table"]
     if table_hint and table_hint in tables:
         mtable = table_hint
@@ -872,6 +899,9 @@ def _explain(result, verdict, metric):
         base = "There isn't enough evidence yet. "
     if a == "correlation":
         d = result.get("driver", "").replace("_", " ")
+        if verdict == "NOT SUPPORTED" and result.get("p_value", 1.0) >= 0.05:
+            return (base + f"there is no clear relationship between {d} and {m}. "
+                           "This does not prove that no relationship exists.")
         which = "rise together" if result.get("direction") == "up" else "move in opposite directions"
         return (base + f"{d} and {m} {which} ({result.get('strength')} link). "
                        f"Knowing one gives a useful read on the other, but it doesn't prove cause.")

@@ -41,6 +41,22 @@ LARGE_INLINE_WARN_BYTES = 10 * 1024 * 1024
 LARGE_INLINE_WARN_PAGES = 100
 
 
+def _safe_id(document_id: str) -> str:
+    """Filename-safe transformation of a caller-supplied document id.
+
+    Document ids are normally internally generated (uuid / hash) and end up
+    in file paths under processed_dir. Legacy-decoded or client-supplied
+    ids could carry path separators/dot-dots; reject anything that is not
+    a plain safe token so lookups never escape the directory.
+    """
+    raw = str(document_id or "").strip()
+    if not raw or len(raw) > 128 or any(c not in
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for c in raw):
+        raise ValueError("Invalid document id.")
+    return raw
+
+
 class DocumentProcessor:
     """
     Main document processing orchestrator.
@@ -458,20 +474,20 @@ class DocumentProcessor:
             # Delete from vector store
             if self.vector_store:
                 self.vector_store.delete_document(document_id)
-            
+
             # Delete file if exists
-            doc_path = self.processed_dir / f"{document_id}.json"
+            doc_path = self.processed_dir / f"{_safe_id(document_id)}.json"
             if doc_path.exists():
                 doc_path.unlink()
-            
+
             return True
         except Exception as e:
             logger.error(f"Failed to delete document {document_id}: {e}")
             return False
-    
+
     def get_document_status(self, document_id: str) -> Optional[Dict]:
         """Get document processing status."""
-        doc_path = self.processed_dir / f"{document_id}.json"
+        doc_path = self.processed_dir / f"{_safe_id(document_id)}.json"
         if doc_path.exists():
             import json
             return json.loads(doc_path.read_text())

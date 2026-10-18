@@ -939,63 +939,87 @@ class GroundingMixin:
             try:
                 quote = (lambda n: self._quote(n, getattr(self, "dialect", "postgresql")))
             except Exception:
-                quote = lambda n: f'"{n}"'  # noqa: E731
+                # Fallback quoter must still escape embedded quotes — a raw
+                # f'"{n}"' breaks on identifiers with quotes inside.
+                quote = lambda n: '"' + str(n).replace('"', '""') + '"'  # noqa: E731
             try:
                 from core.db import base_table as _bt
             except Exception:
                 _bt = lambda n: str(n or "").split(".")[-1]  # noqa: E731
-            for cand in cands:
-                if len(found) >= 2:
-                    break
-                for (t, c) in cols:
-                    try:
-                        # Bare segment: the engine search_path resolves
-                        # schema-qualified keys (sales.employee -> employee).
-                        sql = (f"SELECT DISTINCT {quote(c)} FROM {quote(_bt(t))} "
-                               f"LIMIT 50")
-                        with self.engine.connect() as conn:
-                            # Same dialect-conditional statement timeout the
-                            # main execution path sets: sampling probes must
-                            # never hang a request (bounded read-only SQL).
-                            try:
-                                _dl = getattr(self, "dialect", "")
-                                if _dl == "postgresql":
-                                    conn.execute(_text("SET statement_timeout = '5000'"))
-                                elif _dl == "mysql":
-                                    conn.execute(_text("SET SESSION max_execution_time = 5000"))
-                            except Exception:
-                                pass
-                            rows = conn.execute(_text(sql)).fetchall()
-                    except Exception:
-                        continue
-                    hit = False
-                    hit_val = None
-                    try:
-                        for r in rows or []:
-                            if str(r[0]).strip().lower() == str(cand).strip().lower():
-                                hit = True
-                                try:
-                                    hit_val = str(r[0]).strip()
-                                except Exception:
-                                    hit_val = str(cand).strip()
-                                break
-                    except Exception:
-                        continue
-                    if hit:
-                        # Preserve the database's own casing ('Electronics',
-                        # not the goal's 'electronics'): equality is
-                        # case-sensitive on SQLite/Postgres, so storing the
-                        # goal casing would filter to zero rows.
-                        _val = hit_val if hit_val else str(cand).strip()
-                        found.append({
-                            "column": f"{t}.{c}",
-                            "operator": "=",
-                            "value": _val,
-                            "confidence": 0.85,
-                            "reason": (f"value '{_val}' found in {t}.{c} "
-                                       "(sampled distinct values)"),
-                        })
+            # One sampled connection for all probes: a new engine borrow
+            # (plus its statement_timeout) per candidate × column pooled
+            # several pooled connections per goal; hold one instead.
+            _probe_conn = None
+            try:
+                _probe_conn = self.engine.connect()
+            except Exception:
+                _probe_conn = None
+            try:
+                for cand in cands:
+                    if len(found) >= 2:
                         break
+                    for (t, c) in cols:
+                        try:
+                            # Bare segment: the engine search_path resolves
+                            # schema-qualified keys (sales.employee -> employee).
+                            sql = (f"SELECT DISTINCT {quote(c)} FROM {quote(_bt(t))} "
+                                   f"LIMIT 50")
+                            if _probe_conn is not None:
+                                conn = _probe_conn
+                            else:
+                                conn = self.engine.connect()
+                            try:
+                                # Same dialect-conditional statement timeout the
+                                # main execution path sets: sampling probes must
+                                # never hang a request (bounded read-only SQL).
+                                try:
+                                    _dl = getattr(self, "dialect", "")
+                                    if _dl == "postgresql":
+                                        conn.execute(_text("SET statement_timeout = '5000'"))
+                                    elif _dl == "mysql":
+                                        conn.execute(_text("SET SESSION max_execution_time = 5000"))
+                                except Exception:
+                                    pass
+                                rows = conn.execute(_text(sql)).fetchall()
+                            finally:
+                                if conn is not _probe_conn:
+                                    conn.close()
+                        except Exception:
+                            continue
+                        hit = False
+                        hit_val = None
+                        try:
+                            for r in rows or []:
+                                if str(r[0]).strip().lower() == str(cand).strip().lower():
+                                    hit = True
+                                    try:
+                                        hit_val = str(r[0]).strip()
+                                    except Exception:
+                                        hit_val = str(cand).strip()
+                                    break
+                        except Exception:
+                            continue
+                        if hit:
+                            # Preserve the database's own casing ('Electronics',
+                            # not the goal's 'electronics'): equality is
+                            # case-sensitive on SQLite/Postgres, so storing the
+                            # goal casing would filter to zero rows.
+                            _val = hit_val if hit_val else str(cand).strip()
+                            found.append({
+                                "column": f"{t}.{c}",
+                                "operator": "=",
+                                "value": _val,
+                                "confidence": 0.85,
+                                "reason": (f"value '{_val}' found in {t}.{c} "
+                                           "(sampled distinct values)"),
+                            })
+                            break
+            finally:
+                try:
+                    if _probe_conn is not None:
+                        _probe_conn.close()
+                except Exception:
+                    pass
         except Exception:
             return found
         return found
@@ -1007,7 +1031,8 @@ class GroundingMixin:
             try:
                 quote = (lambda n: self._quote(n, getattr(self, "dialect", "postgresql")))
             except Exception:
-                quote = lambda n: f'"{n}"'  # noqa: E731
+                # Fallback quoter escapes embedded quotes (see _probe_value_filters).
+                quote = lambda n: '"' + str(n).replace('"', '""') + '"'  # noqa: E731
             try:
                 from core.db import base_table as _bt2
             except Exception:

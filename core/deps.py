@@ -133,7 +133,9 @@ def ensure_decision_owner(session_user_id, decision: dict | None) -> dict:
             if int(owner) != int(session_user_id):
                 raise HTTPException(status_code=404, detail="That decision was not found.")
         except (TypeError, ValueError):
-            pass
+            # Fail closed: an unresolvable owner id must not hand a foreign
+            # record to the caller.
+            raise HTTPException(status_code=404, detail="That decision was not found.")
     if decision.get("quarantined"):
         raise HTTPException(
             status_code=410,

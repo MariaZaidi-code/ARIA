@@ -19,7 +19,7 @@ import re
 
 from llm_provider import create_provider
 
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class PrescriptionAgent:

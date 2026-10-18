@@ -32,6 +32,24 @@ router = APIRouter()
 _KPI_CACHE: dict = {}
 _KPI_CACHE_TTL = 300
 _KPI_CACHE_MAX = 100
+
+# Dashboard-config cache: same shape as _KPI_CACHE (schema-mtime key).
+_DASH_CONFIG_CACHE: dict = {}
+_DASH_CONFIG_CACHE_MAX = 200
+
+
+def _dash_evict_oldest() -> None:
+    """Evict oldest-first instead of wholesale clear (doc §Cache owners rows
+    match; an over-size purge must not dump every user's warm config at once)."""
+    if len(_DASH_CONFIG_CACHE) <= _DASH_CONFIG_CACHE_MAX:
+        return
+    try:
+        oldest = sorted(_DASH_CONFIG_CACHE.items(),
+                        key=lambda kv: kv[1][0])[: len(_DASH_CONFIG_CACHE) - _DASH_CONFIG_CACHE_MAX]
+        for key, _v in oldest:
+            _DASH_CONFIG_CACHE.pop(key, None)
+    except Exception:
+        _DASH_CONFIG_CACHE.clear()
 from services.kpi_service import (_fmt, _is_currency_col, _safe, _validate_schema_ident, _bound_limit, _recommend_chart, _profile_numeric, _rollback, _variation, _score_kpi, _time_grain_expr, _parse_full_date, _parse_date_to_month, _pretty_month, _pretty_date, _discover_special_columns, _fetch_time_series, _fetch_count_series, _holiday_lift, _retail_candidates_for_table, _measure_expr, _coerce_num, _SERIES_FALLBACK_MAX, _CHART_BY_INTENT, DASHBOARD_MIN_SCORE, _AMOUNT_HINTS, _ENTITY_HINTS, _DATE_HINTS, _STORE_HINTS, _HOLIDAY_HINTS, _SALES_HINTS, _DATE_PARSE_FORMATS, _MONTH_NAMES)  # noqa: F401,E402  # thin-wrapper re-export
 
 
@@ -896,11 +914,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
 
     # Short-TTL cache (§40): keyed by schema file mtime so reconnects/uploads
     # invalidate automatically. Bounded size, no stale-data risk beyond TTL.
-    global _DASH_CONFIG_CACHE
-    try:
-        _DASH_CONFIG_CACHE
-    except NameError:
-        _DASH_CONFIG_CACHE = {}
+    _schema_mtime = 0.0
     try:
         _schema_mtime = Path(str(session.get("schema_path", ""))).stat().st_mtime
     except Exception:
@@ -919,8 +933,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
             except Exception:
                 return {"ok": True, "config": _cached[1], "cached": True}
         return {"ok": True, "config": _cached_config, "cached": True}
-    if len(_DASH_CONFIG_CACHE) > 200:
-        _DASH_CONFIG_CACHE.clear()
+    _dash_evict_oldest()
 
     engine, dialect, db_type = _build_engine(session)
     db_name = session.get("db_name", session.get("source_type", "data"))
@@ -954,6 +967,9 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
     recommendations = []
     total_rows = 0
     quality_issues = []
+    # A quality score is meaningful only after the data-backed scan runs.
+    # The frontend supplements this with the shared Data Quality endpoint.
+    quality_score = None
 
     if engine is not None:
         try:
@@ -1411,11 +1427,16 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     for tname in tables_list[:6]:
                         if intel.tables[tname].get("empty"):
                             continue
-                        num_cols = intel.get_numeric_cols(tname)
+                        # Correlate true analytical measures only. Raw numeric
+                        # identifiers (order IDs, codes, and keys) create
+                        # meaningless scatter plots that look like findings.
+                        num_cols = intel.find_all_measures(tname)
                         if len(num_cols) < 2:
                             continue
-                        m1 = num_cols[0]
-                        m2 = num_cols[1]
+                        m1 = intel.find_best_measure(tname) or num_cols[0]
+                        m2 = next((col for col in num_cols if col != m1), None)
+                        if not m2:
+                            continue
                         try:
                             result = conn.execute(text(
                                 f"SELECT {_measure_expr(intel, tname, m1, dialect)} AS x, "
@@ -1659,33 +1680,6 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     if measure and dim and len(recommendations) < 6:
                         recommendations.append({"id": f"rec_{tname}_breakdown", "question": f"Show {humanize(measure).lower()} breakdown by {humanize(dim).lower()}", "type": "breakdown"})
 
-                # ── Data quality ──
-                quality_score = 100
-                for tname in tables_list[:5]:
-                    measure = intel.find_best_measure(tname)
-                    if not measure:
-                        continue
-                    try:
-                        result = conn.execute(text(
-                            f"SELECT COUNT(*) FROM {_safe_name(tname, dialect)} WHERE {_safe_name(measure, dialect)} IS NULL"
-                        ))
-                        row = result.fetchone()
-                        if row and row[0] > 0:
-                            total_q = conn.execute(text(f"SELECT COUNT(*) FROM {_safe_name(tname, dialect)}")).fetchone()
-                            if total_q and total_q[0] > 0:
-                                pct = (row[0] / total_q[0]) * 100
-                                if pct > 0:
-                                    quality_issues.append({
-                                        "field": f"{tname}.{measure}",
-                                        "issue": f"{pct:.1f}% null values",
-                                        "severity": "warning" if pct < 10 else "critical",
-                                        "affectedRecords": row[0],
-                                    })
-                                    quality_score -= min(10, int(pct))
-                    except Exception:
-                        _rollback(conn)
-                        continue
-
         except Exception:
             pass
 
@@ -1745,7 +1739,10 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
         "sections": sections[:5],
         "insights": auto_insights,
         "anomalies": auto_anomalies,
-        "quality": {"score": max(0, quality_score), "issues": quality_issues[:10]},
+        "quality": {
+            "score": max(0, quality_score) if quality_score is not None else None,
+            "issues": quality_issues[:10],
+        },
         "recommendations": recommendations[:6],
     }
     # JSON-safety boundary (generic): statistical detectors can emit

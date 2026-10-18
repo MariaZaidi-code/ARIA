@@ -708,7 +708,7 @@ def synthesize_trend_answer(frame, measure_label, period_label) -> str:
     )
 
 
-def build_story(frame, measure_label, entity_label, based_on, op="") -> str:
+def build_story(frame, measure_label, entity_label, based_on, op="", goal="") -> str:
     """Conversational story: headline, concentration, provenance — all traceable."""
     measure_label = natural_label(measure_label)
     entity_label = natural_label(entity_label)
@@ -717,6 +717,20 @@ def build_story(frame, measure_label, entity_label, based_on, op="") -> str:
     names = list(frame[0].keys())
     if len(names) < 2:
         return synthesize_answer(frame, measure_label, entity_label)
+    if op in _TREND_OPS:
+        # A period/value frame is a timeline, not a set of peers: telling the
+        # story with ranking words ("23 last names lead") would be wrong.
+        try:
+            _decline = bool(_DECLINE_WORD_RE.search(str(goal or "")))
+        except Exception:
+            _decline = False
+        if _decline:
+            body = synthesize_decline_answer(frame, measure_label, goal)
+        else:
+            body = synthesize_trend_answer(frame, measure_label, entity_label)
+        if based_on:
+            body = f"{body} This comes from {based_on} underlying records."
+        return _scrub_prose(f"{body} These patterns describe this data only.")
     label_name = names[0]
     measure_name = _numeric_key(frame, names)
     values = [(_to_float(r.get(measure_name)) or 0.0) for r in frame]
@@ -852,7 +866,7 @@ def select_visualization(intent, columns, frame, measure_label) -> dict:
 
 
 def build_why(intent, frame, columns, entity_label, measure_label, based_on,
-              confidence, issues) -> dict:
+              confidence, issues, goal="", table_label="") -> dict:
     """Conversational 'why' — plain English, human-scale numbers, no raw schema.
 
     `what_happened` reads like a person explaining, never 'Ranked N X by Y'.
@@ -861,10 +875,42 @@ def build_why(intent, frame, columns, entity_label, measure_label, based_on,
     """
     entity_label = natural_label(entity_label)
     measure_label = natural_label(measure_label)
+    op = str((intent or {}).get("operation") or "")
     limitations = list(issues)
     if not frame:
         limitations.append("The query returned no rows, so no conclusion can be drawn.")
     limitations.append("These patterns describe this data only.")
+    if op in _TREND_OPS and frame and len(columns) >= 2:
+        # Timeline frame: explain the movement, never count the periods as
+        # if they were competing segments ("You have 23 last names" bug).
+        try:
+            _decline = bool(_DECLINE_WORD_RE.search(str(goal or "")))
+        except Exception:
+            _decline = False
+        if _decline:
+            what = synthesize_decline_answer(frame, measure_label, goal)
+        else:
+            what = synthesize_trend_answer(frame, measure_label, entity_label)
+        tables = [table_label] if table_label else []
+        return {
+            "what_happened": _scrub_prose(what),
+            "why_it_matters": _scrub_prose(
+                f"This shows how {measure_label} moved between periods, "
+                f"straight from {based_on or 'the returned'} records. "
+                f"Segment-level explanations appear only when the data "
+                f"supports them."
+            ),
+            "evidence": {
+                "tables": tables,
+                "columns": [natural_label(c) for c in (columns or [])[:10]],
+                "row_count": len(frame),
+                "sql": None,
+            },
+            "contributing_factors": [],
+            "comparisons": [],
+            "confidence": confidence,
+            "limitations": [_scrub_prose(str(l)) for l in limitations],
+        }
     if frame and len(columns) >= 2:
         names = list(frame[0].keys())
         lead_val = _to_float(frame[0][names[1]])
@@ -892,7 +938,7 @@ def build_why(intent, frame, columns, entity_label, measure_label, based_on,
             f"It shows where your {measure_label} is coming from."
         ),
         "evidence": {
-            "tables": [entity_label],
+            "tables": [table_label] if table_label else [entity_label],
             "columns": [natural_label(c) for c in (columns or [])[:10]],
             "row_count": len(frame),
             "sql": None,
@@ -945,6 +991,14 @@ def analyze_result(ir, columns, rows, goal="", sql="", row_count=0) -> dict:
                 entity_label = natural_label(_cand)
     except Exception:
         pass
+
+    # A period/value result groups by time, not by the question's stale IR
+    # entity ("last name" from "last month"): the entity is the period axis.
+    if op in _TREND_OPS and profile["datetime"]:
+        try:
+            entity_label = natural_label(profile["datetime"][0])
+        except Exception:
+            pass
 
     if op in _GROUPING_OPS and intent.get("entity") is not None and key_col:
         expected_granularity = f"one row per {entity_label}"
@@ -1062,11 +1116,18 @@ def analyze_result(ir, columns, rows, goal="", sql="", row_count=0) -> dict:
             answer = synthesize_trend_answer(final_rows, measure_label, entity_label)
     else:
         answer = synthesize_answer(final_rows, measure_label, entity_label)
-    story = build_story(final_rows, measure_label, entity_label, based_on, op)
+    story = build_story(final_rows, measure_label, entity_label, based_on, op,
+                        goal=goal)
     chart_spec = select_visualization(intent, final_columns, final_rows, measure_label)
+    _table_label = ""
+    try:
+        _tbl = str((intent.get("entity") or {}).get("table") or "").strip()
+        _table_label = natural_label(_tbl) if _tbl else ""
+    except Exception:
+        _table_label = ""
     why = build_why(
         intent, final_rows, final_columns, entity_label, measure_label,
-        based_on, confidence, issues,
+        based_on, confidence, issues, goal=goal, table_label=_table_label,
     )
     # SQL stays server-side for debugging — it must never surface in prose
     # or user-facing evidence. Provenance keeps humanized names only.

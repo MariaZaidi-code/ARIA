@@ -23,6 +23,8 @@ interface InsightEvidence {
   currentValue?: number;
   changePercent?: number;
   limitations?: string[] | string;
+  affectedSegment?: string;
+  affectedRecordCount?: number;
 }
 
 interface InsightBusinessImpact {
@@ -59,6 +61,7 @@ interface Insight {
   title: string;
   description: string;
   metric: string;
+  valueFormat?: "currency" | "number";
   metricValue?: number;
   previousValue?: number;
   magnitude: string;
@@ -211,6 +214,21 @@ function plainBusiness(v: unknown): string {
   return s;
 }
 
+/* Keep the first row per id: backend ids are unique today, but persisted
+   lists (older files, merged sources) can still carry duplicates and React
+   keys / openInsight(id) lookups must stay unambiguous. */
+function dedupeInsights(list: Insight[]): Insight[] {
+  const seen = new Set<string>();
+  const out: Insight[] = [];
+  for (const ins of Array.isArray(list) ? list : []) {
+    const key = String(ins?.id || "").slice(0, 160) || `${out.length}_blank`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ins);
+  }
+  return out;
+}
+
 /* Display helpers: title / description / magnitude in plain business words.
    Data identical — only wording. Falls back to humanized raw when plain
    would empty the string, so cards never render blank. */
@@ -346,6 +364,15 @@ const fmtMoney = (v?: number | null) => {
   return `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
 };
 
+const MONEY_METRIC_TERMS = new Set(["price", "cost", "amount", "total", "revenue", "sales", "income", "expense", "profit", "freight", "tax", "payment", "balance", "charge", "fee", "wage", "salary", "billing"]);
+function fmtInsightValue(ins: Insight, value?: number | null): string {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+  if (ins.valueFormat === "currency") return fmtMoney(value);
+  const metricTokens = (ins.metric || "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (metricTokens.some((token) => MONEY_METRIC_TERMS.has(token))) return fmtMoney(value);
+  return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
 /* ---- Copilot-style error detail: backend `detail` verbatim when it adds
    context, capped + sanitized so SQL/traces never leak to the UI. ---- */
 function cleanDetail(v: unknown, fallback: string): string {
@@ -471,7 +498,7 @@ function EvidenceDataTable({ ins }: { ins: Insight }) {
   const cols = Object.keys(first).slice(0, 4);
   if (!cols.length) return null;
   const cell = (v: unknown): string => {
-    if (typeof v === "number" && !isNaN(v)) return fmtMoney(v);
+    if (typeof v === "number" && !isNaN(v)) return fmtInsightValue(ins, v);
     if (typeof v === "boolean") return v ? "yes" : "no";
     return String(v ?? "—").slice(0, 40);
   };
@@ -710,7 +737,7 @@ function decisionSentenceOf(ins: Insight): string {
   const base = ins.evidence?.baseline;
   const cur = ins.evidence?.currentValue;
   if (!how && isFiniteNum(base) && isFiniteNum(cur)) {
-    how = `from ${fmtMoney(base)} to ${fmtMoney(cur)}`;
+    how = `from ${fmtInsightValue(ins, base)} to ${fmtInsightValue(ins, cur)}`;
   }
   if (!how) return "";
   const det = recommendationDetailOf(ins);
@@ -731,8 +758,8 @@ function anomalyBaselineOf(ins: Insight): string {
   const t = (ins.type || "").toLowerCase();
   if (!t.includes("anomal") && !t.includes("outlier")) return "";
   const usual = expectedRangePlain(ins)
-    || (isFiniteNum(ins.evidence?.baseline) ? fmtMoney(ins.evidence.baseline) : "");
-  const thisTime = isFiniteNum(ins.evidence?.currentValue) ? fmtMoney(ins.evidence.currentValue) : "";
+    || (isFiniteNum(ins.evidence?.baseline) ? fmtInsightValue(ins, ins.evidence.baseline) : "");
+  const thisTime = isFiniteNum(ins.evidence?.currentValue) ? fmtInsightValue(ins, ins.evidence.currentValue) : "";
   if (!usual || !thisTime || usual === "—" || thisTime === "—") return "";
   const started = fmtWhen(ins.detectedAt || "") || (ins.affectedPeriod || "").trim().slice(0, 60);
   const lasted = isFiniteNum(ins.evidence?.sampleSize) && (ins.evidence?.sampleSize as number) > 0
@@ -749,18 +776,9 @@ function anomalyBaselineOf(ins: Insight): string {
 
 /* 3) At-stake estimate: affected records x typical value, in plain words. */
 function atStakeOf(ins: Insight): string {
-  const records = ins.evidence?.sampleSize;
-  const typical = isFiniteNum(ins.evidence?.baseline)
-    ? ins.evidence?.baseline as number
-    : isFiniteNum(ins.evidence?.currentValue)
-      ? ins.evidence?.currentValue as number
-      : isFiniteNum(ins.metricValue)
-        ? ins.metricValue as number
-        : null;
-  if (!isFiniteNum(records) || (records as number) < 1 || typical === null || !isFinite(typical)) return "";
-  const total = (records as number) * (typical as number);
-  if (!isFinite(total) || total <= 0) return "";
-  return `About ${Math.round(records as number).toLocaleString()} records at roughly ${fmtMoney(typical)} each — about ${fmtMoney(total)} at stake.`;
+  const amount = ins.businessImpact?.value;
+  if (!isFiniteNum(amount) || amount <= 0) return "";
+  return `Estimated impact: ${fmtInsightValue(ins, amount)}.`;
 }
 
 /* 4) One plain "why shown" clause per evidence row. */
@@ -926,7 +944,11 @@ export default function Insights({
   const propInsights: Insight[] = Array.isArray(insightResult?.keyInsights)
     ? insightResult.keyInsights.map(adaptLegacyInsight)
     : [];
-  const allInsights: Insight[] = insights.length > 0 ? insights : propInsights;
+  // Dedupe by id: legacy saved backends may emit duplicate deterministic
+  // ids; React keys and openInsight(lookup-by-id) must stay unambiguous.
+  const allInsights: Insight[] = dedupeInsights(
+    insights.length > 0 ? insights : propInsights,
+  );
 
   const metrics = useMemo(() => ["All", ...Array.from(new Set(allInsights.map((i) => (i.metric || "").split(" (")[0]).filter(Boolean))).slice(0, 12)], [allInsights]);
 
@@ -1387,8 +1409,7 @@ export default function Insights({
     const recoDetail = recommendationDetailOf(selected);
     const explains = explainsTextOf(selected);
     const explainsParas = explainsParagraphs(explains);
-    const dims = selected.recommendedNextAnalysis?.dimensions || [];
-    const affectedSegment = dims[0] || selected.tags?.[0] || "";
+    const affectedSegment = selected.evidence?.affectedSegment || "";
     const scenarioAvailable = selected.scenario?.available === true;
     const monitorAvailable = selected.monitoring?.available === true;
     const lims = limitationLines(selected);
@@ -1527,7 +1548,7 @@ export default function Insights({
                         <div className="mb-2 flex items-center gap-2 rounded-lg border border-blue-200 dark:border-blue-500/25 bg-blue-50 dark:bg-blue-500/10 px-2.5 py-1.5 text-[11px]">
                           <span>
                             Context: <span className="font-semibold">{drill.label}</span>
-                            {typeof drill.value === "number" ? ` · ${fmtMoney(drill.value)}` : ""}
+                            {typeof drill.value === "number" ? ` · ${fmtInsightValue(selected, drill.value)}` : ""}
                           </span>
                           <button
                             onClick={() => askCopilot(selected, `Break down "${drill.label}" further: trend and top contributors within this segment for ${shortMetric(selected.metric) || "this metric"}.`, drill.label)}
@@ -1628,9 +1649,9 @@ export default function Insights({
                       {(selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined) ||
                       (selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined) ? (
                         <p className="mt-2 text-[11px] text-secondary-foreground">
-                          {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && <>Baseline <span className="font-semibold text-foreground">{fmtMoney(selected.evidence.baseline)}</span></>}
+                          {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && <>Baseline <span className="font-semibold text-foreground">{fmtInsightValue(selected, selected.evidence.baseline)}</span></>}
                           {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && " → "}
-                          {selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && <>Current <span className="font-semibold text-foreground">{fmtMoney(selected.evidence.currentValue)}</span></>}
+                          {selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && <>Current <span className="font-semibold text-foreground">{fmtInsightValue(selected, selected.evidence.currentValue)}</span></>}
                         </p>
                       ) : null}
                     </div>
@@ -1660,7 +1681,7 @@ export default function Insights({
                     )}
                     {impact?.value !== undefined && impact.value !== null && impact.direction !== "neutral" && impact.explanation && (
                       <p className="mt-2 text-xs text-muted-foreground">
-                        Estimated impact: <span className={`font-semibold ${impact.direction === "positive" ? "text-emerald-600 dark:text-emerald-400" : impact.direction === "negative" ? "text-rose-600 dark:text-rose-400" : "text-foreground"}`}>{fmtMoney(Math.abs(impact.value))}</span>
+                        Estimated impact: <span className={`font-semibold ${impact.direction === "positive" ? "text-emerald-600 dark:text-emerald-400" : impact.direction === "negative" ? "text-rose-600 dark:text-rose-400" : "text-foreground"}`}>{fmtInsightValue(selected, Math.abs(impact.value))}</span>
                       </p>
                     )}
                   </div>
@@ -1670,10 +1691,10 @@ export default function Insights({
                   <div className="space-y-3 min-w-0 max-w-full">
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
                       {selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && (
-                        <div className="rounded-lg border border-border border-l-4 border-l-blue-600 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Current</p><p className="font-semibold break-words">{fmtMoney(selected.evidence.currentValue)}</p></div>
+                        <div className="rounded-lg border border-border border-l-4 border-l-blue-600 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Current</p><p className="font-semibold break-words">{fmtInsightValue(selected, selected.evidence.currentValue)}</p></div>
                       )}
                       {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && (
-                        <div className="rounded-lg border border-border border-l-4 border-l-indigo-500 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Baseline</p><p className="font-semibold break-words">{fmtMoney(selected.evidence.baseline)}</p></div>
+                        <div className="rounded-lg border border-border border-l-4 border-l-indigo-500 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Baseline</p><p className="font-semibold break-words">{fmtInsightValue(selected, selected.evidence.baseline)}</p></div>
                       )}
                       {selected.evidence?.sampleSize !== null && selected.evidence?.sampleSize !== undefined && (
                         <div className="rounded-lg border border-border border-l-4 border-l-blue-600 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Sample</p><p className="font-semibold break-words">{selected.evidence.sampleSize} periods</p></div>

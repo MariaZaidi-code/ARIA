@@ -44,7 +44,9 @@ def _measure_expr(intel, tname: str, col: str, dialect: str) -> str:
     try:
         q = _safe_name(col, dialect)
     except Exception:
-        return str(col)
+        # Fallback must still be a quoted identifier — an unquoted raw column
+        # name can break SQL or allow keyword collisions.
+        return f'"{str(col).replace(chr(34), chr(34) + chr(34))}"'
     try:
         dtype = intel.dtype_of(tname, col) if intel is not None else ""
     except Exception:
@@ -107,9 +109,17 @@ def _fmt(v, is_currency=False):
 
 
 def _is_currency_col(col_name: str) -> bool:
-    from core.schema_intel import AMOUNT_HINTS
-    cl = col_name.lower()
-    return any(k in cl for k in AMOUNT_HINTS)
+    from core.schema_intel import _name_tokens
+    tokens = set(_name_tokens(col_name))
+    # Counts and physical quantities are additive but are not money. Keep
+    # them out of currency formatting even though they can be KPI measures.
+    if tokens & {"quantity", "qty", "count", "weight", "percent", "percentage", "rate"}:
+        return False
+    return bool(tokens & {
+        "amount", "revenue", "sales", "profit", "price", "cost", "total",
+        "value", "payment", "expense", "income", "salary", "turnover",
+        "billing", "balance", "discount", "freight", "tax", "charge", "fee",
+    })
 
 
 def _safe(val):
@@ -624,7 +634,9 @@ def _fetch_time_series(conn, tname: str, dt_col: str, measure: str,
     # Fallback for non-ISO date text: real SQL fetches raw pairs, Python
     # only buckets them to months (no values invented). Bounded: at most
     # _SERIES_FALLBACK_MAX raw pairs feed the month buckets, and the chart
-    # itself carries at most `limit` (≤500) aggregated points.
+    # itself carries at most `limit` (≤500) aggregated points. ORDER BY on
+    # the raw date keeps the window deterministic and chronological
+    # (earliest rows first) instead of an arbitrary scan order.
     try:
         result = conn.execute(
             text(
@@ -632,6 +644,7 @@ def _fetch_time_series(conn, tname: str, dt_col: str, measure: str,
                 f"{_mref} AS v "
                 f"FROM {_safe_name(tname, dialect)} "
                 f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
+                f"ORDER BY {_safe_name(dt_col, dialect)} "
                 f"LIMIT :fallback_limit"
             ),
             {"fallback_limit": _SERIES_FALLBACK_MAX},
@@ -677,6 +690,7 @@ def _fetch_count_series(conn, tname: str, dt_col: str, dialect: str,
                 f"SELECT {_safe_name(dt_col, dialect)} AS d "
                 f"FROM {_safe_name(tname, dialect)} "
                 f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
+                f"ORDER BY {_safe_name(dt_col, dialect)} "
                 f"LIMIT :fallback_limit"
             ),
             {"fallback_limit": _SERIES_FALLBACK_MAX},

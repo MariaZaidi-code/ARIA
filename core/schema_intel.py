@@ -163,11 +163,13 @@ def _run_sql(conn, sql: str, limit: int = 500):
     """
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        cols = [d[0] for d in cur.description] if cur.description else []
-        rows = cur.fetchmany(limit)
-        cur.close()
-        return cols, [dict(zip(cols, row)) for row in rows]
+        try:
+            cur.execute(sql)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchmany(limit)
+            return cols, [dict(zip(cols, row)) for row in rows]
+        finally:
+            cur.close()
     except Exception as exc:
         import logging as _logging
         _logging.getLogger("aria.schema_intel").warning(
@@ -360,17 +362,28 @@ class SchemaIntelligence:
         if not numerics:
             return None
 
-        # Tier 1: amount-like names, not PK/FK
-        tier1 = [c for c in numerics
-                 if any(h in c.lower() for h in AMOUNT_HINTS)]
-        if tier1:
-            return tier1[0]
+        # Rank by meaning rather than whichever column happened to appear
+        # first in the schema. Operational measures such as quantity and
+        # unit price are useful, but should not displace a real sales/revenue
+        # total as the primary business outcome.
+        direct_outcomes = {"sales", "revenue", "profit", "income", "turnover"}
+        totals = {"amount", "total", "value", "payment", "billing", "balance"}
+        financial_components = {"price", "cost", "expense", "salary", "charge", "fee", "tax", "freight", "discount"}
+        operational = {"quantity", "qty", "count", "weight", "unit", "units"}
 
-        # Tier 2: non-PK/FK, non-ID columns
-        if numerics:
-            return numerics[0]
+        def rank(col):
+            tokens = set(_name_tokens(col))
+            if tokens & direct_outcomes:
+                return 4
+            if tokens & totals:
+                return 3
+            if tokens & financial_components:
+                return 2
+            if tokens & operational:
+                return 1
+            return 0
 
-        return None
+        return max(numerics, key=rank)
 
     def find_all_measures(self, table: str):
         """Return all usable numeric measure columns for a table."""

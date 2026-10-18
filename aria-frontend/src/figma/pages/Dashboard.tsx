@@ -1,13 +1,14 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { ArrowRight, ArrowUpRight, ArrowDownRight, Zap, Search, AlertTriangle, ChevronRight, RefreshCw, Database, DollarSign, Store, CalendarDays, Percent, TrendingUp, Users, ShoppingCart, RotateCcw, X, Sparkles, MessageSquare, Send, Lightbulb, Shield, BarChart3, GitBranch, Sun, FileText } from "lucide-react";
-import { AreaChart, Area, Line, BarChart, Bar, Cell, PieChart, Pie, ResponsiveContainer, Tooltip, CartesianGrid, XAxis, YAxis, Brush, ReferenceDot, ScatterChart, Scatter, ZAxis } from "recharts";
+import { ArrowRight, ArrowUpRight, ArrowDownRight, Zap, Search, AlertTriangle, ChevronRight, RefreshCw, Database, DollarSign, Store, CalendarDays, Percent, TrendingUp, Users, ShoppingCart, RotateCcw, X, Sparkles, MessageSquare, Send, Lightbulb, Shield, BarChart3, GitBranch, Sun, FileText, Target } from "lucide-react";
+import { AreaChart, Area, Line, BarChart, Bar, Cell, PieChart, Pie, ResponsiveContainer, Tooltip, CartesianGrid, XAxis, YAxis, ReferenceDot, ScatterChart, Scatter, ZAxis } from "recharts";
 import type { Page } from "../App";
 import { useTheme } from "../App";
 import { TimeRangeSelector } from "../components/TimeRangeSelector";
+import { ChartBrush } from "../components/ChartBrush";
 import { colorForName } from "../lib/charts";
 import { fmtBiz } from "../lib/format";
 import { fmtPeriod, validateDashboardCharts } from "../components/charts";
-import { apiFetch } from "../../services/api";
+import { apiFetch, workspaceApi } from "../../services/api";
 
 interface DashboardProps {
   setPage: (p: Page) => void;
@@ -242,7 +243,7 @@ function storeDrillContext(ctx: Record<string, any>) {
   } catch { /* private mode: navigation still works */ }
 }
 
-function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy }: { kpi: any; index?: number; onDrill: (kpi: any) => void; onAsk?: (q: string) => void; onWhy?: (metric: string) => void }) {
+function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy, target }: { kpi: any; index?: number; onDrill: (kpi: any) => void; onAsk?: (q: string) => void; onWhy?: (metric: string) => void; target?: any }) {
   const [draftMsg, setDraftMsg] = useState("");
   const tint = tintFor(kpi);
   const Icon = iconFor(kpi);
@@ -277,6 +278,16 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy }: { kpi: any; index
       : [];
   const gradId = `kpi-spark-${index}`;
   const periodText = /prev/i.test(String(kpi?.period || "")) ? "Compared with previous period" : (kpi?.period || "All time");
+
+  /* KPI target chip: hit/miss + gap vs the plain-language current value. */
+  const rawNum = kpi?.rawValue === null || kpi?.rawValue === undefined ? NaN : Number(kpi.rawValue);
+  const targetNum = target && Number.isFinite(Number(target?.target)) ? Number(target.target) : null;
+  const targetHit = targetNum !== null && Number.isFinite(rawNum) && !isText
+    ? (String(target?.direction) === "below" ? rawNum <= targetNum : rawNum >= targetNum)
+    : null;
+  const targetGapPct = targetNum !== null && targetNum !== 0 && Number.isFinite(rawNum)
+    ? ((rawNum - targetNum) / Math.abs(targetNum)) * 100
+    : null;
 
   return (
     <div
@@ -339,6 +350,20 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy }: { kpi: any; index
       </div>
       {showChange && (
         <p className="text-[11px] text-muted-foreground truncate">{periodText}</p>
+      )}
+      {targetNum !== null && targetHit !== null && (
+        <p
+          className={`self-start inline-flex items-center gap-1 text-[10.5px] font-semibold px-2 py-0.5 rounded-full border ${targetHit
+            ? "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25"
+            : "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25"}`}
+          title={`Target ${fmt(targetNum, prefix)} — ${targetHit ? "met" : "not yet met"}`}
+        >
+          <Target size={10} />
+          Target {fmt(targetNum, prefix)}
+          <span className="font-medium">
+            · {targetHit ? "hit" : targetGapPct !== null ? `${Math.abs(targetGapPct).toFixed(1)}% to go` : "not hit"}
+          </span>
+        </p>
       )}
       {onAsk && (
         <button
@@ -681,6 +706,39 @@ function exploreToFocusViz(rows: any[], metric: string, dim: string, insightTitl
   };
 }
 
+function insightToFocusViz(raw: any, insightTitle: string): SelectedViz | null {
+  const spec = raw?.visualization || raw?.viz;
+  const rows = Array.isArray(spec?.data) ? spec.data : Array.isArray(raw?.viz_data) ? raw.viz_data : [];
+  if (!rows.length) return null;
+  const xKey = spec?.x || raw?.viz_x || Object.keys(rows[0] || {}).find((key) => typeof rows[0][key] === "string");
+  const yKey = (Array.isArray(spec?.series) ? spec.series : []).find((key: string) => typeof rows[0]?.[key] === "number")
+    || Object.keys(rows[0] || {}).find((key) => typeof rows[0][key] === "number" && key !== xKey);
+  if (!xKey || !yKey) return null;
+  const data = rows.filter((row: any) => Number.isFinite(Number(row?.[yKey]))).slice(-24).map((row: any) => ({
+    ...row, [xKey]: String(row?.[xKey] ?? ""), [yKey]: Number(row[yKey]),
+  }));
+  if (!data.length) return null;
+  const type = String(spec?.type || raw?.viz_type || "bar").toLowerCase();
+  const chartType = ["line", "area", "bar"].includes(type) ? type : "bar";
+  const kind: VizKind = type === "line" || type === "area" ? "time" : "category";
+  const measure = String(raw?.metric_column || raw?.metricColumn || raw?.metric || raw?.measure || yKey);
+  const metricName = normMeasure(measure);
+  const format = /(^| )(revenue|sales|profit|cost|price|amount|payment|budget|spend|expense|income|freight|tax|balance|fee|salary)( |$)/.test(metricName) ? "currency" : "number";
+  const peak = peakOf(data, xKey, yKey);
+  const anomaly = data.find((row: any) => row.anomaly === true);
+  return {
+    key: `focus:${raw?.id || insightTitle}`, kind, chartType,
+    title: String(spec?.title || insightTitle),
+    subtitle: `Focused view · ${insightTitle.slice(0, 90)}`,
+    data, xKey, yKey, format, measure: humanize(measure), dim: humanize(xKey), grain: "", periodLabel: "",
+    current: Number((anomaly || data[data.length - 1])?.[yKey]) || null, trendPct: trendOf(data, yKey),
+    peakLabel: anomaly ? String(anomaly[xKey]) : peak.label,
+    peakValue: anomaly ? Number(anomaly[yKey]) : peak.value,
+    annotation: anomaly ? `${humanize(measure)} anomaly in ${anomaly[xKey]}` : `Focused from this insight: ${insightTitle}`,
+    annotationFromBackend: true, emptyReason: "", sourceId: String(raw?.id || "insight-focus"),
+  };
+}
+
 /* ---------------- business tooltip: value + % change + supporting context ---------------- */
 
 function DashTooltip({ active, payload, label, viz, total }: {
@@ -986,7 +1044,7 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
                   return <Cell key={i} fill={colorForName(String(row?.[viz.xKey] ?? i))} opacity={mine && !active ? 0.35 : 1} />;
                 })}
               </Bar>
-              <Brush dataKey={viz.xKey} height={20} travellerWidth={8} />
+              <ChartBrush dataKey={viz.xKey} />
             </BarChart>
           ) : isScatter ? (
             <ScatterChart margin={{ top: 10, right: 10, bottom: 10, left: 10 }}>
@@ -1014,7 +1072,7 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
                   r={5} fill={measureColor} stroke="#ffffff" strokeWidth={2}
                 />
               )}
-              <Brush dataKey={viz.xKey} height={20} travellerWidth={8} tickFormatter={(v: string) => fmtPeriod(String(v))} />
+              <ChartBrush dataKey={viz.xKey} tickFormatter={(v: string) => fmtPeriod(String(v))} />
             </AreaChart>
           ) : (
             <BarChart
@@ -1031,7 +1089,7 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
                   return <Cell key={i} fill={colorForName(String(row?.[viz.xKey] ?? i))} opacity={mine && !active ? 0.35 : 1} />;
                 })}
               </Bar>
-              {viewData.length > 4 && <Brush dataKey={viz.xKey} height={20} travellerWidth={8} />}
+              {viewData.length > 4 && <ChartBrush dataKey={viz.xKey} />}
             </BarChart>
           )}
         </ResponsiveContainer>
@@ -1106,6 +1164,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
   const [lastUpdatedIso, setLastUpdatedIso] = useState<string>("");
   const [selection, setSelection] = useState<DrillSelection | null>(null);
   const [resetKey, setResetKey] = useState(0);
+  const [targets, setTargets] = useState<any[]>([]);
   const [activeFilter, setActiveFilter] = useState<string>("all");
   const [, setAnomDismiss] = useState(0);
   const [sessionInfo, setSessionInfo] = useState<{ dbName: string; sourceType: string }>({ dbName: "", sourceType: "" });
@@ -1125,6 +1184,9 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     focusAbort.current?.abort();
     setFocusViz(null); setFocusTitle(""); setFocusLoading(false); setFocusError("");
   };
+  /* Unmount: abort any in-flight focus explore (insight-focus loop holds
+     its AbortController here) so responses can't setState after navigation. */
+  useEffect(() => () => { focusAbort.current?.abort(); }, []);
   const scrollToCharts = () => {
     try { document.getElementById("dash-charts")?.scrollIntoView({ behavior: "smooth", block: "start" }); } catch { /* ignore */ }
   };
@@ -1149,7 +1211,30 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     try {
       const data: any = await apiFetch("/dashboard/config");
       if (data.ok) {
-        setConfig(data.config);
+        let nextConfig = data.config;
+        // Use the same database-backed quality scan as the Data page. The
+        // dashboard's KPI builder is best-effort and may not have enough
+        // schema metadata to calculate a trustworthy score on its own.
+        try {
+          const qualityResponse: any = await apiFetch("/data/quality");
+          const quality = qualityResponse?.quality;
+          if (qualityResponse?.ok && Number.isFinite(Number(quality?.overall))) {
+            nextConfig = {
+              ...nextConfig,
+              quality: {
+                ...(nextConfig?.quality || {}),
+                score: Number(quality.overall),
+                issues: Array.isArray(quality.issues) ? quality.issues : [],
+                metrics: quality.metrics || {},
+                lastScan: quality.last_scan || null,
+              },
+            };
+          }
+        } catch (qualityError) {
+          // Keep the dashboard usable if the optional quality scan fails.
+          console.debug("[ARIA] dashboard quality scan unavailable:", qualityError);
+        }
+        setConfig(nextConfig);
         setLastUpdated(Date.now());
         setLastUpdatedIso(new Date().toISOString());
       } else {
@@ -1205,6 +1290,29 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
       } catch { /* card falls back to config summary labels */ }
     })();
   }, [connectionStatus, dbName]);
+
+  /* Workspace extras (KPI targets) — additive, must never block the
+     dashboard: failures resolve to an empty list. Reloaded per connection. */
+  useEffect(() => {
+    if (connectionStatus !== "connected") return;
+    let dead = false;
+    (async () => {
+      const st = await workspaceApi.getTargets().catch(() => ({ data: [] }));
+      if (dead) return;
+      setTargets(Array.isArray(st?.data) ? st.data : []);
+    })();
+    return () => { dead = true; };
+  }, [connectionStatus, dbName]);
+
+  /* A KPI target matches a card when the metric names align (either way). */
+  const targetFor = (label: any) => {
+    const b = String(label || "").trim().toLowerCase();
+    if (!b) return null;
+    return targets.find((t: any) => {
+      const a = String(t?.metric || "").trim().toLowerCase();
+      return !!a && (a === b || b.includes(a) || a.includes(b));
+    }) || null;
+  };
 
   useEffect(() => {
     if (connectionStatus !== "connected") return;
@@ -1280,10 +1388,12 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
   const daypart = hour < 12 ? "morning" : hour < 18 ? "afternoon" : "evening";
   const greeting = `Good ${daypart}, ${firstName}`;
 
-  // Filtered signal pool (insights + anomalies share one taxonomy).
+  // Filtered signal pool (insights + anomalies share one taxonomy). Ids
+  // must be unique across the pool — several detectors can emit the same
+  // default id for different rows, and React keys + focus lookups key on it.
   const pool = [
-    ...rawInsights.map((ins: any) => ({
-      id: ins.id || ins.title,
+    ...rawInsights.map((ins: any, i: number) => ({
+      id: `${ins.id || ins.title || "insight"}_${i}`,
       title: ins.title || "Insight",
       description: ins.description || ins.explanation || "",
       type: ins.type || ins.category || "Insight",
@@ -1291,7 +1401,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
       raw: ins,
     })),
     ...anomalies.map((a: any, i: number) => ({
-      id: a.id || `anomaly_${i}`,
+      id: `${a.id || "anomaly"}_${i}`,
       title: a.title || `${a.metric || a.column || "Metric"} anomaly`,
       description: a.explanation || a.description || "",
       type: a.type || "Anomaly",
@@ -1355,22 +1465,53 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
       return;
     }
     setRxFor(id);
-    if (rxAns[id]) return;
+    if (rxAns[id] && !rxAns[id].startsWith("ARIA couldn't analyze this finding")) return;
     setRxBusy(id);
     try {
       const { prescriptionApi } = await import("../../services/api");
-      const q = `What should I consider for ${ins.title || "this finding"}?`;
-      const r = await (prescriptionApi as any).analyze({ question: q });
+      const raw = (ins && ins.raw) || {};
+      const recommended = raw.recommendedNextAnalysis
+        || raw.recommended_next_analysis || raw.recommendedAnalysis || {};
+      const metric = String(raw.metric_column || raw.metricColumn
+        || recommended.metric_column || recommended.metric
+        || raw.metric || raw.measure || raw.column || "")
+        .replace(/\s*\(.*?\)\s*$/, "").trim();
+      const rawDims = recommended.dimensions || recommended.breakdown || [];
+      const driver = String((Array.isArray(rawDims) ? rawDims[0] : rawDims)
+        || raw.breakdown_column || raw.breakdownColumn || raw.driver
+        || raw.dimension || raw.segmentField || "").trim();
+      if (!metric) {
+        setRxAns((s) => ({
+          ...s,
+          [id]: "This finding has no measurable metric attached yet, so ARIA can't make a data-backed recommendation.",
+        }));
+        return;
+      }
+      const q = `What should I consider for this finding: ${String(ins.title || "this finding").slice(0, 180)}?`;
+      const r = await (prescriptionApi as any).analyze({
+        question: q,
+        metric,
+        ...(driver ? { driver, dimensions: [driver] } : {}),
+        ...(raw.table || raw.table_name ? { table: raw.table || raw.table_name } : {}),
+        context: {
+          origin: "dashboard",
+          insight_id: id.slice(0, 80),
+          metric,
+          ...(driver ? { driver } : {}),
+          ...(raw.confidence ? { confidence: String(raw.confidence).slice(0, 40) } : {}),
+        },
+      });
       const d: any = (r as any)?.data ?? null;
       const top = (d?.prescriptions || [])[0];
       setRxAns((s) => ({
         ...s,
         [id]: top
-          ? String(top?.display?.action_text || top?.title || "")
-          : String(d?.refusal?.headline || d?.reason || "Nothing qualified — the evidence bar held."),
+          ? String(top?.display?.action_text || top?.action_text || top?.title || top?.summary || "ARIA found an evidence-backed action.")
+          : String(d?.detail || d?.refusal?.headline || d?.reason
+            || "ARIA couldn't find a recommendation supported by this finding."),
       }));
     } catch {
-      setRxAns((s) => ({ ...s, [id]: "ARIA couldn't answer that just now." }));
+      setRxAns((s) => ({ ...s, [id]: "ARIA couldn't analyze this finding just now. Try again in a moment." }));
     } finally {
       setRxBusy(null);
     }
@@ -1403,18 +1544,41 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
      when the insight carries no structured metric/dimension. */
   const focusInsight = async (p: any) => {
     const raw = (p && p.raw) || {};
+    const title = String(p?.title || "Insight");
+    const ownViz = insightToFocusViz(raw, title);
+    if (ownViz) {
+      focusAbort.current?.abort();
+      setFocusViz(ownViz); setFocusTitle(title); setFocusError(""); setFocusLoading(false);
+      const selectedRow = ownViz.data.find((row: any) => row.anomaly === true) || ownViz.data[ownViz.data.length - 1];
+      setSelection({ chart: ownViz.title, measure: ownViz.measure, label: String(selectedRow?.[ownViz.xKey] ?? ""), value: selectedRow?.[ownViz.yKey] ?? null });
+      scrollToCharts();
+      return;
+    }
+    const recommended = raw.recommendedNextAnalysis
+      || raw.recommended_next_analysis || raw.recommendedAnalysis || {};
     // Backend metric labels carry table suffixes ("Sales (sample_superstore)")
     // and stray spaces — strip to the bare column name for re-querying.
-    const cleanMetric = String(raw.metric || raw.column || raw.measure || "")
+    const cleanMetric = String(raw.metric_column || raw.metricColumn
+      || recommended.metric_column || recommended.metric || raw.metric || raw.column || raw.measure || "")
       .replace(/\s*\(.*?\)\s*$/, "").trim();
-    const recDims = (raw.recommendedNextAnalysis && (raw.recommendedNextAnalysis as any).dimensions) || [];
-    const dim = String(
-      (Array.isArray(recDims) ? recDims[0] : recDims)
-      || raw.segment || raw.dimension || raw.breakdown || "",
-    ).trim();
-    const title = String(p?.title || "Insight");
+    const recDims = recommended.dimensions || recommended.breakdown || [];
+    const recDimList = (Array.isArray(recDims) ? recDims : [recDims])
+      .concat([raw.breakdown_column, raw.breakdownColumn, raw.segment, raw.breakdown])
+      .filter((d: any) => typeof d === "string" && d.trim());
+    const insightViz = raw.visualization || raw.viz || {};
+    const chartForMetric = [viz1, viz2].find((v: any) =>
+      cleanMetric && normMeasure(v?.measure) === normMeasure(cleanMetric));
+    // A detector's generic `dimension` can belong to an unrelated table. Prefer
+    // the clicked insight's own plotted breakdown, then its explicit recs.
+    const dimCandidates = [
+      insightViz.x, insightViz.xKey, insightViz.dimension,
+      raw.viz_x, raw.x_column, raw.breakdown_column, raw.breakdownColumn,
+      chartForMetric?.dim, chartForMetric?.xKey,
+      ...recDimList,
+    ].filter((d: any) => typeof d === "string" && d.trim());
+    const uniqueDims = [...new Map(dimCandidates.map((d: string) => [normMeasure(d), d.trim()])).values()];
     const metric = cleanMetric;
-    if (!metric || !dim) {
+    if (!metric || !uniqueDims.length) {
       // Unstructured insight: highlight by measure token found in its text.
       const hay = normMeasure(`${p?.title || ""} ${p?.description || ""}`);
       const all = [viz1, viz2].filter((v: any) => v && v.measure);
@@ -1423,7 +1587,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
         return tok && hay.includes(tok);
       });
       if (byText) highlightVizFor(byText.measure, "");
-      else if (metric) highlightVizFor(metric, dim);
+      else if (metric) highlightVizFor(metric, "");
       scrollToCharts();
       return;
     }
@@ -1432,22 +1596,39 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     setFocusLoading(true); setFocusError(""); setFocusTitle(title);
     try {
       const { intelligenceApi } = await import("../../services/api");
-      const r: any = await intelligenceApi.runExplore({ metric, breakdown: dim });
-      if (ctrl.signal.aborted) return;
-      const rd: any = r?.data ?? r;
-      if (rd && rd.ok === false) throw new Error(rd.detail || rd.message || "Explore failed");
-      const rows: any[] = Array.isArray(rd?.rows) ? rd.rows
-        : Array.isArray(rd?.breakdown) ? rd.breakdown
-        : Array.isArray(rd?.table) ? rd.table : [];
-      const fv = exploreToFocusViz(rows, metric, dim, title);
-      if (!fv) throw new Error("No plottable rows returned.");
+      let fv: SelectedViz | null = null;
+      let lastError = "No plottable rows returned.";
+      // Retry cap: at most 3 alternative dimensions per focus click. The
+      // explore chain fans out into server aggregation; an unbounded loop
+      // burns LLM/db budget while the user waits on a failing card.
+      for (const dim of uniqueDims.slice(0, 3)) {
+        try {
+          const r: any = await intelligenceApi.runExplore(
+            { metric, breakdown: dim }, { signal: ctrl.signal });
+          if (ctrl.signal.aborted) return;
+          const rd: any = r?.data ?? r;
+          if (rd && rd.ok === false) {
+            lastError = rd.detail || rd.message || "Explore failed";
+            continue;
+          }
+          const rows: any[] = Array.isArray(rd?.rows) ? rd.rows
+            : Array.isArray(rd?.breakdown) ? rd.breakdown
+            : Array.isArray(rd?.table) ? rd.table : [];
+          fv = exploreToFocusViz(rows, metric, dim, title);
+          if (fv) break;
+        } catch (e: any) {
+          if (ctrl.signal.aborted) return;
+          lastError = e?.message || lastError;
+        }
+      }
+      if (!fv) throw new Error(lastError);
       setFocusViz(fv);
       const top = fv.data[0];
       if (top) setSelection({ chart: fv.title, measure: fv.measure, label: String(top?.[fv.xKey] ?? ""), value: top?.[fv.yKey] ?? null });
     } catch (e: any) {
       if (ctrl.signal.aborted) return;
       setFocusError(e?.message || "Couldn't focus this insight.");
-      if (metric) highlightVizFor(metric, dim);
+      if (metric) highlightVizFor(metric, chartForMetric?.dim || "");
     } finally {
       if (focusAbort.current === ctrl) setFocusLoading(false);
     }
@@ -1695,7 +1876,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
             return cards.length > 0 ? (
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                 {cards.map((kpi: any, i: number) => (
-                  <MetricCard key={kpi.id || kpi.label || i} kpi={kpi} index={i} onDrill={drillKpi} onAsk={askAbout} onWhy={askWhy} />
+                  <MetricCard key={kpi.id || kpi.label || i} kpi={kpi} index={i} onDrill={drillKpi} onAsk={askAbout} onWhy={askWhy} target={targetFor(kpi?.label)} />
                 ))}
               </div>
             ) : !error ? (
@@ -1836,20 +2017,27 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
                     const meta = CAT_META[primaryCategory(ins.type)];
                     const Icon = meta.Icon;
                     return (
-                      <button key={ins.id} onClick={() => focusInsight(ins)} className="w-full text-left py-2.5 flex items-center gap-2.5 group min-w-0" title="Show this insight in the charts above">
-                        <span className={`inline-flex items-center justify-center w-8 h-8 rounded-full flex-shrink-0 ${meta.iconWrap}`}>
-                          <Icon size={14} />
-                        </span>
-                        <span className="min-w-0 flex-1">
-                          <span className="block text-[12px] font-semibold leading-snug group-hover:text-blue-700 dark:group-hover:text-blue-400 line-clamp-2">{ins.title}</span>
-                          <span className="block text-[11px] text-muted-foreground leading-snug line-clamp-2 mt-0.5">{ins.description}</span>
-                          <span className="mt-1 flex items-center gap-2">
-                            <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${meta.pill}`}>{meta.label}</span>
-                            {ins.detectedAt && <span className="text-[10px] text-muted-foreground">{fmtWhen(ins.detectedAt)}</span>}
+                      <div key={ins.id} className="w-full py-2.5 flex items-center gap-2.5 min-w-0">
+                        <button onClick={() => focusInsight(ins)} className="flex-1 text-left flex items-center gap-2.5 group min-w-0 rounded-lg focus-visible:ring-2 focus-visible:ring-blue-500" title="Show this insight in the charts above">
+                          <span className={`inline-flex items-center justify-center w-8 h-8 rounded-full flex-shrink-0 ${meta.iconWrap}`}>
+                            <Icon size={14} />
                           </span>
-                        </span>
-                        <ChevronRight size={14} className="text-slate-300 dark:text-muted-foreground group-hover:text-blue-500 dark:group-hover:text-blue-400 flex-shrink-0" />
-                      </button>
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-[12px] font-semibold leading-snug group-hover:text-blue-700 dark:group-hover:text-blue-400 line-clamp-2">{ins.title}</span>
+                            <span className="block text-[11px] text-muted-foreground leading-snug line-clamp-2 mt-0.5">{ins.description}</span>
+                            <span className="mt-1 flex items-center gap-2">
+                              <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${meta.pill}`}>{meta.label}</span>
+                              {ins.detectedAt && <span className="text-[10px] text-muted-foreground">{fmtWhen(ins.detectedAt)}</span>}
+                            </span>
+                          </span>
+                          <ChevronRight size={14} className="text-slate-300 dark:text-muted-foreground group-hover:text-blue-500 dark:group-hover:text-blue-400 flex-shrink-0" />
+                        </button>
+                        <button
+                          onClick={() => askAbout(`Explain this specific finding using my connected data. Finding: ${String(ins.title || "Insight")}. Details: ${String(ins.description || "No additional details were supplied.")}`)}
+                          className="flex-shrink-0 text-[10px] font-semibold px-2.5 py-1.5 rounded-lg border border-border text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:border-blue-300 dark:hover:border-blue-500/30 transition-colors"
+                          aria-label={`Ask ARIA about ${ins.title}`}
+                        >Ask ARIA</button>
+                      </div>
                     );
                   })}
                 </div>

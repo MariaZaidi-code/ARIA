@@ -1369,6 +1369,16 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
                     return _hits[0]
             return None
 
+        _missing_selected_column = bool(
+            (valid_measure and _resolve_target(processed_data) is None)
+            or (valid_time and _resolve_time(processed_data) is None)
+        )
+        if _missing_selected_column:
+            _try_fallback_once()
+            if ((valid_measure and _resolve_target(processed_data) is None)
+                    or (valid_time and _resolve_time(processed_data) is None)):
+                processed_data["data"] = []
+
         forecast = pred_agent.forecast(
             processed_data,
             numeric_col=_resolve_target(processed_data),

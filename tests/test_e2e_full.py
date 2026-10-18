@@ -79,9 +79,19 @@ class TestFullE2E(unittest.TestCase):
     # -- tests -----------------------------------------------------------
 
     def test_01_health(self):
+        # Unauthenticated: minimal liveness shape only (no DB internals
+        # exposed without a session — contract doc §Security).
         r = self.client.get("/api/health")
         self.assertEqual(r.status_code, 200)
-        self.assertIn("critical", r.json())
+        self.assertTrue(r.json().get("ok"), r.json())
+        self.assertIn("status", r.json())
+        # Authenticated: full check payload (critical checks included).
+        # The auth cookie must NOT leak into later tests, which probe the
+        # unauthenticated 401 guards on this shared client.
+        r2 = self.client.get("/api/health", headers=self._auth())
+        self.assertEqual(r2.status_code, 200)
+        self.assertIn("critical", r2.json())
+        self.client.cookies.clear()
 
     def test_02_providers_endpoint(self):
         r = self.client.get("/api/providers")

@@ -105,7 +105,8 @@ export default function Documents() {
     setResults(null);
   };
 
-  const list = results ?? documents;
+  const list = documents;
+  const showSearchResults = results !== null;
 
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-6">
@@ -150,11 +151,11 @@ export default function Documents() {
         </div>
       </div>
 
-      {loading && list.length === 0 && !loadError && (
+      {loading && documents.length === 0 && !loadError && (
         <div className="premium-card rounded-2xl p-12 text-center text-sm text-muted-foreground">Loading documents…</div>
       )}
 
-      {!loading && loadError && list.length === 0 && (
+      {!loading && loadError && documents.length === 0 && (
         <div className="premium-card rounded-2xl p-12 text-center">
           <h3 className="text-lg font-semibold mb-1">Documents couldn't be loaded</h3>
           <p className="text-sm text-muted-foreground">{loadError}</p>
@@ -164,19 +165,42 @@ export default function Documents() {
         </div>
       )}
 
-      {!loading && !loadError && list.length === 0 && (
+      {!loading && !loadError && ((showSearchResults && results.length === 0) || (!showSearchResults && documents.length === 0)) && (
         <div className="premium-card rounded-2xl p-12 text-center">
-          <div className="text-5xl mb-4">{results ? "🔍" : "📄"}</div>
+          <div className="text-5xl mb-4">{showSearchResults ? "🔍" : "📄"}</div>
           <h3 className="text-lg font-semibold mb-1">
-            {results ? `No results for "${query}"` : "No documents yet"}
+            {showSearchResults ? `No results for "${query}"` : "No documents yet"}
           </h3>
           <p className="text-sm text-muted-foreground">
-            {results ? "Try a different search term." : "Upload PDF documents from the Data Sources page to get started."}
+            {showSearchResults ? "Try a different search term." : "Upload PDF documents from the Data Sources page to get started."}
           </p>
         </div>
       )}
 
-      {list.length > 0 && (
+      {showSearchResults && results.length > 0 && (
+        <div className="space-y-3">
+          <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
+            {results.length} matching {results.length === 1 ? "passage" : "passages"}
+          </p>
+          {results.map((result: any, i: number) => {
+            const sourceName = result.filename || documents.find((doc) => doc.id === result.document_id)?.name || "PDF document";
+            return (
+              <article key={`${result.document_id || "doc"}:${result.chunk_id || i}:${i}`} className="premium-card rounded-2xl p-5 space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <h3 className="font-semibold text-sm text-foreground truncate">{sourceName}</h3>
+                  <span className="text-[11px] text-muted-foreground whitespace-nowrap">
+                    {result.page_number ? `Page ${result.page_number}` : "PDF excerpt"}
+                  </span>
+                </div>
+                {result.section && <p className="text-[11px] text-muted-foreground">{result.section}</p>}
+                <p className="text-sm leading-relaxed text-foreground/90 whitespace-pre-wrap">{result.content || "No excerpt available."}</p>
+              </article>
+            );
+          })}
+        </div>
+      )}
+
+      {!showSearchResults && list.length > 0 && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {list.map((doc) => (
             <article key={doc.id} className="premium-card rounded-2xl p-5 space-y-4 hover:shadow-lg transition-shadow">

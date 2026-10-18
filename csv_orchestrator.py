@@ -920,25 +920,69 @@ def build_sqlite_schema_mapping(sqlite_path: str | Path,
             pragma_pk = [r[1] for r in sorted(
                 [r for r in pragma if r[5]], key=lambda r: r[5])]
             n = conn.execute(f'SELECT COUNT(*) FROM {_quote_ident(t)}').fetchone()[0]
+            # One-pass profiling: null counts + distinct counts for ALL
+            # columns in a single scan (the per-column loop below used to
+            # issue 2 queries per column — N+1 on every SQLite ingest).
             null_stats = {}
-            for c in cols:
-                name = c["column"]
-                nulls = conn.execute(
-                    f'SELECT COUNT(*) FROM {_quote_ident(t)} WHERE {_quote_ident(name)} IS NULL'
-                ).fetchone()[0]
-                null_stats[name] = {"total_rows": n, "nulls": nulls,
-                                    "null_pct": round(nulls / n * 100, 2) if n else 0.0}
+            _dist_by_col: dict[str, int | None] = {}
+            if cols and n:
+                _agg_parts = []
+                _agg_alias = {}
+                for _i, _c in enumerate(cols):
+                    _cn = _c["column"]
+                    _alias = f"__p{_i}"
+                    _agg_alias[_alias] = _cn
+                    _qcn = _quote_ident(_cn)
+                    _agg_parts.append(
+                        f'SUM(CASE WHEN {_qcn} IS NULL THEN 1 ELSE 0 END) AS "{_alias}"')
+                    _agg_parts.append(
+                        f'COUNT(DISTINCT {_qcn}) AS "{_alias}d"')
+                _prof_parts = "COUNT(*) AS __row_count, " + ", ".join(_agg_parts)
+                _prof_desc = None
+                try:
+                    _prof_cur = conn.execute(
+                        f'SELECT {_prof_parts} FROM {_quote_ident(t)}')
+                    _prof_row = _prof_cur.fetchone()
+                    _prof_desc = _prof_cur.description
+                except Exception as exc:
+                    _log.debug("one-pass profiling failed for %s: %s", t, exc)
+                    _prof_row = None
+                if _prof_row is not None:
+                    _d_ = dict(zip([k[0] for k in (_prof_desc or [])], _prof_row))
+                    for _i, _c in enumerate(cols):
+                        name = _c["column"]
+                        _alias = f"__p{_i}"
+                        nulls = int(_d_.get(_alias) or 0)
+                        null_stats[name] = {
+                            "total_rows": n, "nulls": nulls,
+                            "null_pct": round(nulls / n * 100, 2) if n else 0.0}
+                        _dist_by_col[name] = int(_d_.get(_alias + "d") or 0)
+            _full_row = None
+            if not null_stats or n == 0:
+                # Deterministic fallback path (headerless/zero-row table): the
+                # original behavior still applies.
+                for c in cols:
+                    name = c["column"]
+                    nulls = conn.execute(
+                        f'SELECT COUNT(*) FROM {_quote_ident(t)} WHERE {_quote_ident(name)} IS NULL'
+                    ).fetchone()[0]
+                    null_stats[name] = {"total_rows": n, "nulls": nulls,
+                                        "null_pct": round(nulls / n * 100, 2) if n else 0.0}
+                    _dist_by_col[name] = None
             inferred_pk: list[str] = []
             if len(pragma_pk) == 1:
                 inferred_pk = pragma_pk
             elif not pragma_pk:
-                # generic single-column uniqueness probe
+                # generic single-column uniqueness probe (distinct counts from
+                # the one-pass profiling when available)
                 for c in cols:
                     name = c["column"]
                     if null_stats[name]["nulls"]:
                         continue
-                    distinct = conn.execute(
-                        f'SELECT COUNT(DISTINCT {_quote_ident(name)}) FROM {_quote_ident(t)}').fetchone()[0]
+                    distinct = _dist_by_col.get(name)
+                    if distinct is None:
+                        distinct = conn.execute(
+                            f'SELECT COUNT(DISTINCT {_quote_ident(name)}) FROM {_quote_ident(t)}').fetchone()[0]
                     if n and distinct == n:
                         from csv_handler import CsvSchemaExtractor as _E
                         if _E._is_identifier_like(name):
@@ -1017,14 +1061,20 @@ def build_sqlite_schema_mapping(sqlite_path: str | Path,
                 "source": str(sqlite_path),
             }
             for c in cols:
+                name = c["column"]
+                # One-pass profiling already told us this column holds no
+                # distinct values (fully NULL): skip the value-set probe.
+                if _dist_by_col.get(name) == 0:
+                    value_sets[(t, name)] = set()
+                    continue
                 try:
                     vals = conn.execute(
-                        f'SELECT DISTINCT {_quote_ident(c["column"])} FROM {_quote_ident(t)} '
-                        f'WHERE {_quote_ident(c["column"])} IS NOT NULL LIMIT 2000').fetchall()
-                    value_sets[(t, c["column"])] = {r[0] for r in vals}
+                        f'SELECT DISTINCT {_quote_ident(name)} FROM {_quote_ident(t)} '
+                        f'WHERE {_quote_ident(name)} IS NOT NULL LIMIT 2000').fetchall()
+                    value_sets[(t, name)] = {r[0] for r in vals}
                 except Exception as exc:
-                    _log.debug("value set query failed for %s.%s: %s", t, c["column"], exc)
-                    value_sets[(t, c["column"])] = set()
+                    _log.debug("value set query failed for %s.%s: %s", t, name, exc)
+                    value_sets[(t, name)] = set()
     finally:
         conn.close()
     rel = _attach_generic_relationships(tables_mapping, value_sets)

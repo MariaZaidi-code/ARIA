@@ -5,8 +5,9 @@ import {
   LayoutDashboard, Sparkles, Lightbulb, TrendingUp,
   Database, Bot, Clock, Settings, FileText,
   Sun, Moon, Menu, Compass,
-  Search, LogOut, ChevronDown,
+  Search, LogOut, ChevronDown, Bell, CheckCheck, Trash2,
 } from "lucide-react";
+import { workspaceApi } from "../../services/api";
 
 // The standalone Hypothesis page was removed: hypothesis is an investigation
 // capability surfacing as Possible drivers inside AI Analytics / Insights /
@@ -71,12 +72,55 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
     }
   });
   const [profileOpen, setProfileOpen] = useState(false);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [notifs, setNotifs] = useState<any[]>([]);
 
   useEffect(() => {
     try {
       localStorage.setItem("aria_sidebar_collapsed", collapsed ? "1" : "0");
     } catch { /* private mode: session-only */ }
   }, [collapsed]);
+
+  /* Workspace notifications (monitor alerts etc.) — best-effort poll. */
+  useEffect(() => {
+    let dead = false;
+    const tick = async () => {
+      if (document.hidden) return;
+      try {
+        const r = await workspaceApi.listNotifications();
+        if (!dead) setNotifs(Array.isArray(r?.data) ? r.data : []);
+      } catch { /* the bell must never break the shell */ }
+    };
+    tick();
+    const id = window.setInterval(tick, 60_000);
+    return () => { dead = true; window.clearInterval(id); };
+  }, []);
+
+  const unread = notifs.reduce((n, x) => n + (x?.read ? 0 : 1), 0);
+
+  const relTime = (iso: string) => {
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return "";
+    const s = Math.max(0, (Date.now() - t) / 1000);
+    if (s < 60) return "just now";
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+    return `${Math.floor(s / 86400)}d ago`;
+  };
+
+  const markAllRead = async () => {
+    try {
+      await workspaceApi.markNotificationsRead();
+      setNotifs((ns) => ns.map((n) => ({ ...n, read: true })));
+    } catch { /* noop */ }
+  };
+
+  const clearAllNotifs = async () => {
+    try {
+      await workspaceApi.clearNotifications();
+      setNotifs([]);
+    } catch { /* noop */ }
+  };
 
   return (
     <div className="flex h-screen bg-background font-sans text-foreground overflow-hidden">
@@ -215,6 +259,67 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
             {isDark ? <Sun size={14} /> : <Moon size={14} />}
           </button>
 
+          {/* Notifications bell (monitor alerts from the workspace) */}
+          <div className="relative">
+            <button
+              onClick={() => { setProfileOpen(false); setNotifOpen((o) => !o); }}
+              aria-label={unread > 0 ? `Notifications, ${unread} unread` : "Notifications"}
+              className="relative p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-all"
+              title="Notifications"
+            >
+              <Bell size={14} />
+              {unread > 0 && (
+                <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-0.5 rounded-full bg-primary text-white text-[9px] font-bold flex items-center justify-center">
+                  {unread > 9 ? "9+" : unread}
+                </span>
+              )}
+            </button>
+            {notifOpen && (
+              <div
+                className="absolute right-0 top-9 w-80 bg-card border border-border rounded-xl z-50 animate-scale-in overflow-hidden"
+                style={{ boxShadow: "var(--shadow-xl)" }}
+              >
+                <div className="flex items-center justify-between px-3 py-2 border-b border-border">
+                  <p className="text-[12.5px] font-semibold text-foreground">Notifications</p>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={markAllRead}
+                      disabled={!unread}
+                      className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground disabled:opacity-40"
+                      title="Mark all read" aria-label="Mark all notifications read">
+                      <CheckCheck size={13} />
+                    </button>
+                    <button
+                      onClick={clearAllNotifs}
+                      disabled={notifs.length === 0}
+                      className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-negative disabled:opacity-40"
+                      title="Clear all" aria-label="Clear all notifications">
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                </div>
+                <div className="max-h-80 overflow-y-auto premium-scroll">
+                  {notifs.length === 0 ? (
+                    <p className="px-3 py-6 text-center text-[12px] text-muted-foreground">
+                      Nothing yet. Monitors you create will alert you here.
+                    </p>
+                  ) : (
+                    notifs.map((n) => (
+                      <div key={String(n?.id || "")} className={`px-3 py-2.5 border-b border-border/60 last:border-0 ${n?.read ? "" : "bg-primary/5"}`}>
+                        <div className="flex items-center gap-2 min-w-0">
+                          {!n?.read && <span className="w-1.5 h-1.5 rounded-full bg-primary flex-shrink-0" aria-hidden />}
+                          <p className="text-[12px] font-semibold text-foreground truncate flex-1">{String(n?.title || "Update")}</p>
+                          <span className="text-[10px] text-muted-foreground flex-shrink-0">{relTime(String(n?.at || ""))}</span>
+                        </div>
+                        <p className="mt-0.5 text-[11.5px] text-muted-foreground leading-relaxed">{String(n?.message || "")}</p>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* Settings shortcut (was a dead Notifications bell with a dot) */}
           <button
             onClick={() => setPage("settings")}
@@ -228,7 +333,7 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
           {/* Profile */}
           <div className="relative">
             <button
-              onClick={() => setProfileOpen((o) => !o)}
+              onClick={() => { setNotifOpen(false); setProfileOpen((o) => !o); }}
               className="flex items-center gap-1.5 p-1 rounded-lg hover:bg-secondary transition-all"
             >
               <div

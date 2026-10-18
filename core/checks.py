@@ -45,6 +45,8 @@ _OPTIONAL_PACKAGES = {
     "scikit-learn": ("sklearn", "scikit-learn"), # tabular prediction; graceful fallback when absent
     "statsmodels": ("statsmodels", "statsmodels"), # forecast models; skipped when absent
     "httpx": ("httpx", "httpx"),             # dev/test only (FastAPI TestClient); no prod module imports it
+    "openpyxl": ("openpyxl", "openpyxl"),    # XLSX story export; 501 when absent
+    "python-pptx": ("pptx", "python-pptx"),  # PPTX story export; 501 when absent
 }
 
 

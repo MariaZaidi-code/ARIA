@@ -3,6 +3,7 @@
    /api/intelligence/explore via useExplore — this file only renders. */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { motion, AnimatePresence, MotionConfig } from "framer-motion";
 import {
   BarChart3, Compass, FlaskConical, AlertTriangle, Target, SlidersHorizontal,
@@ -1386,7 +1387,7 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
 
         {/* Chart fullscreen: larger view reusing the same live data. */}
         <AnimatePresence>
-          {expanded && trendPoints.length > 0 && (
+          {expanded && trendPoints.length > 0 && typeof document !== "undefined" && createPortal(
             <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label="Expanded trend chart">
               <motion.div
                 className="absolute inset-0 bg-slate-900/50"
@@ -1431,7 +1432,8 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
                   </div>
                 </motion.div>
               </div>
-            </div>
+            </div>,
+            document.body,
           )}
         </AnimatePresence>
 
