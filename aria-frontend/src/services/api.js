@@ -215,6 +215,12 @@ const request = async (path, options = {}) => {
     error.status = response.status;
     error.code = norm.code;
     error.requestId = norm.requestId || requestId;
+    // Mobile read-only refusals (core.deps.require_writable) are an expected
+    // outcome on phones, not a fault: flag them so UI can show a calm hint
+    // instead of a red error when a stale affordance fires a write.
+    if (response.status === 403 && /read-only on mobile/i.test(norm.message || "")) {
+      error.readOnly = true;
+    }
     throw error;
   }
 
@@ -1194,11 +1200,25 @@ export const intelligenceApi = {
       total: intelTotal(data, list),
       page: data?.page ?? params.page ?? null,
       pageSize: data?.page_size ?? params.page_size ?? null,
+      // Plain-worded reason when a searched measure has no date column
+      // (backend hint) — surfaced in the empty state instead of a blank.
+      hint: typeof data?.hint === "string" ? data.hint : "",
     };
   },
 
   getHypothesis: async (id) => {
     const data = await request(`/intelligence/hypotheses/${encodeURIComponent(id)}`);
+    return { success: true, data: data?.data || data || {} };
+  },
+
+  // Run the evidence-grounded investigation pipeline for a user question.
+  // Results are returned directly and are not silently saved as hypotheses.
+  investigateHypotheses: async (question, opts = {}) => {
+    const data = await request("/hypotheses/investigation", {
+      method: "POST",
+      body: JSON.stringify({ question: String(question || "").trim(), top_n: 4 }),
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+    });
     return { success: true, data: data?.data || data || {} };
   },
 

@@ -33,7 +33,8 @@ class TestAuthFlow(unittest.TestCase):
         _prev_cookie_secure = os.environ.get("ARIA_COOKIE_SECURE")
         os.environ["ARIA_COOKIE_SECURE"] = "0"
         try:
-            c = TestClient(app_module.app, raise_server_exceptions=False)
+            c = TestClient(app_module.app, raise_server_exceptions=False,
+                           headers={"Origin": "http://127.0.0.1:8000"})
             user = f"apitest_{int(time.time() * 1000) % 1000000}"
             r = c.post("/api/auth/register", json={"username": user, "password": "Secret123!"})
             self.assertEqual(r.status_code, 200, r.text[:200])

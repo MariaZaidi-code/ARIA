@@ -1908,10 +1908,14 @@ export default function AIAnalytics({
         <aside className="w-[300px] flex-shrink-0 hidden lg:block space-y-4">
           {/* 360 degree business view — side panel keeps the main column short */}
           {b360 && (
-            <div className="bg-card border border-blue-200/80 dark:border-blue-500/25 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4 bg-gradient-to-b from-blue-50/60 dark:from-blue-500/10 to-card">
-              <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">360 DEGREE BUSINESS VIEW</p>
-              <h3 className="text-[14px] font-bold text-foreground tracking-tight mt-1 leading-snug">{strOf(b360?.headline || "Here's the full picture")}</h3>
-              <p className="mt-1.5 text-[12px] text-secondary-foreground leading-relaxed">{strOf(b360?.what_happened?.summary || "")}</p>
+            <div className="bg-card border border-blue-200/80 dark:border-blue-500/25 rounded-2xl shadow-[0_2px_8px_rgba(0,0,0,0.06)] p-4 bg-gradient-to-br from-blue-50/70 via-card dark:from-blue-500/10 dark:via-card to-card overflow-hidden relative">
+              <div className="absolute top-0 right-0 w-24 h-24 bg-blue-500/5 dark:bg-blue-400/5 rounded-full -translate-y-8 translate-x-8 pointer-events-none" />
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center justify-center w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 text-white shadow-sm"><Sparkles size={13} /></span>
+                <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">360° BUSINESS VIEW</p>
+              </div>
+              <h3 className="text-[15px] font-bold text-foreground tracking-tight mt-2 leading-snug">{strOf(b360?.headline || "Here's the full picture")}</h3>
+              <p className="mt-1.5 text-[12.5px] text-secondary-foreground leading-relaxed">{strOf(b360?.what_happened?.summary || "")}</p>
               {asList(b360?.likely_causes).length > 0 && (
                 <div className="mt-2.5">
                   <p className="text-[11px] font-semibold text-foreground">Most likely causes</p>

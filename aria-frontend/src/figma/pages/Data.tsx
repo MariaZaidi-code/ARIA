@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 
 import { apiFetch } from "../../services/api";
+import { useReadOnly, READ_ONLY_HINT } from "../lib/readonly";
 
 type SourceType = "postgresql" | "mysql" | "csv" | "pdf" | "";
 type Tab = "sources" | "schema" | "preview" | "quality";
@@ -55,6 +56,7 @@ interface Props {
   dbPort?: string;
   dbUsername?: string;
   dbPassword?: string;
+  dbType?: string;
   setDbHost?: (v: string) => void;
   setDbPort?: (v: string) => void;
   setDbName?: (v: string) => void;
@@ -81,6 +83,7 @@ export default function Data({
   dbPort: propDbPort = "5432",
   dbUsername: propDbUsername = "postgres",
   dbPassword: propDbPassword = "",
+  dbType = "postgresql",
   setDbHost: propSetDbHost,
   setDbPort: propSetDbPort,
   setDbName: propSetDbName,
@@ -88,6 +91,7 @@ export default function Data({
   setDbPassword: propSetDbPassword,
   connectionError = "",
 }: Props) {
+  const readOnly = useReadOnly();
   const [activeTab, setActiveTab] = useState<Tab>("sources");
   const [localSourceType, setLocalSourceType] = useState<SourceType>("" as SourceType);
   const [localFile, setLocalFile] = useState<File | null>(null);
@@ -105,20 +109,36 @@ export default function Data({
   const [columnDetail, setColumnDetail] = useState<any>(null);
   const [showColumnDetail, setShowColumnDetail] = useState<string | null>(null);
   const [overrideMsg, setOverrideMsg] = useState("");
+  const [reconnectRequested, setReconnectRequested] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const sourceType = selectedSourceType || localSourceType;
+  const sourceType = reconnectRequested ? localSourceType : selectedSourceType || localSourceType;
   const file = selectedFile !== undefined ? selectedFile : localFile;
   const error = connectionError || localError;
   const connecting = connectionStatus === "connecting" || localConnecting;
-  const isConnected = connectionStatus === "connected";
+  const isConnected = connectionStatus === "connected" && !reconnectRequested;
   const tables = schemaData?.tables || {};
   const tableNames = Object.keys(tables);
   const sourceMeta = SOURCES.find((s) => s.id === sourceType);
   const SourceIcon = sourceMeta?.icon || Plug;
 
   useEffect(() => { setLPass(propDbPassword || ""); }, [propDbPassword]);
+
+  useEffect(() => {
+    if (!reconnectRequested) return;
+    setLocalSourceType(dbType === "mysql" ? "mysql" : "postgresql");
+    setLHost(propDbHost || "localhost");
+    setLPort(propDbPort || (dbType === "mysql" ? "3306" : "5432"));
+    setLDbName(dbName || "");
+    setLUser(propDbUsername || (dbType === "mysql" ? "root" : "postgres"));
+    setLPass("");
+  }, [reconnectRequested, dbType, dbName, propDbHost, propDbPort, propDbUsername]);
+
+  const beginReconnect = () => {
+    setLocalError("");
+    setReconnectRequested(true);
+  };
 
   // Connection health state — fetched only on mount / connect, not on every render
   const [connHealth, setConnHealth] = useState<any>(null);
@@ -180,6 +200,7 @@ export default function Data({
   };
 
   const handleConnect = async () => {
+    if (readOnly) return;
     setLocalError("");
     if (!sourceType) { setLocalError("Select a data source first."); return; }
     if (sourceType === "postgresql" || sourceType === "mysql") {
@@ -198,6 +219,7 @@ export default function Data({
         await onFileUpload?.(sourceType!);
       } else {
         await onConnect?.({ host: lHost, port: lPort, db: lDbName, user: lUser, password: lPass, sourceType });
+        setReconnectRequested(false);
       }
     } catch (err: any) {
       setLocalError(err?.message || "Connection failed.");
@@ -207,6 +229,7 @@ export default function Data({
   };
 
   const handleDisconnect = () => {
+    if (readOnly) return;
     setLocalSourceType("" as SourceType); setLocalFile(null); setLocalError("");
     setLHost("localhost"); setLPort("5432"); setLDbName(""); setLUser("postgres"); setLPass("");
     propSetDbHost?.("localhost"); propSetDbPort?.("5432"); propSetDbName?.("");
@@ -220,9 +243,14 @@ export default function Data({
   };
 
   const handleRefreshConnection = async () => {
+    if (readOnly) return;
     try {
       const r = await api("/api/data/refresh", { method: "POST" });
-      setOverrideMsg(r.message || "Refreshed");
+      if (r?.ok === false) {
+        setOverrideMsg(r.detail || r.message || "Connection refresh failed.");
+        return;
+      }
+      setOverrideMsg(r.message || "Connection refreshed successfully.");
       setTimeout(() => setOverrideMsg(""), 3000);
     } catch (e: any) {
       setOverrideMsg(e.message || "Refresh failed");
@@ -230,6 +258,7 @@ export default function Data({
   };
 
   const handleOverride = async (action: string, table: string, column = "", references_table = "", references_column = "") => {
+    if (readOnly) return;
     try {
       const r = await api("/api/data/schema/override", {
         method: "POST",
@@ -255,8 +284,12 @@ export default function Data({
   const sourcesTabJSX = (
     <div className="space-y-5">
       {isConnected && healthError && !connHealth && (
-        <div className="bg-warning/10 border border-warning/30 text-warning text-sm rounded-xl px-4 py-2.5 flex items-center gap-2">
-          <AlertTriangle size={14} /> {healthError}
+        <div className="bg-warning/10 border border-warning/30 text-warning text-sm rounded-xl px-4 py-2.5 flex items-center justify-between gap-3">
+          <span className="flex items-center gap-2"><AlertTriangle size={14} /> {healthError}</span>
+          <button type="button" onClick={beginReconnect}
+            className="shrink-0 rounded-lg border border-warning/40 px-3 py-1.5 text-xs font-semibold hover:bg-warning/10">
+            Reconnect database
+          </button>
         </div>
       )}
       {isConnected && connHealth && (
@@ -282,16 +315,16 @@ export default function Data({
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <button onClick={handleRefreshConnection}
-                className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground px-3 py-1.5 rounded-lg hover:bg-secondary transition-all">
+              <button onClick={handleRefreshConnection} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
+                className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground px-3 py-1.5 rounded-lg hover:bg-secondary transition-all disabled:opacity-50">
                 <RefreshCw size={11} /> Refresh
               </button>
               <button onClick={handleRefreshSchema}
                 className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground px-3 py-1.5 rounded-lg hover:bg-secondary transition-all">
                 <Columns3 size={11} /> Rescan Schema
               </button>
-              <button onClick={handleDisconnect}
-                className="flex items-center gap-1.5 text-[11px] text-negative hover:text-negative/80 px-3 py-1.5 rounded-lg hover:bg-negative/5 transition-all">
+              <button onClick={handleDisconnect} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
+                className="flex items-center gap-1.5 text-[11px] text-negative hover:text-negative/80 px-3 py-1.5 rounded-lg hover:bg-negative/5 transition-all disabled:opacity-50">
                 <XCircle size={11} /> Disconnect
               </button>
             </div>
@@ -380,7 +413,7 @@ export default function Data({
                   <p className="text-xs text-negative">{error}</p>
                 </div>
               )}
-              <button onClick={handleConnect} disabled={connecting}
+              <button onClick={handleConnect} disabled={connecting || readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
                 className="premium-btn btn-glow w-full sm:w-auto px-6 py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2 disabled:opacity-50"
                 style={{ background: "var(--gradient-primary)" }}>
                 {connecting ? <><Loader2 size={13} className="animate-spin" /> Connecting...</> : <><Plug size={13} /> Connect {sourceMeta?.label}</>}
@@ -405,7 +438,7 @@ export default function Data({
                 )}
               </div>
               {error && <div className="flex items-center gap-2 bg-negative/8 border border-negative/20 rounded-lg px-3 py-2.5"><AlertTriangle size={13} className="text-negative flex-shrink-0" /><p className="text-xs text-negative">{error}</p></div>}
-              <button onClick={handleConnect} disabled={!file || connecting}
+              <button onClick={handleConnect} disabled={!file || connecting || readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
                 className="premium-btn btn-glow w-full sm:w-auto px-6 py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2 disabled:opacity-50"
                 style={{ background: "var(--gradient-primary)" }}>
                 {connecting ? <><Loader2 size={13} className="animate-spin" /> Processing...</> : <><Upload size={13} /> Upload & Analyze CSV</>}
@@ -430,7 +463,7 @@ export default function Data({
                 )}
               </div>
               {error && <div className="flex items-center gap-2 bg-negative/8 border border-negative/20 rounded-lg px-3 py-2.5"><AlertTriangle size={13} className="text-negative flex-shrink-0" /><p className="text-xs text-negative">{error}</p></div>}
-              <button onClick={handleConnect} disabled={!file || connecting}
+              <button onClick={handleConnect} disabled={!file || connecting || readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
                 className="premium-btn btn-glow w-full sm:w-auto px-6 py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2 disabled:opacity-50"
                 style={{ background: "var(--gradient-primary)" }}>
                 {connecting ? <><Loader2 size={13} className="animate-spin" /> Processing...</> : <><Upload size={13} /> Upload & Analyze PDF</>}
@@ -586,14 +619,14 @@ export default function Data({
                             <td className="px-2 py-2">
                               <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
                                 {!isPk && pkList.length === 0 && (
-                                  <button onClick={() => handleOverride("set_pk", selectedTable, colName)}
-                                    className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary hover:bg-primary/20 transition-colors flex items-center gap-1">
+                                  <button onClick={() => handleOverride("set_pk", selectedTable, colName)} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
+                                    className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary hover:bg-primary/20 transition-colors flex items-center gap-1 disabled:opacity-50">
                                     <Key size={9} /> Set PK
                                   </button>
                                 )}
                                 {isPk && (
-                                  <button onClick={() => handleOverride("remove_pk", selectedTable, colName)}
-                                    className="text-[10px] px-1.5 py-0.5 rounded bg-negative/10 text-negative hover:bg-negative/20 transition-colors flex items-center gap-1">
+                                  <button onClick={() => handleOverride("remove_pk", selectedTable, colName)} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
+                                    className="text-[10px] px-1.5 py-0.5 rounded bg-negative/10 text-negative hover:bg-negative/20 transition-colors flex items-center gap-1 disabled:opacity-50">
                                     <Key size={9} /> Remove PK
                                   </button>
                                 )}
@@ -677,10 +710,10 @@ export default function Data({
                               <span className="text-[9px] px-1 py-0.5 rounded bg-positive/10 text-positive font-medium">Confirmed</span>
                             ) : (
                               <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-                                <button onClick={() => handleOverride("confirm_relationship", selectedTable, r.from?.split(".")?.[1], r.to?.split(".")?.[0], r.to?.split(".")?.[1])}
-                                  className="text-[9px] px-1 py-0.5 rounded bg-positive/10 text-positive hover:bg-positive/20 transition-colors">Confirm</button>
-                                <button onClick={() => handleOverride("reject_relationship", selectedTable, r.from?.split(".")?.[1], r.to?.split(".")?.[0], r.to?.split(".")?.[1])}
-                                  className="text-[9px] px-1 py-0.5 rounded bg-negative/10 text-negative hover:bg-negative/20 transition-colors">Reject</button>
+                                <button onClick={() => handleOverride("confirm_relationship", selectedTable, r.from?.split(".")?.[1], r.to?.split(".")?.[0], r.to?.split(".")?.[1])} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
+                                  className="text-[9px] px-1 py-0.5 rounded bg-positive/10 text-positive hover:bg-positive/20 transition-colors disabled:opacity-50">Confirm</button>
+                                <button onClick={() => handleOverride("reject_relationship", selectedTable, r.from?.split(".")?.[1], r.to?.split(".")?.[0], r.to?.split(".")?.[1])} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
+                                  className="text-[9px] px-1 py-0.5 rounded bg-negative/10 text-negative hover:bg-negative/20 transition-colors disabled:opacity-50">Reject</button>
                               </div>
                             )}
                           </div>
@@ -759,7 +792,7 @@ export default function Data({
           </div>
           <div className="flex justify-end gap-2 mt-5">
             <button onClick={() => setShowFKModal(false)} className="text-xs px-3 py-1.5 rounded-lg bg-secondary text-muted-foreground hover:text-foreground transition-colors">Cancel</button>
-            <button onClick={handleCreateFK} disabled={!fkSourceTable || !fkSourceCol || !fkTargetTable || !fkTargetCol}
+            <button onClick={handleCreateFK} disabled={!fkSourceTable || !fkSourceCol || !fkTargetTable || !fkTargetCol || readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
               className="text-xs px-3 py-1.5 rounded-lg bg-primary text-white font-medium disabled:opacity-40 transition-colors">
               Create Relationship
             </button>

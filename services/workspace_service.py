@@ -900,14 +900,11 @@ def get_integrations(user_id: int, reveal: bool = False) -> dict:
                     pass
         except Exception:
             pass
-# Never emit the token inside the command URL unless this is an explicit
-    # reveal (set/regenerate). A status GET must not leak the secret into
-    # response bodies, browser history, or proxy/access logs.
+    # Keep the command endpoint URL secret-free, including on reveal. Slack
+    # supplies the token as a POST form field.
     url = ""
     if token:
         url = "/api/integrations/slack/command"
-        if reveal:
-            url += "?token=" + token
     return {
         "slack_command_token": token if reveal else (token[:6] + "..." if token else ""),
         "slack_configured": bool(token),

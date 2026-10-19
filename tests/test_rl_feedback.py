@@ -29,7 +29,8 @@ class TestRLFeedbackRoutes(unittest.TestCase):
     def _client(self):
         from fastapi.testclient import TestClient
         import app as app_module
-        return TestClient(app_module.app, raise_server_exceptions=False)
+        return TestClient(app_module.app, raise_server_exceptions=False,
+                           headers={"Origin": "http://127.0.0.1:8000"})
 
     def _register(self, c):
         user = f"rl_fb_{int(time.time() * 1000) % 100000000}"

@@ -195,6 +195,90 @@ async def _security_headers(request: Request, call_next):
 
 
 @app.middleware("http")
+async def _request_safety(request: Request, call_next):
+    """Reject cross-origin cookie writes and unauthenticated uploads early.
+
+    This middleware runs before FastAPI parses multipart bodies, avoiding disk
+    spooling for unauthenticated upload attempts.
+    """
+    from urllib.parse import urlsplit
+
+    method = request.method.upper()
+    is_write = method in {"POST", "PUT", "PATCH", "DELETE"}
+    api_path = request.url.path.startswith("/api/")
+    cookies = request.cookies
+    cookie_token = cookies.get("aria_token") or cookies.get("__Host-aria_token")
+
+    if is_write and api_path and cookie_token:
+        supplied = request.headers.get("origin", "").strip()
+        if not supplied:
+            referer = request.headers.get("referer", "").strip()
+            supplied = f"{urlsplit(referer).scheme}://{urlsplit(referer).netloc}" if referer else ""
+        expected = f"{request.url.scheme}://{request.url.netloc}"
+        allowed = {expected, *(o.rstrip("/") for o in _cors_origins)}
+        if supplied.rstrip("/") not in allowed:
+            return JSONResponse(status_code=403, content={"ok": False, "success": False,
+                                 "code": "FORBIDDEN", "detail": "Cross-origin request rejected."})
+
+    upload_limits = {
+        "/api/connect_file": connect_routes.MAX_UPLOAD_BYTES_CSV + 2 * 1024 * 1024,
+        "/api/connect_pdf": connect_routes.MAX_UPLOAD_BYTES_PDF + 2 * 1024 * 1024,
+        "/api/insight/pdf/upload": insight_rag_routes.MAX_PDF_MB * 1024 * 1024 + 2 * 1024 * 1024,
+    }
+    cap = upload_limits.get(request.url.path)
+    if cap is not None:
+        token = request.headers.get("authorization", "")
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        else:
+            token = cookie_token or ""
+        try:
+            import auth as _auth
+            authenticated = bool(token and _auth.verify_token(token))
+        except Exception:
+            authenticated = False
+        if not authenticated:
+            return JSONResponse(status_code=401, content={"ok": False, "success": False,
+                                 "code": "UNAUTHORIZED", "detail": "Authentication required."})
+        raw_length = request.headers.get("content-length")
+        try:
+            if raw_length and int(raw_length) > cap:
+                return JSONResponse(status_code=413, content={"ok": False, "success": False,
+                                     "code": "REQUEST_FAILED", "detail": "Upload exceeds the configured size limit."})
+        except ValueError:
+            return JSONResponse(status_code=400, content={"ok": False, "success": False,
+                                 "code": "REQUEST_FAILED", "detail": "Invalid Content-Length."})
+        # Content-Length may be omitted on streamed/chunked requests. Count
+        # bytes as Starlette consumes the body so parsing stops at the same cap.
+        received = 0
+        exceeded = False
+        original_receive = request._receive
+
+        async def limited_receive():
+            nonlocal received, exceeded
+            message = await original_receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > cap:
+                    exceeded = True
+                    return {"type": "http.disconnect"}
+            return message
+
+        request._receive = limited_receive
+        try:
+            response = await call_next(request)
+        except Exception:
+            if not exceeded:
+                raise
+            response = None
+        if exceeded or response is None:
+            return JSONResponse(status_code=413, content={"ok": False, "success": False,
+                                 "code": "REQUEST_FAILED", "detail": "Upload exceeds the configured size limit."})
+        return response
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def _request_id(request: Request, call_next):
     """Attach a stable request ID (t.txt-7): full tracebacks are logged
     server-side against it; clients only ever see the ID."""

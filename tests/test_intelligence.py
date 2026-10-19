@@ -338,3 +338,97 @@ class TestHypotheses:
             assert "vary by" not in candidate["title"].lower()
             assert candidate["evidence_strength"] == "Not tested"
             assert candidate["evidence"] == []
+            # Measure labels are table-qualified ("Orders Revenue"), never a
+            # bare ambiguous column word.
+            assert candidate["metric_label"].startswith("Orders ")
+
+    def test_trend_detail_spans_full_range(self, tmp_path):
+        """The "All data" trend compares halves of the WHOLE range.
+
+        Regression: the quick trend used to read only the earliest 24 date
+        buckets, so a dataset could headline "increased" from its first
+        month while the full range declined.
+        """
+        import sqlite3
+        from datetime import date, timedelta
+        from services.intelligence_service import (_hypothesis_items,
+                                                   get_hypothesis_detail)
+        db = tmp_path / "orders.db"
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute("CREATE TABLE orders (order_id INTEGER PRIMARY KEY, "
+                         "revenue REAL, quantity INTEGER, order_date TEXT)")
+            rows, base = [], date(2021, 1, 1)
+            for day in range(40):
+                # Days 13-24 are double days 1-12: a 24-bucket window reads
+                # "+100%", the full 40 days read a decline (280 -> 160).
+                rev = 10.0 if day < 12 else (20.0 if day < 24 else 5.0)
+                rows.append((day + 1, rev, 1,
+                             (base + timedelta(days=day)).isoformat()))
+            conn.executemany("INSERT INTO orders VALUES (?, ?, ?, ?)", rows)
+            conn.commit()
+        finally:
+            conn.close()
+        SESSION["db_uri"] = f"sqlite:///{db}"
+        try:
+            cands = _hypothesis_items(SESSION)
+            rev = next(c for c in cands if c["metric"] == "revenue")
+            assert rev["metric_label"] == "Orders Revenue"
+            detail = get_hypothesis_detail(SESSION, rev["id"])
+        finally:
+            SESSION["db_uri"] = "sqlite:///:memory:"
+        pat = detail["observed_pattern"]
+        assert len(pat["series"]) == 40
+        assert pat["direction"] == "declined"
+        assert abs(pat["change_pct"] - (-42.9)) < 0.15
+
+
+class TestHypothesesListEnrichment:
+    """List cards carry measured moves; empty searches explain themselves."""
+
+    def test_list_hint_when_search_measure_has_no_time(self):
+        """A searched measure whose table has no date gets a plain-worded hint."""
+        from services.intelligence_service import generate_hypotheses
+        res = generate_hypotheses(SESSION, {"search": "capacity"})
+        assert res["ok"] is True
+        assert res["items"] == []
+        # rooms.capacity is a real numeric measure and rooms has no date
+        # column — the empty result explains why instead of a blank page.
+        assert "no time column" in res["hint"]
+        assert "capacity" in res["hint"].lower()
+
+    def test_list_cards_carry_measured_trend_summary(self, tmp_path):
+        """Every trend card gets real earliest-vs-latest numbers when the
+        pair can be measured from the data — never a fabricated chip."""
+        import sqlite3
+        from datetime import date, timedelta
+        from services.intelligence_service import generate_hypotheses
+        db = tmp_path / "orders.db"
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute("CREATE TABLE orders (order_id INTEGER PRIMARY KEY, "
+                         "revenue REAL, quantity INTEGER, order_date TEXT)")
+            base = date(2021, 1, 1)
+            rows = []
+            for day in range(12):
+                rev = 10.0 if day < 6 else 20.0
+                rows.append((day + 1, rev, 1,
+                             (base + timedelta(days=day)).isoformat()))
+            conn.executemany("INSERT INTO orders VALUES (?, ?, ?, ?)", rows)
+            conn.commit()
+        finally:
+            conn.close()
+        SESSION["db_uri"] = f"sqlite:///{db}"
+        try:
+            res = generate_hypotheses(SESSION, {"page_size": 10, "sort": "az"})
+        finally:
+            SESSION["db_uri"] = "sqlite:///:memory:"
+        assert res["ok"] is True
+        item = next(i for i in res["items"] if i["metric"] == "revenue")
+        ts = item.get("trend_summary")
+        assert ts, "revenue trend should be measurable from real dates"
+        assert ts["direction"] == "increased"
+        assert ts["change_pct"] == 100.0
+        assert ts["first_display"] and ts["last_display"]
+        assert ts["first_label"] != ts["last_label"]
+        assert "trend_limitation" not in item

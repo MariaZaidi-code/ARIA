@@ -98,6 +98,41 @@ class FakeLLM:
         raise AssertionError("LLM must not be called in this test path")
 
 
+def marketing_mapping():
+    """Sales + marketing tables with explicit measures (spend/signups/visits)
+    so lexical measure-column binding can be exercised against the generic
+    concept vocabulary."""
+    return {
+        "schema": "public",
+        "tables": {
+            "sales": {
+                "columns": [
+                    {"column": "sale_id", "data_type": "integer", "nullable": False},
+                    {"column": "sale_date", "data_type": "timestamp", "nullable": False},
+                    {"column": "region_id", "data_type": "integer", "nullable": False},
+                    {"column": "unit_price", "data_type": "real", "nullable": False},
+                    {"column": "units", "data_type": "integer", "nullable": False},
+                    {"column": "revenue", "data_type": "real", "nullable": False},
+                ],
+                "primary_key": ["sale_id"],
+            },
+            "marketing_daily": {
+                "columns": [
+                    {"column": "day", "data_type": "timestamp", "nullable": False},
+                    {"column": "spend", "data_type": "real", "nullable": False},
+                    {"column": "visits", "data_type": "integer", "nullable": False},
+                    {"column": "signups", "data_type": "integer", "nullable": False},
+                ],
+                "primary_key": ["day"],
+            },
+        },
+        "relationship_edges": [],
+        "declared_relationships": [],
+        "inferred_relationships": [],
+        "ambiguous_relationships": [],
+    }
+
+
 class GoalAgentSetup(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -544,6 +579,49 @@ class GoalIR(unittest.TestCase):
         self.assertTrue(ir["join_plan"])
         for e in ir["join_plan"]:
             self.assertIn("cardinality", e)
+
+
+class LexicalMeasureBinding(unittest.TestCase):
+    """A measure column literally named in the question ("total spend",
+    "signups", "how much did we spend") binds that column instead of the
+    generic revenue / computed qty*price fallback. Generic, schema-driven."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.agent = make_agent(marketing_mapping(), self._tmp.name)
+
+    def _resolved(self, question):
+        ir = self.agent._build_goal_ir(question)
+        join_path = self.agent._determine_join_path(
+            self.agent._get_relevant_tables(question))
+        ir = self.agent._resolve_semantics(question, ir, join_path)
+        metrics = [m for m in ir["metrics"] if m.get("resolved_column")]
+        self.assertTrue(metrics, f"no resolved metric for {question!r}")
+        return metrics[0]
+
+    def test_total_spend_binds_spend_column(self):
+        m = self._resolved("What is the total spend in marketing?")
+        self.assertEqual(m["resolved_expression"], "marketing_daily.spend")
+        self.assertEqual(m["aggregation"], "SUM")
+
+    def test_total_signups_binds_signups_column(self):
+        m = self._resolved("What is the total signups?")
+        self.assertEqual(m["resolved_expression"], "marketing_daily.signups")
+
+    def test_inferred_count_upgraded_to_named_measure(self):
+        m = self._resolved("How much did we spend on marketing?")
+        self.assertEqual(m["resolved_expression"], "marketing_daily.spend")
+        self.assertEqual(m["aggregation"], "SUM")
+
+    def test_total_revenue_binds_revenue_column(self):
+        m = self._resolved("What is the total revenue?")
+        self.assertEqual(m["resolved_expression"], "sales.revenue")
+
+    def test_average_unit_price_stays_on_unit_price(self):
+        m = self._resolved("What is the average unit price?")
+        self.assertEqual(m["resolved_expression"], "sales.unit_price")
+        self.assertEqual(m["aggregation"], "AVG")
 
 
 class JoinPlan(unittest.TestCase):

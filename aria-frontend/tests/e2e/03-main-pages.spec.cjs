@@ -24,12 +24,11 @@ test.describe('Main App pages', () => {
     expect(hasInput + hasHeading).toBeGreaterThan(0);
   });
 
-  test('Data source page loads with connect form', async () => {
-        await page.goto(`${BASE}#/dataSource`);
-    await page.waitForLoadState('networkidle');
-    const hasConnect = await page.locator('button', { hasText: /connect|submit/i }).count();
-    const hasForm = await page.locator('input, select').count();
-    expect(hasForm + hasConnect).toBeGreaterThan(0);
+  test('Data source page opens a database connection form', async () => {
+    await page.getByRole('navigation').getByRole('button', { name: /^data$/i }).click();
+    await expect(page.getByRole('heading', { name: /^data$/i })).toBeVisible();
+    await page.getByRole('button', { name: /PostgreSQL Database/i }).click();
+    await expect(page.getByLabel('Password')).toBeVisible();
   });
 
   test('Schema page loads', async () => {
@@ -91,8 +90,7 @@ test.describe('Main App pages', () => {
   test('Settings page loads with AI config', async () => {
         await page.goto(`${BASE}#/settings`);
     await page.waitForLoadState('networkidle');
-    // Check AI Configuration tab is accessible
-    const hasAIConfig = await page.getByText(/AI Configuration/i).count();
-    expect(hasAIConfig).toBeGreaterThan(0);
+    await expect(page.getByRole('heading', { name: /^settings$/i })).toBeVisible();
+    await expect(page.getByRole('button', { name: /AI Configuration/i })).toBeVisible();
   });
 });

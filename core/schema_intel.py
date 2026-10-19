@@ -174,10 +174,15 @@ def _run_sql(conn, sql: str, limit: int = 500):
         import logging as _logging
         _logging.getLogger("aria.schema_intel").warning(
             "sql failed (returning empty): sql=%.200s error=%s", sql, exc)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        for target in (conn, getattr(conn, "connection", None), getattr(conn, "raw_connection", None)):
+            if target is not None:
+                try:
+                    if callable(target):
+                        target = target()
+                    if hasattr(target, "rollback"):
+                        target.rollback()
+                except Exception:
+                    pass
         return [], []
 
 
@@ -508,7 +513,7 @@ class SchemaIntelligence:
 
         for fk_col, ref_table, ref_col in self.get_fks(to_table):
             if ref_table == from_table:
-                return [(to_table, fk_col, from_table, ref_col)]
+                return [(from_table, ref_col, to_table, fk_col)]
 
         for fk1_col, ref1_table, ref1_col in self.get_fks(from_table):
             for fk2_col, ref2_table, ref2_col in self.get_fks(ref1_table):
@@ -520,15 +525,22 @@ class SchemaIntelligence:
 
         return []
 
-    def build_join_clause(self, joins: list, dialect: str = "postgresql") -> str:
+    def build_join_clause(self, joins: list, dialect: str = "postgresql", base_table: str = None) -> str:
         """Build SQL JOIN clause from a list of join steps."""
         clauses = []
+        joined = {base_table.lower()} if base_table else set()
         for from_t, from_c, to_t, to_c in joins:
+            target_t, target_c, source_t, source_c = to_t, to_c, from_t, from_c
+            if target_t.lower() in joined and source_t.lower() not in joined:
+                target_t, target_c, source_t, source_c = from_t, from_c, to_t, to_c
+            if target_t.lower() in joined:
+                continue
             clauses.append(
-                f'JOIN {_safe_name(to_t, dialect)} ON '
-                f'{_safe_name(from_t, dialect)}.{_safe_name(from_c, dialect)} = '
-                f'{_safe_name(to_t, dialect)}.{_safe_name(to_c, dialect)}'
+                f'JOIN {_safe_name(target_t, dialect)} ON '
+                f'{_safe_name(source_t, dialect)}.{_safe_name(source_c, dialect)} = '
+                f'{_safe_name(target_t, dialect)}.{_safe_name(target_c, dialect)}'
             )
+            joined.add(target_t.lower())
         return " ".join(clauses)
 
     def get_table_row_count(self, table: str) -> int | None:

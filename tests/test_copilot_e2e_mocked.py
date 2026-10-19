@@ -41,7 +41,8 @@ class TestCopilotE2EMocked(unittest.TestCase):
         # defaults remain Secure; see api/auth_routes._cookie_secure).
         cls._prev_cookie_secure = os.environ.get("ARIA_COOKIE_SECURE")
         os.environ["ARIA_COOKIE_SECURE"] = "0"
-        cls.client = TestClient(app_module.app, raise_server_exceptions=False)
+        cls.client = TestClient(app_module.app, raise_server_exceptions=False,
+                                headers={"Origin": "http://127.0.0.1:8000"})
 
     @classmethod
     def tearDownClass(cls):
@@ -77,7 +78,8 @@ class TestCopilotE2EMocked(unittest.TestCase):
         from fastapi.testclient import TestClient
         import app as app_module
 
-        anon = TestClient(app_module.app, raise_server_exceptions=False)
+        anon = TestClient(app_module.app, raise_server_exceptions=False,
+                          headers={"Origin": "http://127.0.0.1:8000"})
         r = anon.post("/api/copilot", json={"question": LEGACY_QUESTIONS[0]})
         self.assertEqual(r.status_code, 401, r.text[:200])
         r = anon.get("/api/copilot/suggestions")

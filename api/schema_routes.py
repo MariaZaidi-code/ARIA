@@ -8,7 +8,13 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 import schema_agent
-from core.config import SCHEMA_DIR, get_session, save_session
+from core.config import (
+    SCHEMA_DIR,
+    _atomic_write_text,
+    _read_text_locked,
+    get_session,
+    save_session,
+)
 from core.deps import get_current_user, require_data, require_writable
 
 router = APIRouter()
@@ -36,7 +42,7 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
                 detail="This source is a text document — use Document Chat "
                        "(Copilot) instead of schema analytics.",
             )
-        mapping = json.loads(Path(str(_sp)).read_text(encoding="utf-8"))
+        mapping = json.loads(_read_text_locked(Path(str(_sp))))
         return {
             "ok": True,
             "provider": session["provider_name"],
@@ -100,7 +106,7 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
                     f"schema_mapping_{_safe_db(session['db_name'])}_latest.json"
                 )
                 if prev_latest.exists():
-                    previous_mapping = json.loads(prev_latest.read_text(encoding="utf-8"))
+                    previous_mapping = json.loads(_read_text_locked(prev_latest))
             except Exception:
                 previous_mapping = None
             if multi_schema:
@@ -146,8 +152,18 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
         snapshot_id=mapping.get("snapshot_id"),
     )
     mapping["snapshot_id"] = snapshot_id
-    for path in (output_path, snapshot_path, latest_path):
-        path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+    payload = json.dumps(mapping, indent=2)
+    try:
+        for path in (output_path, snapshot_path, latest_path):
+            _atomic_write_text(path, payload)
+    except OSError as exc:
+        from core.errors import sanitize_error as _san
+        raise HTTPException(
+            status_code=503,
+            detail=("The database was reachable, but ARIA could not save the schema. "
+                    "Check the configured ARIA_DATA_DIR is writable and retry. "
+                    f"({_san(exc)})"),
+        ) from exc
 
     session["schema_path"] = latest_path
     save_session(user["user_id"], session)

@@ -121,9 +121,10 @@ def test_cross_user_artifact_paths_differ():
         # Dirs created deterministically.
         assert p1.parent.exists() and i1.parent.exists()
         assert p2.parent.exists() and i2.parent.exists()
-        # Resolved paths stay within the project base.
-        from core.config import BASE_DIR
-        base = BASE_DIR.resolve()
+        # Resolved paths stay within the configured artifact root, which
+        # may intentionally live outside the source tree.
+        from core.config import ARTIFACTS_DIR
+        base = ARTIFACTS_DIR.resolve()
         for p in (p1, p2, i1, i2):
             assert p.resolve().is_relative_to(base)
         # Helper roots are isolated per user too.
@@ -136,6 +137,42 @@ def test_cross_user_artifact_paths_differ():
         with SESSION_LOCK:
             SESSION_STORE.pop(uid1, None)
             SESSION_STORE.pop(uid2, None)
+
+
+def test_session_status_read_only_verdict():
+    """Mobile clients get read_only=true from the session verdict.
+
+    The frontend mirrors require_writable from this flag, so the contract is:
+    desktop UA -> read_only false; mobile UA or x-client-type: mobile ->
+    read_only true; and writes on that client are refused server-side.
+    """
+    c = _client()
+    uid = 910777
+    tok = auth.issue_token(uid, "ro_probe")
+    headers = {"Authorization": f"Bearer {tok}"}
+    try:
+        r = c.get("/api/session/status", headers=headers)
+        assert r.status_code == 200, r.text[:300]
+        assert r.json()["read_only"] is False
+        assert r.json()["client_type"] == "desktop"
+
+        ios_ua = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148")
+        r2 = c.get("/api/session/status", headers={**headers, "User-Agent": ios_ua})
+        assert r2.json()["read_only"] is True
+        assert r2.json()["client_type"] == "mobile"
+
+        r3 = c.get("/api/session/status",
+                   headers={**headers, "x-client-type": "mobile", "User-Agent": "curl/8"})
+        assert r3.json()["read_only"] is True
+
+        w = c.post("/api/disconnect", headers={**headers, "x-client-type": "mobile"})
+        assert w.status_code == 403, w.text[:300]
+        assert "Read-only on mobile" in w.json().get("detail", "")
+    finally:
+        from core.config import SESSION_STORE, SESSION_LOCK
+        with SESSION_LOCK:
+            SESSION_STORE.pop(uid, None)
 
 
 def test_require_data_provider_enforce_auth():

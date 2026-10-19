@@ -5,9 +5,10 @@ import {
   LayoutDashboard, Sparkles, Lightbulb, TrendingUp,
   Database, Bot, Clock, Settings, FileText,
   Sun, Moon, Menu, Compass,
-  Search, LogOut, ChevronDown, Bell, CheckCheck, Trash2,
+  Search, LogOut, ChevronDown, Bell, CheckCheck, Trash2, Eye,
 } from "lucide-react";
 import { workspaceApi } from "../../services/api";
+import { useReadOnly, READ_ONLY_HINT } from "../lib/readonly";
 
 // The standalone Hypothesis page was removed: hypothesis is an investigation
 // capability surfacing as Possible drivers inside AI Analytics / Insights /
@@ -64,6 +65,7 @@ interface Props {
 
 export default function AppShell({ children, user, selectedLLM, dbName, onChangeLLM, onSignOut }: Props) {
   const { isDark, toggleTheme, page, setPage } = useTheme();
+  const readOnly = useReadOnly();
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem("aria_sidebar_collapsed") === "1";
@@ -71,6 +73,20 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
       return false;
     }
   });
+  // Small screens: sidebar becomes an overlay drawer instead of collapsing.
+  const [isSmall, setIsSmall] = useState(() => typeof window !== "undefined" && window.innerWidth < 768);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+
+  useEffect(() => {
+    const onResize = () => setIsSmall(window.innerWidth < 768);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // Leaving small screens must not leave a stale drawer open.
+  useEffect(() => {
+    if (!isSmall && mobileNavOpen) setMobileNavOpen(false);
+  }, [isSmall, mobileNavOpen]);
   const [profileOpen, setProfileOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
   const [notifs, setNotifs] = useState<any[]>([]);
@@ -97,6 +113,9 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
   }, []);
 
   const unread = notifs.reduce((n, x) => n + (x?.read ? 0 : 1), 0);
+  // On small screens the drawer always shows labels, regardless of the
+  // desktop collapse preference.
+  const showLabels = isSmall || !collapsed;
 
   const relTime = (iso: string) => {
     const t = Date.parse(iso);
@@ -124,12 +143,27 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
 
   return (
     <div className="flex h-screen bg-background font-sans text-foreground overflow-hidden">
+      {/* Backdrop for the mobile nav drawer */}
+      {isSmall && mobileNavOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/40 backdrop-blur-[1px]"
+          onClick={() => setMobileNavOpen(false)}
+          aria-hidden
+        />
+      )}
       {/* Sidebar */}
       <aside
-        className="flex flex-col flex-shrink-0 border-r border-border/70 transition-all duration-300 ease-out h-full"
+        className={`flex flex-col flex-shrink-0 border-r border-border/70 transition-all duration-300 ease-out h-full ${
+          isSmall
+            ? `fixed inset-y-0 left-0 z-50 shadow-2xl ${mobileNavOpen ? "translate-x-0" : "-translate-x-full"}`
+            : ""
+        }`}
         style={{
-          width: collapsed ? 68 : 232,
-          background: "linear-gradient(180deg, var(--card) 0%, var(--card) 70%, var(--secondary)/40 100%)",
+          width: showLabels ? 232 : 68,
+          // Solid card behind the drawer so mobile overlay never shows
+          // page content through (the old gradient used invalid syntax
+          // and was being dropped by the browser).
+          background: "var(--card)",
         }}
       >
         {/* Logo */}
@@ -140,7 +174,7 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
           >
             <Sparkles size={15} className="text-white" />
           </div>
-          {!collapsed && (
+          {showLabels && (
             <div className="flex flex-col leading-none">
               <span className="font-bold text-[15px] text-foreground tracking-tight">ARIA</span>
               <span className="text-[9px] font-semibold text-primary/80 tracking-[0.18em] uppercase">Analytics</span>
@@ -152,7 +186,7 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
         <nav className="flex-1 py-2 px-2.5 overflow-y-auto premium-scroll space-y-4">
           {navGroups.map((group) => (
             <div key={group.label}>
-              {!collapsed && (
+              {showLabels && (
                 <p className="px-3 mb-1 text-[10px] font-bold text-muted-foreground/70 uppercase tracking-[0.14em]">
                   {group.label}
                 </p>
@@ -163,22 +197,22 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
                   return (
                     <button
                       key={id}
-                      onClick={() => setPage(id)}
-                      title={collapsed ? label : undefined}
+                      onClick={() => { setPage(id); setMobileNavOpen(false); }}
+                      title={showLabels ? undefined : label}
                       aria-current={active ? "page" : undefined}
                       aria-label={label}
                       className={`relative w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-[13px] transition-all duration-200 ${
                         active
                           ? "bg-primary/10 text-primary font-semibold shadow-[inset_0_0_0_1px_rgba(79,70,229,0.15)]"
                           : "text-muted-foreground hover:text-foreground hover:bg-secondary/80"
-                      } ${collapsed ? "justify-center px-0" : ""}`}
+                      } ${showLabels ? "" : "justify-center px-0"}`}
                     >
-                      {active && !collapsed && (
+                      {active && showLabels && (
                         <span className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-5 rounded-r-full" style={{ background: "var(--gradient-primary)" }} />
                       )}
                       <Icon size={16} className="flex-shrink-0" strokeWidth={active ? 2.25 : 2} />
-                      {!collapsed && <span className="truncate">{label}</span>}
-                      {active && !collapsed && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-primary" />}
+                      {showLabels && <span className="truncate">{label}</span>}
+                      {active && showLabels && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-primary" />}
                     </button>
                   );
                 })}
@@ -189,14 +223,14 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
 
         {/* User */}
         <div className="p-2.5 flex-shrink-0">
-          <div className={`flex items-center gap-2.5 rounded-xl bg-secondary/60 border border-border/60 px-2.5 py-2 overflow-hidden ${collapsed ? "justify-center px-0" : ""}`}>
+          <div className={`flex items-center gap-2.5 rounded-xl bg-secondary/60 border border-border/60 px-2.5 py-2 overflow-hidden ${showLabels ? "" : "justify-center px-0"}`}>
             <div
               className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white shadow-sm"
               style={{ background: "var(--gradient-primary)" }}
             >
               {user?.email?.[0]?.toUpperCase() || "A"}
             </div>
-            {!collapsed && (
+            {showLabels && (
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-semibold text-foreground truncate">{user?.email?.split("@")[0] || "User"}</p>
                 <p className="text-[11px] text-muted-foreground truncate">{user?.email || "user@email.com"}</p>
@@ -215,9 +249,13 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
           style={{ boxShadow: "0 1px 0 0 rgba(0,0,0,0.02), 0 1px 8px -4px rgba(0,0,0,0.04)" }}
         >
           <button
-            onClick={() => setCollapsed((c) => !c)}
-            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            onClick={() => (isSmall ? setMobileNavOpen((o) => !o) : setCollapsed((c) => !c))}
+            aria-label={
+              isSmall
+                ? mobileNavOpen ? "Close navigation" : "Open navigation"
+                : collapsed ? "Expand sidebar" : "Collapse sidebar"
+            }
+            title={isSmall ? "Menu" : collapsed ? "Expand sidebar" : "Collapse sidebar"}
             className="p-1.5 -ml-1 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-all"
           >
             <Menu size={15} />
@@ -235,6 +273,16 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
               </button>
             ) : null}</h1>
           </div>
+
+          {readOnly && (
+            <span
+              title={READ_ONLY_HINT}
+              aria-label={READ_ONLY_HINT}
+              className="inline-flex items-center gap-1 flex-shrink-0 text-[11px] font-medium text-amber-700 dark:text-amber-400 bg-amber-500/10 border border-amber-500/25 rounded-full px-2.5 py-0.5"
+            >
+              <Eye size={11} /> Read-only
+            </span>
+          )}
 
           <div className="flex-1" />
 
@@ -371,6 +419,12 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
             )}
           </div>
         </header>
+
+        {readOnly && (
+          <div className="px-4 py-1.5 text-[11.5px] bg-amber-500/10 text-amber-800 dark:text-amber-300 border-b border-amber-500/20 flex-shrink-0">
+            Mobile read-only view — connect sources and run analyses on desktop.
+          </div>
+        )}
 
         {/* Content */}
         <main className="flex-1 overflow-auto page-bg">

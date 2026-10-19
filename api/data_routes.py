@@ -33,13 +33,22 @@ def _get_db_config(session):
         try:
             config["password"] = _decrypt_secret(config["password"])
         except Exception as exc:
-            # Never silently treat ciphertext as the password: a decrypt
-            # failure would surface as a confusing auth error downstream.
+            # Never use ciphertext as if it were the password. That would
+            # turn a local Windows identity mismatch into a misleading server
+            # authentication error.
             import logging as _logging
             _logging.getLogger("aria.data").warning(
-                "data_routes: db password decrypt failed (%s); "
-                "connection will likely fail.", type(exc).__name__,
+                "data_routes: saved DB password decrypt failed (%s).",
+                type(exc).__name__,
             )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "ARIA could not decrypt the saved database password. "
+                    "Start ARIA under the same Windows account that saved it, "
+                    "or reconnect and enter the database password again."
+                ),
+            ) from exc
     driver = "mysql" if db_type == "mysql" else "postgresql"
     dialect = "mysql" if driver == "mysql" else "postgresql"
     from core.db import format_db_host

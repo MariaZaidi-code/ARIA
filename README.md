@@ -46,7 +46,9 @@ python -m pytest tests/ -q    # backend suite must stay green
 
 ## Secrets
 
-API keys in `.env` are stored **DPAPI-encrypted** (`enc1:<base64>`, Windows-only) and
+API keys in `.env` are stored **DPAPI-encrypted** (`enc2:<base64>`, Windows-only,
+machine scope protected by private file ACLs; legacy `enc1` values still decrypt
+under their original Windows identity) and
 decrypted transparently at startup (`core/config.py`). To encrypt a new key:
 
 ```bash
@@ -54,7 +56,7 @@ python -c "import sys; sys.path.insert(0,'.'); from core.secret_box import encry
 ```
 
 Never commit `.env`, `data/.jwt_secret`, `*.db`, or token files (all gitignored).
-`TOKEN_TTL_DAYS` (default 1, clamped to 1-7) and login rate limits live in `auth.py` /
+`TOKEN_TTL_HOURS` (default 12, clamped to 1-168) and login rate limits live in `auth.py` /
 `api/auth_routes.py`. Relational `db_uri` is never written to disk (rebuilt from
 encrypted `db` config on restart). Rotate provider keys in their dashboards if ever exposed.
 

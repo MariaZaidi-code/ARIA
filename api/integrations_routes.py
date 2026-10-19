@@ -135,13 +135,11 @@ def _post_later(response_url: str, text: str) -> None:
 
 
 @router.post("/slack/command")
-async def slack_command(request: Request, token: str = ""):
-    """Slack slash-command endpoint (form-encoded; workspace token accepted
-    from the query string or the POST body ``token`` field so the secret
-    never has to sit in a logged URL).
+async def slack_command(request: Request):
+    """Slack slash-command endpoint; accept the workspace token in POST body only.
 
-    Configure in Slack as:
-    ``POST {base}/api/integrations/slack/command?token=<workspace token>``
+    Configure in Slack with URL ``{base}/api/integrations/slack/command`` and
+    send the workspace token in Slack's ``token`` form field.
     """
     from services.workspace_service import resolve_user_by_slack_token
 
@@ -150,9 +148,7 @@ async def slack_command(request: Request, token: str = ""):
         form = dict(await request.form())
     except Exception:
         form = {}
-    # Prefer the POST body (Slack form fields are not usually logged); the
-    # query param stays accepted for the documented URL config.
-    token = str(form.get("token") or token or "").strip()
+    token = str(form.get("token") or "").strip()
     user_id = resolve_user_by_slack_token(token)
     if not user_id:
         raise HTTPException(status_code=401,

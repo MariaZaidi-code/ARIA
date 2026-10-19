@@ -73,7 +73,7 @@ def _cookie_kwargs(request: Request | None = None) -> dict:
         "samesite": "lax",
         "secure": _cookie_secure(request),
         "path": "/",
-        "max_age": auth.TOKEN_TTL_DAYS * 24 * 3600,
+        "max_age": auth.TOKEN_TTL_HOURS * 3600,
     }
 
 

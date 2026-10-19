@@ -115,7 +115,10 @@ function matchesFilter(type: string, filter: string): boolean {
     case "performance": return t.includes("growth") || t.includes("decline");
     case "anomalies": return t.includes("anomal") || t.includes("outlier");
     case "relationships": return t.includes("correl") || t.includes("relation");
-    case "opportunities": return t.includes("opportunit") || t.includes("growth");
+    // Growth is classified and labeled as Performance by primaryCategory.
+    // Keep the opportunity count/filter aligned with the category displayed
+    // on each card instead of counting growth cards in both categories.
+    case "opportunities": return t.includes("opportunit");
     case "risks": return t.includes("risk") || t.includes("decline");
     default: return true;
   }
@@ -963,15 +966,19 @@ export default function Insights({
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { critical: 0 };
+    const matchesOtherFilters = (ins: Insight) =>
+      (!criticalOnly || (ins.severity || "").toLowerCase() === "high") &&
+      (metricFilter === "All" || (ins.metric || "").startsWith(metricFilter) || (ins.metric || "") === metricFilter);
     for (const f of FILTERS) {
       if (f.id === "all") continue;
-      c[f.id] = allInsights.filter((ins) => matchesFilter(ins.type, f.id)).length;
+      c[f.id] = allInsights.filter((ins) => matchesFilter(ins.type, f.id) && matchesOtherFilters(ins)).length;
     }
     for (const ins of allInsights) {
-      if ((ins.severity || "").toLowerCase() === "high") c.critical += 1;
+      if ((ins.severity || "").toLowerCase() === "high" &&
+          (metricFilter === "All" || (ins.metric || "").startsWith(metricFilter) || (ins.metric || "") === metricFilter)) c.critical += 1;
     }
     return c;
-  }, [allInsights]);
+  }, [allInsights, criticalOnly, metricFilter]);
 
   const openInsight = (id: string) => {
     setSelectedId(id);

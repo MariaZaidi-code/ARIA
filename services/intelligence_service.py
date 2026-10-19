@@ -2364,30 +2364,128 @@ def _hypothesis_items(session: dict) -> list:
                          if c in (col_roles or {})][:1]
             except Exception:
                 pass
+        tbl_label = display_name(tname, tname)
         for m in measures[:3]:
             ml = display_name(m, m)
+            # Qualify the measure with its table ("Invoice Total") — a bare
+            # column label like "Total" reads ambiguous everywhere it appears.
+            subj = f"{tbl_label} {ml}".strip() if tbl_label.lower() not in ml.lower() else ml
             for dt in dates[:1]:
                 hid = hashlib.sha256(f"{tname}:{m}:{dt}:trend".encode()).hexdigest()[:12]
                 items.append({
                     "id": hid, "type": "trend", "metric": m, "time": dt,
-                    "table": tname, "metric_label": ml,
-                    "title": f"Why did {ml.lower()} change over time?",
-                    "question": f"Why might {ml} have changed?",
+                    "table": tname, "metric_label": subj,
+                    "title": f"Why did {subj} change over time?",
+                    "question": f"Why might {subj} have changed?",
                     "period": "All data",
                     "verdict": "Ready to investigate",
                     "drivers": [],
-                    "summary": f"Investigate whether {ml.lower()} increased, declined, or held steady over time.",
-                    "description": f"Trend of {ml} over {display_name(dt, dt)}.",
+                    "summary": f"Investigate whether {subj} increased, declined, or held steady over time.",
+                    "description": f"Trend of {subj} over {display_name(dt, dt)}.",
                     "evidence_strength": "Not tested", "strength": "Not tested", "status": "Ready to investigate",
-                    "observed_pattern": {"headline": "Change not tested yet", "detail": f"Open this question to measure whether {ml.lower()} increased, declined, or held steady."},
-                    "key_takeaways": [f"Historical change in {ml.lower()} can be tested using the available time field."],
-                    "takeaways": [f"Test whether {ml.lower()} changed over time."],
+                    "observed_pattern": {"headline": "Change not tested yet", "detail": f"Open this question to measure whether {subj} increased, declined, or held steady."},
+                    "key_takeaways": [f"Historical change in {subj} can be tested using the available time field."],
+                    "takeaways": [f"Test whether {subj} changed over time."],
                     "associated_factors": [],
                     "evidence": [],
-                    "related": [], "next_steps": [f"Measure how {ml} changed over time and investigate the largest movement."],
-                    "context": {"metric": ml, "breakdown": "Time", "table": display_name(tname, tname), "period": "All data"},
+                    "related": [], "next_steps": [f"Measure how {subj} changed over time and investigate the largest movement."],
+                    "context": {"metric": subj, "breakdown": "Time", "table": tbl_label, "period": "All data"},
                 })
     return items
+
+
+def _attach_trend_summary(session: dict, item: dict) -> None:
+    """Attach a real earliest-vs-latest measurement to a trend item (list view).
+
+    Two bounded TOP-1 grouped queries on the item's metric/date pair — cheap
+    enough for a page of list cards. Numbers round through _human_total like
+    everywhere else; when the pair cannot be measured the item gets a
+    plain-worded trend_limitation — never a fabricated number.
+    """
+    try:
+        if item.get("type") != "trend":
+            return
+        db_uri = session.get("db_uri")
+        t, m, dt = item.get("table"), item.get("metric"), item.get("time")
+        if not (db_uri and t and m and dt):
+            return
+        mapping = _load_schema_mapping(session)
+        hd = _dialect_of(db_uri)
+        try:
+            mdt = _col_data_type(mapping, t, m)
+            expr = _nan_safe_sql(
+                _numeric_metric_sql(_qident(hd, m), mdt, hd), mdt, hd)
+        except Exception:
+            mdt, expr = "", _qident(hd, m)
+        if not _is_native_date_dtype(_col_data_type(mapping, t, dt)) or _is_text_dtype(mdt):
+            item["trend_limitation"] = ("Dates are stored as text in this table — "
+                                        "open the question to measure it there.")
+            return
+        engine = _pooled_engine(db_uri)
+        from sqlalchemy import text as sql_text
+        base = (f"SELECT {_qident(hd, dt)} AS p, SUM({expr}) AS v "
+                f"FROM {_qident(hd, t)} GROUP BY {_qident(hd, dt)} "
+                f"ORDER BY {_qident(hd, dt)}")
+        with engine.connect() as conn:
+            if hd == "sqlite":
+                try:
+                    from services.intelligence_validation import (
+                        ensure_sqlite_helpers as _esh3)
+                    _esh3(engine)
+                except Exception:
+                    pass
+            first = conn.execute(sql_text(base + " ASC LIMIT 1")).first()
+            last = conn.execute(sql_text(base + " DESC LIMIT 1")).first()
+        if not first or not last:
+            item["trend_limitation"] = "No periods of data to measure yet."
+            return
+        f_lab, l_lab = str(first[0] or ""), str(last[0] or "")
+        if f_lab == l_lab:
+            item["trend_limitation"] = "Only one period of data — a trend needs at least two."
+            return
+        f_val, l_val = float(first[1] or 0), float(last[1] or 0)
+        pct = ((l_val - f_val) / f_val * 100) if f_val else 0.0
+        direction = "declined" if pct < 0 else "increased" if pct > 0 else "held steady"
+        item["trend_summary"] = {
+            "change_pct": round(pct, 1),
+            "direction": direction,
+            "first_label": f_lab, "last_label": l_lab,
+            "first_display": _human_total(f_val), "last_display": _human_total(l_val),
+            "basis": "earliest vs latest period",
+        }
+    except Exception:
+        item["trend_limitation"] = "ARIA couldn't measure this trend just now."
+
+
+def _no_time_search_hint(session: dict, search: str) -> str:
+    """Plain-worded reason when a searched measure has no time column.
+
+    Search matched no hypothesis — if the term names a real numeric measure
+    whose table has no date field, say that instead of showing a blank
+    result the user can't explain.
+    """
+    try:
+        mapping = _load_schema_mapping(session)
+        roles = _classify_columns(mapping)
+    except Exception:
+        return ""
+    no_date: list[str] = []
+    for tname, col_roles in (roles or {}).items():
+        has_date = any(r == "DATE" for r in col_roles.values())
+        for c, r in col_roles.items():
+            if r not in ("BUSINESS_MEASURE", "MEASURE", "DERIVED_METRIC"):
+                continue
+            if search in f"{display_name(c, c)} {c}".lower() and not has_date:
+                label = f"{display_name(tname, tname)} {display_name(c, c)}".strip()
+                if label not in no_date:
+                    no_date.append(label)
+    if not no_date:
+        return ""
+    shown = ", ".join(no_date[:3])
+    verb = "has" if len(no_date) == 1 else "have"
+    pronoun = "it" if len(no_date) == 1 else "them"
+    return (f"{shown} {verb} no time column — trend questions need a date "
+            f"field, so no hypothesis was created for {pronoun}.")
 
 
 def generate_hypotheses(session: dict, request: dict) -> dict:
@@ -2400,8 +2498,11 @@ def generate_hypotheses(session: dict, request: dict) -> dict:
                 "total_candidates": 0, "total": 0, "count": 0,
                 "reason": NO_SCHEMA_REASON, "hint": NO_SCHEMA_HINT}
     search = str(request.get("search") or "").strip().lower()
+    hint = ""
     if search:
         items = [h for h in items if search in f"{h.get('title','')} {h.get('summary','')} {h.get('metric_label','')}".lower()]
+        if not items:
+            hint = _no_time_search_hint(session, search)
     sort = str(request.get("sort") or "recent").lower()
     if sort == "az":
         items = sorted(items, key=lambda h: str(h.get("title", "")))
@@ -2419,6 +2520,10 @@ def generate_hypotheses(session: dict, request: dict) -> dict:
     total = len(items)
     start = (page - 1) * page_size
     sliced = items[start:start + page_size]
+    # Real measured move per list card (bounded: first 10 rows of the page).
+    # Failures attach a plain-worded trend_limitation instead of a number.
+    for h in sliced[:10]:
+        _attach_trend_summary(session, h)
     return {
         "ok": True,
         "candidates": items,
@@ -2429,6 +2534,7 @@ def generate_hypotheses(session: dict, request: dict) -> dict:
         "count": total,
         "page": page,
         "page_size": page_size,
+        "hint": hint,
     }
 
 
@@ -2437,8 +2543,8 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
 
     Computes a real observed pattern from the database (top/bottom segment
     totals with share + mini-series for segment hypotheses; first-half vs
-    second-half totals with direction for trend hypotheses). All numbers are
-    rounded to a human scale — never fabricated.
+    second-half totals over the full time range with direction for trend
+    hypotheses). All numbers are rounded to a human scale — never fabricated.
     """
     items = _hypothesis_items(session)
     found = next((h for h in items if str(h.get("id")) == str(hypothesis_id)), None)
@@ -2575,9 +2681,14 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                         _col_data_type(_hmap2, t, dt))
                     pts: list = []
                     if _native_dt and not _is_text_dtype(_mdt):
+                        # Full-range buckets: the headline says "All data", so
+                        # the first-half vs second-half comparison must span
+                        # the whole range — not just the earliest buckets.
+                        # 4000 is a bounded safety cap (~11 years of daily
+                        # points), never the window itself.
                         sql = (f"SELECT {_qident(_hd2, dt)} AS p, SUM({_mexpr}) AS v "
                                f"FROM {_qident(_hd2, t)} GROUP BY {_qident(_hd2, dt)} "
-                               f"ORDER BY {_qident(_hd2, dt)} ASC LIMIT 24")
+                               f"ORDER BY {_qident(_hd2, dt)} ASC LIMIT 4000")
                         _r = conn.execute(sql_text(sql))
                         _c = list(_r.keys())
                         rows = _r.fetchall()
@@ -2588,8 +2699,9 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                         # TEXT/odd-stored dates (or TEXT measures): SQL
                         # ORDER BY over stored spellings is meaningless
                         # (DD-MM-YYYY scrambles), so bucket in SQL but sort
-                        # by the shared tolerant parser in Python. Earliest
-                        # 24 buckets mirrors the native LIMIT 24 ASC window.
+                        # by the shared tolerant parser in Python. The
+                        # whole sorted range is kept (same 4000 cap as the
+                        # native path) so halves span all data.
                         _sql2 = (f"SELECT {_qident(_hd2, dt)} AS p, SUM({_mexpr}) AS v "
                                  f"FROM {_qident(_hd2, t)} GROUP BY {_qident(_hd2, dt)}")
                         _r = conn.execute(sql_text(_sql2))
@@ -2606,7 +2718,7 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                                 continue
                             _pairs.append((_pd, str(_dd.get("p") or ""), _vv))
                         _pairs.sort(key=lambda x: x[0])
-                        pts = [(lab, v) for _, lab, v in _pairs[:24]]
+                        pts = [(lab, v) for _, lab, v in _pairs[:4000]]
                     if pts and len(pts) >= 2:
                         half = max(1, len(pts) // 2)
                         before = sum(v for _, v in pts[:half]) or 0

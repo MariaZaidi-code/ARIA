@@ -64,7 +64,8 @@ class TestWorkspaceRoutes(unittest.TestCase):
     def _client(self):
         from fastapi.testclient import TestClient
         import app as app_module
-        return TestClient(app_module.app, raise_server_exceptions=False)
+        return TestClient(app_module.app, raise_server_exceptions=False,
+                           headers={"Origin": "http://127.0.0.1:8000"})
 
     def _user_id(self, username: str) -> int:
         import auth
@@ -323,8 +324,9 @@ class TestWorkspaceRoutes(unittest.TestCase):
                    json={"regenerate_slack_token": True})
         token = r.json()["data"]["slack_command_token"]
         self.assertGreaterEqual(len(token), 20)
-        # Reveal path (regenerate/set response) carries the full command URL.
-        self.assertIn("token=" + token, r.json()["data"]["slack_command_url"])
+        # The reveal response returns the token separately and keeps it out of
+        # URLs so browser history, proxy logs, and referrers cannot expose it.
+        self.assertNotIn("token=" + token, r.json()["data"]["slack_command_url"])
 
         # Masked in the read path — the secret must never appear in a status GET.
         data = c.get("/api/workspace/integrations").json()["data"]
@@ -334,11 +336,13 @@ class TestWorkspaceRoutes(unittest.TestCase):
         self.assertNotIn("token=", data["slack_command_url"])
 
         # Wrong token -> 401.
-        r = c.post("/api/integrations/slack/command?token=wrong", data={"text": "hi"})
+        r = c.post("/api/integrations/slack/command",
+                   data={"token": "wrong", "text": "hi"})
         self.assertEqual(r.status_code, 401)
 
         # Empty text -> help, ephemeral.
-        r = c.post(f"/api/integrations/slack/command?token={token}", data={"text": ""})
+        r = c.post("/api/integrations/slack/command",
+                   data={"token": token, "text": ""})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["response_type"], "ephemeral")
 
@@ -346,8 +350,8 @@ class TestWorkspaceRoutes(unittest.TestCase):
         # keep the test hermetic; the wiring returns the summary text).
         with patch("api.integrations_routes._ask_sync",
                    return_value="*q*\n> stub answer"):
-            r = c.post(f"/api/integrations/slack/command?token={token}",
-                       data={"text": "why did revenue drop?"})
+            r = c.post("/api/integrations/slack/command",
+                       data={"token": token, "text": "why did revenue drop?"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["response_type"], "in_channel")
         self.assertIn("stub answer", r.json()["text"])

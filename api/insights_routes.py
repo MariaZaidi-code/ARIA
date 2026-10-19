@@ -1336,13 +1336,13 @@ class InsightsEngine:
                 if not join_path:
                     continue
 
-                join_clause = self.intel.build_join_clause(join_path)
+                join_clause = self.intel.build_join_clause(join_path, dialect=self._dialect(), base_table=t1)
                 join_on = join_path[-1]  # last join step
                 _dtq = f"{_safe_name(t1)}.{_safe_name(dt1)}"
-                _dd = self._dialect()
-                if _dd == "mysql":
+                _dd = str(self._dialect() or "").lower()
+                if "mysql" in _dd:
                     _mline = f"DATE_FORMAT({_dtq}, '%Y-%m-01')"
-                elif _dd == "sqlite":
+                elif "sqlite" in _dd:
                     _mline = f"strftime('%Y-%m-01', {_dtq})"
                 else:
                     _mline = f"DATE_TRUNC('month', {_dtq})"
@@ -2041,6 +2041,10 @@ def get_insights(request: Request, user: dict = Depends(get_current_user)):
                     options=f"-c search_path={db_config.get('db_schema', 'public')}",
                     connect_timeout=10,
                 )
+                try:
+                    conn.autocommit = True
+                except Exception:
+                    pass
             except (psycopg2.Error, OSError, ValueError, TypeError) as exc:
                 log.exception("insights postgres connect failed request_id=%s: %s",
                               get_request_id(request), exc)
@@ -2393,6 +2397,10 @@ def get_insight_detail(insight_id: str, request: Request, user: dict = Depends(g
                     options=f"-c search_path={db_config.get('db_schema', 'public')}",
                     connect_timeout=10,
                 )
+                try:
+                    conn.autocommit = True
+                except Exception:
+                    pass
             except (psycopg2.Error, OSError, ValueError, TypeError) as exc:
                 log.exception("insights postgres connect failed request_id=%s: %s",
                               get_request_id(request), exc)

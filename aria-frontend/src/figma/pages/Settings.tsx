@@ -88,7 +88,14 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
   };
 
   return (
-    <div className="flex h-full">
+    <div className="flex flex-col h-full">
+      {/* Page header: every content page renders its own heading inside
+          main (banner h1 is chrome); Settings must not be the exception. */}
+      <div className="px-6 pt-5 pb-4 border-b border-border flex-shrink-0">
+        <h2 className="text-xl font-bold text-foreground tracking-tight">Settings</h2>
+        <p className="text-xs text-muted-foreground mt-0.5">Manage your account, AI providers, data sources, and application preferences.</p>
+      </div>
+      <div className="flex flex-1 min-h-0">
       {/* Sub-sidebar */}
       <div className="w-48 border-r border-border bg-card/80 backdrop-blur-sm flex-shrink-0">
         <div className="py-3">
@@ -324,6 +331,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
             </div>
           </div>
         )}
+        </div>
       </div>
     </div>
   );

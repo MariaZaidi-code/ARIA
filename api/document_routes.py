@@ -227,6 +227,46 @@ def get_document(
         raise HTTPException(status_code=404, detail="Document not found")
     return {"ok": True, "document": doc}
 
+@router.get("/api/documents/{document_id}/chunks")
+def get_document_chunks(
+    document_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Return the extracted text chunks for a document (for preview/summary)."""
+    document_id = _sanitize_document_id(document_id)
+    from insight_rag.storage import RAGMetadataStore
+    meta = RAGMetadataStore(user["user_id"])
+    doc = meta.get_document(document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    chunks = []
+    try:
+        # Local chunk store (file-backed, no pgvector needed)
+        import json as _json
+        from pathlib import Path as _P
+        root = meta.root if hasattr(meta, "root") else None
+        if root is None:
+            from insight_rag.storage import user_dir as _ud
+            root = _ud(user["user_id"])
+        chunk_file = _P(root) / "chunks" / f"{document_id}.json"
+        if chunk_file.exists():
+            raw = _json.loads(chunk_file.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                for c in raw:
+                    text = ""
+                    if isinstance(c, dict):
+                        text = str(c.get("page_content") or c.get("content") or c.get("text") or "")
+                    chunks.append({"text": text, "metadata": c.get("metadata", {}) if isinstance(c, dict) else {}})
+    except Exception as exc:
+        logger.warning("chunk read failed: %s", type(exc).__name__)
+    # Auto-summary: first ~400 chars of the first chunk
+    summary = ""
+    if chunks and chunks[0].get("text"):
+        t = chunks[0]["text"].strip()
+        summary = t[:400] + ("…" if len(t) > 400 else "")
+    return {"ok": True, "chunks": chunks, "summary": summary, "chunk_count": len(chunks)}
+
+
 
 @router.post("/api/documents/{document_id}/search")
 def search_document(
@@ -246,6 +286,57 @@ def search_document(
     )
     return {"ok": True, "results": results}
 
+
+class DocumentAskRequest(BaseModel):
+    question: str
+    document_ids: Optional[List[str]] = None
+    k: int = 6
+
+
+@router.post("/api/documents/ask")
+def ask_documents(
+    request: DocumentAskRequest,
+    user: dict = Depends(get_current_user),
+):
+    from core.config import get_session
+    session = get_session(user["user_id"])
+    adapter = _CanonicalRAGAdapter(user["user_id"])
+    passages = adapter.search_documents(
+        query=request.question,
+        document_ids=request.document_ids,
+        k=request.k,
+    )
+    norm = [pp for pp in (passages or []) if isinstance(pp, dict)]
+    answer = ""
+    provider = session.get("provider") if isinstance(session, dict) else None
+    if provider is not None and norm:
+        try:
+            context = "\n\n".join(
+                "[{}] {} p.{}: {}".format(i + 1, pp.get("filename", "doc"), pp.get("page_number", "?"), pp.get("content", ""))
+                for i, pp in enumerate(norm[:6])
+            )
+            prompt = (
+                "You are ARIA, an analyst. Answer the user question using ONLY the document passages below. "
+                "Cite passages as [1], [2], etc. If the passages don't contain the answer, say so plainly. Keep it concise.\n\n"
+                "Question: " + request.question + "\n\nPassages:\n" + context + "\n\nAnswer:"
+            )
+            try:
+                out = provider.complete("copilot", prompt, temperature=0.2, num_predict=400, timeout=30, user_id=user["user_id"])
+                answer = str(out or "").strip()
+            except Exception:
+                try:
+                    out = provider.chat("copilot", [{"role": "user", "content": prompt}], temperature=0.2, num_predict=400, timeout=30)
+                    answer = str(out or "").strip()
+                except Exception:
+                    answer = ""
+        except Exception:
+            answer = ""
+    citations = [
+        {"index": i + 1, "document_id": pp.get("document_id"), "filename": pp.get("filename"),
+         "page_number": pp.get("page_number"), "chunk_id": pp.get("chunk_id")}
+        for i, pp in enumerate(norm[:6])
+    ]
+    return {"ok": True, "answer": answer, "passages": norm, "citations": citations}
 
 @router.post("/api/documents/search")
 def search_all_documents(

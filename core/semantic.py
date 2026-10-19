@@ -360,6 +360,16 @@ def classify_field_role(column_name: str, db_type: str = "",
     dtype = str(db_type or "").lower()
     if is_fk:
         return "FOREIGN_KEY"
+    # A primary key that is genuinely a date (day, order_date, created_at
+    # stored as DATE/TIMESTAMP) is still a DATE for trend/forecast purposes:
+    # being a PK does not make it an opaque identifier.
+    _date_by_dtype = any(h in dtype for h in _DATE_HINTS)
+    _date_by_name = (low in ("date", "time", "datetime", "timestamp", "day",
+                             "month", "year")
+                     or low.endswith(("_date", "_time", "_at", "_on", "_ts",
+                                      "_day", "_month", "_year")))
+    if (_date_by_dtype or _date_by_name) and not _has_technical_signal(name):
+        return "DATE"
     if is_pk or _is_identifier_flavored(name):
         return "IDENTIFIER"
     if any(h in dtype for h in _DATE_HINTS):

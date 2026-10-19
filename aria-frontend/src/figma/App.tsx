@@ -42,6 +42,7 @@ import {
 } from "../services/api";
 import { clearAuthSession, getAuthUser } from "../utils/authStorage";
 import { KEYS, storage } from "../utils/storage";
+import { ReadOnlyContext, looksLikeMobile } from "./lib/readonly";
 import { ToastProvider } from "../components/Toast";
 
 export type Page =
@@ -96,6 +97,10 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<{ email?: string } | null>(null);
   const [selectedLLM, setSelectedLLM] = useState("");
   const bootSessionCheckRef = useRef<AbortController | null>(null);
+
+  // Mobile read-only: server verdict (session/status) with a UA guess until
+  // the first response lands. Gates write affordances across the shell/pages.
+  const [readOnly, setReadOnly] = useState(looksLikeMobile);
 
   // ---- Theme ----
   const [isDark, setIsDark] = useState(() => {
@@ -155,6 +160,23 @@ export default function App() {
         });
         if (ctrl.signal.aborted) return;
         if (!body) return;
+        // Restore the authenticated UI stage as well as data connectivity.
+        // A valid httpOnly cookie survives reloads, but React state does not;
+        // leaving appStage at its initial "login" value strands a valid
+        // session on the sign-in screen after every refresh.
+        if (body?.ok) {
+          const savedUser = getAuthUser();
+          setCurrentUser(savedUser
+            ? { email: savedUser.email || savedUser.username || "user" }
+            : { email: "user" });
+          const savedMode = storage.getString(KEYS.llmMode, "");
+          if (savedMode) {
+            setSelectedLLM(savedMode);
+            setAppStage("app");
+          } else {
+            setAppStage("llm-selection");
+          }
+        }
         // Restore connection state from the live server session so a page
         // reload does not drop every page to "Connect a data source" while
         // the backend still holds the connection (connectionStatus is
@@ -169,6 +191,26 @@ export default function App() {
           }
           if (body.db_name) setDbName(body.db_name);
           if (body.source_type) setSelectedSourceType(body.source_type);
+          if (body.db_type === "postgresql" || body.db_type === "mysql") setDbType(body.db_type);
+          try {
+            const schemaJson: any = await apiFetch("/schema");
+            if (schemaJson?.ok && schemaJson.schema) {
+              setSchemaData(schemaJson.schema);
+              setSchemaStatus("success");
+            } else {
+              setSchemaStatus("idle");
+              setSchemaData(null);
+            }
+          } catch (e: any) {
+            if (e?.status === 401) {
+              clearAuthSession();
+              setCurrentUser(null);
+              setAppStage("login");
+              return;
+            }
+            setSchemaStatus("idle");
+            setSchemaData(null);
+          }
         }
       } catch (e: any) {
         // 401 returns to login; blips/offline keep the current stage so
@@ -193,6 +235,7 @@ export default function App() {
   // ---- Connection state ----
   const [connectionStatus, setConnectionStatus] = useState("not-connected");
   const [dbName, setDbName] = useState("");
+  const [dbType, setDbType] = useState("postgresql");
   const [schemaData, setSchemaData] = useState<any>(null);
   const [schemaStatus, setSchemaStatus] = useState("idle");
   const [schemaError, setSchemaError] = useState("");
@@ -245,6 +288,13 @@ export default function App() {
   };
 
   const handleLLMSelect = async (mode: string, apiKey?: string) => {
+    // Persist the UI choice synchronously BEFORE the server round-trip: a
+    // reload that races the /provider/switch call would otherwise kill the
+    // in-flight continuation and lose the choice, stranding the user on the
+    // engine chooser after every refresh. The key is removed again if the
+    // switch fails so a rejected choice never persists.
+    setSelectedLLM(mode);
+    storage.set(KEYS.llmMode, mode);
     // Materialize the choice server-side so the session provider matches
     // the UI immediately (prevents "choose an LLM provider" right after).
     // Provider isolation: the key is sent only to its selected hosted provider;
@@ -254,9 +304,8 @@ export default function App() {
         method: "POST",
         body: JSON.stringify(apiKey ? { provider: mode, api_key: apiKey } : { provider: mode }),
       });
-      setSelectedLLM(mode);
-      storage.set(KEYS.llmMode, mode);
     } catch (err: any) {
+      storage.remove(KEYS.llmMode);
       if (err?.status === 401) {
         clearAuthSession();
         setCurrentUser(null);
@@ -271,10 +320,15 @@ export default function App() {
     (async () => {
       const result = await fetchSessionStatus();
       if (result.success && result.data) {
+        if (typeof (result.data as any).read_only === "boolean") setReadOnly((result.data as any).read_only);
         if (result.data.connection_status === "connected") {
           setConnectionStatus("connected");
           setDbName(result.data.db_name || "");
           setSelectedSourceType(result.data.source_type || "relational");
+          if (result.data.db_type === "postgresql" || result.data.db_type === "mysql") setDbType(result.data.db_type);
+          if (result.data.db_host) setDbHost(result.data.db_host);
+          if (result.data.db_port) setDbPort(String(result.data.db_port));
+          if (result.data.db_username) setDbUsername(result.data.db_username);
           // Load schema from the server when reconnecting so the Data
           // section never shows "pending" — the DB was never disconnected.
           // Load schema directly (skip extraction) when reconnecting so the
@@ -340,6 +394,7 @@ export default function App() {
     try {
       const st = await fetchSessionStatus();
       const body: any = (st as any)?.data || {};
+      if (typeof body.read_only === "boolean") setReadOnly(body.read_only);
       const display = body?.display_state || body?.connection_status || "";
       const schemaSt = body?.schema_status || "";
       if (display === "ready" || body?.connection_status === "connected") {
@@ -348,8 +403,12 @@ export default function App() {
         } else {
           setConnectionStatus("connected");
         }
-        if (body.db_name) setDbName(body.db_name);
-        if (body.source_type) setSelectedSourceType(body.source_type);
+          if (body.db_name) setDbName(body.db_name);
+          if (body.source_type) setSelectedSourceType(body.source_type);
+          if (body.db_type === "postgresql" || body.db_type === "mysql") setDbType(body.db_type);
+          if (body.db_host) setDbHost(body.db_host);
+          if (body.db_port) setDbPort(String(body.db_port));
+          if (body.db_username) setDbUsername(body.db_username);
         return "connected";
       }
       if (display === "schema-loading") {
@@ -375,6 +434,7 @@ export default function App() {
         setConnectionStatus("connected");
         setDbName(result?.data?.database || details?.db || "");
         setSelectedSourceType("relational");
+        if (details?.sourceType === "postgresql" || details?.sourceType === "mysql") setDbType(details.sourceType);
         // Auto-fetch schema after connect
         await handleSchemaFetch();
         // Verify against backend truth; downgrade to error when the
@@ -402,6 +462,7 @@ export default function App() {
     }
     setConnectionStatus("not-connected");
     setDbName("");
+    setDbType("postgresql");
     setSchemaData(null);
     setSchemaStatus("idle");
   };
@@ -611,6 +672,7 @@ export default function App() {
   }
 
   return (
+    <ReadOnlyContext.Provider value={readOnly}>
     <ThemeContext.Provider value={{ isDark, toggleTheme, page, setPage }}>
       {/* ToastProvider mounts the toast region: figma/pages/Documents.tsx
           already calls useToast(), which throws without a provider. */}
@@ -673,6 +735,7 @@ export default function App() {
                   connectionStatus={connectionStatus}
                   selectedSourceType={selectedSourceType}
                   dbName={dbName}
+                  dbType={dbType}
                   schemaData={schemaData}
                   schemaStatus={schemaStatus}
                   schemaError={schemaError}
@@ -732,5 +795,6 @@ export default function App() {
       <FeedbackPopup page={page} />
       </ToastProvider>
     </ThemeContext.Provider>
+    </ReadOnlyContext.Provider>
   );
 }

@@ -287,7 +287,8 @@ class IsolationCase(unittest.TestCase):
         clients = []
         for u in ("rxiso%s" % _rng.randint(1000000, 9999999),
                   "rxiso%s" % _rng.randint(1000000, 9999999)):
-            c = TestClient(_app.app, raise_server_exceptions=False)
+            c = TestClient(_app.app, raise_server_exceptions=False,
+                           headers={"Origin": "http://127.0.0.1:8000"})
             r = c.post("/api/auth/register",
                        json={"username": u, "password": "password123"})
             self.assertEqual(r.status_code, 200, r.text[:200])

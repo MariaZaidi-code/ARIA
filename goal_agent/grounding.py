@@ -1393,8 +1393,9 @@ class GroundingMixin:
                 return (_direct, _named, _isolated, 0 if _geo else 1, _card_v,
                         -_conf, str(_t or ""), str(_c or ""))
             try:
-                # Keep date dims required by trends outside the cap;
-                # cap only the categorical breakdown candidates.
+                # Keep date dims required by trends outside the categorical cap;
+                # cap them separately so multi-table schemas do not explode
+                # dimensions across all tables.
                 _date_ds = []
                 _cat_ds = []
                 for _d in dims:
@@ -1407,6 +1408,13 @@ class GroundingMixin:
                         _date_ds.append(_d)
                     else:
                         _cat_ds.append(_d)
+                def _date_rank(d):
+                    _t = d.get("resolved_table")
+                    _in_rel = 0 if _t in relevant else 1
+                    return (_in_rel, _rank_key(d))
+                _date_ds = sorted(_date_ds, key=_date_rank)
+                _date_cap = min(_cap_n, 2)
+                _date_ds = _date_ds[:_date_cap]
                 _cat_ds = sorted(_cat_ds, key=_rank_key)[:_cap_n]
                 dims = _date_ds + _cat_ds
             except Exception:
@@ -1423,6 +1431,43 @@ class GroundingMixin:
         for metric in ir["metrics"]:
             concept = metric["concept"].lower()
             if metric.get("aggregation") == "COUNT" or concept == "row count":
+                # An INFERRED count (no explicit "how many"/"count" wording)
+                # whose question lexically names a real measure column
+                # ("how much did we spend", "total signups") tracks that
+                # column instead of counting rows. Fully schema-driven.
+                if metric.get("inferred"):
+                    _lex = None
+                    try:
+                        _q = set(self._normalize_tokens(goal_l))
+                    except Exception:
+                        _q = set()
+                    for m in measures:
+                        try:
+                            _snake = re.sub(
+                                r"([a-z0-9])([A-Z])", r"\1_\2",
+                                str(m["column"] or "")).lower()
+                            cts = {p for p in re.split(r"[^a-z0-9]+", _snake) if p}
+                        except Exception:
+                            cts = set()
+                        if not cts or not _q:
+                            continue
+                        miss = {t for t in cts if t not in _q
+                                and not (t.endswith("s") and t[:-1] in _q)}
+                        if not miss:
+                            _lex = m
+                            break
+                    if _lex is not None:
+                        metric["resolved_table"] = _lex["table"]
+                        metric["resolved_column"] = _lex["column"]
+                        metric["resolved_expression"] = (
+                            f"{_lex['table']}.{_lex['column']}")
+                        metric["aggregation"] = "SUM"
+                        metric["confidence"] = 0.8
+                        metric["reason"] = (
+                            "question names the measure column "
+                            f"{_lex['table']}.{_lex['column']}; aggregating "
+                            "it instead of counting rows")
+                        continue
                 # A vague trend goal ("analyze trend over time") names no
                 # measure: tracking the table's real measure over time is the
                 # useful default, not a row count. Only inferred (guessed)
@@ -1549,11 +1594,43 @@ class GroundingMixin:
                 if best_key is None or key > best_key:
                     best_key = key
                     best = m
+            # Lexical name hit (generic, no DB names): a measure column
+            # literally named in the question ("total spend" -> spend,
+            # "signups" -> signups) outranks concept-token scoring and is
+            # never traded for the computed qty*price fallback.
+            best_direct = False
+            try:
+                _q = set(self._normalize_tokens(goal_l))
+            except Exception:
+                _q = set()
+            _direct = None
+            for m in _pool:
+                try:
+                    _snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2",
+                                    str(m["column"] or "")).lower()
+                    cts = {p for p in re.split(r"[^a-z0-9]+", _snake) if p}
+                except Exception:
+                    cts = set()
+                if not cts or not _q:
+                    continue
+                miss = {t for t in cts if t not in _q
+                        and not (t.endswith("s") and t[:-1] in _q)}
+                if not miss:
+                    try:
+                        _line = 1 if self._is_line_grain_table(m.get("table")) else 0
+                    except Exception:
+                        _line = 0
+                    key = (len(cts), -_line, str(m.get("table") or ""))
+                    if _direct is None or key > _direct[0]:
+                        _direct = (key, m)
+            if _direct is not None:
+                best = _direct[1]
+                best_direct = True
             # Goal-name override: if the user explicitly names a column
             # (e.g. "average rating" -> "rating"), prefer it over the
             # concept-token match which may pick the wrong column. Never
             # overrides a revenue-like goal with a cost/fuel/id/count column.
-            if not monetary_bias:
+            if not monetary_bias and not best_direct:
                 try:
                     goal_words = {w for w in self._normalize_tokens(goal_l) if len(w) >= 3}
                 except Exception:
@@ -1580,7 +1657,8 @@ class GroundingMixin:
                 # A header-level monetary total (tier 0) always wins over the
                 # line-grain synthesis: header totals are already the
                 # qty*price rollup and re-multiplying lines double-counts.
-                if computed and best_tier >= 1 and monetary_bias:
+                if computed and best_tier >= 1 and monetary_bias \
+                        and not best_direct:
                     metric["resolved_table"] = computed["table"]
                     metric["resolved_column"] = None
                     metric["resolved_expression"] = computed["expression"]

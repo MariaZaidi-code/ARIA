@@ -284,22 +284,25 @@ def prescription_context(user: dict = Depends(get_current_user)):
 def _enrich_context(engine, dialect, intel, tables, session):
     """Opportunities, per-table limitations, and latest saved evidence (§1).
 
-    Opportunity candidates are schema-discovered only (no data scanned):
-    metric × controllable-ish drivers within the same table. Foreign-key
-    relationships never auto-generate drivers (hyp §4) and derived fields
-    never auto-generate drivers (hyp §5) — actionability for those is
-    established separately inside the prescription engine behind statistical
-    evidence gates. Actionable reasons name row counts and missing pieces.
+    Opportunity candidates are schema-discovered only (metric × drivers
+    within the same table), then ranked by what the data actually shows on a
+    bounded sample: measures that move beat constants, and tables with
+    dimensions make better segmentation stories. Foreign-key relationships
+    never auto-generate drivers (hyp §4) and derived fields never
+    auto-generate drivers (hyp §5) — actionability for those is established
+    separately inside the prescription engine behind statistical evidence
+    gates. Actionable reasons name row counts and missing pieces.
     """
     from prescription_engine.engine import _usable_measures, classify_driver
     from prescription_engine.engine import (classify_semantic_role as _role,
                                             NON_LEVER_ROLES as _NON_LEVER,
-                                            NON_OUTCOME_ROLES as _NON_OUTCOME)
+                                            NON_OUTCOME_ROLES as _NON_OUTCOME,
+                                            _HIGHER_BETTER_HINTS)
+    from core.schema_intel import _safe_name
     from sqlalchemy import text as _t
     opportunities, limitations = [], []
 
     def _count(table):
-        from core.schema_intel import _safe_name
         try:
             with engine.connect() as conn:
                 return int(conn.execute(
@@ -307,10 +310,31 @@ def _enrich_context(engine, dialect, intel, tables, session):
         except Exception:
             return -1
 
+    def _variation(table, col, sample=10000):
+        """(distinct, sampled) over a bounded sample; (-1, -1) on failure.
+
+        Only asks "does this column move at all" — never an exact
+        statistic — so the LIMIT sample keeps the probe cheap on big
+        tables. A count of 1 means constant: nothing to vary or act on.
+        """
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(_t(
+                    f"SELECT COUNT(*) AS n, "
+                    f"COUNT(DISTINCT {_safe_name(col, dialect)}) AS d "
+                    f"FROM (SELECT {_safe_name(col, dialect)} "
+                    f"FROM {_safe_name(table, dialect)} LIMIT {int(sample)}) AS s"
+                )).first()
+            if row is None:
+                return -1, -1
+            return int(row[1] or 0), int(row[0] or 0)
+        except Exception:
+            return -1, -1
+
     # Rank-first scan: tiny lookup tables must not eat the 3-table modeling
     # budget (e.g. northwind's categories/demographics hid orders entirely).
-    # Up to 12 tables are cheaply COUNTed; the 3 most promising (most rows,
-    # most measures) get the full opportunity treatment.
+    # Up to 12 tables are cheaply COUNTed; the most promising get the full
+    # opportunity treatment.
     ranked = []
     for t in tables[:12]:
         measures = _usable_measures(intel, t)
@@ -324,12 +348,63 @@ def _enrich_context(engine, dialect, intel, tables, session):
         ranked.append((n, t, measures))
     # Uncountable tables (-1) sort last; then most rows, then most measures.
     ranked.sort(key=lambda x: (x[0] < 0, -(x[0] if x[0] >= 0 else 0), -len(x[2])))
-    for _n, t, measures in ranked[:3]:
-        for m in measures[:2]:
+
+    # Variation + segmentation probe on the shortlist: a table whose numbers
+    # actually move, and that offers dimensions to segment by, makes a far
+    # better opportunity than a big table full of constants. (Row counts and
+    # measure counts stay as tiebreakers.)
+    scored = []
+    for n, t, measures in ranked[:6]:
+        vary: dict = {}
+        for m in measures[:8]:
+            d, _s = _variation(t, m)
+            vary[m] = d
+        n_var = sum(1 for d in vary.values() if d >= 2)
+        try:
+            seg = len(intel.find_all_dimensions(t)) + len(intel.get_datetime_cols(t))
+        except Exception:
+            seg = 0
+        scored.append((n_var, seg, n, t, measures, vary))
+    scored.sort(key=lambda x: (x[2] < 0, -x[0], -x[1],
+                               -(x[2] if x[2] >= 0 else 0), -len(x[4])))
+
+    for _nv, _seg, _n, t, measures, vary in scored[:3]:
+        # Metric preference: recognized business OUTCOMES first (revenue,
+        # signups, conversions ...), then other business measures; levers
+        # (price/spend/discount) stay pickable as drivers below.
+        def _role_rank(c):
+            low = str(c or "").lower()
+            try:
+                outcome = 0 if any(h in low for h in _HIGHER_BETTER_HINTS) else 1
+            except Exception:
+                outcome = 1
+            try:
+                business = 0 if _role(c, "numeric") == "BUSINESS_MEASURE" else 1
+            except Exception:
+                business = 1
+            return (outcome, business)
+        ordered = sorted(measures, key=_role_rank)
+        # A pair and its mirror (a→b and b→a) are the same relationship —
+        # emit it once, in the direction the ranking reached first. Only
+        # suppress the mirror when the first direction actually became an
+        # opportunity (a role-refused direction never blocks its mirror).
+        seen_pairs: set = set()
+        for m in ordered[:2]:
+            if vary.get(m, -1) == 1:
+                limitations.append(f"{t}.{m}: holds a single value — nothing to vary or act on.")
+                continue
             cands = []
             for c in measures:
-                if c != m:
-                    cands.append((c, None, "same table"))
+                if c == m or vary.get(c, -1) == 1:
+                    continue
+                _lvl, _rsn = classify_driver(c, "numeric")
+                # Outcomes (revenue/signups/visits ...) and segmentation
+                # fields are never auto-levers: driving a metric with a
+                # downstream outcome inverts causality. Only adjustable
+                # levels become candidate drivers.
+                if _lvl in ("not_controllable", "segmentation"):
+                    continue
+                cands.append((c, None, "same table", _lvl))
             # hyp §4: FK relationships are join metadata, never auto-drivers —
             # no cross-table candidates are seeded here. An explicit driver
             # request over a declared join is still supported inside the
@@ -340,7 +415,12 @@ def _enrich_context(engine, dialect, intel, tables, session):
             if not cands:
                 limitations.append(f"{t}.{m}: no other numbers reachable to test as drivers.")
                 continue
-            for c, ot, how in cands[:3]:
+            _pref = {"controllable": 0, "potentially_controllable": 1}
+            cands.sort(key=lambda x: _pref.get(x[3], 2))
+            for c, ot, how, _lvl in cands[:3]:
+                pair_key = tuple(sorted((str(m).lower(), str(c).lower())))
+                if pair_key in seen_pairs:
+                    continue
                 # hyp.txt §§4/10-11: technical/system measurements stay
                 # analytic — they never become auto-opportunities, however
                 # "measurable" they look. Generalized role check, never
@@ -359,6 +439,7 @@ def _enrich_context(engine, dialect, intel, tables, session):
                     limitations.append(f"{t}.{_bad}: a {_kind} — analytic signal only, not an actionable opportunity.")
                     continue
                 level, _ = classify_driver(c, "numeric")
+                seen_pairs.add(pair_key)
                 opportunities.append({"table": t, "metric": m, "driver": c,
                                       "driver_table": ot or t, "control": level,
                                       "note": how})

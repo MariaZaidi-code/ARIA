@@ -237,11 +237,24 @@ def build_business360(*, question, result_data, columns, metric_label=None,
                 pass
         likely_causes = likely_causes[:3]
         if not likely_causes:
-            likely_causes = [{
-                "cause": "Spread across many small factors",
-                "why_plain": "No single item dominates. That usually means the fix is operational (pricing, stock, follow-up) rather than one big cause.",
-                "share_pct": None,
-            }]
+            top_seg = ""
+            try:
+                if seg_col and rows and value_col:
+                    top_seg = str(max(rows, key=lambda r: (_num(r.get(value_col)) or 0)).get(seg_col) or "")
+            except Exception:
+                top_seg = ""
+            if top_seg:
+                likely_causes = [{
+                    "cause": top_seg,
+                    "why_plain": top_seg + " is the largest single contributor to " + metric_plain.lower() + " in this view, but no single factor dominates the rest. Look at pricing, stock and follow-up together.",
+                    "share_pct": None,
+                }]
+            else:
+                likely_causes = [{
+                    "cause": metric_plain + " mix",
+                    "why_plain": "No single factor dominates " + metric_plain.lower() + " in this view. The drivers are spread across several small factors, so the fix is usually operational (pricing, stock, follow-up) rather than one big cause.",
+                    "share_pct": None,
+                }]
 
         # ---- What to do (translate engine cards → businessman actions) ----
         what_to_do = []

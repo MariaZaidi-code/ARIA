@@ -9,6 +9,7 @@ import { colorForName } from "../lib/charts";
 import { fmtBiz } from "../lib/format";
 import { apiFetch } from "../../services/api";
 import { KEYS, storage } from "../../utils/storage";
+import { useReadOnly, READ_ONLY_HINT } from "../lib/readonly";
 
 type Message = {
   id: string;
@@ -126,6 +127,7 @@ function renderChart(msg: Message, isDark?: boolean) {
 export default function Copilot({ initialQuestion = "", analysisResult = null, goalResult = null }: { initialQuestion?: string; analysisResult?: any; goalResult?: any }) {
   void analysisResult; void goalResult;
   const { isDark } = useTheme();
+  const readOnly = useReadOnly();
   // Data-driven starter questions (4, from the connected schema).
   // Refreshed on mount and whenever a new chat starts (source may change).
   const [suggestions, setSuggestions] = useState<string[]>(FALLBACK_SUGGESTIONS);
@@ -195,7 +197,7 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
 
   const send = async (text?: string) => {
     const content = text || input;
-    if (!content.trim()) return;
+    if (readOnly || !content.trim()) return;
     setInput("");
 
     let targetId = activeId;
@@ -459,8 +461,8 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
         {/* Suggestion chips */}
         <div className="px-5 pb-2 flex flex-wrap gap-1.5">
           {suggestions.map((s) => (
-            <button key={s} onClick={() => send(s)}
-              className="text-[11px] px-2.5 py-1 bg-secondary border border-border rounded-full text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors">
+            <button key={s} onClick={() => send(s)} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
+              className="text-[11px] px-2.5 py-1 bg-secondary border border-border rounded-full text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors disabled:opacity-50">
               {s}
             </button>
           ))}
@@ -471,13 +473,16 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
           <div className="flex items-end gap-2 bg-card border border-border rounded-xl px-3.5 py-2.5 focus-within:border-primary/50 transition-colors">
             <input value={input} onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-              placeholder="Ask ARIA anything about your data..."
+              placeholder={readOnly ? "Read-only on mobile — ask ARIA on desktop." : "Ask ARIA anything about your data..."}
               className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none" />
-            <button onClick={() => send()}
-              className={`p-1.5 rounded-lg transition-all ${input.trim() ? "bg-primary text-primary-foreground hover:opacity-90" : "bg-secondary text-muted-foreground"}`}>
+            <button onClick={() => send()} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
+              className={`p-1.5 rounded-lg transition-all disabled:opacity-50 ${input.trim() && !readOnly ? "bg-primary text-primary-foreground hover:opacity-90" : "bg-secondary text-muted-foreground"}`}>
               <Send size={13} />
             </button>
           </div>
+          {readOnly && (
+            <p className="mt-2 text-[11px] text-amber-700 dark:text-amber-400">Copilot is read-only on mobile — open ARIA on desktop to ask questions.</p>
+          )}
         </div>
       </div>
     </div>

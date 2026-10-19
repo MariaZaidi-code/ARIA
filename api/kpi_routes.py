@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from urllib.parse import quote_plus
 from sqlalchemy import create_engine, text
 
-from core.config import get_session, SCHEMA_DIR
+from core.config import get_session, SCHEMA_DIR, _read_text_locked
 from core.deps import require_data, get_current_user, reject_document_sql
 from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, log_and_sanitize
 from core.secret_box import decrypt as _decrypt_secret
@@ -188,7 +188,7 @@ def _load_schema(session, user_id=None):
     schema_path = session.get("schema_path")
     # Try user-specific DB schema file first (set by connect_routes)
     if schema_path and Path(str(schema_path)).exists():
-        mapping = json.loads(Path(str(schema_path)).read_text(encoding="utf-8"))
+        mapping = json.loads(_read_text_locked(Path(str(schema_path))))
         return SchemaIntelligence(mapping)
     # NOTE: no global SCHEMA_DIR/schema_mapping_latest.json fallback here.
     # A shared default would leak one user's tables into another user's
@@ -201,12 +201,12 @@ def _load_schema(session, user_id=None):
         user_dir = f"user_{user_id}"
         alt_path = SCHEMA_DIR / user_dir / f"schema_mapping_{safe_name}_latest.json"
         if alt_path.exists():
-            mapping = json.loads(alt_path.read_text(encoding="utf-8"))
+            mapping = json.loads(_read_text_locked(alt_path))
             return SchemaIntelligence(mapping)
         # Also try the user's directory without DB name suffix
         user_default = SCHEMA_DIR / user_dir / "schema_mapping_latest.json"
         if user_default.exists():
-            mapping = json.loads(user_default.read_text(encoding="utf-8"))
+            mapping = json.loads(_read_text_locked(user_default))
             return SchemaIntelligence(mapping)
     # Last resort: try to trigger auto-extraction from the session DB info.
     # Canonical stack is schema_engine/; schema_agent/ is legacy and used here

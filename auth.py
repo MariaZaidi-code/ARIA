@@ -46,6 +46,28 @@ def _token_ttl_days() -> int:
 
 
 TOKEN_TTL_DAYS = _token_ttl_days()
+
+
+def _token_ttl_hours() -> int:
+    raw = os.getenv("TOKEN_TTL_HOURS")
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        legacy = os.getenv("TOKEN_TTL_DAYS")
+        if legacy not in (None, ""):
+            try:
+                return min(168, max(1, int(str(legacy).strip()) * 24))
+            except (TypeError, ValueError):
+                pass
+        return 12
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Invalid TOKEN_TTL_HOURS=%r: must be an integer 1..168 hours." % raw
+        )
+    return min(168, max(1, value))
+
+
+TOKEN_TTL_HOURS = _token_ttl_hours()
 # New hashes use the current stronger work factor. Existing hashes carry
 # their iteration count in the stored format and are transparently upgraded
 # after a successful login (see authenticate), so deployments do not need a
@@ -254,14 +276,14 @@ def authenticate(username: str, password: str) -> int | None:
     return None
 
 
-def issue_token(user_id: int, username: str, ttl_days: float | None = None) -> str:
+def issue_token(user_id: int, username: str, ttl_hours: float | None = None) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
         "username": username,
         "iat": now,
-        "exp": now + timedelta(days=float(ttl_days) if ttl_days is not None
-                               else TOKEN_TTL_DAYS),
+        "exp": now + timedelta(hours=float(ttl_hours) if ttl_hours is not None
+                               else TOKEN_TTL_HOURS),
     }
     return jwt.encode(payload, SECRET, algorithm=JWT_ALGO)
 

@@ -20,13 +20,13 @@ try:
 except ImportError:
     pass
 
-# Secrets in .env may be stored DPAPI-encrypted (`enc1:<base64>`) so the file
+# Secrets in .env may be stored DPAPI-encrypted (`enc2:<base64>`) so the file
 # is unreadable at rest. Decrypt them back into the environment now that dotenv
 # has loaded, before any module reads os.getenv for credentials.
-from core.secret_box import decrypt, encrypt, PREFIX  # noqa: E402
+from core.secret_box import decrypt, encrypt, is_encrypted  # noqa: E402
 
 for _name, _value in list(os.environ.items()):
-    if isinstance(_value, str) and _value.startswith(PREFIX):
+    if is_encrypted(_value):
         try:
             os.environ[_name] = decrypt(_value)
         except Exception:
@@ -72,14 +72,14 @@ def resolve_provider_key(provider_name, api_keys=None):
 def _encrypt_api_keys(api_keys):
     """Encrypt per-provider API keys for at-rest storage.
 
-    Plaintext values get `enc1:` prefix via DPAPI; already-encrypted
+    Plaintext values get the current DPAPI envelope; already-encrypted
     values pass through unchanged. Non-string values are left as-is.
     """
     if not isinstance(api_keys, dict):
         return api_keys
     out = {}
     for k, v in api_keys.items():
-        if isinstance(v, str) and v and not v.startswith(PREFIX):
+        if isinstance(v, str) and v and not is_encrypted(v):
             try:
                 out[k] = encrypt(v)
             except Exception:
@@ -99,7 +99,7 @@ def _decrypt_api_keys(api_keys):
         return api_keys
     out = {}
     for k, v in api_keys.items():
-        if isinstance(v, str) and v.startswith(PREFIX):
+        if is_encrypted(v):
             try:
                 out[k] = decrypt(v)
             except Exception:
@@ -140,7 +140,7 @@ def _ensure_relational_uri(session):
         if not (cfg.get("host") and cfg.get("db")):
             return session
         pwd = cfg.get("password")
-        if isinstance(pwd, str) and pwd.startswith(PREFIX):
+        if is_encrypted(pwd):
             try:
                 with _PWD_CACHE_LOCK:
                     _cached = _PWD_CACHE.get(pwd)
@@ -202,11 +202,23 @@ def _decrypt_session_keys(session):
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
-DATA_DIR = BASE_DIR / "data"
+# Keep mutable runtime state separate from the source tree when configured.
+# This is required for read-only installs, managed sandboxes, and packaged builds.
+_configured_data_dir = os.getenv("ARIA_DATA_DIR")
+DATA_DIR = (
+    Path(_configured_data_dir).expanduser().resolve()
+    if _configured_data_dir
+    else BASE_DIR / "data"
+)
 # Dedicated folder for all schema mapping JSON files, keeping them out of the
 # code tree (everything under data/ is gitignored and regenerable).
 SCHEMA_DIR = DATA_DIR / "schemas"
-ARTIFACTS_DIR = BASE_DIR / "artifacts"
+_configured_artifacts_dir = os.getenv("ARIA_ARTIFACTS_DIR")
+ARTIFACTS_DIR = (
+    Path(_configured_artifacts_dir).expanduser().resolve()
+    if _configured_artifacts_dir
+    else BASE_DIR / "artifacts"
+)
 PROCESSED_DIR = ARTIFACTS_DIR / "processed_data"
 INSIGHTS_DIR = ARTIFACTS_DIR / "insights"
 FLOW_REPORTS_DIR = ARTIFACTS_DIR / "flow_reports"
@@ -380,8 +392,47 @@ def _unlock_handle(fh) -> None:
         pass
 
 
+def _recover_staged_json(path: Path) -> None:
+    """Restore a flushed JSON staging file after an interrupted Windows write."""
+    if path.suffix.lower() != ".json":
+        return
+    import os as _os
+    staged_files = list(path.parent.glob(f"{path.name}.*.tmp"))
+    legacy_staged = path.with_suffix(path.suffix + ".tmp")
+    if legacy_staged.exists():
+        staged_files.append(legacy_staged)
+    if not staged_files:
+        return
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as lock_fh:
+        _lock_handle(lock_fh, exclusive=True)
+        try:
+            for staged in sorted(
+                (p for p in staged_files if p.exists()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            ):
+                import json as _json
+                try:
+                    payload = staged.read_text(encoding="utf-8")
+                    _json.loads(payload)
+                except Exception:
+                    continue
+                with open(staged, "rb") as src, open(path, "wb") as dst:
+                    import shutil as _shutil
+                    _shutil.copyfileobj(src, dst)
+                    dst.flush()
+                    _os.fsync(dst.fileno())
+                staged.unlink(missing_ok=True)
+                break
+        finally:
+            _unlock_handle(lock_fh)
+
+
 def _read_text_locked(path: Path) -> str:
     """Read a file under a shared lock (best-effort; falls back to plain read)."""
+    _recover_staged_json(path)
     try:
         lock_path = path.with_suffix(path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,9 +451,13 @@ def _atomic_write_text(target: Path, text: str) -> None:
     import os as _os
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target.with_suffix(target.suffix + ".tmp")
+    import uuid as _uuid
+
+    tmp_path = target.with_name(f"{target.name}.{_uuid.uuid4().hex}.tmp")
     # Create tmp with 0600 from the start (POSIX); Windows relies on DPAPI ACLs.
-    fd = _os.open(str(tmp_path), _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+    # Read/write access lets the Windows fallback and crash-recovery path
+    # consume the staged payload without relaxing its private-file mode.
+    fd = _os.open(str(tmp_path), _os.O_RDWR | _os.O_CREAT | _os.O_TRUNC, 0o600)
     try:
         with _os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -430,17 +485,25 @@ def _atomic_write_text(target: Path, text: str) -> None:
         except Exception:
             pass
         # Hold an exclusive sidecar lock across the replace to reduce races.
-        try:
-            lock_path = target.with_suffix(target.suffix + ".lock")
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(lock_path, "a+b") as lock_fh:
-                _lock_handle(lock_fh, exclusive=True)
+        lock_path = target.with_suffix(target.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+b") as lock_fh:
+            _lock_handle(lock_fh, exclusive=True)
+            try:
                 try:
                     _os.replace(tmp_path, target)
-                finally:
-                    _unlock_handle(lock_fh)
-        except Exception:
-            _os.replace(tmp_path, target)
+                except PermissionError:
+                    # Some Windows-managed folders allow creating and writing
+                    # files but deny rename/replace operations. The staged file
+                    # is already flushed, so copy it into the existing target
+                    # under the same inter-process lock instead of failing the
+                    # entire connection or session save.
+                    with open(target, "w", encoding="utf-8") as dst:
+                        dst.write(text)
+                        dst.flush()
+                        _os.fsync(dst.fileno())
+            finally:
+                _unlock_handle(lock_fh)
         try:
             if os.name != "nt":
                 _os.chmod(target, 0o600)
@@ -550,14 +613,21 @@ def _ensure_user_paths(session: dict, user_id) -> dict:
         cur = session.get(key)
         try:
             cur_s = str(cur) if cur is not None else ""
-            # Keep per-user per-DB files already under this user's dir.
-            # Segment match (never bare substring: "user_1" is inside
-            # "user_10"). Resolve + verify the parent dir name instead.
+            # Keep files only when their resolved parent is this user's
+            # configured artifact directory. During a data-root migration,
+            # rebase an existing per-DB filename to the new root if its copy
+            # exists there; never trust a matching `user_<id>` basename alone.
             _keep = False
             if cur_s:
                 try:
-                    _parent = Path(cur_s).parent.name
-                    _keep = (_parent == tag)
+                    cur_path = Path(cur_s)
+                    resolved_user_dir = user_dir.resolve()
+                    _keep = cur_path.parent.resolve() == resolved_user_dir
+                    if not _keep and cur_path.parent.name == tag:
+                        rebased = resolved_user_dir / cur_path.name
+                        if rebased.is_file():
+                            session[key] = rebased
+                            _keep = True
                 except Exception:
                     _keep = False
             if _keep:
@@ -630,6 +700,25 @@ def _session_to_disk_dict(session: dict) -> dict:
     sess_disk = dict(session)
     if isinstance(sess_disk.get("api_keys"), dict):
         sess_disk["api_keys"] = _encrypt_api_keys(sess_disk["api_keys"])
+    # Migrate legacy user-scoped DB credentials when this process runs as the
+    # identity that can decrypt them. If it cannot, preserve the ciphertext;
+    # never overwrite it with plaintext or with a second encryption layer.
+    from core.secret_box import LEGACY_PREFIX as _LEGACY_SECRET_PREFIX
+    for _config_key in ("db", "linked_db"):
+        _db_config = sess_disk.get(_config_key)
+        if not isinstance(_db_config, dict):
+            continue
+        _password = _db_config.get("password")
+        if not (isinstance(_password, str) and _password.startswith(_LEGACY_SECRET_PREFIX)):
+            continue
+        try:
+            _plain_password = decrypt(_password)
+            if _plain_password:
+                _db_config = dict(_db_config)
+                _db_config["password"] = encrypt(_plain_password)
+                sess_disk[_config_key] = _db_config
+        except Exception:
+            pass
     # Never persist live provider objects; reconstructed via _ensure_provider.
     if not isinstance(sess_disk.get("provider"), (str, type(None))):
         sess_disk["provider"] = None

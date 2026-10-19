@@ -56,10 +56,8 @@ async function registerAndLogin(page, email, password) {
   await page.getByRole("button", { name: /create account/i }).last().click();
   await page.waitForTimeout(800);
 
-  // Now sign in (register flips back to login mode).
-  await page.locator("#login-email").fill(email);
-  await page.locator("#login-password").fill(password);
-  await page.getByRole("button", { name: /access intelligence hub/i }).click();
+  // Registration establishes the session and advances directly to LLM choice.
+  await expect(page.getByText(/choose your ai engine/i)).toBeVisible({ timeout: 20000 });
 }
 
 async function chooseLLM(page, label) {
@@ -78,7 +76,10 @@ test.describe("ARIA QA - non-Data pages", () => {
     const password = "QaPass123!";
 
     await registerAndLogin(page, email, password);
-    await chooseLLM(page, "Cloud AI");
+    // Local AI only: the default suite must never touch cloud providers
+    // (no user key use, no data egress). Ollama availability is asserted by
+    // the selection screen itself; the switch to local is ping-free.
+    await chooseLLM(page, "Local AI");
 
     const perPage = {};
 

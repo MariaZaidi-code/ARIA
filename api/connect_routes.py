@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 from typing import AsyncGenerator
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -21,13 +21,70 @@ import csv_orchestrator
 import schema_agent
 from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session, save_session, get_user_artifact_paths, _atomic_write_text
 from core.db import build_db_uri
-from core.deps import require_writable, get_current_user
+from core.deps import require_writable, get_current_user, is_mobile
 from core.secret_box import decrypt as _decrypt_secret
 from csv_handler import CsvValidationError
 from llm_provider import create_provider
 from document_processor import create_document_processor
 
 router = APIRouter()
+@router.get("/session/status")
+def session_status(user: dict = Depends(get_current_user)):
+    from pathlib import Path as _Path
+    session = get_session(user["user_id"])
+    try:
+        from core.config import _ensure_relational_uri as _eru
+        _eru(session)
+        try:
+            save_session(user["user_id"], session)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    source_type = session.get("source_type")
+    db_name = session.get("db_name")
+    db_uri = session.get("db_uri")
+    db_type = session.get("db_type") or "postgresql"
+    cfg = session.get("db") if isinstance(session.get("db"), dict) else {}
+    connected = bool(source_type) and (
+        bool(db_uri) if source_type == "relational" else True
+    )
+    schema_status = "pending"
+    sp = session.get("schema_path")
+    if sp:
+        try:
+            pp = _Path(str(sp))
+            if pp.exists() and pp.stat().st_size > 0:
+                schema_status = "ready"
+        except Exception:
+            schema_status = "pending"
+    if connected:
+        if schema_status == "pending":
+            connection_status = "schema-loading"
+            display_state = "schema-loading"
+        else:
+            connection_status = "connected"
+            display_state = "ready"
+    else:
+        connection_status = "disconnected"
+        display_state = "idle"
+    out = {
+        "connection_status": connection_status,
+        "display_state": display_state,
+        "schema_status": schema_status,
+        "db_name": db_name,
+        "source_type": source_type,
+        "db_type": db_type,
+    }
+    if connected and isinstance(cfg, dict):
+        if cfg.get("host"):
+            out["db_host"] = cfg.get("host")
+        if cfg.get("port"):
+            out["db_port"] = cfg.get("port")
+        if cfg.get("user"):
+            out["db_username"] = cfg.get("user")
+    return out
+
 
 # Hosted providers run inference off-machine (need an API key, can serve vision).
 HOSTED_PROVIDERS = {"cloud", "deepseek", "omniroute", "grok"}
@@ -199,7 +256,7 @@ def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql",
     Used by both the real connect path and /api/database/test so probing
     via error oracle is blocked consistently. Returns validated port int.
 
-    Loopback (localhost/127.0.0.1/::1) stays allowed for local-dev DBs;
+    Loopback is allowed for local-dev DBs and blocked by default in production;
     cloud-metadata (169.254.169.254 in any numeric form), private ranges,
     link-local/multicast/reserved, and DNS names resolving to them are blocked.
 
@@ -209,6 +266,9 @@ def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql",
     DNS-rebind window (resolve→check→connect re-resolution).
     """
     host = (host or "").strip()
+    _env = (os.getenv("ARIA_ENV", "") or "").strip().lower()
+    _loopback_flag = (os.getenv("ARIA_ALLOW_LOOPBACK_DB", "") or "").strip().lower()
+    allow_loopback = _loopback_flag in {"1", "true", "yes", "on"} if _loopback_flag else _env != "production"
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", host) or len(host) > 253:
         raise HTTPException(status_code=400, detail="Invalid host.")
     low = host.lower().rstrip(".")
@@ -217,8 +277,7 @@ def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql",
     # Numeric-form bypasses (decimal/octal/hex/integer IP).
     norm = _normalize_host_ip(host)
     if norm is not None:
-        # allow loopback for local dev, block everything else private/reserved
-        if _ip_is_blocked(norm, allow_loopback=True):
+        if _ip_is_blocked(norm, allow_loopback=allow_loopback):
             raise HTTPException(status_code=400, detail="Host is blocked.")
     else:
         # Hostname: block nip.io-style suffixes and resolve-then-check.
@@ -227,7 +286,7 @@ def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql",
             raise HTTPException(status_code=400, detail="Host is blocked.")
         resolved = _resolve_host_ips(host)
         for rip in resolved:
-            if _ip_is_blocked(rip, allow_loopback=True):
+            if _ip_is_blocked(rip, allow_loopback=allow_loopback):
                 raise HTTPException(status_code=400, detail="Host resolves to a blocked address.")
         if pin_to is not None and getattr(pin_to, "host", None) == host and resolved:
             # All resolved IPs passed the blocklist — pin the first so the
@@ -758,8 +817,9 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
                                 "reconnect with a fresh password. (%s)", exc)
                 raise HTTPException(
                     status_code=400,
-                    detail="Stored database credential is unreadable. "
-                           "Please reconnect with your password.",
+                    detail=("ARIA could not decrypt the saved database password. "
+                            "Start ARIA under the same Windows account that saved it, "
+                            "or reconnect and enter the database password again."),
                 )
         try:
             conn = schema_agent.get_connection(types.SimpleNamespace(**config))
@@ -1362,9 +1422,15 @@ def connect_pdf(
 
 
 @router.get("/api/session/status")
-def session_status(user: dict = Depends(get_current_user)):
-    """Return the current session's connectivity and DB info so the frontend can restore state."""
+def session_status(request: Request, user: dict = Depends(get_current_user)):
+    """Return the current session's connectivity and DB info so the frontend can restore state.
+
+    Includes the server-side read-only verdict for mobile clients so the UI
+    mirrors ``require_writable`` (single source of truth) instead of guessing
+    from the user-agent on its own.
+    """
     session = get_session(user.get("user_id"))
+    db_config = session.get("db") if isinstance(session.get("db"), dict) else {}
     is_connected = bool(session.get("db") or session.get("db_uri") or
                         session.get("source_type") == "semi-structured")
     # Never expose credentials: db_uri embeds user:password (§41).
@@ -1386,13 +1452,22 @@ def session_status(user: dict = Depends(get_current_user)):
         display_state = "error"
     else:
         display_state = "connected"
+    readonly = is_mobile(request)
     return {
         "ok": True,
         "connection_status": "connected" if is_connected else "not-connected",
         "display_state": display_state,
         "schema_status": schema_status,
+        # Mobile clients are read-only (view saved history); the frontend
+        # uses this server verdict to gate write affordances up front.
+        "read_only": readonly,
+        "client_type": "mobile" if readonly else "desktop",
         "db_name": session.get("db_name", ""),
         "source_type": session.get("source_type", ""),
+        "db_type": session.get("db_type", ""),
+        "db_host": db_config.get("host", ""),
+        "db_port": db_config.get("port", ""),
+        "db_username": db_config.get("user", ""),
         "db_uri": safe_uri,
         # Multi-source (§7): a linked database and/or document stay visible
         # so the UI can show what ARIA can reason over.
@@ -1441,8 +1516,12 @@ async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depen
         if password:
             try:
                 password = _decrypt_secret(password)
-            except Exception:
-                pass
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=("ARIA cannot decrypt this saved database credential. "
+                            "Re-enter the database password in the connection form."),
+                ) from exc
 
         from core.db import format_db_host
         host = format_db_host(req.host)
@@ -1459,6 +1538,8 @@ async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depen
             engine.dispose()
 
         return {"ok": True, "message": "Connection successful"}
+    except HTTPException:
+        raise
     except Exception as e:
         from core.errors import sanitize_error
 
