@@ -1,7 +1,7 @@
 // CommonJS // Playwright e2e: Data source connection flow (all 4 types)
 // Single host: http://localhost:8000. One login per file (auth limiter).
 const { test, expect } = require('@playwright/test');
-const { seedAuth } = require('./auth-helper');
+const { seedAuth, signInVerified } = require('./auth-helper');
 
 const BASE = 'http://localhost:8000';
 
@@ -59,14 +59,7 @@ test.describe('Data source connection flow', () => {
     // the default suite never engages cloud providers or sends data.
     const cloudPage = await browser.newPage();
     try {
-      const user = 'pw' + Date.now() + Math.floor(Math.random() * 1e6);
-      await cloudPage.goto(BASE);
-      await cloudPage.getByRole('button', { name: /create account/i }).first().click();
-      await cloudPage.locator('#login-email').fill(`${user}@aria.test`);
-      await cloudPage.locator('#login-password').fill('password123');
-      await cloudPage.locator('#login-confirm').fill('password123');
-      await cloudPage.getByRole('button', { name: /create account/i }).last().click();
-      await cloudPage.getByText('Choose your AI engine').waitFor({ timeout: 20000 });
+      await signInVerified(cloudPage, BASE);
       await cloudPage.getByRole('button', { name: /Cloud AI/i }).first().click();
       const content = await cloudPage.content();
       expect(/Groq|groq/i.test(content)).toBeTruthy();

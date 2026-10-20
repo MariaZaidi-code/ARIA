@@ -1,6 +1,7 @@
 """Authentication and per-user history routes."""
 
 import os
+import smtplib
 import threading
 import time
 
@@ -9,7 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import auth
-from core.deps import get_current_user, is_mobile, require_writable
+from core.deps import get_current_user, is_mobile, require_admin, require_writable
 
 router = APIRouter()
 
@@ -84,7 +85,13 @@ def _auth_response(
     user_id: int | None = None,
 ) -> JSONResponse:
     # HttpOnly cookie flow: never return the raw JWT in JSON.
-    resp = JSONResponse({"ok": True, "username": username, "user_id": user_id})
+    resp = JSONResponse({
+        "ok": True,
+        "username": username,
+        "email": username,
+        "user_id": user_id,
+        "is_admin": auth.is_admin_email(username),
+    })
     cookie_name = _cookie_name(request)
     cookie_kwargs = _cookie_kwargs(request)
     resp.set_cookie(cookie_name, token, **cookie_kwargs)
@@ -192,41 +199,149 @@ def _check_login_rate_limit(request: Request) -> None:
 
 
 class AuthRequest(BaseModel):
-    username: str
+    email: str
     password: str
+
+
+class VerificationRequest(BaseModel):
+    token: str
+
+
+class ResendVerificationRequest(BaseModel):
+    email: str
+
+
+class PageVisitRequest(BaseModel):
+    page: str
 
 
 @router.post("/api/auth/register")
 def register(auth_req: AuthRequest, request: Request):
-    """Create a user account and return a JWT (generic error avoids enumeration)."""
+    """Create an account and send an email verification link."""
     _check_login_rate_limit(request)
     try:
-        user_id = auth.register(auth_req.username, auth_req.password)
+        email = auth.normalize_email(auth_req.email)
     except ValueError:
-        # Generic message: don't reveal whether the username is taken.
-        raise HTTPException(status_code=400, detail="Could not create account. Try a different username.")
-    username = auth_req.username.strip()
-    return _auth_response(
-        auth.issue_token(user_id, username), username, request, user_id=user_id,
-    )
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+    try:
+        user_id = auth.register_email(email, auth_req.password)
+    except ValueError:
+        # Do not disclose whether an email has an existing account.
+        token = auth.create_email_verification_token(email)
+        if token:
+            try:
+                auth.send_email_verification(email, token)
+            except (OSError, RuntimeError, smtplib.SMTPException) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Could not send the verification email. Check mail settings and try again.",
+                ) from exc
+        return {
+            "ok": True,
+            "verification_required": True,
+            "message": "If this address can be registered, a verification link has been sent.",
+        }
+    token = auth.create_email_verification_token(email)
+    if not token:
+        raise HTTPException(status_code=500, detail="Could not create email verification.")
+    try:
+        auth.send_email_verification(email, token)
+    except (OSError, RuntimeError, smtplib.SMTPException) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Your account is pending verification, but the email could not be sent. Try resending after checking mail settings.",
+        ) from exc
+    return {
+        "ok": True,
+        "verification_required": True,
+        "message": "Check your email for a verification link before signing in.",
+    }
 
 
 @router.post("/api/auth/login")
 def login(auth_req: AuthRequest, request: Request):
-    """Exchange username/password for a JWT."""
+    """Exchange a verified email/password pair for a JWT."""
     _check_login_rate_limit(request)
-    user_id = auth.authenticate(auth_req.username, auth_req.password)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid username or password.")
-    username = auth_req.username.strip()
+    account = auth.authenticate_email(auth_req.email, auth_req.password)
+    if not account:
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    if not account.get("verified"):
+        raise HTTPException(
+            status_code=403,
+            detail="Verify your email address before signing in.",
+        )
+    email = account["email"]
     return _auth_response(
-        auth.issue_token(user_id, username), username, request, user_id=user_id,
+        auth.issue_token(account["user_id"], email),
+        email,
+        request,
+        user_id=account["user_id"],
     )
+
+
+@router.post("/api/auth/verify-email")
+def verify_email(req: VerificationRequest):
+    email = auth.verify_email_token(req.token)
+    if not email:
+        raise HTTPException(
+            status_code=400,
+            detail="This verification link is invalid, expired, or already used.",
+        )
+    return {"ok": True, "message": "Email verified. You can now sign in."}
+
+
+@router.post("/api/auth/resend-verification")
+def resend_verification(req: ResendVerificationRequest, request: Request):
+    _check_login_rate_limit(request)
+    try:
+        email = auth.normalize_email(req.email)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+    token = auth.create_email_verification_token(email)
+    if token:
+        try:
+            auth.send_email_verification(email, token)
+        except (OSError, RuntimeError, smtplib.SMTPException) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Could not send the verification email. Check mail settings and try again.",
+            ) from exc
+    return {
+        "ok": True,
+        "message": "If this account needs verification, a new link has been sent.",
+    }
 
 
 @router.get("/api/auth/me")
 def me(user: dict = Depends(get_current_user)):
-    return {"ok": True, "username": user["username"], "user_id": user["user_id"]}
+    email = str(user.get("username") or "")
+    return {
+        "ok": True,
+        "username": email,
+        "email": email,
+        "user_id": user["user_id"],
+        "is_admin": auth.is_admin_email(email),
+    }
+
+
+@router.get("/api/admin/overview")
+def admin_overview(user: dict = Depends(require_admin)):
+    return {"ok": True, "overview": auth.get_admin_overview()}
+
+
+@router.post("/api/admin/page-visit")
+def admin_page_visit(
+    req: PageVisitRequest, user: dict = Depends(get_current_user),
+):
+    allowed_pages = {
+        "admin", "dashboard", "analytics", "insights", "intelligence",
+        "predictive", "data", "documents", "copilot", "history", "settings",
+    }
+    page = (req.page or "").strip().lower()
+    if page not in allowed_pages:
+        raise HTTPException(status_code=400, detail="Unknown page.")
+    auth.record_auth_event(user["user_id"], "page_visit", page)
+    return {"ok": True}
 
 
 @router.post("/api/auth/logout")

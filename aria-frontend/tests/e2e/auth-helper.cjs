@@ -1,20 +1,26 @@
 // Shared Playwright helper: real backend auth + LLM selection.
 // Single-host policy: everything runs against http://localhost:8000.
-// No fake tokens: registers a throwaway user through the real signup form,
-// then picks the requested AI engine. Signup already establishes the session.
+// E2E uses a pre-provisioned verified non-admin account so tests exercise
+// real cookie auth without bypassing the email-verification requirement.
 const { expect } = require('@playwright/test');
 
-async function seedAuth(page, base = 'http://localhost:8000', mode = 'Local AI') {
-  const user = 'pw' + Date.now() + Math.floor(Math.random() * 1e6);
-  const email = `${user}@aria.test`;
-  const pass = 'password123';
+async function signInVerified(page, base = 'http://localhost:8000') {
+  const email = process.env.ARIA_E2E_EMAIL;
+  const pass = process.env.ARIA_E2E_PASSWORD;
+  if (!email || !pass) {
+    throw new Error(
+      'Set ARIA_E2E_EMAIL and ARIA_E2E_PASSWORD to an existing verified non-admin test account.',
+    );
+  }
   await page.goto(base);
-  await page.getByRole('button', { name: /create account/i }).first().click();
   await page.locator('#login-email').fill(email);
   await page.locator('#login-password').fill(pass);
-  await page.locator('#login-confirm').fill(pass);
-  await page.getByRole('button', { name: /create account/i }).last().click();
+  await page.getByRole('button', { name: /access intelligence hub/i }).click();
   await page.getByText('Choose your AI engine').waitFor({ timeout: 20000 });
+}
+
+async function seedAuth(page, base = 'http://localhost:8000', mode = 'Local AI') {
+  await signInVerified(page, base);
   await page.getByText(mode, { exact: false }).first().click();
   await page.getByRole('button', { name: /continue/i }).click();
   // Fail here (not 60s later inside the test body) if the engine switch did
@@ -23,4 +29,4 @@ async function seedAuth(page, base = 'http://localhost:8000', mode = 'Local AI')
     .toBeVisible({ timeout: 20000 });
 }
 
-module.exports = { seedAuth };
+module.exports = { seedAuth, signInVerified };

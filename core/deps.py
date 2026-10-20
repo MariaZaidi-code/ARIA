@@ -126,6 +126,13 @@ def require_writable(request: Request, user: dict = Depends(get_current_user)) -
     return user
 
 
+def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    """Allow only usernames explicitly configured as administrators."""
+    if not auth.is_admin_email(str(user.get("email") or user.get("username") or "")):
+        raise HTTPException(status_code=403, detail="Administrator access required.")
+    return user
+
+
 def ensure_decision_owner(session_user_id, decision: dict | None) -> dict:
     """Ownership gate for Decision Center records (hyp.txt #84-85).
 

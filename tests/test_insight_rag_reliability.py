@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from langchain_core.documents import Document
+import pandas as pd
 
 from insight_rag import InsightPDFRAG
 from insight_rag.context_engine import ContextEngineer, ContextPlan
@@ -20,6 +21,7 @@ from insight_rag.retrieval import bm25_search
 from insight_rag.semantic_router import SemanticRouter
 from insight_rag.storage import ConversationStore, RAGMetadataStore, UserPGVectorStore
 from insight_rag.table_reasoner import build_table_facts, markdown_to_frame
+from insight_rag.tabular import dataframe_to_table_documents
 
 DID = "document-a"
 
@@ -128,6 +130,89 @@ def test_summary_comparison_balances_documents():
     for did in [DID, "document-b"]:
         pages = {d.metadata["page"] for d in selected if d.metadata["document_id"] == did}
         assert len(pages) == 4 and 1 in pages and 20 in pages
+
+
+def test_broad_summary_keeps_multiple_tabular_chunks_on_same_page():
+    docs = [
+        document(
+            f"Chunk {index}",
+            cid=f"chunk-{index}",
+            content_type="table",
+            source_type="tabular",
+            table_summary=index == 0,
+        )
+        for index in range(12)
+    ]
+
+    selected = ContextEngineer.select_evidence(
+        "summarize this document",
+        docs,
+        selected_document_ids=[DID],
+        broad_query=True,
+    )
+
+    assert len(selected) == 8
+    assert selected[0].metadata["table_summary"] is True
+    assert len({item.metadata["chunk_id"] for item in selected}) == 8
+    assert selected[-1].metadata["chunk_id"] == "chunk-11"
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What are the key takeaways from this document?",
+        "Summarize the PDF",
+    ],
+)
+def test_documents_assistant_routes_summary_prompts_to_grounded_summary(make_rag, question):
+    docs = [
+        document(
+            f"Revenue was {100 + index} in 2025. [row {index}]",
+            cid=f"summary-chunk-{index}",
+            content_type="table",
+            source_type="tabular",
+            table_summary=index == 0,
+        )
+        for index in range(10)
+    ]
+    rag = make_rag(Model(answer="Revenue was 100 in 2025 [S1]."), docs=docs)
+
+    result = rag.chat(question, document_only=True)
+
+    assert result["routing"]["task"] == "DOCUMENT_SUMMARY"
+    assert result["context_plan"]["broad_query"] is True
+    assert result["evidence_status"] == "supported"
+    assert result["sources"]
+
+
+def test_documents_assistant_summarizes_spreadsheet_without_model_guessing(make_rag):
+    frame = pd.DataFrame({
+        "month": ["Jan", "Feb", "Mar", "Apr"],
+        "sales": [100, 150, 125, 175],
+        "units": [10, 15, 12, 18],
+    })
+    docs, _ = dataframe_to_table_documents(
+        frame, document_id=DID, filename="sales.csv", table_name="sales.csv",
+    )
+    model = Model(
+        answer="I couldn't find that information in the uploaded document.",
+        verify="UNSUPPORTED",
+    )
+    rag = make_rag(model, docs=docs)
+
+    result = rag.chat(
+        "What are the key takeaways in my documents?",
+        document_only=True,
+    )
+
+    assert result["evidence_status"] == "supported"
+    assert result["answer_mode"] == "deterministic"
+    assert result["citation_status"] == "cited"
+    assert result["sources"]
+    assert "sales.csv contains 4 rows across 3 columns" in result["answer"]
+    assert "sales averages 137.5" in result["answer"]
+    assert "[S1]" in result["answer"]
+    assert not any(role in {"rag", "rag_verify"} for role, _ in model.calls)
 
 
 def test_bm25_matches_identifiers_and_prefers_concise_relevant_chunk():
@@ -404,6 +489,21 @@ def test_http_chat_endpoint_uses_authenticated_user_and_complete_result(make_rag
     assert response.status_code == 200
     assert captured == ["authenticated-user"]
     assert response.json()["grounding"]["used_pdf_evidence"] is True
+
+
+def test_documents_assistant_chat_bypasses_semantic_router(make_rag):
+    model = Model()
+    rag = make_rag(model)
+    rag.semantic_router.decide = lambda **_kwargs: pytest.fail(
+        "Document-only chat must not depend on semantic routing"
+    )
+
+    result = rag.chat("What was revenue?", document_only=True)
+
+    assert result["scope"] == "DOCUMENT"
+    assert result["grounding"]["used_pdf_evidence"] is True
+    assert result["sources"]
+    assert not any(role == "rag_scope" for role, _ in model.calls)
 
 
 def test_concurrent_manifest_updates_keep_every_document(make_rag):

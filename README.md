@@ -59,10 +59,35 @@ Never commit `.env`, `data/.jwt_secret`, `*.db`, or token files (all gitignored)
 `TOKEN_TTL_HOURS` (default 12, clamped to 1-168) and login rate limits live in `auth.py` /
 `api/auth_routes.py`. Relational `db_uri` is never written to disk (rebuilt from
 encrypted `db` config on restart). Rotate provider keys in their dashboards if ever exposed.
+Email verification is required before sign-in. Configure Gmail-compatible SMTP
+with `ARIA_SMTP_HOST`, `ARIA_SMTP_PORT`, `ARIA_SMTP_USERNAME`,
+`ARIA_SMTP_PASSWORD` (a Google App Password), and `ARIA_SMTP_FROM`; set
+`ARIA_PUBLIC_URL` to the public HTTPS origin in production. Verification links
+expire after 24 hours and can only be used once.
+
+Only the verified address configured in `ARIA_ADMIN_EMAIL` receives admin
+access. Set that value to the owner’s exact email in the server environment;
+there is no UI/API operation to grant another administrator. Admin endpoints
+recheck this server-side setting on each request. The separate Admin Dashboard
+records successful logins and authenticated page visits (180-day retention),
+and reports aggregate usage plus API, auth database, session/shared store,
+SMTP configuration, local Ollama, and default database status.
+Application-level admin access control cannot prevent a repository collaborator
+with write access from changing the source or deployment settings; enforce that
+separately with protected branches, required owner review, and restricted
+deployment-secret access.
+
+Playwright tests that exercise authenticated backend flows use an existing,
+verified non-admin test account supplied through `ARIA_E2E_EMAIL` and
+`ARIA_E2E_PASSWORD`. Do not use a production account for E2E runs.
 
 ## Key API contracts
 
-- `POST /api/auth/register|login` → `{ok, token, username}` (30 req / 5 min / IP)
+- `POST /api/auth/register` → sends a verification email; no session until verified
+- `POST /api/auth/verify-email` and `POST /api/auth/resend-verification`
+- `POST /api/auth/login` → verified email/password; sets the HttpOnly session cookie
+- `GET /api/admin/overview` → aggregate account/login/page-visit/system metrics; requires `ARIA_ADMIN_EMAIL`
+- `POST /api/admin/page-visit` → records an authenticated page visit for admin aggregates
 - `POST /api/connect_file` (multipart CSV) → `{ok, table, rows, columns, quality}`
 - `GET /api/schema`, `POST /api/data/preview` (`{table, limit, offset, search, sort_*}`)
 - `POST /api/data/schema/override` — user PK/FK corrections outrank inference

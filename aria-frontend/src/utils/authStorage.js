@@ -37,30 +37,6 @@ try {
 } catch { /* ignore unavailable storage */ }
 
 // =========================================================
-// BACKEND USERNAME
-// =========================================================
-//
-// Email addresses map deterministically to the backend username created
-// at registration. Login also accepts legacy accounts that used a username
-// directly, preserving its case as usernames are case-sensitive.
-// =========================================================
-
-const toBackendUsername = (email) => {
-  // Collision-safe: "@" -> "_at_", "+" -> "_plus_", "." preserved.
-  // "a.b@gmail.com" and "ab@gmail.com" now map to distinct usernames.
-  const cleaned = normalizeEmail(email)
-    .replace(/@/g, "_at_")
-    .replace(/\+/g, "_plus_")
-    .replace(/[^a-z0-9_.-]/g, "");
-
-  return cleaned.length >= 3 ? cleaned : `user_${cleaned}`;
-};
-
-const toBackendLoginUsername = (identity) => {
-  const value = String(identity || "").trim();
-  return value.includes("@") ? toBackendUsername(value) : value;
-};
-
 export const isTokenExpired = (token) => {
   try {
     const parts = (token || "").split(".");
@@ -97,7 +73,7 @@ export const getAuthUser = () => {
   try {
     const stored = storage.get(KEYS.authUser, null);
     return Number.isInteger(stored?.user_id)
-      ? { user_id: stored.user_id }
+      ? { user_id: stored.user_id, is_admin: stored.is_admin === true }
       : null;
   } catch (error) {
     console.error("Could not read ARIA auth session:", error);
@@ -105,18 +81,20 @@ export const getAuthUser = () => {
   }
 };
 
-export const setAuthSession = (token, username, email, userId) => {
+export const setAuthSession = (token, username, email, userId, isAdmin = false) => {
   // token ignored: session lives in the httpOnly cookie. Keep display details
-  // in memory only, and persist only a non-PII id for per-user chat scoping.
+  // in memory; persist only the non-PII id and a non-authoritative role hint.
+  // Admin API access is always checked against the server allowlist.
   void token;
   currentAuthUser = {
     user_id: Number.isInteger(userId) ? userId : null,
     username: username || "",
     email: email || username || "",
+    is_admin: isAdmin === true,
   };
   clearLegacyAuthStorage();
   storage.set(KEYS.authUser, currentAuthUser.user_id
-    ? { user_id: currentAuthUser.user_id }
+    ? { user_id: currentAuthUser.user_id, is_admin: currentAuthUser.is_admin }
     : null);
 };
 
@@ -179,23 +157,15 @@ export const registerLocalUser = async (email, password) => {
 
   try {
     const data = await authRequest("/auth/register", {
-      username: toBackendUsername(currentEmail),
-
+      email: currentEmail,
       password,
     });
 
-    const username = data?.username || toBackendUsername(currentEmail);
-
-    setAuthSession(data?.token, username, currentEmail, data?.user_id);
-
     return {
       success: true,
-
-      user: {
-        id: username,
-
-        email: currentEmail,
-      },
+      verificationRequired: true,
+      email: currentEmail,
+      message: data?.message || "Check your email for a verification link.",
     };
   } catch (error) {
     console.error("Registration error:", error);
@@ -213,33 +183,34 @@ export const registerLocalUser = async (email, password) => {
 // =========================================================
 
 export const authenticateLocalUser = async (identity, password) => {
-  const loginIdentity = String(identity || "").trim();
-  const backendUsername = toBackendLoginUsername(loginIdentity);
-  const displayEmail = loginIdentity.includes("@")
-    ? normalizeEmail(loginIdentity)
-    : "";
+  const email = normalizeEmail(identity);
 
   try {
     const data = await authRequest("/auth/login", {
-      username: backendUsername,
+      email,
       password,
     });
 
-    const username = data?.username || backendUsername;
-    setAuthSession(data?.token, username, displayEmail, data?.user_id);
+    const username = data?.username || email;
+    setAuthSession(data?.token, username, email, data?.user_id, data?.is_admin);
 
     return {
       success: true,
-      user: { id: username, email: displayEmail },
+      user: { id: username, email, is_admin: data?.is_admin === true },
     };
   } catch (error) {
     console.error("Login error:", error);
 
-    // The API intentionally returns the same 401 for unknown usernames and
-    // wrong passwords. Do not treat it as a signal to switch to registration.
     return {
       success: false,
-      message: error?.message || "Invalid username or password.",
+      message: error?.message || "Invalid email or password.",
+      needsVerification: error?.status === 403,
     };
   }
 };
+
+export const verifyEmailAddress = async (token) =>
+  authRequest("/auth/verify-email", { token });
+
+export const resendVerificationEmail = async (email) =>
+  authRequest("/auth/resend-verification", { email: normalizeEmail(email) });

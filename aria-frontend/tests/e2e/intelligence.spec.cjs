@@ -1,6 +1,6 @@
 // CommonJS // Playwright e2e: Intelligence module (Explore / Hypotheses /
 // Goals / What-If / Reports). Single-host policy: everything runs against
-// http://localhost:8000 with a real throwaway user (see auth-helper).
+// http://localhost:8000 with a pre-provisioned verified test user (see auth-helper).
 // Assertions are backend-agnostic: they verify tabs, actions, persistence
 // and navigation work, and that failures render a Retry (never a bare
 // "Failed to fetch"), whether or not /api/intelligence/* is implemented.

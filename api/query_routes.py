@@ -1522,7 +1522,12 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             question=req.goal,
             result_data=result_data,
             columns=columns,
-            metric_label=_analytics_envelope.get("metric") if "_analytics_envelope" in dir() else None,
+            metric_label=(
+                (_metric_label if "_metric_label" in dir() and _metric_label
+                 and _metric_label not in ("value", "Value") else None)
+                or (processed.get("kpi_alignment", {}) or {}).get("kpis", [{}])[0].get("resolved_column", "").split(".")[-1]
+                or (_analytics_envelope.get("metric") if "_analytics_envelope" in dir() else None)
+                or _metric_col if "_metric_col" in dir() else None),
             metric_col=_metric_col if "_metric_col" in dir() else None,
             dims=_dims if "_dims" in dir() else [],
             drivers=_drivers_list if "_drivers_list" in dir() else [],

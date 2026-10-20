@@ -33,8 +33,9 @@ class TestRLFeedbackRoutes(unittest.TestCase):
                            headers={"Origin": "http://127.0.0.1:8000"})
 
     def _register(self, c):
-        user = f"rl_fb_{int(time.time() * 1000) % 100000000}"
-        r = c.post("/api/auth/register", json={"username": user, "password": "Secret123!"})
+        user = f"rl_fb_{int(time.time() * 1000) % 100000000}@example.test"
+        from helpers import register_verified_email
+        r = register_verified_email(c, user)
         self.assertEqual(r.status_code, 200, r.text[:200])
         return user
 

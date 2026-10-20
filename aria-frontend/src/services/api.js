@@ -553,9 +553,64 @@ export const listDocuments = async () => {
   return { success: true, data: data?.documents || data?.data || [] };
 };
 
+export const getDocumentOverview = async () => {
+  const data = await request("/documents/overview/stats");
+  return { success: true, data: data?.overview || {} };
+};
+
+export const uploadDocument = async (file) => {
+  if (!file) return { success: false, message: "No file selected." };
+  const formData = new FormData();
+  formData.append("file", file);
+  try {
+    const data = await request("/insight/pdf/upload", { method: "POST", body: formData });
+    return { success: true, message: "Document uploaded and indexed.", data };
+  } catch (error) {
+    return { success: false, message: error?.message || "Document upload failed." };
+  }
+};
+
+/** @param {string} question @param {string[] | null} [documentIds] @param {string | null} [conversationId] */
+export const askDocuments = async (question, documentIds = null, conversationId = null) => {
+  const response = await request("/insight/pdf/chat", {
+    method: "POST",
+    body: JSON.stringify({
+      question,
+      document_ids: documentIds,
+      conversation_id: conversationId,
+      document_only: true,
+    }),
+  });
+  const sources = Array.isArray(response?.sources) ? response.sources : [];
+  return {
+    success: true,
+    data: {
+      ...response,
+      answer_mode: response?.answer_mode || "ai",
+      passages: sources.map((source) => ({
+        ...source,
+        page_number: source.page,
+        content: source.snippet,
+      })),
+      citations: sources.map((source, index) => ({
+        index: source.source_id || index + 1,
+        document_id: source.document_id,
+        filename: source.filename,
+        page_number: source.page,
+        chunk_id: source.chunk_id,
+      })),
+    },
+  };
+};
+
 export const getDocument = async (documentId) => {
   const data = await request(`/documents/${documentId}`);
   return { success: true, data: data?.document };
+};
+
+export const getDocumentDashboard = async (documentId) => {
+  const data = await request(`/documents/${documentId}/dashboard`, { method: "POST" });
+  return { success: true, data: data || {} };
 };
 
 export const searchDocuments = async (query, documentIds = null, k = 10) => {

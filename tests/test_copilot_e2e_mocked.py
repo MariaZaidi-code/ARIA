@@ -56,9 +56,9 @@ class TestCopilotE2EMocked(unittest.TestCase):
     # -- helpers ---------------------------------------------------------
 
     def _register(self):
-        user = f"copilotmock_{int(time.time() * 1000) % 10000000}"
-        r = self.client.post("/api/auth/register",
-                             json={"username": user, "password": PASSWORD})
+        user = f"copilotmock_{int(time.time() * 1000) % 10000000}@example.test"
+        from helpers import register_verified_email
+        r = register_verified_email(self.client, user, PASSWORD)
         self.assertEqual(r.status_code, 200, r.text[:300])
         token = (self.client.cookies.get("aria_token")
                  or self.client.cookies.get("__Host-aria_token"))

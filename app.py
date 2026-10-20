@@ -143,7 +143,17 @@ async def lifespan(app: FastAPI):
         "ARIA effective workers=%d (UVICORN_WORKERS/WEB_CONCURRENCY/ARIA_WORKERS).",
         _eff_workers,
     )
+    try:
+        from services.reingest_scheduler import start as _sched_start
+        _sched_start()
+    except Exception as _e:
+        logging.getLogger("uvicorn.error").warning("reingest scheduler start failed: %s", type(_e).__name__)
     yield
+    try:
+        from services.reingest_scheduler import stop as _sched_stop
+        _sched_stop()
+    except Exception:
+        pass
 
 
 _enable_docs = os.getenv("ARIA_ENABLE_DOCS", "0").strip().lower() in {"1", "true", "yes", "on"}

@@ -20,6 +20,7 @@ sentence-transformers==5.5.0
 faiss-cpu==1.13.2
 pillow==12.3.0
 python-pptx==1.0.2
+python-docx==1.2.0
 openpyxl==3.1.5
 requests==2.34.2
 scikit-learn==1.8.0
@@ -40,4 +41,3 @@ fastembed
 pymupdf
 langchain-postgres
 mysql-connector-python
-

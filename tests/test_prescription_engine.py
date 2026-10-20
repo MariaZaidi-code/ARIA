@@ -285,12 +285,12 @@ class IsolationCase(unittest.TestCase):
         import app as _app
         import random as _rng
         clients = []
-        for u in ("rxiso%s" % _rng.randint(1000000, 9999999),
-                  "rxiso%s" % _rng.randint(1000000, 9999999)):
+        for u in ("rxiso%s@example.test" % _rng.randint(1000000, 9999999),
+                  "rxiso%s@example.test" % _rng.randint(1000000, 9999999)):
             c = TestClient(_app.app, raise_server_exceptions=False,
                            headers={"Origin": "http://127.0.0.1:8000"})
-            r = c.post("/api/auth/register",
-                       json={"username": u, "password": "password123"})
+            from helpers import register_verified_email
+            r = register_verified_email(c, u, "password123")
             self.assertEqual(r.status_code, 200, r.text[:200])
             self.assertNotIn("token", r.json())
             self.assertTrue(c.cookies.get("aria_token") or c.cookies.get("__Host-aria_token"))

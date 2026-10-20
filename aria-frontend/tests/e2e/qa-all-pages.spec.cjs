@@ -1,5 +1,6 @@
 // QA: drive login -> LLM selection -> every non-Data page, capturing runtime errors.
 const { test, expect } = require("@playwright/test");
+const { signInVerified } = require("./auth-helper");
 
 const BASE = process.env.ARIA_BASE || "http://localhost:8000";
 
@@ -45,21 +46,6 @@ function attach(page, sink) {
   });
 }
 
-async function registerAndLogin(page, email, password) {
-  await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded" });
-
-  // Switch to register mode and create the account.
-  await page.getByRole("button", { name: /create account/i }).first().click();
-  await page.locator("#login-email").fill(email);
-  await page.locator("#login-password").fill(password);
-  await page.locator("#login-confirm").fill(password);
-  await page.getByRole("button", { name: /create account/i }).last().click();
-  await page.waitForTimeout(800);
-
-  // Registration establishes the session and advances directly to LLM choice.
-  await expect(page.getByText(/choose your ai engine/i)).toBeVisible({ timeout: 20000 });
-}
-
 async function chooseLLM(page, label) {
   await expect(page.getByText(/choose your ai engine/i)).toBeVisible({ timeout: 15000 });
   await page.getByRole("button", { name: new RegExp(label, "i") }).first().click();
@@ -72,10 +58,7 @@ test.describe("ARIA QA - non-Data pages", () => {
     const sink = { consoleErrors: [], pageErrors: [], failedResponses: [] };
     attach(page, sink);
 
-    const email = `qa_${Date.now()}@aria.test`;
-    const password = "QaPass123!";
-
-    await registerAndLogin(page, email, password);
+    await signInVerified(page, BASE);
     // Local AI only: the default suite must never touch cloud providers
     // (no user key use, no data egress). Ollama availability is asserted by
     // the selection screen itself; the switch to local is ping-free.

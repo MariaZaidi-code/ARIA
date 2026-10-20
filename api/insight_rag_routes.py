@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import zipfile
 from collections import Counter
 from pathlib import Path
 
@@ -29,12 +30,15 @@ from insight_rag.storage import RAGMetadataStore, UserPGVectorStore
 from llm_provider import create_provider
 
 router = APIRouter(prefix="/api/insight/pdf", tags=["Insight PDF RAG"])
+_DOCUMENT_MAX_UNPACKED_BYTES = 250 * 1024 * 1024
+_DOCUMENT_MAX_ARCHIVE_ENTRIES = 20_000
 
 
 class PDFChatRequest(BaseModel):
     question: str = Field(min_length=2, max_length=4000)
     conversation_id: str | None = Field(default=None, max_length=80)
     document_ids: list[str] | None = Field(default=None, max_length=20)
+    document_only: bool = False
 
 
 def _capability(user_id: str | int) -> InsightPDFRAG:
@@ -114,6 +118,21 @@ def _capability(user_id: str | int) -> InsightPDFRAG:
     return InsightPDFRAG(insight_agent=insight_agent, user_id=user_id)
 
 
+def _validate_office_archive(path: Path, required_member: str) -> None:
+    """Bound Office archive expansion before handing it to a document parser."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            entries = archive.infolist()
+            if len(entries) > _DOCUMENT_MAX_ARCHIVE_ENTRIES:
+                raise ValueError("The Office document contains too many entries.")
+            if sum(entry.file_size for entry in entries) > _DOCUMENT_MAX_UNPACKED_BYTES:
+                raise ValueError("The Office document expands beyond the supported size.")
+            if required_member not in archive.namelist():
+                raise ValueError("The uploaded file is not a valid Office document.")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("The uploaded file is not a valid Office document.") from exc
+
+
 @router.get("/health")
 def pdf_rag_health(user: dict = Depends(get_current_user)):
     """Authenticated readiness/quality snapshot without exposing secrets or PDF text."""
@@ -166,19 +185,22 @@ def pdf_rag_health(user: dict = Depends(get_current_user)):
 
 
 @router.post("/upload")
-def upload_pdf(
+def upload_document(
     file: UploadFile = File(...),
     user: dict = Depends(require_writable),
 ):
-    filename = Path(file.filename or "document.pdf").name
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported right now.")
-
+    filename = Path(file.filename or "document").name
+    extension = Path(filename).suffix.lower()
+    if extension not in {".pdf", ".csv", ".xlsx", ".docx"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Supported document formats are PDF, CSV, XLSX, and DOCX.",
+        )
     temp_path = None
     max_bytes = MAX_PDF_MB * 1024 * 1024
     written = 0
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp:
             temp_path = Path(temp.name)
             while True:
                 chunk = file.file.read(1024 * 1024)
@@ -188,14 +210,82 @@ def upload_pdf(
                 if written > max_bytes:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"PDF exceeds the current {MAX_PDF_MB} MB limit.",
+                        detail=f"Document exceeds the current {MAX_PDF_MB} MB limit.",
                     )
                 temp.write(chunk)
 
-        return _capability(user["user_id"]).ingest_pdf(
-            temp_path,
-            original_filename=filename,
-        )
+        capability = _capability(user["user_id"])
+        if extension == ".pdf":
+            return capability.ingest_pdf(temp_path, original_filename=filename)
+
+        element_count = 0
+        if extension == ".csv":
+            result = capability.ingest_tabular(temp_path, filename=filename, table_name=filename)
+            element_count = int((result.get("document") or {}).get("row_count") or 0)
+        elif extension == ".xlsx":
+            _validate_office_archive(temp_path, "xl/workbook.xml")
+            import pandas as pd
+
+            try:
+                sheets = pd.read_excel(temp_path, sheet_name=None)
+            except Exception as exc:
+                raise ValueError("The uploaded workbook could not be read.") from exc
+            frames = [(name, frame) for name, frame in sheets.items() if not frame.empty]
+            if not frames:
+                raise ValueError("The workbook contains no usable rows.")
+            worksheet_column = "_worksheet"
+            while any(worksheet_column in frame.columns for _, frame in frames):
+                worksheet_column = f"_{worksheet_column}"
+            for name, frame in frames:
+                frame[worksheet_column] = name
+            workbook = pd.concat([frame for _, frame in frames], ignore_index=True, sort=False)
+            result = capability.ingest_tabular(workbook, filename=filename, table_name=filename)
+            element_count = int((result.get("document") or {}).get("row_count") or len(workbook))
+        else:
+            _validate_office_archive(temp_path, "word/document.xml")
+            from docx import Document as WordDocument
+
+            try:
+                word_document = WordDocument(temp_path)
+            except Exception as exc:
+                raise ValueError("The uploaded Word document could not be read.") from exc
+            records = [
+                {"Section": f"Paragraph {index + 1}", "Text": paragraph.text.strip()}
+                for index, paragraph in enumerate(word_document.paragraphs)
+                if paragraph.text.strip()
+            ]
+            for table_index, table in enumerate(word_document.tables, start=1):
+                for row_index, row in enumerate(table.rows, start=1):
+                    text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                    if text:
+                        records.append({
+                            "Section": f"Table {table_index}, row {row_index}",
+                            "Text": text,
+                        })
+            if not records:
+                raise ValueError("The Word document contains no readable text.")
+            result = capability.ingest_tabular(records, filename=filename, table_name=filename)
+            element_count = len(records)
+
+        stored = result.get("document") if isinstance(result, dict) else None
+        document_id = stored.get("document_id") if isinstance(stored, dict) else None
+        if not document_id:
+            raise RuntimeError("Document ingestion did not return a document record.")
+
+        metadata = RAGMetadataStore(user["user_id"])
+        record_data = metadata.get_document(document_id)
+        if not record_data:
+            raise RuntimeError("The ingested document could not be loaded.")
+        record_data["size_bytes"] = written
+        record_data["source_type"] = extension.lstrip(".")
+        record_data["element_count"] = element_count
+        chunks = metadata.load_chunks(document_id)
+        sample_text = " ".join(chunk.page_content for chunk in chunks[:5])
+        from insight_rag.service import _classify_document
+        record_data["tags"] = _classify_document(filename, sample_text)
+        metadata.put_document(record_data)
+        result["document"] = record_data
+        return result
     except HTTPException:
         raise
     except ValueError as exc:
@@ -203,9 +293,10 @@ def upload_pdf(
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=sanitize_error(exc))
     except Exception:
+        logging.getLogger(__name__).exception("Document ingestion failed for %s", extension)
         raise HTTPException(
             status_code=503,
-            detail="I couldn't index that PDF right now. Please check the RAG database/model connection and try again.",
+            detail="I couldn't index that document right now. Please check the document and search service, then try again.",
         )
     finally:
         try:
@@ -221,7 +312,8 @@ def list_pdf_documents(user: dict = Depends(get_current_user)):
     """List local PDF metadata without requiring a cloud LLM call."""
     documents = RAGMetadataStore(user["user_id"]).list_documents()
     public_docs = [
-        {key: value for key, value in document.items() if key != "chunk_ids"}
+        {key: value for key, value in document.items()
+         if key not in ("chunk_ids", "share_token", "shared_with", "shared")}
         for document in documents
     ]
     return {"ok": True, "documents": public_docs, "pipeline_version": RAG_PIPELINE_VERSION}
@@ -255,6 +347,7 @@ def chat_with_pdfs(request: PDFChatRequest, user: dict = Depends(require_writabl
             request.question,
             conversation_id=request.conversation_id,
             document_ids=request.document_ids,
+            document_only=request.document_only,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=sanitize_error(exc))

@@ -34,8 +34,8 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
     @staticmethod
     def _source_summary(sources: list[dict]) -> str:
         if not sources:
-            return "My previous answer did not use PDF evidence, so there are no PDF citations to show."
-        lines = ["I used these PDF sources for my previous answer:"]
+            return "My previous answer did not use document evidence, so there are no citations to show."
+        lines = ["I used these documents for my previous answer:"]
         seen = set()
         for source in sources:
             key = (
@@ -47,7 +47,7 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
             if key in seen:
                 continue
             seen.add(key)
-            detail = f"- {source.get('filename') or 'PDF'}, page {source.get('page')}"
+            detail = f"- {source.get('filename') or 'Document'}, page {source.get('page')}"
             if source.get("content_type") == "table" and source.get("table_index"):
                 detail += f", table {source.get('table_index')}"
             if source.get("source_id"):

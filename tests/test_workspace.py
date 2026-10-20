@@ -67,12 +67,12 @@ class TestWorkspaceRoutes(unittest.TestCase):
         return TestClient(app_module.app, raise_server_exceptions=False,
                            headers={"Origin": "http://127.0.0.1:8000"})
 
-    def _user_id(self, username: str) -> int:
+    def _user_id(self, email: str) -> int:
         import auth
         conn = auth._get_db()
         try:
-            row = conn.execute("SELECT id FROM users WHERE username = ?",
-                               (username,)).fetchone()
+            row = conn.execute("SELECT id FROM users WHERE email = ?",
+                               (email,)).fetchone()
             return int(row["id"])
         finally:
             conn.close()
@@ -85,9 +85,9 @@ class TestWorkspaceRoutes(unittest.TestCase):
             if prev is None else os.environ.__setitem__("ARIA_COOKIE_SECURE", prev)
         )
         c = self._client()
-        user = f"ws_{int(time.time() * 1000) % 100000000}"
-        r = c.post("/api/auth/register",
-                   json={"username": user, "password": "Secret123!"})
+        user = f"ws_{int(time.time() * 1000) % 100000000}@example.test"
+        from helpers import register_verified_email
+        r = register_verified_email(c, user)
         self.assertEqual(r.status_code, 200, r.text[:200])
         return c, self._user_id(user)
 

@@ -3,6 +3,7 @@
 const { test, expect } = require("@playwright/test");
 const fs = require("fs");
 const path = require("path");
+const { signInVerified } = require("./auth-helper");
 
 const BASE = process.env.ARIA_BASE || "http://localhost:8000";
 const CSV = process.env.ARIA_CSV ||
@@ -24,16 +25,6 @@ function attach(page, sink) {
   });
 }
 
-async function registerAndLogin(page, email, password) {
-  await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded" });
-  await page.getByRole("button", { name: /create account/i }).first().click();
-  await page.locator("#login-email").fill(email);
-  await page.locator("#login-password").fill(password);
-  await page.locator("#login-confirm").fill(password);
-  await page.getByRole("button", { name: /create account/i }).last().click();
-  await expect(page.getByText(/choose your ai engine/i)).toBeVisible({ timeout: 20000 });
-}
-
 async function chooseLLM(page, label) {
   await page.getByRole("button", { name: new RegExp(label, "i") }).first().click();
   await page.getByRole("button", { name: /^continue$/i }).click();
@@ -46,7 +37,7 @@ test.describe("ARIA QA - connected flow", () => {
     const sink = { consoleErrors: [], pageErrors: [], failedResponses: [] };
     attach(page, sink);
 
-    await registerAndLogin(page, `qa_conn_${Date.now()}@aria.test`, "QaPass123!");
+    await signInVerified(page, BASE);
     // Local AI only: connected-flow QA must stay offline/private â€” the
     // synthetic fixture CSV is processed on-device (Ollama), never sent to
     // a cloud provider and never touching the user's real dataset.
@@ -168,4 +159,3 @@ test.describe("ARIA QA - connected flow", () => {
     expect(sink.pageErrors, `uncaught errors: ${sink.pageErrors.join(" | ")}`).toEqual([]);
   });
 });
-

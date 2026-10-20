@@ -90,7 +90,7 @@ def _record_token_usage(completion) -> None:
     except Exception:
         pass
 _SOURCE_BLOCK_RE = re.compile(r"(?ms)^\[(S\d+)\][^\n]*\n.*?(?=^\[S\d+\][^\n]*\n|\Z)")
-REFUSAL = "I couldn't verify a fully supported answer from the selected PDF evidence. Please ask a more specific question."
+REFUSAL = "I couldn't verify a fully supported answer from the selected document evidence. Please ask a more specific question."
 
 _VERDICT_SCHEMA = {
     "type": "object",
@@ -211,7 +211,7 @@ def verify_evidence(llm, *, question: str, context: str) -> str:
         },
         {
             "role": "user",
-            "content": f"Question:\n{question}\n\nPDF evidence:\n{context}",
+            "content": f"Question:\n{question}\n\nDocument evidence:\n{context}",
         },
     ]
     verdict = _binary_verdict(llm, role="rag_verify", messages=messages, timeout=12)

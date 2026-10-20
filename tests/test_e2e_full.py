@@ -60,9 +60,9 @@ class TestFullE2E(unittest.TestCase):
     # -- helpers ---------------------------------------------------------
 
     def _auth(self):
-        user = f"e2e_{int(time.time() * 1000) % 10000000}"
-        r = self.client.post("/api/auth/register",
-                             json={"username": user, "password": "Secret123!"})
+        user = f"e2e_{int(time.time() * 1000) % 10000000}@example.test"
+        from helpers import register_verified_email
+        r = register_verified_email(self.client, user, "Secret123!")
         self.assertEqual(r.status_code, 200, r.text[:300])
         token = self.client.cookies.get("aria_token") or self.client.cookies.get("__Host-aria_token")
         self.assertTrue(token, f"Auth cookie missing: {r.json()} cookies={dict(self.client.cookies)}")

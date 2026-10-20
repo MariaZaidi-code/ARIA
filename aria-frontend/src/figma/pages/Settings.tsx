@@ -22,7 +22,7 @@ interface SettingsProps {
   selectedLLM?: string;
   onChangeLLM?: () => void;
   onProviderSwitched?: (provider: string) => void;
-  user?: { email?: string; username?: string } | null;
+  user?: { email?: string; username?: string; is_admin?: boolean } | null;
   connectionStatus?: string;
   dbName?: string;
   selectedSourceType?: string;
@@ -33,7 +33,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
   const [tab, setTab] = useState<Tab>("profile");
   const [displayName, setDisplayName] = useState(user?.username || "User");
   const [email, setEmail] = useState(user?.email || "");
-  const [role, setRole] = useState("Business Analyst");
+  const role = user?.is_admin ? "Administrator" : "User";
   const [providers, setProviders] = useState<any[]>([]);
   const [apiKey, setApiKey] = useState("");
   const [selectedProvider, setSelectedProvider] = useState("cloud");
@@ -151,8 +151,8 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
               </div>
               <div>
                 <label className="text-xs font-medium text-muted-foreground">Role</label>
-                <input value={role} onChange={(e) => setRole(e.target.value)}
-                  className="mt-1 w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none focus:border-primary focus:shadow-[0_0_0_3px_rgba(99,102,241,0.08)] transition-all duration-150" />
+                <input value={role} readOnly
+                  className="mt-1 w-full cursor-not-allowed bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-muted-foreground outline-none" />
               </div>
             </div>
             <button onClick={async () => {

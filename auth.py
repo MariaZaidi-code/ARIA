@@ -10,11 +10,15 @@ import json
 import os
 import re
 import secrets
+import smtplib
 import sqlite3
+import ssl
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
+from urllib.parse import quote
 
 import jwt
 
@@ -75,6 +79,9 @@ TOKEN_TTL_HOURS = _token_ttl_hours()
 PBKDF2_ITERATIONS = 600_000
 
 _USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]+")
+_EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s.]+(?:\.[^@\s.]+)+$")
+EMAIL_VERIFICATION_TTL_HOURS = 24
+AUTH_EVENT_RETENTION_DAYS = 180
 
 
 def _is_production() -> bool:
@@ -136,8 +143,40 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            email TEXT,
+            email_verified INTEGER NOT NULL DEFAULT 0
         )"""
+    )
+    user_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(users)").fetchall()
+    }
+    if "email" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+    if "email_verified" not in user_columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0"
+        )
+    # Older frontend accounts used this reversible username mapping. Recover
+    # their candidate address, but keep it unverified until the owner proves
+    # control through the same email flow as new accounts.
+    legacy_rows = conn.execute(
+        "SELECT id, username FROM users WHERE email IS NULL"
+    ).fetchall()
+    for row in legacy_rows:
+        username = str(row["username"] or "")
+        if "_at_" not in username:
+            continue
+        candidate = username.replace("_at_", "@", 1).replace("_plus_", "+")
+        if _EMAIL_RE.fullmatch(candidate):
+            conn.execute(
+                "UPDATE users SET email = ? WHERE id = ? AND email IS NULL",
+                (candidate.lower(), row["id"]),
+            )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique "
+        "ON users(email COLLATE NOCASE) WHERE email IS NOT NULL"
     )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS history (
@@ -160,6 +199,27 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             token_hash TEXT PRIMARY KEY,
             expires_at TEXT NOT NULL
         )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS email_verification_tokens (
+            token_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS auth_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            page TEXT,
+            occurred_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_auth_events_type_time "
+        "ON auth_events(event_type, occurred_at)"
     )
     conn.commit()
     _SCHEMA_READY_PATHS.add(key)
@@ -233,6 +293,222 @@ def register(username: str, password: str) -> int:
         conn.close()
 
 
+def normalize_email(email: str) -> str:
+    value = (email or "").strip().lower()
+    if len(value) > 254 or not _EMAIL_RE.fullmatch(value):
+        raise ValueError("Enter a valid email address.")
+    return value
+
+
+def _legacy_email_username(email: str) -> str:
+    return (
+        email.lower()
+        .replace("@", "_at_")
+        .replace("+", "_plus_")
+    )
+
+
+def register_email(email: str, password: str) -> int:
+    normalized = normalize_email(email)
+    if len(password) < 8 or len(password) > 128:
+        raise ValueError("Password must be 8-128 characters.")
+    conn = _get_db()
+    try:
+        conn.execute(
+            """INSERT INTO users
+               (username, password_hash, created_at, email, email_verified)
+               VALUES (?, ?, ?, ?, 0)""",
+            (
+                _legacy_email_username(normalized),
+                _hash_password(password),
+                datetime.now(timezone.utc).isoformat(),
+                normalized,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id FROM users WHERE email = ? COLLATE NOCASE", (normalized,)
+        ).fetchone()
+        return int(row["id"])
+    except sqlite3.IntegrityError:
+        raise ValueError("An account already exists for this email address.")
+    finally:
+        conn.close()
+
+
+def create_email_verification_token(email: str) -> str | None:
+    normalized = normalize_email(email)
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc)
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT id, email_verified FROM users WHERE email = ? COLLATE NOCASE",
+            (normalized,),
+        ).fetchone()
+        if not row or row["email_verified"]:
+            return None
+        conn.execute(
+            """UPDATE email_verification_tokens SET used_at = ?
+               WHERE user_id = ? AND used_at IS NULL""",
+            (now.isoformat(), row["id"]),
+        )
+        conn.execute(
+            """INSERT INTO email_verification_tokens
+               (token_hash, user_id, expires_at, used_at)
+               VALUES (?, ?, ?, NULL)""",
+            (
+                token_hash,
+                row["id"],
+                (now + timedelta(hours=EMAIL_VERIFICATION_TTL_HOURS)).isoformat(),
+            ),
+        )
+        conn.commit()
+        return raw_token
+    finally:
+        conn.close()
+
+
+def send_email_verification(email: str, token: str) -> None:
+    """Send a one-time verification link using Gmail-compatible SMTP."""
+    host = (os.getenv("ARIA_SMTP_HOST") or "").strip()
+    username = (os.getenv("ARIA_SMTP_USERNAME") or "").strip()
+    password = (os.getenv("ARIA_SMTP_PASSWORD") or "").strip()
+    sender = (os.getenv("ARIA_SMTP_FROM") or username).strip()
+    if not all((host, username, password, sender)):
+        raise RuntimeError(
+            "Email verification is not configured. Set ARIA_SMTP_HOST, "
+            "ARIA_SMTP_USERNAME, ARIA_SMTP_PASSWORD, and ARIA_SMTP_FROM."
+        )
+    try:
+        port = int(os.getenv("ARIA_SMTP_PORT", "587"))
+    except ValueError as exc:
+        raise RuntimeError("ARIA_SMTP_PORT must be a valid port number.") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError("ARIA_SMTP_PORT must be between 1 and 65535.")
+
+    public_url = (
+        os.getenv("ARIA_PUBLIC_URL") or "http://127.0.0.1:8000"
+    ).strip().rstrip("/")
+    if _is_production() and not public_url.startswith("https://"):
+        raise RuntimeError("ARIA_PUBLIC_URL must use HTTPS in production.")
+    verification_url = (
+        f"{public_url}/?verify_email={quote(token, safe='')}"
+    )
+    message = EmailMessage()
+    message["Subject"] = "Verify your ARIA email address"
+    message["From"] = sender
+    message["To"] = email
+    message.set_content(
+        "Verify your email address to activate your ARIA account. "
+        f"This link expires in {EMAIL_VERIFICATION_TTL_HOURS} hours:\n\n"
+        f"{verification_url}\n\n"
+        "If you did not request this account, you can ignore this email."
+    )
+
+    context = ssl.create_default_context()
+    timeout = 15
+    if port == 465:
+        with smtplib.SMTP_SSL(host, port, timeout=timeout, context=context) as smtp:
+            smtp.login(username, password)
+            smtp.send_message(message)
+    else:
+        with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+            smtp.ehlo()
+            smtp.starttls(context=context)
+            smtp.ehlo()
+            smtp.login(username, password)
+            smtp.send_message(message)
+
+
+def verify_email_token(raw_token: str) -> str | None:
+    token = (raw_token or "").strip()
+    if not token or len(token) > 256:
+        return None
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """SELECT t.user_id, u.email
+               FROM email_verification_tokens t
+               JOIN users u ON u.id = t.user_id
+               WHERE t.token_hash = ? AND t.used_at IS NULL AND t.expires_at > ?
+                 AND u.email_verified = 0""",
+            (token_hash, now),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE users SET email_verified = 1 WHERE id = ?",
+            (row["user_id"],),
+        )
+        conn.execute(
+            "UPDATE email_verification_tokens SET used_at = ? WHERE token_hash = ?",
+            (now, token_hash),
+        )
+        conn.commit()
+        return str(row["email"])
+    finally:
+        conn.close()
+
+
+def authenticate_email(email: str, password: str) -> dict | None:
+    try:
+        normalized = normalize_email(email)
+    except ValueError:
+        normalized = ""
+    if not normalized or not isinstance(password, str) or len(password) > 128:
+        return None
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            """SELECT id, username, password_hash, email, email_verified
+               FROM users WHERE email = ? COLLATE NOCASE""",
+            (normalized,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row and _verify_password(password, row["password_hash"]):
+        if not row["email_verified"]:
+            return {"user_id": int(row["id"]), "email": normalized, "verified": False}
+        record_auth_event(int(row["id"]), "login")
+        return {
+            "user_id": int(row["id"]),
+            "email": str(row["email"]),
+            "username": str(row["email"]),
+            "verified": True,
+        }
+    _verify_password(
+        "dummy-password-for-timing",
+        f"pbkdf2_sha256${PBKDF2_ITERATIONS}$" + "00" * 16 + "$" + "00" * 32,
+    )
+    return None
+
+
+def record_auth_event(user_id: int, event_type: str, page: str | None = None) -> None:
+    if event_type not in {"login", "page_visit"}:
+        raise ValueError("Unsupported auth event.")
+    if event_type == "page_visit" and (
+        not page or len(page) > 64 or not re.fullmatch(r"[a-z][a-z0-9_-]*", page)
+    ):
+        raise ValueError("Invalid page identifier.")
+    conn = _get_db()
+    try:
+        conn.execute(
+            "INSERT INTO auth_events (user_id, event_type, page, occurred_at) VALUES (?, ?, ?, ?)",
+            (user_id, event_type, page, datetime.now(timezone.utc).isoformat()),
+        )
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=AUTH_EVENT_RETENTION_DAYS)
+        ).isoformat()
+        conn.execute("DELETE FROM auth_events WHERE occurred_at < ?", (cutoff,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def authenticate(username: str, password: str) -> int | None:
     if not username or not isinstance(username, str):
         return None
@@ -274,6 +550,135 @@ def authenticate(username: str, password: str) -> int | None:
         f"pbkdf2_sha256${PBKDF2_ITERATIONS}$" + "00" * 16 + "$" + "00" * 32,
     )
     return None
+
+
+def is_admin_email(email: str) -> bool:
+    """Authorize the single email address configured as the ARIA owner."""
+    configured = (os.getenv("ARIA_ADMIN_EMAIL") or "").strip().lower()
+    candidate = (email or "").strip().lower()
+    return bool(configured and candidate and candidate == configured)
+
+
+def get_admin_overview() -> dict:
+    """Return aggregate account, login, page-visit, and health data."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    conn = _get_db()
+    try:
+        users_total = int(conn.execute(
+            "SELECT COUNT(*) FROM users WHERE email_verified = 1"
+        ).fetchone()[0])
+        users_new_7d = int(conn.execute(
+            "SELECT COUNT(*) FROM users WHERE email_verified = 1 AND created_at >= ?",
+            (cutoff,),
+        ).fetchone()[0])
+        analyses_total = int(conn.execute("SELECT COUNT(*) FROM history").fetchone()[0])
+        activity = conn.execute(
+            """SELECT COUNT(*) AS analyses_7d,
+                      COUNT(DISTINCT user_id) AS active_users_7d,
+                      MAX(created_at) AS last_activity
+               FROM history WHERE created_at >= ?""",
+            (cutoff,),
+        ).fetchone()
+        logins = conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN occurred_at >= ? THEN 1 ELSE 0 END) AS last_7d
+               FROM auth_events WHERE event_type = 'login'""",
+            (cutoff,),
+        ).fetchone()
+        visits = conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN occurred_at >= ? THEN 1 ELSE 0 END) AS last_7d
+               FROM auth_events WHERE event_type = 'page_visit'""",
+            (cutoff,),
+        ).fetchone()
+        page_visits = conn.execute(
+            """SELECT page, COUNT(*) AS total,
+                      SUM(CASE WHEN occurred_at >= ? THEN 1 ELSE 0 END) AS last_7d
+               FROM auth_events WHERE event_type = 'page_visit'
+               GROUP BY page ORDER BY total DESC, page ASC""",
+            (cutoff,),
+        ).fetchall()
+        recent_events = conn.execute(
+            """SELECT event_type, page, occurred_at FROM auth_events
+               ORDER BY id DESC LIMIT 12"""
+        ).fetchall()
+        active_users = conn.execute(
+            """SELECT COUNT(DISTINCT user_id) FROM auth_events
+               WHERE occurred_at >= ?""",
+            (cutoff,),
+        ).fetchone()[0]
+        auth_store = "available"
+        try:
+            conn.execute("SELECT 1").fetchone()
+        except sqlite3.Error:
+            auth_store = "unavailable"
+            raise
+        mail_configured = all(
+            (os.getenv(name) or "").strip()
+            for name in ("ARIA_SMTP_HOST", "ARIA_SMTP_USERNAME", "ARIA_SMTP_PASSWORD")
+        ) and bool((os.getenv("ARIA_SMTP_FROM") or os.getenv("ARIA_SMTP_USERNAME") or "").strip())
+
+        system = {
+            "api": "available",
+            "auth_store": auth_store,
+            "email_delivery": "configured" if mail_configured else "not_configured",
+        }
+        try:
+            from core.config import session_store_status
+            session_status = session_store_status()
+            system["session_store"] = (
+                "available" if session_status.get("ok", True) else "degraded"
+            )
+        except (ImportError, AttributeError):
+            system["session_store"] = "unknown"
+        try:
+            from core.checks import check_ollama, check_default_db, check_shared_store
+            system["local_llm"] = (
+                "available" if check_ollama().get("ok") else "unavailable"
+            )
+            default_db = check_default_db()
+            system["default_database"] = (
+                "available" if default_db.get("ok") is True
+                else "not_configured" if default_db.get("configured") is False
+                else "unavailable"
+            )
+            shared_store = check_shared_store()
+            system["shared_store"] = (
+                "available" if shared_store.get("ok") else "degraded"
+            )
+        except (ImportError, AttributeError, OSError):
+            system["dependency_checks"] = "unavailable"
+        return {
+            "users_total": users_total,
+            "users_new_7d": users_new_7d,
+            "analyses_total": analyses_total,
+            "analyses_7d": int(activity["analyses_7d"] or 0),
+            "active_users_7d": int(active_users or 0),
+            "last_activity": activity["last_activity"],
+            "logins_total": int(logins["total"] or 0),
+            "logins_7d": int(logins["last_7d"] or 0),
+            "page_visits_total": int(visits["total"] or 0),
+            "page_visits_7d": int(visits["last_7d"] or 0),
+            "page_visits_by_page": [
+                {
+                    "page": row["page"],
+                    "total": int(row["total"] or 0),
+                    "last_7d": int(row["last_7d"] or 0),
+                }
+                for row in page_visits
+            ],
+            "recent_events": [
+                {
+                    "event_type": row["event_type"],
+                    "page": row["page"],
+                    "occurred_at": row["occurred_at"],
+                }
+                for row in recent_events
+            ],
+            "system": system,
+        }
+    finally:
+        conn.close()
 
 
 def issue_token(user_id: int, username: str, ttl_hours: float | None = None) -> str:

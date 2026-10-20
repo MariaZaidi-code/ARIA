@@ -11,6 +11,7 @@ import Login from "./pages/Login";
 // vite.config.js). The hash router itself is untouched.
 const LLMSelection = lazy(() => import("./pages/LLMSelection"));
 const Dashboard = lazy(() => import("./pages/Dashboard"));
+const AdminDashboard = lazy(() => import("./pages/AdminDashboard"));
 const AIAnalytics = lazy(() => import("./pages/AIAnalytics"));
 const Insights = lazy(() => import("./pages/Insights"));
 const Predictive = lazy(() => import("./pages/Predictive"));
@@ -47,6 +48,7 @@ import { ToastProvider } from "../components/Toast";
 
 export type Page =
   | "dashboard"
+  | "admin"
   | "analytics"
   | "insights"
   | "predictive"
@@ -57,7 +59,7 @@ export type Page =
   | "history"
   | "settings";
 
-const VALID_PAGES: Page[] = ["dashboard","analytics","insights","predictive","intelligence","data","documents","copilot","history","settings"];
+const VALID_PAGES: Page[] = ["dashboard","admin","analytics","insights","predictive","intelligence","data","documents","copilot","history","settings"];
 
 // Legacy aliases: "hypothesis" -> AI Analytics (the standalone Hypothesis
 // page was removed; its capability surfaces as Possible drivers inside
@@ -94,9 +96,10 @@ export const useTheme = () => useContext(ThemeContext);
 export default function App() {
   // ---- Auth stage ----
   const [appStage, setAppStage] = useState<AppStage>("login");
-  const [currentUser, setCurrentUser] = useState<{ email?: string } | null>(null);
+  const [currentUser, setCurrentUser] = useState<{ email?: string; is_admin?: boolean } | null>(null);
   const [selectedLLM, setSelectedLLM] = useState("");
   const bootSessionCheckRef = useRef<AbortController | null>(null);
+  const lastPageVisitRef = useRef("");
 
   // Mobile read-only: server verdict (session/status) with a UA guess until
   // the first response lands. Gates write affordances across the shell/pages.
@@ -129,6 +132,19 @@ export default function App() {
     document.documentElement.classList.toggle("dark", isDark);
     storage.set(KEYS.theme, isDark ? "dark" : "light");
   }, [isDark]);
+
+  useEffect(() => {
+    if (appStage !== "app" || !currentUser?.email) return;
+    const visitKey = `${currentUser.email}:${page}`;
+    if (lastPageVisitRef.current === visitKey) return;
+    lastPageVisitRef.current = visitKey;
+    void apiFetch("/admin/page-visit", {
+      method: "POST",
+      body: JSON.stringify({ page }),
+    }).catch((error: unknown) => {
+      console.warn("ARIA could not record this page visit:", error);
+    });
+  }, [appStage, currentUser?.email, page]);
 
   // Cookie auth: the session lives in the httpOnly `aria_token` cookie.
   // On mount, probe the live backend session (credentials:include). 401
@@ -166,11 +182,27 @@ export default function App() {
         // session on the sign-in screen after every refresh.
         if (body?.ok) {
           const savedUser = getAuthUser();
-          setCurrentUser(savedUser
-            ? { email: savedUser.email || savedUser.username || "user" }
-            : { email: "user" });
+          let identity = savedUser?.email || savedUser?.username || "user";
+          let isAdmin = false;
+          try {
+            const me: any = await apiFetch("/auth/me", {
+              signal: ctrl.signal,
+              suppressUnauthorized: true,
+            });
+            identity = me.username || identity;
+            isAdmin = me.is_admin === true;
+          } catch (err: any) {
+            if (err?.status === 401) {
+              toLogin();
+              return;
+            }
+          }
+          setCurrentUser({ email: identity, is_admin: isAdmin });
           const savedMode = storage.getString(KEYS.llmMode, "");
-          if (savedMode) {
+          if (isAdmin) {
+            if (page === "dashboard") setPage("admin");
+            setAppStage("app");
+          } else if (savedMode) {
             setSelectedLLM(savedMode);
             setAppStage("app");
           } else {
@@ -283,8 +315,15 @@ export default function App() {
     bootSessionCheckRef.current?.abort();
     bootSessionCheckRef.current = null;
     const user = getAuthUser();
-    setCurrentUser(user ? { email: user.email || user.username } : { email: "user" });
-    setAppStage("llm-selection");
+    setCurrentUser(user
+      ? { email: user.email || user.username, is_admin: user.is_admin === true }
+      : { email: "user", is_admin: false });
+    if (user?.is_admin) {
+      setPage("admin");
+      setAppStage("app");
+    } else {
+      setAppStage("llm-selection");
+    }
   };
 
   const handleLLMSelect = async (mode: string, apiKey?: string) => {
@@ -659,6 +698,12 @@ export default function App() {
     <ErrorBoundary key={`${key}-${page}`} page={key}>{node}</ErrorBoundary>
   );
 
+  useEffect(() => {
+    if (appStage === "app" && page === "admin" && !currentUser?.is_admin) {
+      setPage("dashboard");
+    }
+  }, [appStage, currentUser?.is_admin, page]);
+
   if (appStage === "login") {
     return <Login onLogin={handleLogin} />;
   }
@@ -679,6 +724,7 @@ export default function App() {
       <ToastProvider>
       <AppShell
         user={currentUser}
+        isAdmin={currentUser?.is_admin === true}
         selectedLLM={selectedLLM}
         dbName={dbName}
         onChangeLLM={() => setAppStage("llm-selection")}
@@ -686,6 +732,19 @@ export default function App() {
       >
         <div key={page} className="page-enter"><Suspense fallback={<PageFallback />}>{wrapPage(page, (() => {
           switch (page) {
+            case "admin":
+              return currentUser?.is_admin
+                ? <AdminDashboard />
+                : <Dashboard
+                    setPage={setPage}
+                    onAsk={goCopilot}
+                    user={currentUser}
+                    connectionStatus={connectionStatus}
+                    dbName={dbName}
+                    insightResult={insightResult}
+                    analysisResult={analysisResult}
+                    connectionError={connectionError}
+                  />;
             case "dashboard":
               return (
                 <Dashboard
@@ -789,8 +848,8 @@ export default function App() {
           }
         })())}</Suspense></div>
       </AppShell>
-      {/* Mini ARIA robot: every page except the Copilot page itself. */}
-      {page !== "copilot" && <MiniAria />}
+      {/* Documents has its own contextual assistant; avoid an overlapping global widget. */}
+      {page !== "copilot" && page !== "documents" && <MiniAria />}
       {/* Random RL feedback popup (probability + cooldown; /api/rl/feedback) */}
       <FeedbackPopup page={page} />
       </ToastProvider>

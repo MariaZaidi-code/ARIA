@@ -4,7 +4,7 @@ import type { Page } from "../App";
 import {
   LayoutDashboard, Sparkles, Lightbulb, TrendingUp,
   Database, Bot, Clock, Settings, FileText,
-  Sun, Moon, Menu, Compass,
+  Sun, Moon, Menu, Compass, ShieldCheck,
   Search, LogOut, ChevronDown, Bell, CheckCheck, Trash2, Eye,
 } from "lucide-react";
 import { workspaceApi } from "../../services/api";
@@ -43,6 +43,7 @@ const navGroups: { label: string; items: { id: Page; label: string; icon: React.
 
 const pageTitles: Record<Page, string> = {
   dashboard: "Dashboard",
+  admin: "Admin Dashboard",
   analytics: "AI Analytics",
   insights: "Insights",
   intelligence: "Intelligence",
@@ -57,13 +58,14 @@ const pageTitles: Record<Page, string> = {
 interface Props {
   children: React.ReactNode;
   user?: { email?: string } | null;
+  isAdmin?: boolean;
   selectedLLM?: string;
   dbName?: string;
   onChangeLLM?: () => void;
   onSignOut?: () => void;
 }
 
-export default function AppShell({ children, user, selectedLLM, dbName, onChangeLLM, onSignOut }: Props) {
+export default function AppShell({ children, user, isAdmin = false, selectedLLM, dbName, onChangeLLM, onSignOut }: Props) {
   const { isDark, toggleTheme, page, setPage } = useTheme();
   const readOnly = useReadOnly();
   const [collapsed, setCollapsed] = useState(() => {
@@ -116,6 +118,12 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
   // On small screens the drawer always shows labels, regardless of the
   // desktop collapse preference.
   const showLabels = isSmall || !collapsed;
+  const visibleNavGroups = isAdmin
+    ? [...navGroups, {
+        label: "Administration",
+        items: [{ id: "admin" as Page, label: "Admin Dashboard", icon: ShieldCheck }],
+      }]
+    : navGroups;
 
   const relTime = (iso: string) => {
     const t = Date.parse(iso);
@@ -184,7 +192,7 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
 
         {/* Nav */}
         <nav className="flex-1 py-2 px-2.5 overflow-y-auto premium-scroll space-y-4">
-          {navGroups.map((group) => (
+          {visibleNavGroups.map((group) => (
             <div key={group.label}>
               {showLabels && (
                 <p className="px-3 mb-1 text-[10px] font-bold text-muted-foreground/70 uppercase tracking-[0.14em]">

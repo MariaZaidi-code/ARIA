@@ -9,7 +9,7 @@ from services import intelligence_service as intel
 
 def test_token_verification_fails_closed_when_revocation_store_is_unavailable(monkeypatch):
     monkeypatch.setattr(auth, "_REVOKE_CACHE", {})
-    token = auth.issue_token(902341, "audit-regression", ttl_days=1)
+    token = auth.issue_token(902341, "audit-regression", ttl_hours=24)
     monkeypatch.setattr(auth, "_get_db", lambda: (_ for _ in ()).throw(OSError("offline")))
 
     assert auth.verify_token(token) is None
