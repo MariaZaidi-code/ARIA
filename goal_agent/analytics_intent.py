@@ -1351,7 +1351,10 @@ def build_followups(question: str, primary_intent: str, metric: str | None,
         def _nl(v):
             return str(v or "")
     m = _nl(m) if m != "the metric" else m
-    dims = [_nl(d) for d in dims]
+    # SQL aggregate aliases ('count', 'value', 'total') are not groupings.
+    dims = [_nl(d) for d in dims
+            if str(d or "").strip().lower() not in ("count", "value", "total", "sum",
+                                                     "average", "avg", "metric")]
     try:
         drivers = [{**t, "dimension": _nl(t.get("dimension")),
                     "value": str(t.get("value"))} for t in (drivers or [])]
@@ -1390,10 +1393,13 @@ def build_followups(question: str, primary_intent: str, metric: str | None,
     # it references the metric that was actually analyzed). Trend is only
     # offered when a real datetime column was verified upstream.
     if not out:
-        out = [f"Show {m} breakdown by {d0}"]
+        # 'segment' is only a placeholder word, never a real grouping:
+        # breakdown questions need an actual dimension from the result.
+        if dims:
+            out = [f"Show {m} breakdown by {d0}"]
         if has_datetime:
             out.append(f"How has {m} changed over time?")
-        else:
+        elif dims:
             out.append(f"Which {d0} has the highest {m}?")
     return out[:limit]
 

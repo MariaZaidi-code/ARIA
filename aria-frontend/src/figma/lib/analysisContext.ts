@@ -1,3 +1,4 @@
+import { localStore, sessionStore } from "../../utils/storage.js";
 /* =====================================================================
    Shared cross-module analysis context (AI Analytics <-> Forecast <->
    Insights -> Decision Center, chart drill-downs).
@@ -16,6 +17,8 @@
    ===================================================================== */
 
 export const ANALYSIS_CONTEXT_KEY = "aria_analysis_context";
+/** One-shot question for the Analytics page to run on arrival. */
+export const ANALYTICS_QUESTION_KEY = "aria_analytics_question";
 
 export interface AnalysisContext {
   origin?: string;
@@ -43,7 +46,7 @@ const pick = (v: any): string | null => {
 export function saveAnalysisContext(patch: Partial<AnalysisContext>): AnalysisContext {
   let prev: Partial<AnalysisContext> = {};
   try {
-    const raw = localStorage.getItem(ANALYSIS_CONTEXT_KEY);
+    const raw = localStore.getItem(ANALYSIS_CONTEXT_KEY);
     if (raw) prev = JSON.parse(raw) || {};
   } catch {
     prev = {};
@@ -56,7 +59,7 @@ export function saveAnalysisContext(patch: Partial<AnalysisContext>): AnalysisCo
     updatedAt: new Date().toISOString(),
   };
   try {
-    localStorage.setItem(ANALYSIS_CONTEXT_KEY, JSON.stringify(next));
+    localStore.setItem(ANALYSIS_CONTEXT_KEY, JSON.stringify(next));
   } catch {
     /* storage full/blocked — context is best-effort */
   }
@@ -64,7 +67,7 @@ export function saveAnalysisContext(patch: Partial<AnalysisContext>): AnalysisCo
   // (and in-flight sessions) keep working during the migration.
   try {
     if (next.metric) {
-      sessionStorage.setItem(
+      sessionStore.setItem(
         "aria_forecast_prefill",
         JSON.stringify({ metric: next.metric, period: next.period || next.dateRange || undefined }),
       );
@@ -77,7 +80,7 @@ export function saveAnalysisContext(patch: Partial<AnalysisContext>): AnalysisCo
 
 export function loadAnalysisContext(): AnalysisContext | null {
   try {
-    const raw = localStorage.getItem(ANALYSIS_CONTEXT_KEY);
+    const raw = localStore.getItem(ANALYSIS_CONTEXT_KEY);
     if (!raw) return null;
     const ctx = JSON.parse(raw);
     if (!ctx || typeof ctx !== "object") return null;

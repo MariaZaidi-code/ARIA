@@ -11,10 +11,12 @@ import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid,
   Tooltip, LineChart, Line, PieChart, Pie, Cell,
 } from "recharts";
-import { apiFetch } from "../../services/api";
+import { apiFetch, AI_ANSWER_TIMEOUT_MS } from "../../services/api";
 import { BizTooltip } from "./charts";
 import { colorForName } from "../lib/charts";
 import { useTheme } from "../App";
+import { sessionStore } from "../../utils/storage.js";
+import { explainScreen, getScreen, screenStarters } from "../lib/screenContext";
 
 interface MiniMsg {
   id: string;
@@ -23,6 +25,10 @@ interface MiniMsg {
   rows?: Record<string, any>[];
   chart?: { type: string; x: string; y: string; reason?: string } | null;
   sql?: string | null;
+  /** Next-question chips for this answer (screen explanations). */
+  followUps?: string[];
+  /** Answered from what is on screen, not from a new query. */
+  fromScreen?: boolean;
 }
 
 // Inline follow-ups: data-relevant chips from /copilot/suggestions (already
@@ -225,6 +231,19 @@ export default function MiniAria() {
     if (!q || busy) return;
     setInput("");
     setMsgs((m) => [...m, { id: `u${Date.now()}`, role: "user", text: q }]);
+    // Questions about the screen itself ("what does -1% mean?", "explain
+    // this dashboard") are answered from the numbers on screen, so the
+    // answer always matches what the user is looking at.
+    const local = explainScreen(q, getScreen(page));
+    if (local) {
+      setMsgs((m) => [...m, {
+        id: `s${Date.now()}`, role: "assistant", text: local.text,
+        followUps: local.followUps, fromScreen: true,
+      }]);
+      setHappy(true);
+      setTimeout(() => setHappy(false), 2200);
+      return;
+    }
     setBusy(true);
     try {
       // Page awareness: current page + any chart context stashed by the
@@ -232,8 +251,8 @@ export default function MiniAria() {
       // so "what is this chart/page showing?" resolves correctly.
       let chartCtx: any = null;
       try {
-        const raw = sessionStorage.getItem("aria_copilot_context");
-        if (raw) { chartCtx = JSON.parse(raw); sessionStorage.removeItem("aria_copilot_context"); }
+        const raw = sessionStore.getItem("aria_copilot_context");
+        if (raw) { chartCtx = JSON.parse(raw); sessionStore.removeItem("aria_copilot_context"); }
       } catch { chartCtx = null; }
       const data: any = await apiFetch("/copilot", {
         method: "POST",
@@ -241,7 +260,7 @@ export default function MiniAria() {
           question: q,
           context: { page, ...(chartCtx && typeof chartCtx === "object" ? chartCtx : {}) },
         }),
-        timeoutMs: 300000,
+        timeoutMs: AI_ANSWER_TIMEOUT_MS,
       });
       const rows = Array.isArray(data?.data) ? data.data : [];
       setMsgs((m) => [...m, {
@@ -279,6 +298,11 @@ export default function MiniAria() {
       setBusy(false);
     }
   }, [busy, page]);
+
+  // Screen-aware starters (e.g. "Explain this dashboard") come first, then
+  // the schema-driven data questions.
+  const starters = open ? screenStarters(getScreen(page)) : [];
+  const starterChips = [...starters, ...suggestions.filter((s) => !starters.includes(s))].slice(0, 4);
 
   return (
     <>
@@ -318,10 +342,14 @@ export default function MiniAria() {
             {msgs.length === 0 && (
               <div className="text-center pt-6">
                 <p className="text-[13px] font-semibold text-foreground">Hey there! 👋</p>
-                <p className="text-[12px] text-muted-foreground mt-1">I'm ARIA. Ask me anything about your data, insights or business performance.</p>
-                {suggestions.length > 0 && (
+                <p className="text-[12px] text-muted-foreground mt-1">
+                  {starters.length
+                    ? "Not sure what something on this page means? Ask me about any card, chart or badge, or about your data."
+                    : "I'm ARIA. Ask me anything about your data, insights or business performance."}
+                </p>
+                {starterChips.length > 0 && (
                   <div className="mt-3 space-y-1.5">
-                    {suggestions.map((s, i) => (
+                    {starterChips.map((s, i) => (
                       <button
                         key={i}
                         onClick={() => void send(s)}
@@ -355,12 +383,17 @@ export default function MiniAria() {
                       <pre className="mt-1 text-[10px] font-mono text-muted-foreground overflow-x-auto whitespace-pre-wrap">{m.sql}</pre>
                     </details>
                   )}
-                  {m.role === "assistant" && inlineChipsFor(suggestions).length > 0 && (
+                  {m.role === "assistant" && m.fromScreen && (
+                    <p className="mt-1.5 flex items-center gap-1 text-[10.5px] text-muted-foreground">
+                      <Sparkles size={11} /> Explained from what's on your screen
+                    </p>
+                  )}
+                  {m.role === "assistant" && (m.followUps?.length ? m.followUps : inlineChipsFor(suggestions)).length > 0 && (
                     <div
                       className="mt-2 flex flex-wrap gap-1.5"
                       aria-label={isTroubledAnswer(m.text) ? "Suggested follow-ups" : "Suggested next questions"}
                     >
-                      {inlineChipsFor(suggestions).map((s, i) => (
+                      {(m.followUps?.length ? m.followUps : inlineChipsFor(suggestions)).map((s, i) => (
                         <button
                           key={`${m.id}-chip-${i}`}
                           onClick={() => void send(s)}

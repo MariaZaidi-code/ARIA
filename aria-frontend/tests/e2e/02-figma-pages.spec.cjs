@@ -35,7 +35,8 @@ test.describe('Figma pages - all load', () => {
     test(`${name} page loads`, async () => {
       await page.waitForLoadState('networkidle');
       // Navigate to page via sidebar
-      await page.getByRole('button', { name: new RegExp(nav, 'i') }).click();
+      // Exact sidebar label: "Settings" also names the top-bar gear button.
+      await page.getByRole('button', { name: new RegExp('^' + nav + '$', 'i') }).first().click();
       await page.waitForTimeout(500);
       // Check page heading or key element exists
       const el = page.locator(`h1, h2`).filter({ hasText: new RegExp(heading, 'i') }).first();

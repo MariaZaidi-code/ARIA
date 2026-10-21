@@ -71,20 +71,13 @@ def is_valid_identifier(name: str, max_len: int = 64) -> bool:
 # stays generic: ``total_amt`` → ``Total Amount``, ``room_id`` → ``Room``.
 # Unknown tokens pass through untouched; raw names remain available to
 # callers for technical diagnostics.
-_ABBR = {
-    "amt": "Amount",
-    "qty": "Quantity",
-    "avg": "Average",
-    "tot": "Total",
-    "val": "Value",
-    "num": "Number",
-    "cnt": "Count",
-    "pct": "Percent",
-    "desc": "Description",
-    "cat": "Category",
-    "yr": "Year",
-    "mon": "Month",
-}
+def _abbr_map() -> dict:
+    """Title-cased shorthand expansions from the shared lexical map."""
+    from schema_engine.lexical import ABBREVIATIONS
+    return {k: v.title() for k, v in ABBREVIATIONS.items()}
+
+
+_ABBR = _abbr_map()
 
 
 def humanize(name: str) -> str:
@@ -97,10 +90,18 @@ def humanize(name: str) -> str:
     a primary user-facing label — use this helper; keep raw names for
     technical diagnostics only.
     """
+    from schema_engine.lexical import tokenize_words
     text = re.sub(r"[_-]+", " ", str(name or "")).strip()
-    text = re.sub(r"\s+", " ", text)
-    words = [w for w in text.split(" ") if w]
-    drop_tail = {"id", "key", "code", "uuid", "guid", "pk", "fk"}
+    # Split CamelCase too ('TotalDue' -> 'Total Due'), keeping each word's
+    # original casing so acronyms ('HTTP') survive title-casing.
+    words = []
+    for chunk in text.split():
+        parts = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", chunk)
+        parts = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", parts)
+        words.extend(p for p in re.split(r"[^A-Za-z0-9]+", parts) if p)
+    if not words and tokenize_words(str(name or "")):
+        words = tokenize_words(str(name or ""))
+    drop_tail = {"id", "key", "code", "cd", "uuid", "guid", "pk", "fk"}
     while len(words) > 1 and words[-1].lower() in drop_tail:
         words.pop()
     words = [_ABBR.get(w.lower(), w) for w in words]
@@ -129,6 +130,9 @@ def kpi_label(agg: str, column: str) -> str:
         return f"{human} Count"
     if agg == "COUNT":
         return "Total Records"
+    # 'Total Due' / 'Line Total' already say total: never "Total Total Due".
+    if "total" in human.lower().split():
+        return human
     return f"Total {human}"
 
 

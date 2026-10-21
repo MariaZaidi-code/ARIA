@@ -54,12 +54,17 @@ async function registerAndLogin(page, email, password) {
   await page.locator("#login-password").fill(password);
   await page.locator("#login-confirm").fill(password);
   await page.getByRole("button", { name: /create account/i }).last().click();
-  await page.waitForTimeout(800);
-
-  // Now sign in (register flips back to login mode).
-  await page.locator("#login-email").fill(email);
-  await page.locator("#login-password").fill(password);
-  await page.getByRole("button", { name: /access intelligence hub/i }).click();
+  // Registering signs the user in directly (AI engine screen); older
+  // builds returned to the login form - handle both.
+  // Wait for the engine screen itself: the register form can disappear a
+  // moment before it renders, so "form gone" alone is not a signal.
+  const engine = page.getByText(/choose your ai engine/i);
+  await engine.waitFor({ timeout: 15000 }).catch(() => {});
+  if (!(await engine.isVisible().catch(() => false))) {
+    await page.locator("#login-email").fill(email);
+    await page.locator("#login-password").fill(password);
+    await page.getByRole("button", { name: /access intelligence hub/i }).click();
+  }
 }
 
 async function chooseLLM(page, label) {
@@ -78,7 +83,8 @@ test.describe("ARIA QA - non-Data pages", () => {
     const password = "QaPass123!";
 
     await registerAndLogin(page, email, password);
-    await chooseLLM(page, "Cloud AI");
+    // Cloud AI by default; ARIA_E2E_ENGINE="Local AI" where no valid Groq key exists.
+    await chooseLLM(page, process.env.ARIA_E2E_ENGINE || "Cloud AI");
 
     const perPage = {};
 

@@ -340,6 +340,25 @@ def _apply_stmt_timeout(conn, dialect):
         pass
 
 
+_LATER_DATE_WORDS = {"ship", "shipped", "due", "delivery", "delivered", "updated",
+                     "modified", "closed", "end", "expiry", "expires"}
+_EVENT_DATE_WORDS = {"order", "transaction", "txn", "created", "sale", "invoice",
+                     "booking", "purchase", "start"}
+
+
+def _time_dim_rank(column: str) -> int:
+    """0 = the date the event happened (order/transaction/created), 1 =
+    neutral, 2 = a follow-up date (ship/due/updated): forecasts default
+    to when things happened, like the Dashboard trend."""
+    from schema_engine.lexical import identifier_words
+    words = set(identifier_words(column))
+    if words & _EVENT_DATE_WORDS:
+        return 0
+    if words & _LATER_DATE_WORDS:
+        return 2
+    return 1
+
+
 def _validate_time_dim(engine_or_conn, dialect, table, column, dtype):
     """Check a candidate time column against REAL data.
 
@@ -511,13 +530,25 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
     for tname in list(tables)[:15]:
         cols = _table_columns(tables, tname)
         measures = [m for m in (intel.find_all_measures(tname) or [])]
-        # Time candidates: real date dtypes first, then date-hinted text cols.
-        # Token-based hints (never substrings): "holiday" must not match "day".
+        # Headline measure first (the one the Dashboard leads with, e.g.
+        # Total Due before Sub Total) so the default forecast matches it.
+        try:
+            _best = intel.find_best_measure(tname)
+            if _best in measures:
+                measures = [_best] + [m for m in measures if m != _best]
+        except Exception:
+            pass
+        # Time candidates: real date dtypes first, then date-hinted text cols
+        # (shorthand such as 'txn_dt' included). Token-based hints (never
+        # substrings): "holiday" must not match "day". Event dates (order,
+        # transaction, created) rank before follow-up dates (ship, due).
+        from core.data_intelligence import is_date_name as _is_date_name
         date_cols = [n for n, d in cols
                      if any(k in d.lower() for k in ("date", "time", "timestamp"))]
         text_hints = [n for n, d in cols
-                      if n not in date_cols and _hint_hit(n, _DATE_NAME_HINTS)]
-        _plan.append((tname, cols, measures, (date_cols + text_hints)[:3]))
+                      if n not in date_cols and _is_date_name(n)]
+        _plan.append((tname, cols, measures,
+                      sorted(date_cols + text_hints, key=_time_dim_rank)[:3]))
 
     def _scan_one(tname, cols, measures, cands):
         """Validate one table on its own connection (thread-safe)."""
@@ -583,7 +614,12 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
     recommended = None
     for t in out_tables:
         if t["measures"] and t["time_dims"]:
-            best_td = max(t["time_dims"], key=lambda d: (d["kind"] == "date", d["distinct"]))
+            # Among usable axes (>= 5 points), the event date (order /
+            # transaction) beats a follow-up date (ship / due) even when
+            # the latter has a few more distinct values.
+            _usable = [d for d in t["time_dims"] if d["distinct"] >= 5] or t["time_dims"]
+            best_td = max(_usable, key=lambda d: (d["kind"] == "date",
+                                                  -_time_dim_rank(d["column"]), d["distinct"]))
             if best_td["distinct"] >= 5:
                 recommended = {
                     "table": t["table"],

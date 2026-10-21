@@ -8,6 +8,8 @@ import {
   Search, LogOut, ChevronDown, Bell, CheckCheck, Trash2,
 } from "lucide-react";
 import { workspaceApi } from "../../services/api";
+import { localStore } from "../../utils/storage.js";
+import { datasetLabel } from "../lib/labels";
 
 // The standalone Hypothesis page was removed: hypothesis is an investigation
 // capability surfacing as Possible drivers inside AI Analytics / Insights /
@@ -66,7 +68,7 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
   const { isDark, toggleTheme, page, setPage } = useTheme();
   const [collapsed, setCollapsed] = useState(() => {
     try {
-      return localStorage.getItem("aria_sidebar_collapsed") === "1";
+      return localStore.getItem("aria_sidebar_collapsed") === "1";
     } catch {
       return false;
     }
@@ -77,7 +79,7 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
 
   useEffect(() => {
     try {
-      localStorage.setItem("aria_sidebar_collapsed", collapsed ? "1" : "0");
+      localStore.setItem("aria_sidebar_collapsed", collapsed ? "1" : "0");
     } catch { /* private mode: session-only */ }
   }, [collapsed]);
 
@@ -226,12 +228,12 @@ export default function AppShell({ children, user, selectedLLM, dbName, onChange
             <h1 className="text-[15px] font-semibold text-foreground tracking-tight flex items-center gap-2">{pageTitles[page]}{dbName ? (
               <button
                 onClick={() => setPage("data")}
-                title={`Analyzing: ${dbName} — click to switch dataset`}
-                aria-label={`Analyzing ${dbName}. Switch dataset`}
+                title={`Analyzing: ${datasetLabel(dbName)} — click to switch dataset`}
+                aria-label={`Analyzing ${datasetLabel(dbName)}. Switch dataset`}
                 className="inline-flex items-center gap-1 text-[11px] text-muted-foreground font-normal bg-secondary/70 border border-border/60 rounded-full px-2.5 py-0.5 hover:text-foreground hover:border-primary/50 transition-colors"
               >
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
-                {dbName}
+                {datasetLabel(dbName)}
               </button>
             ) : null}</h1>
           </div>

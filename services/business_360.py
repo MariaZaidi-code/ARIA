@@ -203,6 +203,7 @@ def build_business360(*, question, result_data, columns, metric_label=None,
                 "cause": _human(name),
                 "why_plain": f"{_human(name)} {why} When this moves, your total moves with it — focus here first.",
                 "share_pct": share_f,
+                "is_segment": True,
             })
         if hypothesis and isinstance(hypothesis, dict):
             ht = str(hypothesis.get("text") or "")[:300]
@@ -226,10 +227,14 @@ def build_business360(*, question, result_data, columns, metric_label=None,
                     if any(nm.lower() in str(c.get("cause", "")).lower() for c in likely_causes):
                         continue
                     sh = round(v / tot * 100, 1) if tot else None
+                    # Only the first (largest) group is "the biggest lever".
+                    _lever = (" — the biggest lever in view." if not likely_causes
+                              else " — the next lever to watch.")
                     likely_causes.append({
                         "cause": nm,
-                        "why_plain": f"{nm} contributes {_fmt_money(v)}" + (f" ({sh}% of the total)" if sh else "") + " — the biggest lever in view.",
+                        "why_plain": f"{nm} contributes {_fmt_money(v)}" + (f" ({sh}% of the total)" if sh else "") + _lever,
                         "share_pct": sh,
+                        "is_segment": True,
                     })
                     if len(likely_causes) >= 3:
                         break
@@ -242,6 +247,10 @@ def build_business360(*, question, result_data, columns, metric_label=None,
                 "why_plain": "No single item dominates. That usually means the fix is operational (pricing, stock, follow-up) rather than one big cause.",
                 "share_pct": None,
             }]
+
+        # Real groups from the data, never the "spread across many small
+        # factors" placeholder: action titles must name something you can act on.
+        _segments = [c["cause"] for c in likely_causes if c.get("is_segment")]
 
         # ---- What to do (translate engine cards → businessman actions) ----
         what_to_do = []
@@ -262,7 +271,7 @@ def build_business360(*, question, result_data, columns, metric_label=None,
             if action:
                 steps.append(action)
             # add concrete generic steps so a businessman can act Monday morning
-            top_cause = likely_causes[0]["cause"] if likely_causes else "your top segment"
+            top_cause = _segments[0] if _segments else "your top segment"
             if len(steps) < 3:
                 steps += [
                     f"Protect {top_cause}: check stock, price and delivery for the next 14 days.",
@@ -276,8 +285,8 @@ def build_business360(*, question, result_data, columns, metric_label=None,
             })
         # engine refused → still give 3 excellent businessman plays from real top segments
         if not what_to_do:
-            top_cause = likely_causes[0]["cause"] if likely_causes else "your best-selling line"
-            second = likely_causes[1]["cause"] if len(likely_causes) > 1 else "the weakest spot"
+            top_cause = _segments[0] if _segments else "your best-selling line"
+            second = _segments[1] if len(_segments) > 1 else "the weakest spot"
             what_to_do = [
                 {
                     "title": f"Defend {top_cause} — your money-maker",

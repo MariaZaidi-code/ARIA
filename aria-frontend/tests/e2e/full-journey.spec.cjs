@@ -6,16 +6,17 @@ const { test, expect } = require('@playwright/test');
 const { seedAuth } = require('./auth-helper');
 
 const PAGES = [
-  { name: 'Dashboard', navText: 'Dashboard', check: () => expect(page.locator('h2')).toContainText('Dashboard') },
-  { name: 'AIAnalytics', navText: 'AI Analytics', check: () => expect(page.locator('h2')).toContainText('Analytics') },
-  { name: 'Insights', navText: 'Insights', check: () => expect(page.locator('h2')).toContainText('Insight') },
-  { name: 'Predictive', navText: 'Forecast', check: () => expect(page.locator('h2')).toContainText('Forecast') },
-  { name: 'Intelligence', navText: 'Intelligence', check: () => expect(page.locator('h2')).toContainText('Intelligence') },
-  { name: 'Data', navText: 'Data', check: () => expect(page.locator('.premium-card')).toBeVisible({ timeout: 5000 }) },
-  { name: 'Documents', navText: 'Documents', check: () => expect(page.locator('.premium-card, h2')).toBeVisible({ timeout: 5000 }) },
-  { name: 'Copilot', navText: 'Copilot', check: () => expect(page.locator('textarea, input')).toBeVisible({ timeout: 5000 }) },
-  { name: 'History', navText: 'History', check: () => expect(page.locator('h2')).toContainText('History') },
-  { name: 'Settings', navText: 'Settings', check: () => expect(page.locator('.nav-item')).toHaveCount(7) },
+  // navText = exact sidebar label; the top-bar <h1> shows the same title.
+  { name: 'Dashboard', navText: 'Dashboard' },
+  { name: 'AIAnalytics', navText: 'AI Analytics' },
+  { name: 'Insights', navText: 'Insights' },
+  { name: 'Predictive', navText: 'Forecast' },
+  { name: 'Intelligence', navText: 'Intelligence' },
+  { name: 'Data', navText: 'Data' },
+  { name: 'Documents', navText: 'Documents' },
+  { name: 'Copilot', navText: 'Copilot' },
+  { name: 'History', navText: 'History' },
+  { name: 'Settings', navText: 'Settings' },
 ];
 
 test.describe('Full journey - every page loads', () => {
@@ -24,9 +25,10 @@ test.describe('Full journey - every page loads', () => {
 
   for (const p of PAGES) {
     test(`navigate to ${p.name}`, async () => {
-      await page.getByRole('button', { name: new RegExp(p.navText, 'i') }).click();
-      await page.waitForTimeout(300);
-      await p.check();
+      await page.getByRole('button', { name: new RegExp('^' + p.navText + '$', 'i') }).first().click();
+      await expect(page.locator('h1').filter({ hasText: new RegExp('^' + p.navText, 'i') }).first())
+        .toBeVisible({ timeout: 15000 });
+      await expect(page.getByText(/something went wrong on this page/i)).toHaveCount(0);
     });
   }
 

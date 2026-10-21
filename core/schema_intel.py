@@ -26,6 +26,18 @@ def _is_id_like(name: str) -> bool:
     return toks[-1] in ("id", "uuid", "guid", "key", "code")
 
 
+def _meaning_words(name: str) -> set:
+    """Name tokens plus their plain-English expansions ('amt' -> 'amount',
+    'txn_dt' -> 'transaction', 'date'), for ranking by meaning only."""
+    from schema_engine.lexical import identifier_words
+    return set(_name_tokens(name)) | set(identifier_words(name))
+
+
+# Calendar parts: grouping axes, never measures (SUM of month numbers is
+# as meaningless as SUM of years).
+_PERIOD_PART_WORDS = {"year", "month", "quarter", "week", "weekday", "day", "hour"}
+
+
 def _hint_hit(name: str, hints) -> bool:
     """Any name token equals a hint (singular/plural tolerant)."""
     for t in _name_tokens(name):
@@ -350,7 +362,8 @@ class SchemaIntelligence:
                 and not _is_id_like(c)
                 and not _is_binary_like_name(c)
                 and not _is_binary_like_type(col_types.get(c, ""))
-                and not _is_year_like(c)]
+                and not _is_year_like(c)
+                and not (_meaning_words(c) & _PERIOD_PART_WORDS)]
 
     def find_best_measure(self, table: str):
         """Pick the most analytically useful numeric column (prefer amounts over IDs).
@@ -371,12 +384,17 @@ class SchemaIntelligence:
         financial_components = {"price", "cost", "expense", "salary", "charge", "fee", "tax", "freight", "discount"}
         operational = {"quantity", "qty", "count", "weight", "unit", "units"}
 
+        # Parts of a total (sub total, tax amount, line total, unit price)
+        # rank below the headline total they add up to ('TotalDue').
+        component_parts = {"sub", "tax", "freight", "shipping", "line", "unit",
+                           "discount", "fee"}
+
         def rank(col):
-            tokens = set(_name_tokens(col))
+            tokens = _meaning_words(col)
             if tokens & direct_outcomes:
                 return 4
             if tokens & totals:
-                return 3
+                return 2.5 if tokens & component_parts else 3
             if tokens & financial_components:
                 return 2
             if tokens & operational:
@@ -413,8 +431,21 @@ class SchemaIntelligence:
                   if c not in pks and c not in fk_cols
                   and not _is_id_like(c)]
         if usable:
-            non_date = [c for c in usable if not _hint_hit(c, _DATE_NAME_HINTS)]
-            return (non_date or usable)[0]
+            # Shorthand dates ('txn_dt') are dates too.
+            non_date = [c for c in usable if not _hint_hit(c, _DATE_NAME_HINTS)
+                        and not (_meaning_words(c) & {"date", "time", "timestamp"})]
+            pool = non_date or usable
+            # Prefer a real grouping (few distinct values) over near-unique
+            # text such as names or free text, when profiling knows it.
+            stats = (self.tables.get(table) or {}).get("null_stats") or {}
+
+            def _distinct(c):
+                try:
+                    return int((stats.get(c) or {}).get("distinct_count") or 0)
+                except (TypeError, ValueError):
+                    return 0
+            groupable = [c for c in pool if 0 < _distinct(c) <= 50]
+            return (groupable or pool)[0]
         non_pk = [c for c in texts if c not in pks]
         if non_pk:
             non_date = [c for c in non_pk if not _hint_hit(c, _DATE_NAME_HINTS)]

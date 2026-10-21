@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -93,19 +94,32 @@ def _coerce_num(value):
 
 
 def _fmt(v, is_currency=False):
-    if v is None:
+    """Card-sized number that never misstates the value.
+
+    Below 10,000 the full number is shown (1,500 - never '2K'); larger
+    values are shortened with enough precision to stay honest (47.3K,
+    151K, 1.8M, 2.1B). Small fractions keep two decimals (4.37).
+    """
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
         return "N/A"
-    if is_currency:
-        if abs(v) >= 1_000_000:
-            return f"${v/1_000_000:,.1f}M"
-        if abs(v) >= 1_000:
-            return f"${v/1_000:,.0f}K"
-        return f"${v:,.0f}"
-    if abs(v) >= 1_000_000:
-        return f"{v/1_000_000:,.1f}M"
-    if abs(v) >= 1_000:
-        return f"{v/1_000:,.0f}K"
-    return f"{v:,.0f}"
+    if math.isnan(v) or math.isinf(v):
+        return "N/A"
+    a = abs(v)
+    if a >= 1_000_000_000:
+        s = f"{v/1_000_000_000:,.1f}B"
+    elif a >= 1_000_000:
+        s = f"{v/1_000_000:,.1f}M"
+    elif a >= 100_000:
+        s = f"{v/1_000:,.0f}K"
+    elif a >= 10_000:
+        s = f"{v/1_000:,.1f}K"
+    elif a >= 100 or v == int(v):
+        s = f"{v:,.0f}"
+    else:
+        s = f"{v:,.2f}"
+    return f"${s}" if is_currency else s
 
 
 def _is_currency_col(col_name: str) -> bool:

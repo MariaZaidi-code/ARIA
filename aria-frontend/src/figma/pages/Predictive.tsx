@@ -8,7 +8,9 @@ import { ChartBrush } from "../components/ChartBrush";
 import { CATEGORY_COLORS } from "../lib/charts";
 import AIProcessingIndicator from "../components/AIProcessingIndicator";
 import { loadAnalysisContext, readHashParams, saveAnalysisContext } from "../lib/analysisContext";
+import { humanizeLabel } from "../lib/labels";
 import { apiFetch, normalizeApiError, prescriptionApi } from "../../services/api";
+import { localStore, sessionStore } from "../../utils/storage.js";
 
 interface PredictiveProps {
   insightResult?: any;
@@ -196,17 +198,17 @@ function normalizeLinkFilters(f: any): { column: string; value: string }[] {
 
 function readForecastLinkContext(): ForecastLinkContext | null {
   try {
-    const ls = localStorage.getItem("aria_forecast_context");
+    const ls = localStore.getItem("aria_forecast_context");
     if (ls) {
-      localStorage.removeItem("aria_forecast_context");
+      localStore.removeItem("aria_forecast_context");
       const c = JSON.parse(ls);
       if (c && typeof c === "object") return c;
     }
   } catch { /* best-effort */ }
   try {
-    const ss = sessionStorage.getItem("aria_forecast_prefill");
+    const ss = sessionStore.getItem("aria_forecast_prefill");
     if (ss) {
-      sessionStorage.removeItem("aria_forecast_prefill");
+      sessionStore.removeItem("aria_forecast_prefill");
       const h = JSON.parse(ss);
       if (h && typeof h === "object") {
         return {
@@ -701,6 +703,9 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   const targetName = plainName(
     selection?.measure || (predictions as any)?.target || predictions?.column || selectedTarget);
   const timeName = plainName(selection?.time_dim || selectedTime);
+  // Display-only label ("total_amount" -> "Total amount"); the raw name
+  // stays in API payloads, saved context and the CSV export.
+  const targetLabel = targetName ? humanizeLabel(targetName) : "";
   // Backend accuracy lives in two shapes: accuracy_pct (number) or
   // accuracy: { pct, summary }. Support both verbatim.
   const accuracy: number | null = (() => {
@@ -904,10 +909,10 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   // scenario values, never static copy (see buildForecastStory).
   const forecastStory: { story: string; signal: string } = useMemo(() => {
     return buildForecastStory({
-      hasPredictions, scenarios, targetName,
+      hasPredictions, scenarios, targetName: targetLabel,
       horizonPeriods: fwdVals.length, accuracy, momDelta,
     });
-  }, [hasPredictions, scenarios, targetName, fwdVals.length, accuracy, momDelta]);
+  }, [hasPredictions, scenarios, targetLabel, fwdVals.length, accuracy, momDelta]);
 
   // Preliminary comes from the backend total: the backend marks fewer than
   // 50 observations preliminary, mirrored here via forecast_stage + n_obs.
@@ -1222,7 +1227,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none cursor-pointer"
               >
                 {tables.map((t) => (
-                  <option key={t.table} value={t.table}>{t.table} ({t.row_count ?? "?"} rows)</option>
+                  <option key={t.table} value={t.table}>{humanizeLabel(t.table)} ({t.row_count ?? "?"} rows)</option>
                 ))}
               </select>
             </div>
@@ -1238,7 +1243,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               >
                 {activeMeasures.length === 0 && <option value="">No measures in this dataset</option>}
                 {activeMeasures.map((m: string) => (
-                  <option key={m} value={m}>{m}</option>
+                  <option key={m} value={m}>{humanizeLabel(m)}</option>
                 ))}
               </select>
             </div>
@@ -1251,7 +1256,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               >
                 {activeTimes.length === 0 && <option value="">Auto-detect…</option>}
                 {activeTimes.map((d: any) => (
-                  <option key={d.column} value={d.column}>{d.column}{d.kind === "text" ? " (text)" : ""} · {d.distinct ?? "?"} points</option>
+                  <option key={d.column} value={d.column}>{humanizeLabel(d.column)}{d.kind === "text" ? " (text)" : ""} · {d.distinct ?? "?"} points</option>
                 ))}
               </select>
               {selectedTime && (
@@ -1338,7 +1343,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                     aria-label="Filter column"
                   >
                     {schemaCols.map((c: any) => (
-                      <option key={c.name} value={c.name}>{c.name}</option>
+                      <option key={c.name} value={c.name}>{humanizeLabel(c.name)}</option>
                     ))}
                   </select>
                   <input
@@ -1351,7 +1356,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                   />
                   <datalist id="predictive-filter-values">
                     {filters.map((f) => (
-                      <option key={`sug-${f.column}-${f.value}`} value={f.value}>{f.column}</option>
+                      <option key={`sug-${f.column}-${f.value}`} value={f.value}>{humanizeLabel(f.column)}</option>
                     ))}
                   </datalist>
                   <button
@@ -1375,7 +1380,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
             <div className="flex flex-wrap gap-2">
               {filters.map((f) => (
                 <span key={f.column} className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full bg-secondary text-foreground">
-                  {f.column} = {f.value}
+                  {humanizeLabel(f.column)} = {f.value}
                   <button
                     onClick={() => setFilters((prev) => prev.filter((x) => x.column !== f.column))}
                     className="text-muted-foreground hover:text-foreground"
@@ -1395,7 +1400,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
             >
               {loading ? "Working…" : hasPredictions ? "Update" : "Build forecast"}
             </button>
-            {timeName && <p className="text-[11px] text-muted-foreground">Time base: {timeName} · detected from your data, changeable above.</p>}
+            {timeName && <p className="text-[11px] text-muted-foreground">Time base: {humanizeLabel(timeName)} · detected from your data, changeable above.</p>}
           </div>
           {horizonWarning && <p className="text-[11px] text-warning mt-1">{horizonWarning}</p>}
         </div>
@@ -1448,7 +1453,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
           <div className="lg:col-span-2 space-y-4">
             <div className={`bg-card border border-border rounded-xl p-5 forecast-reveal ${loading ? "opacity-70" : ""}`} key={`fc-${revealKey}`}>
               <ChartFrame
-                title={`${plainName(selectedTarget) || "Metric"} forecast`}
+                title={`${humanizeLabel(plainName(selectedTarget)) || "Metric"} forecast`}
                 explanation={`Solid line: what actually happened${frequency ? ` (${frequency})` : ""}. Line ahead: what ARIA expects next. Shaded band: likely range. Hover any point for detail, click a point to inspect it, drag the range bar to zoom. Click legend items to toggle series.`}
                 empty={chartRows.length === 0}
                 emptyText="Chart couldn't be drawn from this result — the numbers above still apply."
@@ -1664,7 +1669,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
             {/* What-if estimate: wired to the real scenario endpoint. */}
             <div className="bg-card border border-border rounded-xl p-4 space-y-2">
               <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">What-if estimate</p>
-              <p className="text-xs text-muted-foreground leading-relaxed">See what a change to {targetName || "this number"} could look like. Arithmetic estimate from your history, not a forecast.</p>
+              <p className="text-xs text-muted-foreground leading-relaxed">See what a change to {targetLabel || "this number"} could look like. Arithmetic estimate from your history, not a forecast.</p>
               <div className="flex items-center gap-2 flex-wrap">
                 <label className="text-xs text-muted-foreground" htmlFor="predictive-scenario-pct">Change (%)</label>
                 <input
@@ -1690,7 +1695,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                   <div className="flex justify-between"><span className="text-muted-foreground">Starting level</span><span className="font-bold text-foreground">{fmtNum(scenario.baseline)}</span></div>
                   <div className="flex justify-between"><span className="text-muted-foreground">With change</span><span className="font-bold text-foreground">{fmtNum(scenario.scenario_value)} ({Number(scenario.pct_change) >= 0 ? "+" : ""}{scenario.pct_change}%)</span></div>
                   <div className="flex justify-between"><span className="text-muted-foreground">Difference</span><span className="font-bold text-foreground">{fmtNum(scenario.delta)}</span></div>
-                  <p className="text-[11px] text-muted-foreground">Based on the last {scenario.periods_used ?? 3} periods of {scenario.column || targetName}.</p>
+                  <p className="text-[11px] text-muted-foreground">Based on the last {scenario.periods_used ?? 3} periods of {scenario.column ? humanizeLabel(scenario.column) : targetLabel}.</p>
                   {Array.isArray(scenario.assumptions) && scenario.assumptions.length > 0 && (
                     <ul className="space-y-0.5 pt-1">
                       {scenario.assumptions.map((a: string, i: number) => (
@@ -1777,7 +1782,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 <span className="text-muted-foreground text-xs">{confidenceOpen ? "▾" : "▸"}</span>
               </button>
               <p className="text-sm text-foreground leading-relaxed">
-                {targetName ? <><strong>{targetName}</strong> is </> : "Your number is "}
+                {targetLabel ? <><strong>{targetLabel}</strong> is </> : "Your number is "}
                 {pctChange !== null && pctChange > 1 && <>heading up about <strong>+{pctChange.toFixed(1)}%</strong></>}
                 {pctChange !== null && pctChange < -1 && <>heading down about <strong>{pctChange.toFixed(1)}%</strong></>}
                 {(pctChange === null || Math.abs(pctChange) <= 1) && <>holding roughly steady</>}
@@ -1874,7 +1879,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 metrics live only under Technical details — never in the main view. */}
             <Evidence
               sections={[
-                { title: "Data analyzed", body: `${targetName || "The selected number"} over the last ${historyCount > 0 ? `${historyCount} periods` : "available history"}${frequency ? ` (${frequency}).` : "."}` },
+                { title: "Data analyzed", body: `${targetLabel || "The selected number"} over the last ${historyCount > 0 ? `${historyCount} periods` : "available history"}${frequency ? ` (${frequency}).` : "."}` },
                 { title: "Key observation", body: pctChange !== null && Math.abs(pctChange) > 1 ? `Recent momentum points ${pctChange > 0 ? "up" : "down"} about ${Math.abs(Math.round(pctChange))}%.` : "Recent values sit close to their average — no strong direction." },
                 { title: "Analysis method", body: "ARIA compared several projection approaches and kept the one that held up best against past actuals before showing any projection." },
                 { title: "Confidence", body: accuracy !== null ? `${accuracy >= 70 ? "Reliable" : "Weak"} in backtesting (${Math.round(accuracy)}% accuracy). Uncertainty grows further out — treat distant points as directional.` : "Backtesting could not score this series — treat the projection as directional." },
@@ -1921,8 +1926,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
             )}
             <p className="text-[11px] text-muted-foreground pt-1">
               {pointSel.forecast !== null && pointSel.forecast !== undefined
-                ? `Forecast${modelName ? ` · ${modelName}` : ""} · ${targetName}`
-                : `Historical actual · ${targetName}`}
+                ? `Forecast${modelName ? ` · ${modelName}` : ""} · ${targetLabel}`
+                : `Historical actual · ${targetLabel}`}
             </p>
           </div>
         </div>

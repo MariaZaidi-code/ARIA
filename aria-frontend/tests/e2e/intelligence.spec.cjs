@@ -5,7 +5,7 @@
 // and navigation work, and that failures render a Retry (never a bare
 // "Failed to fetch"), whether or not /api/intelligence/* is implemented.
 const { test, expect } = require('@playwright/test');
-const { seedAuth } = require('./auth-helper');
+const { seedAuth, connectSampleCsv } = require('./auth-helper');
 
 const BASE = 'http://localhost:8000';
 const BARE_FETCH = /failed to fetch/i;
@@ -15,12 +15,14 @@ test.describe('Intelligence module', () => {
   test.beforeAll(async ({ browser }) => {
     page = await browser.newPage();
     await seedAuth(page, BASE);
+    // Intelligence shows its tabs only with data connected.
+    await connectSampleCsv(page, BASE);
   });
   test.afterAll(async () => { await page.close(); });
 
   async function openIntelligence() {
     await page.waitForLoadState('networkidle');
-    await page.getByRole('button', { name: /^intelligence$/i }).click();
+    await page.getByRole('button', { name: /^intelligence$/i }).first().click();
     await expect(page.getByRole('heading', { name: 'ARIA Intelligence' })).toBeVisible({ timeout: 8000 });
   }
 
@@ -62,8 +64,10 @@ test.describe('Intelligence module', () => {
     await page.getByRole('button', { name: /run analysis/i }).click();
     await page.waitForTimeout(2500);
     if (await page.getByText('ARIA Observation').count()) {
-      await page.getByRole('button', { name: /^line chart$/i }).click();
-      await page.getByRole('button', { name: /^bar chart$/i }).click();
+      // The chart type is a dropdown ("Bar Chart" / "Line Chart").
+      const chartType = page.getByLabel('Chart type').locator('select').or(page.locator('select[aria-label="Chart type"]')).first();
+      await chartType.selectOption('line');
+      await chartType.selectOption('bar');
       // Next step -> What-If tab becomes selected.
       await page.getByRole('button', { name: /test a scenario/i }).click();
       await expect(page.getByRole('tab', { name: /what-if/i })).toHaveAttribute('aria-selected', 'true');
@@ -94,7 +98,7 @@ test.describe('Intelligence module', () => {
   test('Goals: filter tabs + Save goal persists after reload', async () => {
     await openIntelligence();
     await openTab('Goals');
-    for (const t of ['Active', 'Completed', 'Paused', 'All Goals']) {
+    for (const t of ['Active Goals', 'Completed', 'Paused', 'All Goals']) {
       await expect(page.getByRole('tab', { name: new RegExp(`^${t}$`, 'i') })).toBeVisible();
     }
     await page.getByRole('button', { name: /^create goal$/i }).first().click();
@@ -139,7 +143,8 @@ test.describe('Intelligence module', () => {
     await expect(page.getByLabel('Report name')).toBeVisible({ timeout: 8000 });
     await expect(page.getByLabel('Report description')).toBeVisible();
     await page.getByLabel('Report name').fill('E2E Review ' + Date.now());
-    const gen = page.getByRole('button', { name: /generate pdf/i });
+    // Exact name: a second "Generate PDF top" button sits in the header.
+    const gen = page.getByRole('button', { name: 'Generate PDF', exact: true });
     await expect(gen).toBeVisible();
     await gen.click();
     await expect(

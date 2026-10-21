@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 
 import { apiFetch } from "../../services/api";
+import { datasetLabel } from "../lib/labels";
 
 type SourceType = "postgresql" | "mysql" | "csv" | "pdf" | "";
 type Tab = "sources" | "schema" | "preview" | "quality";
@@ -268,16 +269,24 @@ export default function Data({
               </div>
               <div>
                 <div className="flex items-center gap-2">
-                  <p className="text-sm font-semibold text-foreground">{connHealth.database || dbName}</p>
+                  <p className="text-sm font-semibold text-foreground">{datasetLabel(connHealth.database || dbName)}</p>
                   <span className="flex items-center gap-1 text-[11px] text-positive font-medium">
                     <span className="w-1.5 h-1.5 rounded-full bg-positive" /> {connHealth.status === "connected" ? "Connected" : connHealth.status}
                   </span>
                 </div>
                 <p className="text-[11px] text-muted-foreground mt-0.5">
-                  {connHealth.db_type?.toUpperCase()} · {connHealth.host} · Schema: {connHealth.schema || "default"} · {connHealth.table_count} tables · {connHealth.column_count} columns
+                  {/* Only parts that exist: a file upload has no server or schema. */}
+                  {[
+                    connHealth.source_type === "relational" ? connHealth.db_type?.toUpperCase() : "Uploaded file",
+                    connHealth.source_type === "relational" ? (String(connHealth.host || "").trim() || null) : null,
+                    connHealth.schema ? `${String(connHealth.schema).includes(",") ? "Schemas" : "Schema"}: ${connHealth.schema}` : null,
+                    `${connHealth.table_count ?? 0} ${connHealth.table_count === 1 ? "table" : "tables"}`,
+                    `${connHealth.column_count ?? 0} ${connHealth.column_count === 1 ? "column" : "columns"}`,
+                  ].filter(Boolean).join(" · ")}
                 </p>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  Last scan: {connHealth.last_schema_scan ? new Date(connHealth.last_schema_scan).toLocaleString() : "Never"} · Provider: {connHealth.provider}
+                  Last scan: {connHealth.last_schema_scan ? new Date(connHealth.last_schema_scan).toLocaleString() : "Never"}
+                  {connHealth.provider ? ` · AI: ${connHealth.provider === "local" ? "Local (on this computer)" : connHealth.provider === "cloud" ? "Cloud (Groq)" : connHealth.provider}` : ""}
                 </p>
               </div>
             </div>

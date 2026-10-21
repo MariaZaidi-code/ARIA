@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from core.config import get_session, save_session
 from core.deps import get_current_user, require_writable
-from core.errors import sanitize_error
+from core.errors import provider_key_error, sanitize_error
 from llm_provider import PROVIDERS, create_provider
 
 router = APIRouter()
@@ -89,7 +89,7 @@ async def save_provider(req: ProviderConfigRequest, _user: dict = Depends(requir
             log.warning("Provider key validation failed for '%s': %s", name, exc)
             raise HTTPException(
                 status_code=400,
-                detail=f"The {name} key was rejected or unreachable ({sanitize_error(exc)}). Check the key and try again.",
+                detail=provider_key_error(name, exc),
             )
 
     session = get_session(_user["user_id"])
@@ -143,8 +143,14 @@ async def providers_status(_user: dict = Depends(get_current_user)):
                 await _asyncio.to_thread(_ping_ollama, 5)
                 return {"provider": name, "available": True, "reason": "Ollama is running on this machine."}
             except Exception as exc:
+                # "Running but models missing" is not "unreachable": Local
+                # mode still answers through the built-in rule engine.
+                if "none of the ARIA models" in str(exc):
+                    return {"provider": name, "available": True,
+                            "reason": ("Ollama is running, but ARIA's local models aren't installed, "
+                                       "so answers use the built-in rule engine.")}
                 return {"provider": name, "available": False,
-                        "reason": f"Ollama is not reachable ({sanitize_error(exc)}). Start Ollama and try again."}
+                        "reason": "Ollama isn't running on this computer. Start Ollama and try again."}
         key = resolve_provider_key(name, saved)
         if not key:
             label = {"cloud": "Groq", "deepseek": "DeepSeek", "omniroute": "OmniRoute", "grok": "Grok"}.get(name, name)
@@ -155,7 +161,7 @@ async def providers_status(_user: dict = Depends(get_current_user)):
             return {"provider": name, "available": True, "reason": "API key verified and reachable."}
         except Exception as exc:
             return {"provider": name, "available": False,
-                    "reason": f"Key rejected or unreachable ({sanitize_error(exc)}). Check the key and retry."}
+                    "reason": provider_key_error(name, exc)}
 
     names = ["local", "cloud", "deepseek", "omniroute", "grok"]
     results = await _asyncio.gather(*[_check(n) for n in names])

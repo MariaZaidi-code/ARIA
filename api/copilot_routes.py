@@ -123,8 +123,12 @@ def _suggest_questions(mapping: dict, session: dict | None = None) -> list[str]:
 
         def _total_q(raw_col: str) -> str:
             lbl = _nl(raw_col)
-            if lbl.strip().lower() in ("total", "sum", "count", "value", "amount"):
+            if lbl.strip().lower() in ("total", "sum", "count"):
                 return "What is the overall total value?"
+            # Labels that already say "total" ('total due', 'sub total')
+            # never get a second one ("the total sub total").
+            if "total" in lbl.lower().split():
+                return f"What is the {lbl}?"
             return f"What is the total {lbl}?"
         if measure:
             out.append(_total_q(measure))
@@ -393,5 +397,83 @@ async def copilot_endpoint(body: CopilotRequest, user: dict = Depends(require_wr
         }
 
     payload = result.to_public()
+    if not payload.get("ok") and _needs_mapping:
+        # The LLM path could not answer (model missing, slow or wrong SQL):
+        # answer through the same deterministic engine the Analytics page
+        # uses, so Ask ARIA, Analytics and the Dashboard agree on numbers.
+        fallback = await asyncio.to_thread(
+            _goal_agent_answer, session, user, body.question or "")
+        if fallback:
+            payload = fallback
     payload["provider"] = session.get("provider_name")
     return payload
+
+
+def _goal_agent_answer(session: dict, user: dict, question: str) -> dict | None:
+    """Deterministic answer via the Goal Agent (schema-grounded SQL
+    templates when the LLM is unavailable), shaped like a Copilot reply.
+
+    Writes to its own processed file so the Analytics page's current result
+    is never overwritten. Returns None when it cannot produce rows.
+    """
+    try:
+        from core.analytical_result import analyze_result
+        from core.config import resolve_provider_key
+        from core.validation import validate_goal_text
+        from goal_agent import GoalAgent
+        from goal_agent.schema import load_user_overrides
+
+        validate_goal_text(question)
+        if not session.get("schema_path") or not session.get("processed_path"):
+            return None
+        out_path = Path(str(session["processed_path"])).with_name("copilot_fallback.json")
+        provider = session.get("provider")
+        agent = GoalAgent(
+            schema_json_path=str(session["schema_path"]),
+            db_uri=session["db_uri"],
+            provider=provider,
+            api_key=resolve_provider_key(provider, session.get("api_keys", {})),
+            dialect=session.get("dialect"),
+            overrides=load_user_overrides(user["user_id"], session.get("db_name", "")),
+            schemas=session.get("schemas"),
+        )
+        agent._active_current_question = question
+        agent.process_goal(question, output_path=str(out_path))
+        processed = json.loads(out_path.read_text(encoding="utf-8"))
+    except HTTPException:
+        return None
+    except Exception as exc:
+        log.info("Copilot Goal Agent fallback failed (%s).", type(exc).__name__)
+        return None
+    rows = processed.get("data") or []
+    sql = processed.get("sql_used") or None
+    if not rows or not sql:
+        return None
+    analysis = analyze_result(
+        ir=processed.get("goal_ir") or {},
+        columns=processed.get("columns") or list(rows[0].keys()),
+        rows=rows, goal=question, sql=sql,
+        row_count=processed.get("row_count", 0),
+    )
+    data = analysis.get("data") or rows
+    columns = analysis.get("columns") or list(data[0].keys())
+    answer = analysis.get("answer") or ""
+    if not answer:
+        return None
+    try:
+        from copilot.pipeline import infer_chart
+        chart = infer_chart(columns, data, question)
+    except Exception:
+        chart = None
+    tables = (processed.get("data_selection") or {}).get("tables") or []
+    return {
+        "ok": True,
+        "answer": answer,
+        "sql": sql,
+        "columns": columns,
+        "row_count": len(data),
+        "data": data[:50],
+        "chart": chart,
+        "tables_used": tables,
+        "intent": "analytics",
+    }

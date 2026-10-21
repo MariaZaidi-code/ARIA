@@ -96,6 +96,19 @@ def is_id_like_name(column_name: str) -> bool:
     return toks[-1] in ("id", "uuid", "guid", "key", "code")
 
 
+def is_date_name(column_name: str) -> bool:
+    """Name says "this is a date": 'order_date', 'CreatedAt', and data
+    shorthand such as 'txn_dt' / 'created_ts' (expanded through the shared
+    abbreviation dictionary, so 'dt' reads as 'date')."""
+    if hint_hit(column_name, _DATE_NAME_HINTS):
+        return True
+    try:
+        from schema_engine.lexical import identifier_words
+        return bool({"date", "timestamp", "time"} & set(identifier_words(column_name)))
+    except Exception:
+        return False
+
+
 def hint_hit(column_name: str, hints) -> bool:
     """True when any token of the name equals a hint (singular/plural).
 
@@ -230,13 +243,13 @@ def classify_column(column_name: str, data_type: Any = "") -> str:
     if any(tok in dtype for tok in _TEXT_TOKENS) or not dtype:
         if is_id_like_name(name):
             return "identifier"
-        if hint_hit(name, _DATE_NAME_HINTS):
+        if is_date_name(name):
             return "datetime"
         return "categorical"
     # Unknown vendor type: fall back to the name.
     if is_id_like_name(name):
         return "identifier"
-    if hint_hit(name, _DATE_NAME_HINTS):
+    if is_date_name(name):
         return "datetime"
     return "categorical"
 

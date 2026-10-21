@@ -22,7 +22,8 @@ export const API_BASE = (import.meta?.env?.VITE_API_BASE || "/api").replace(/\/$
 
 // Versioned storage (aria.v1.*) with legacy-key fallback. Static import is
 // cycle-safe: storage.js is dependency-free.
-import { storage as versionedStorage } from "../utils/storage.js";
+import { storage as versionedStorage, localStore, sessionStore } from "../utils/storage.js";
+import { humanizeLabel } from "../figma/lib/labels";
 
 const storageHelperGet = (key, fallback) => {
   try {
@@ -75,6 +76,10 @@ const resolvePath = (path) => {
 // (VITE_API_TIMEOUT_MS overrides, then clamped).
 const RAW_TIMEOUT_MS = Number(import.meta?.env?.VITE_API_TIMEOUT_MS || 90000);
 const REQUEST_TIMEOUT_MS = Math.max(60000, Math.min(120000, RAW_TIMEOUT_MS));
+// One budget for every AI-answered question (Analytics, Copilot, Ask ARIA
+// bot): the same backend pipeline must never time out on one page while
+// it is still allowed to finish on another. Cold local models are slow.
+export const AI_ANSWER_TIMEOUT_MS = 300000;
 export const API_TIMEOUT_MS = REQUEST_TIMEOUT_MS;
 
 // =========================================================
@@ -112,6 +117,10 @@ const request = async (path, options = {}) => {
     signal: externalSignal,
     timeoutMs,
     suppressUnauthorized = false,
+    // responseType "text" returns the raw body (e.g. printable report HTML)
+    // while keeping every hardened behaviour: timeout, abort, request id,
+    // 401 handling and normalized errors.
+    responseType = "json",
     ...rest
   } = options || {};
   // Per-request timeout override (clamped 1s–10min): cold local LLM calls
@@ -194,10 +203,17 @@ const request = async (path, options = {}) => {
     externalSignal?.removeEventListener?.("abort", onExternalAbort);
   } catch { /* ignore */ }
 
-  let data;
-
+  let raw;
   try {
-    data = await response.json();
+    raw = await response.text();
+  } catch {
+    raw = "";
+  }
+  if (responseType === "text" && response.ok) return raw;
+
+  let data;
+  try {
+    data = raw ? JSON.parse(raw) : {};
   } catch {
     data = {};
   }
@@ -316,12 +332,7 @@ const formatValue = (value) => {
   }).format(parsed);
 };
 
-const humanize = (key) => {
-  return String(key || "")
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
-};
+const humanize = (key) => humanizeLabel(key, { titleCase: true });
 
 const isIdLike = (key) => {
   // Whole-token / suffix match mirroring the backend (semantic +
@@ -716,9 +727,9 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
   // dimension), so "this period / previous period" resolves dynamically.
   try {
     let shared = {};
-    try { shared = JSON.parse(sessionStorage.getItem("aria_shared_context") || "{}") || {}; } catch { shared = {}; }
+    try { shared = JSON.parse(sessionStore.getItem("aria_shared_context") || "{}") || {}; } catch { shared = {}; }
     if (!shared || typeof shared !== "object" || Object.keys(shared).length === 0) {
-      try { shared = JSON.parse(localStorage.getItem("aria_analysis_context") || "{}") || {}; } catch { shared = {}; }
+      try { shared = JSON.parse(localStore.getItem("aria_analysis_context") || "{}") || {}; } catch { shared = {}; }
     }
     // Dataset guard: cross-module context describes a specific dataset. When
     // the caller names its dataset explicitly and the stored context names
@@ -1358,25 +1369,15 @@ export const intelligenceApi = {
   },
 
   // GET /api/intelligence/reports/:id/html -> styled printable HTML string
-  // (Reporting Agent). Uses raw fetch (not the JSON request helper) so the
-  // HTML body is preserved; throws a normalized Error on failure.
+  // (Reporting Agent). Goes through the hardened client in text mode, so it
+  // gets the same timeout, abort, request id and 401/error handling as
+  // every other call; throws a normalized Error on failure.
   getReportHtml: async (id) => {
-    const res = await fetch(
-      `${API_BASE}/intelligence/reports/${encodeURIComponent(id)}/html`,
-      { credentials: "include" },
+    const html = await request(
+      `/intelligence/reports/${encodeURIComponent(id)}/html`,
+      { responseType: "text" },
     );
-    if (res.status === 401) handleUnauthorized();
-    if (!res.ok) {
-      let data = {};
-      try { data = await res.json(); } catch { /* HTML/empty error body */ }
-      const norm = normalizeApiError(data, res.status, res.headers);
-      const error = new Error(norm.message);
-      error.status = res.status;
-      error.code = norm.code;
-      error.requestId = norm.requestId;
-      throw error;
-    }
-    return { success: true, data: await res.text() };
+    return { success: true, data: html };
   },
 
   // POST /api/intelligence/reports/:id/rerun -> same definition, fresh numbers.

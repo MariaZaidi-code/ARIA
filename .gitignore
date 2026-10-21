@@ -77,3 +77,7 @@ test_cloud_ask.cjs
 work/
 reports/
 .claude/settings.local.json
+
+# Audit run outputs (screenshots, traces)
+aria-frontend/test-results-*/
+aria-frontend/playwright-report-*/

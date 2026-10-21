@@ -92,7 +92,7 @@ test.describe('Main App pages', () => {
         await page.goto(`${BASE}#/settings`);
     await page.waitForLoadState('networkidle');
     // Check AI Configuration tab is accessible
-    const hasAIConfig = await page.getByText(/AI Configuration/i).count();
-    expect(hasAIConfig).toBeGreaterThan(0);
+    // The page renders after the boot session check, so wait for it.
+    await expect(page.getByText(/AI Configuration/i).first()).toBeVisible({ timeout: 20000 });
   });
 });

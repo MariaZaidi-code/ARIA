@@ -4,7 +4,30 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>aria-frontend</title>
+    <title>ARIA</title>
+    <script>
+      // Blocking theme script: apply the saved theme before first paint so
+      // night mode never flashes white. Reads the same versioned key the app
+      // writes (utils/storage.js KEYS.theme, {__aria_v1, exp, v} envelope),
+      // then the legacy key. Must stay inline and synchronous.
+      (function () {
+        try {
+          var theme = null;
+          var raw = localStorage.getItem("aria.v1.theme");
+          if (raw) {
+            try {
+              var p = JSON.parse(raw);
+              theme = p && typeof p === "object" && "v" in p ? p.v : p;
+            } catch (_) { theme = raw; }
+          }
+          if (!theme) theme = localStorage.getItem("aria_theme");
+          if (theme === "dark") {
+            document.documentElement.classList.add("dark");
+            document.documentElement.style.colorScheme = "dark";
+          }
+        } catch (_) { /* storage blocked: default light theme */ }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -535,11 +535,9 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
             from core.provider_health import ping_with_retry
             ping_with_retry(llm, timeout=25)
         except Exception as exc:
-            from core.errors import sanitize_error as _san
-            raise HTTPException(
-                status_code=400,
-                detail=f"The {request.provider} key was rejected or unreachable ({_san(exc)}). Check the key and try again.",
-            )
+            from core.errors import provider_key_error
+            raise HTTPException(status_code=400,
+                                detail=provider_key_error(request.provider, exc))
 
     session["provider"] = llm
     session["provider_name"] = request.provider

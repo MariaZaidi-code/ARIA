@@ -1384,7 +1384,9 @@ class CopilotPipeline:
         try:
             tables = sorted((self.mapping or {}).get("tables", {}) or {})
             if tables:
-                named = ", ".join(tables[:3])
+                # Plain words, never raw identifiers ('dataset_c_messy_txns').
+                from core.analytical_result import natural_label
+                named = ", ".join(dict.fromkeys(natural_label(t) for t in tables[:3]))
                 return (f" Try asking about {named} — for example a total, "
                         f"a breakdown, or how it changed over time.")
         except Exception:

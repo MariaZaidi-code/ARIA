@@ -135,6 +135,16 @@ async def lifespan(app: FastAPI):
             "ARIA worker/shared-store check skipped (%s).", type(exc).__name__,
         )
     logging.getLogger("uvicorn.error").info("ARIA startup checks complete.")
+    # Warm the Copilot embedder in the background (loading takes seconds),
+    # so the first Ask ARIA question is as fast as the rest. Never blocks
+    # or fails startup.
+    try:
+        import threading as _threading
+        from copilot.embeddings import create_embedder as _warm_embedder
+        _threading.Thread(target=_warm_embedder, name="aria-embedder-warmup",
+                          daemon=True).start()
+    except Exception:
+        pass
     try:
         _eff_workers = _resolve_workers()
     except Exception:

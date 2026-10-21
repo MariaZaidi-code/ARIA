@@ -257,7 +257,14 @@ def get_intelligence_meta(session: dict) -> dict:
             if role in ("BUSINESS_MEASURE", "MEASURE", "DERIVED_METRIC"):
                 metrics.append(entry)
             elif role in ("DIMENSION", "CATEGORY", "TEXT"):
-                dimensions.append(entry)
+                # A text column named like a date ('txn_dt', 'order_date')
+                # is a time axis, never a breakdown: grouping by single days
+                # gives "50 groups" of dates instead of business segments.
+                from core.data_intelligence import is_date_name as _is_date_name
+                if _is_date_name(cname):
+                    date_columns.append({**entry, "role": "DATE", "detected": "date_name"})
+                else:
+                    dimensions.append(entry)
             elif role == "DATE":
                 date_columns.append(entry)
         # Role-poor tables (no text dimensions / no DATE role, e.g. a
@@ -2179,7 +2186,10 @@ def run_explore(session: dict, request: dict) -> dict:
                     else:
                         bullets.append("Performance held broadly steady across the window.")
                 basis = (
-                    f"Based on {_raw_count} records from {primary_table} "
+                    # Plain words, schema dropped: "sales.SalesOrderDetail"
+                    # -> "Sales Order Detail".
+                    f"Based on {_raw_count} records from "
+                    f"{display_name(str(primary_table).split('.')[-1], str(primary_table))} "
                     f"({_cur_start.isoformat()} to {_cur_end.isoformat()} vs "
                     f"{_prev_start.isoformat()} to {_prev_end.isoformat()}; {date_label}). "
                     "Category and monthly figures are summed from your data; "
@@ -2213,7 +2223,10 @@ def run_explore(session: dict, request: dict) -> dict:
 
             _change_all = (_r2(total_current - total_previous)
                            if total_previous is not None else None)
-            _groups = len(_cells) if _has_time else len(_cat_only)
+            # Distinct breakdown groups (companies, regions ...), never the
+            # (group x period x bucket) cells: 150 companies must read
+            # "150 groups", not the number of month cells they span.
+            _groups = (len({k[0] for k in _cells}) if _has_time else len(_cat_only))
             chart_data = {
                 "type": "bar" if breakdown_col else "line",
                 "title": _trend_title,

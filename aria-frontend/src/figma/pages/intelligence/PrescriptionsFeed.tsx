@@ -11,6 +11,7 @@ import {
   Card, EmptyState, LoadingPanel, ErrorPanel, btnGhost, btnPrimary,
 } from "./cards";
 import RxCaseDrawer, { type RxCaseInput } from "./RxCaseDrawer";
+import { localStore } from "../../../utils/storage.js";
 
 /* =====================================================================
    Prescriptions auto feed — "What needs attention".
@@ -338,7 +339,7 @@ export default function PrescriptionsFeed() {
       const at = Date.now();
       setCacheAt(at);
       try {
-        localStorage.setItem(CACHE_KEY, JSON.stringify({ at, cards: next }));
+        localStore.setItem(CACHE_KEY, JSON.stringify({ at, cards: next }));
       } catch { /* best-effort */ }
     } catch (e: any) {
       if (!background && !cards.length) {
@@ -355,7 +356,7 @@ export default function PrescriptionsFeed() {
      run refreshes from live context + engine. */
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(CACHE_KEY);
+      const raw = localStore.getItem(CACHE_KEY);
       if (raw) {
         const c = JSON.parse(raw);
         if (Array.isArray(c?.cards) && c.cards.length && Date.now() - Number(c.at || 0) < CACHE_TTL_MS) {

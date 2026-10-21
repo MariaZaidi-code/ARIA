@@ -65,7 +65,7 @@ encrypted `db` config on restart). Rotate provider keys in their dashboards if e
 - `GET /api/schema`, `POST /api/data/preview` (`{table, limit, offset, search, sort_*}`)
 - `POST /api/data/schema/override` — user PK/FK corrections outrank inference
 - `POST /api/ask` → answer + `provenance {sql, tables, methodology, confidence, timestamp}`
-- `POST /api/predictive/forecast`, `POST /api/prescription/generate`, `POST /api/hypothesis`
+- `POST /api/predictive/forecast`, `POST /api/prescriptions/analyze` (`/api/prescription/generate` is deprecated), `POST /api/hypothesis`
 - `POST /api/rl/event`, `GET /api/rl/events` — RL telemetry (summaries only, never raw datasets)
 - `POST /api/rl/feedback` (random popup reward, 1-5 stars -> [-1, +1]), `GET /api/rl/status` (policy/observability), `POST /api/rl/rank` (replaceable policy ranks pre-validated candidates)
 - `GET/POST/PATCH/DELETE /api/workspace/monitors[/{id}[/check]]`, `POST /api/workspace/monitors/preview` (plain English -> condition + cadence)

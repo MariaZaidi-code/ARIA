@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { motion, AnimatePresence, MotionConfig } from "framer-motion";
+import { motion, MotionConfig } from "framer-motion";
 import {
   BarChart3, Lightbulb, Target, SlidersHorizontal, FileText, Play, RotateCcw,
   ChevronRight, ArrowLeft, RefreshCw, Database, Sparkles,
@@ -20,6 +20,7 @@ import {
 import ExploreTab from "./intelligence/ExploreTab";
 import PrescriptionsFeed from "./intelligence/PrescriptionsFeed";
 import { intelligenceApi, normalizeApiError, apiFetch } from "../../services/api";
+import { localStore, sessionStore } from "../../utils/storage.js";
 
 /* =====================================================================
    ARIA Intelligence — Explore / Hypotheses / Goals / What-If / Reports.
@@ -88,7 +89,7 @@ type ReportDraftItem = { id: string; title: string };
 
 function loadReportDraft(): ReportDraftItem[] {
   try {
-    const raw = localStorage.getItem(REPORT_DRAFT_KEY);
+    const raw = localStore.getItem(REPORT_DRAFT_KEY);
     const v = JSON.parse(raw || "[]");
     if (!Array.isArray(v)) return [];
     return v
@@ -101,7 +102,7 @@ function loadReportDraft(): ReportDraftItem[] {
 
 function saveReportDraft(items: ReportDraftItem[]): void {
   try {
-    localStorage.setItem(REPORT_DRAFT_KEY, JSON.stringify(items || []));
+    localStore.setItem(REPORT_DRAFT_KEY, JSON.stringify(items || []));
   } catch { /* best-effort */ }
 }
 
@@ -126,14 +127,14 @@ function clearReportDraft(): void {
 
 function pushToast(msg: string): void {
   try {
-    sessionStorage.setItem(INTEL_TOAST_KEY, msg);
+    sessionStore.setItem(INTEL_TOAST_KEY, msg);
   } catch { /* best-effort */ }
 }
 
 function popToast(): string | null {
   try {
-    const v = sessionStorage.getItem(INTEL_TOAST_KEY);
-    if (v) sessionStorage.removeItem(INTEL_TOAST_KEY);
+    const v = sessionStore.getItem(INTEL_TOAST_KEY);
+    if (v) sessionStore.removeItem(INTEL_TOAST_KEY);
     return v || null;
   } catch {
     return null;
@@ -142,9 +143,9 @@ function popToast(): string | null {
 
 function readGoalPrefill(): any | null {
   try {
-    const raw = sessionStorage.getItem(GOAL_PREFILL_KEY);
+    const raw = sessionStore.getItem(GOAL_PREFILL_KEY);
     if (!raw) return null;
-    sessionStorage.removeItem(GOAL_PREFILL_KEY);
+    sessionStore.removeItem(GOAL_PREFILL_KEY);
     return JSON.parse(raw);
   } catch {
     return null;
@@ -211,9 +212,9 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
   /* One-tap why from Dashboard KPI cards: prefilled metric search. */
   useEffect(() => {
     try {
-      const raw = sessionStorage.getItem("aria_hypothesis_prefill");
+      const raw = sessionStore.getItem("aria_hypothesis_prefill");
       if (!raw) return;
-      sessionStorage.removeItem("aria_hypothesis_prefill");
+      sessionStore.removeItem("aria_hypothesis_prefill");
       const m = String(JSON.parse(raw)?.metric || "").trim();
       if (m) setSearch(m);
     } catch { /* best-effort */ }
@@ -313,7 +314,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
         onGoto("goals");
       } else {
         try {
-          sessionStorage.setItem(GOAL_PREFILL_KEY, JSON.stringify({
+          sessionStore.setItem(GOAL_PREFILL_KEY, JSON.stringify({
             name, ...(metric ? { metric } : {}), due: duePlus90(),
           }));
         } catch { /* best-effort */ }
@@ -354,14 +355,14 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
     const breakdown = hypBreakdownOf(h);
     try {
       if (metric || breakdown) {
-        sessionStorage.setItem("aria_explore_prefill", JSON.stringify({
+        sessionStore.setItem("aria_explore_prefill", JSON.stringify({
           ...(metric ? { metric } : {}),
           ...(breakdown ? { breakdown } : {}),
         }));
       }
     } catch { /* best-effort */ }
     try {
-      localStorage.setItem("aria_dashboard_drill", JSON.stringify({
+      localStore.setItem("aria_dashboard_drill", JSON.stringify({
         at: Date.now(), kind: "hypothesis",
         ...(metric ? { metric } : {}),
         ...(breakdown ? { dimension: breakdown, breakdown } : {}),
@@ -768,10 +769,10 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                                 <button
                                   onClick={() => {
                                     try {
-                                      sessionStorage.setItem("aria_explore_prefill", JSON.stringify({ metric: strOf(h?.metric || ctx?.metric || ""), breakdown: strOf(h?.dimension || ctx?.breakdown || "") }));
+                                      sessionStore.setItem("aria_explore_prefill", JSON.stringify({ metric: strOf(h?.metric || ctx?.metric || ""), breakdown: strOf(h?.dimension || ctx?.breakdown || "") }));
                                     } catch { /* best-effort */ }
                                     try {
-                                      localStorage.setItem("aria_dashboard_drill", JSON.stringify({
+                                      localStore.setItem("aria_dashboard_drill", JSON.stringify({
                                         at: Date.now(), kind: "hypothesis-factor",
                                         metric: strOf(h?.metric || ctx?.metric || ""),
                                         dimension: strOf(h?.dimension || ctx?.breakdown || ""),
@@ -786,7 +787,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                                 <button
                                   onClick={() => {
                                     try {
-                                      sessionStorage.setItem("aria_whatif_prefill", JSON.stringify({ variable: strOf(h?.metric || ctx?.metric || "") }));
+                                      sessionStore.setItem("aria_whatif_prefill", JSON.stringify({ variable: strOf(h?.metric || ctx?.metric || "") }));
                                     } catch { /* best-effort */ }
                                     onGoto("whatif");
                                   }}
@@ -1363,12 +1364,12 @@ function WhatIfTab() {
 
   useEffect(() => {
     try {
-      const raw = sessionStorage.getItem("aria_whatif_prefill");
+      const raw = sessionStore.getItem("aria_whatif_prefill");
       if (raw && variables.length) {
         const p = JSON.parse(raw);
         const v = strOf(p?.variable);
         if (v && variables.some((x) => x.toLowerCase() === v.toLowerCase())) setVariable(v);
-        sessionStorage.removeItem("aria_whatif_prefill");
+        sessionStore.removeItem("aria_whatif_prefill");
       }
     } catch { /* ignore */ }
   }, [variables]);
@@ -2443,7 +2444,7 @@ export default function Intelligence({
     const question = (q || "").trim();
     if (onAskCopilot) { onAskCopilot(question); return; }
     try {
-      sessionStorage.setItem("aria_copilot_context", JSON.stringify({ origin: "intelligence", question }));
+      sessionStore.setItem("aria_copilot_context", JSON.stringify({ origin: "intelligence", question }));
     } catch { /* best-effort */ }
     if (setPage) setPage("copilot");
   };
@@ -2540,12 +2541,13 @@ export default function Intelligence({
 
         <div id={`intel-panel-${tab}`} role="tabpanel" aria-labelledby={`intel-tab-${tab}`} className="mt-4">
           <MotionConfig reducedMotion="user">
-            <AnimatePresence mode="wait" initial={false}>
+            {/* Enter-only fade, no exit/"wait": with mode="wait" a quick
+                tab change could leave the old panel stuck on screen while
+                the new tab was already highlighted. */}
               <motion.div
                 key={tab}
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -6 }}
                 transition={{ duration: 0.22, ease: "easeOut" }}
               >
                 {tab === "explore" && <ExploreTab meta={meta || {}} onRunQuick={quickPrefill} onGoto={goto} onAsk={ask} />}
@@ -2555,7 +2557,6 @@ export default function Intelligence({
                 {tab === "whatif" && <WhatIfTab />}
                 {tab === "reports" && <ReportsTab meta={meta || {}} />}
               </motion.div>
-            </AnimatePresence>
           </MotionConfig>
         </div>
       </div>

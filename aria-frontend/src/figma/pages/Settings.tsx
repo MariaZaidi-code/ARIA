@@ -4,6 +4,7 @@ import { useTheme } from "../App";
 import { apiFetch } from "../../services/api";
 import { KEYS, storage } from "../../utils/storage";
 import WorkspacePanels from "../components/WorkspacePanels";
+import { datasetLabel } from "../lib/labels";
 
 type Tab = "profile" | "appearance" | "ai" | "datasources" | "workspace" | "notifications" | "privacy" | "application";
 
@@ -38,7 +39,10 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
   const [apiKey, setApiKey] = useState("");
   const [selectedProvider, setSelectedProvider] = useState("cloud");
   const [saving, setSaving] = useState(false);
-  const [saveMsg, setSaveMsg] = useState("");
+  const [saveMsg, setSaveMsgText] = useState("");
+  /* Errors must never look like success: tone drives red vs green. */
+  const [saveTone, setSaveTone] = useState<"ok" | "error">("ok");
+  const setSaveMsg = (text: string, tone: "ok" | "error" = "ok") => { setSaveMsgText(text); setSaveTone(tone); };
   const [notifAnalysis, setNotifAnalysis] = useState(true);
   const [notifInsights, setNotifInsights] = useState(true);
   const [notifSystem, setNotifSystem] = useState(false);
@@ -49,8 +53,8 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
 
   const pickAvatar = (file: File | undefined) => {
     if (!file) return;
-    if (!file.type.startsWith("image/")) { setSaveMsg("Please choose an image file"); return; }
-    if (file.size > 2 * 1024 * 1024) { setSaveMsg("Image must be under 2MB"); return; }
+    if (!file.type.startsWith("image/")) { setSaveMsg("Please choose an image file", "error"); return; }
+    if (file.size > 2 * 1024 * 1024) { setSaveMsg("Image must be under 2MB", "error"); return; }
     const reader = new FileReader();
     reader.onload = () => {
       const url = String(reader.result || "");
@@ -84,7 +88,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
       onProviderSwitched?.(data.provider || selectedProvider);
       setSaveMsg(data.message || "Provider saved"); setApiKey(""); fetchProviders();
       setTimeout(() => setSaveMsg(""), 3000);
-    } catch (e: any) { setSaveMsg(e?.status === 401 ? "Session expired. Please sign in again." : (e?.message || "Failed")); } finally { setSaving(false); }
+    } catch (e: any) { setSaveMsg(e?.status === 401 ? "Session expired. Please sign in again." : (e?.message || "Couldn't save the provider. Please try again."), "error"); } finally { setSaving(false); }
   };
 
   return (
@@ -93,8 +97,8 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
       <div className="w-48 border-r border-border bg-card/80 backdrop-blur-sm flex-shrink-0">
         <div className="py-3">
           {tabs.map((t) => (
-            <button key={t.id} onClick={() => setTab(t.id)}
-              className={`nav-item w-full flex items-center gap-2.5 px-4 py-2 text-[13px] transition-all duration-150 ${tab === t.id ? "bg-primary/8 text-primary font-medium border-r-2 border-primary active" : "text-muted-foreground hover:text-foreground hover:bg-secondary/60"}`}>
+            <button key={t.id} onClick={() => setTab(t.id)} aria-current={tab === t.id ? "page" : undefined}
+              className={`w-full flex items-center gap-2.5 px-4 py-2 text-[13px] transition-all duration-150 ${tab === t.id ? "bg-primary/10 text-primary font-semibold border-r-2 border-primary" : "text-secondary-foreground hover:text-foreground hover:bg-secondary/60"}`}>
               <t.icon size={14} />
               <span>{t.label}</span>
               {tab === t.id && <ChevronRight size={12} className="ml-auto" />}
@@ -106,7 +110,10 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
       {/* Content */}
       <div className="flex-1 overflow-auto p-6 max-w-2xl">
         {saveMsg && (
-          <div className="mb-4 text-sm text-positive bg-positive/10 border border-positive/20 rounded-lg px-3 py-2">{saveMsg}</div>
+          <div role={saveTone === "error" ? "alert" : "status"}
+            className={`mb-4 text-sm rounded-lg px-3 py-2 border ${saveTone === "error"
+              ? "text-negative bg-negative/10 border-negative/20"
+              : "text-positive bg-positive/10 border-positive/20"}`}>{saveMsg}</div>
         )}
 
         {tab === "workspace" && <WorkspacePanels />}
@@ -158,7 +165,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
                   setSaveMsg("Profile saved");
                   setTimeout(() => setSaveMsg(""), 3000);
                 } catch {
-                  setSaveMsg("Failed to save");
+                  setSaveMsg("Couldn't save your profile. Please try again.", "error");
                   setTimeout(() => setSaveMsg(""), 3000);
                 } finally {
                   setSaving(false);
@@ -256,7 +263,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
                 <div className="space-y-2 text-sm">
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Database</span>
-                    <span className="text-foreground font-medium">{dbName}</span>
+                    <span className="text-foreground font-medium">{datasetLabel(dbName)}</span>
                   </div>
                   {selectedSourceType && (
                     <div className="flex justify-between">

@@ -16,7 +16,9 @@ from sqlalchemy import create_engine, text
 from llm_provider import LLMProvider, create_provider
 from core.validation import unknown_sql_tables, empty_sql_tables, unknown_sql_columns
 from core.config import SCHEMA_DIR, BASE_DIR
-from schema_engine.lexical import singularize
+from schema_engine.lexical import (
+    expand_abbreviation, identifier_words, pluralize, singularize,
+)
 
 try:
     from langgraph.graph import END, StateGraph
@@ -36,6 +38,32 @@ class SemanticMixin:
             tokens.add(word.lower())
             tokens.update(part.lower() for part in word.split("_") if part)
         return {t for t in tokens if t}
+
+    # ---- _expand_goal_shorthand (_expand_goal_shorthand) ----
+
+    # Shorthand that only ever means one thing in a business question.
+    # Ambiguous short words ('cat', 'val', 'ref', 'cd', 'dt') stay as typed.
+    _GOAL_SHORTHAND = frozenset({
+        "amt", "amnt", "qty", "qnty", "cnt", "txn", "txns", "trx", "cust",
+        "mthd", "pmt", "pymt", "yr", "yrs", "mth", "qtr", "avg", "pct",
+        "perc", "dept", "emp", "mgr", "addr", "acct", "ccy", "freq",
+    })
+
+    def _expand_goal_shorthand(self, text):
+        """'total amt by pay mthd' -> 'total amount by pay method', so the
+        planner sees the measure word. Columns named with the shorthand
+        still match, because shorthand and its expansion are synonyms."""
+        def _sub(m):
+            word = m.group(0)
+            low = word.lower()
+            if low not in self._GOAL_SHORTHAND:
+                return word
+            full = expand_abbreviation(low)
+            return full.capitalize() if word[:1].isupper() else full
+        try:
+            return re.sub(r"\b[A-Za-z]+\b", _sub, str(text or ""))
+        except Exception:
+            return text
 
     # ---- _has_resolvable_analytical_structure (_has_resolvable_analytical_structure) ----
 
@@ -58,6 +86,10 @@ class SemanticMixin:
             return set()
         w = str(word).lower().strip()
         bases = {w}
+        # Data shorthand means its expansion: 'amt' == 'amount'.
+        _full = expand_abbreviation(w)
+        if _full != w and " " not in _full:
+            bases |= self._synonym_bases(_full, _depth + 1)
         for base, group in self.SEMANTIC_SYNONYMS.items():
             if w == base or w in group:
                 bases.add(base)
@@ -275,24 +307,21 @@ class SemanticMixin:
 
     def _natural_label(self, identifier):
         """Turn an identifier into a plain-English phrase: 'order_details'
-        -> 'order detail', 'unit_price' -> 'unit price'. Schema-qualified
-        names use the table segment only ('sales.person' -> 'person'), so
-        schema prefixes never leak into user-facing prose."""
-        _bare = str(identifier).split(".")[-1]
-        words = [w for w in re.split(r"[^a-zA-Z0-9]+", _bare) if w]
+        -> 'order detail', 'TotalDue' -> 'total due', 'txn_dt' ->
+        'transaction date'. Schema-qualified names use the table segment
+        only ('sales.person' -> 'person'), so schema prefixes never leak
+        into user-facing prose."""
+        words = identifier_words(identifier)
         if not words:
             return str(identifier)
-        return " ".join(singularize(w.lower()) for w in words)
+        words[-1] = singularize(words[-1])
+        return " ".join(words)
 
     # ---- _pluralize_word (_pluralize_word) ----
 
     def _pluralize_word(self, word):
         """Best-effort English plural of a single word."""
-        if word.endswith("y") and len(word) > 1 and word[-2] not in "aeiou":
-            return word[:-1] + "ies"
-        if word.endswith(("s", "x", "z", "ch", "sh")):
-            return word + "es"
-        return word + "s"
+        return pluralize(word)
 
     # ---- _plural_label (_plural_label) ----
 

@@ -29,8 +29,10 @@ import {
   CountUp, Sparkline, selectCls, inputCls, btnPrimary, btnGhost,
 } from "./intelligence/cards";
 import { useExplore, RANGE_OPTIONS, type RangeKey } from "./intelligence/useExplore";
-import { intelligenceApi, analyzeQuestion, normalizeApiError, apiFetch, workspaceApi, downloadStoryExport } from "../../services/api";
+import { intelligenceApi, analyzeQuestion, normalizeApiError, apiFetch, workspaceApi, downloadStoryExport, AI_ANSWER_TIMEOUT_MS } from "../../services/api";
 import EvidenceDrawer, { type EvidenceContext } from "./intelligence/EvidenceDrawer";
+import { localStore, sessionStore } from "../../utils/storage.js";
+import { ANALYTICS_QUESTION_KEY } from "../lib/analysisContext";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -923,19 +925,39 @@ export default function AIAnalytics({
 
   /* ---- Autocomplete ---- */
   const [acOptions, setAcOptions] = useState<string[]>([]);
-  const [acOpen, setAcOpen] = useState(false);
+  /* Which input owns the dropdown: several search boxes can be on screen
+     at once, and only the one being typed in may show suggestions. */
+  const [acOpen, setAcOpen] = useState<null | "search" | "start" | "followup">(null);
+  const [acIndex, setAcIndex] = useState(-1);
+  const acSeq = useRef(0);
   const acTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchAc = useCallback((partial: string) => {
     if (acTimer.current) clearTimeout(acTimer.current);
+    const seq = ++acSeq.current;
     if (!partial || partial.length < 1) { setAcOptions([]); return; }
     acTimer.current = setTimeout(async () => {
       try {
         const data: any = await apiFetch(`/autocomplete?partial=${encodeURIComponent(partial)}&limit=6`);
         const list = Array.isArray(data?.suggestions) ? data.suggestions.map((s: any) => typeof s === "string" ? s : s?.text || "").filter(Boolean) : [];
-        setAcOptions(list);
-      } catch { setAcOptions([]); }
+        // A slower reply for an older keystroke must never replace newer ones.
+        if (seq === acSeq.current) setAcOptions(list);
+      } catch { if (seq === acSeq.current) setAcOptions([]); }
     }, 200);
   }, []);
+  /* Arrow keys move through the list, Enter runs the highlighted
+     suggestion (or the typed text), Escape closes the list. */
+  const acKeyDown = (e: React.KeyboardEvent<HTMLInputElement>, owner: "search" | "start" | "followup",
+                     pick: (v: string) => void, submit: () => void) => {
+    const open = acOpen === owner && acOptions.length > 0;
+    if (open && e.key === "ArrowDown") { e.preventDefault(); setAcIndex((i) => Math.min(i + 1, acOptions.length - 1)); return; }
+    if (open && e.key === "ArrowUp") { e.preventDefault(); setAcIndex((i) => Math.max(i - 1, -1)); return; }
+    if (e.key === "Escape") { setAcOpen(null); setAcIndex(-1); return; }
+    if (e.key === "Enter") {
+      setAcOpen(null);
+      if (open && acIndex >= 0 && acOptions[acIndex]) pick(acOptions[acIndex]); else submit();
+      setAcIndex(-1);
+    }
+  };
 
   /* ---- Suggestions (starter chips) — refreshed for the connected
      database, and stale analysis is cleared on dataset switch so old
@@ -955,7 +977,7 @@ export default function AIAnalytics({
     if (prevDatasetRef.current !== null && prevDatasetRef.current !== datasetKey) {
       abortRef.current?.abort();
       setResult(null); setError(""); setHistory([]); setAskedQuestion("");
-      setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(false);
+      setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(null);
       setSidebarCtx({});
       setDrillTrail([]); setShowSql(false); setMonitorOpen(false);
       setMonitorMsg(""); setExportMsg("");
@@ -1000,14 +1022,14 @@ export default function AIAnalytics({
     const h = hypothesisHandoff();
     try {
       if (h.metric || h.breakdown) {
-        sessionStorage.setItem("aria_explore_prefill", JSON.stringify({
+        sessionStore.setItem("aria_explore_prefill", JSON.stringify({
           ...(h.metric ? { metric: h.metric } : {}),
           ...(h.breakdown ? { breakdown: h.breakdown } : {}),
         }));
       }
     } catch { /* best-effort */ }
     try {
-      localStorage.setItem("aria_dashboard_drill", JSON.stringify({
+      localStore.setItem("aria_dashboard_drill", JSON.stringify({
         at: Date.now(), kind: "hypothesis",
         ...(h.metric ? { metric: h.metric } : {}),
         ...(h.breakdown ? { dimension: h.breakdown, breakdown: h.breakdown } : {}),
@@ -1028,7 +1050,7 @@ export default function AIAnalytics({
       const key = "aria_report_draft";
       let cur: any[] = [];
       try {
-        const v = JSON.parse(localStorage.getItem(key) || "[]");
+        const v = JSON.parse(localStore.getItem(key) || "[]");
         if (Array.isArray(v)) cur = v;
       } catch { cur = []; }
       if (cur.some((x) => String(x?.title || "") === title)) {
@@ -1036,7 +1058,7 @@ export default function AIAnalytics({
         return;
       }
       cur.push({ id: "", title });
-      localStorage.setItem(key, JSON.stringify(cur));
+      localStore.setItem(key, JSON.stringify(cur));
       setReportMsg(`Added to the report draft (${cur.length}). Open Intelligence → Reports to generate.`);
     } catch { setReportMsg("Couldn't update the report draft."); }
   }, [result, askedQuestion]);
@@ -1046,14 +1068,14 @@ export default function AIAnalytics({
     const q = question.trim();
     if (!q || running) return;
     setAskedQuestion(q);
-    setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(false);
+    setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(null);
     setRunning(true); setError(""); setResult(null);
     setShowSql(false); setMonitorMsg(""); setExportMsg("");
     setDrillTrail((t) => (t[t.length - 1] === q ? t : [...t.slice(-5), q]));
     abortRef.current?.abort();
     const ctrl = new AbortController(); abortRef.current = ctrl;
     try {
-      const data = await analyzeQuestion(q, null, { dataset: datasetKey || undefined }, null, { signal: ctrl.signal, timeoutMs: 120000 });
+      const data = await analyzeQuestion(q, null, { dataset: datasetKey || undefined }, null, { signal: ctrl.signal, timeoutMs: AI_ANSWER_TIMEOUT_MS });
       if (ctrl.signal.aborted) return;
       setResult(data);
       setSidebarCtx({ metric: data?.analytics_envelope?.metric || data?.display?.metric, breakdown: (data?.analytics_envelope?.dimensions || [])[0] });
@@ -1063,6 +1085,21 @@ export default function AIAnalytics({
       setError(e?.message || "Could not analyze this question.");
     } finally { setRunning(false); }
   }, [running, datasetKey]);
+
+  /* One-shot question handoff from other pages (e.g. clicking a Dashboard
+     KPI card): the question runs here as soon as the page opens, so the
+     user lands on an answer instead of an empty page. */
+  const handoffDone = useRef(false);
+  useEffect(() => {
+    if (handoffDone.current || (connectionStatus !== undefined && connectionStatus !== "connected")) return;
+    handoffDone.current = true;
+    let q = "";
+    try {
+      q = String(sessionStore.getItem(ANALYTICS_QUESTION_KEY) || "").trim();
+      if (q) sessionStore.removeItem(ANALYTICS_QUESTION_KEY);
+    } catch { q = ""; }
+    if (q) { setSearchQuery(q); runOnPage(q); }
+  }, [connectionStatus, runOnPage]);
 
   /* ---- Follow-up submit ---- */
   const submitFollowUp = () => {
@@ -1374,23 +1411,23 @@ export default function AIAnalytics({
                 <Search size={15} className="text-muted-foreground flex-shrink-0" />
                 <input
                   value={searchQuery}
-                  onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
-                  onFocus={() => setAcOpen(true)}
-                  onBlur={() => setTimeout(() => setAcOpen(false), 200)}
-                  onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); runOnPage(searchQuery); } }}
+                  onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen("search"); setAcIndex(-1); }}
+                  onFocus={() => setAcOpen("search")}
+                  onBlur={() => setTimeout(() => setAcOpen((cur) => (cur === "search" ? null : cur)), 200)}
+                  onKeyDown={(e) => acKeyDown(e, "search", (v) => { setSearchQuery(v); runOnPage(v); }, () => runOnPage(searchQuery))}
                   placeholder="Ask another question..."
                   className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground"
                   aria-label="Ask a question"
                 />
-                <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
+                <button onClick={() => { setAcOpen(null); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
                   <Send size={14} />
                 </button>
               </div>
-              {acOpen && acOptions.length > 0 && (
+              {acOpen === "search" && acOptions.length > 0 && (
                 <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
                   {acOptions.map((s, i) => (
-                    <button key={s + i} onMouseDown={() => { setAcOpen(false); setSearchQuery(s); runOnPage(s); }}
-                      className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left">
+                    <button key={s + i} role="option" aria-selected={i === acIndex} onMouseDown={() => { setAcOpen(null); setSearchQuery(s); runOnPage(s); }}
+                      className={`w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left ${i === acIndex ? "bg-secondary" : ""}`}>
                       <Zap size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
                       <span className="truncate">{s}</span>
                     </button>
@@ -1415,23 +1452,23 @@ export default function AIAnalytics({
                   <Search size={15} className="text-muted-foreground flex-shrink-0" />
                   <input
                     value={searchQuery}
-                    onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
-                    onFocus={() => setAcOpen(true)}
-                    onBlur={() => setTimeout(() => setAcOpen(false), 200)}
-                    onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); runOnPage(searchQuery); } }}
+                    onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen("start"); setAcIndex(-1); }}
+                    onFocus={() => setAcOpen("start")}
+                    onBlur={() => setTimeout(() => setAcOpen((cur) => (cur === "start" ? null : cur)), 200)}
+                    onKeyDown={(e) => acKeyDown(e, "start", (v) => { setSearchQuery(v); runOnPage(v); }, () => runOnPage(searchQuery))}
                     placeholder="E.g. Why did revenue drop last month?"
                     className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground"
                     aria-label="Ask a question"
                   />
-                  <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
+                  <button onClick={() => { setAcOpen(null); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
                     <ChevronRight size={15} />
                   </button>
                 </div>
-                {acOpen && acOptions.length > 0 && (
+                {acOpen === "start" && acOptions.length > 0 && (
                   <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
                     {acOptions.map((s, i) => (
-                      <button key={s + i} onMouseDown={() => { setAcOpen(false); setSearchQuery(s); runOnPage(s); }}
-                        className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left">
+                      <button key={s + i} role="option" aria-selected={i === acIndex} onMouseDown={() => { setAcOpen(null); setSearchQuery(s); runOnPage(s); }}
+                        className={`w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left ${i === acIndex ? "bg-secondary" : ""}`}>
                         <Zap size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
                         <span className="truncate">{s}</span>
                       </button>
@@ -1817,23 +1854,23 @@ export default function AIAnalytics({
                       <Search size={15} className="text-muted-foreground flex-shrink-0" />
                       <input
                         value={followUpQuery}
-                        onChange={(e) => { setFollowUpQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
-                        onFocus={() => setAcOpen(true)}
-                        onBlur={() => setTimeout(() => setAcOpen(false), 200)}
-                        onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); submitFollowUp(); } }}
+                        onChange={(e) => { setFollowUpQuery(e.target.value); fetchAc(e.target.value); setAcOpen("followup"); setAcIndex(-1); }}
+                        onFocus={() => setAcOpen("followup")}
+                        onBlur={() => setTimeout(() => setAcOpen((cur) => (cur === "followup" ? null : cur)), 200)}
+                        onKeyDown={(e) => acKeyDown(e, "followup", (v) => { setFollowUpQuery(v); runOnPage(v); }, () => submitFollowUp())}
                         placeholder="Ask a follow-up..."
                         className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground"
                         aria-label="Ask a follow-up question"
                       />
-                      <button onClick={() => { setAcOpen(false); submitFollowUp(); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Send">
+                      <button onClick={() => { setAcOpen(null); submitFollowUp(); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Send">
                         <Send size={14} />
                       </button>
                     </div>
-                    {acOpen && acOptions.length > 0 && (
+                    {acOpen === "followup" && acOptions.length > 0 && (
                       <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
                         {acOptions.map((s, i) => (
-                          <button key={s + i} onMouseDown={() => { setAcOpen(false); setFollowUpQuery(s); runOnPage(s); }}
-                            className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left">
+                          <button key={s + i} role="option" aria-selected={i === acIndex} onMouseDown={() => { setAcOpen(null); setFollowUpQuery(s); runOnPage(s); }}
+                            className={`w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left ${i === acIndex ? "bg-secondary" : ""}`}>
                             <Zap size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
                             <span className="truncate">{s}</span>
                           </button>

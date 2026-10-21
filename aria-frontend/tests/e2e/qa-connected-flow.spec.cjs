@@ -31,10 +31,17 @@ async function registerAndLogin(page, email, password) {
   await page.locator("#login-password").fill(password);
   await page.locator("#login-confirm").fill(password);
   await page.getByRole("button", { name: /create account/i }).last().click();
-  await page.waitForTimeout(800);
-  await page.locator("#login-email").fill(email);
-  await page.locator("#login-password").fill(password);
-  await page.getByRole("button", { name: /access intelligence hub/i }).click();
+  // Registering signs the user in directly (AI engine screen); older
+  // builds returned to the login form - handle both.
+  // Wait for the engine screen itself: the register form can disappear a
+  // moment before it renders, so "form gone" alone is not a signal.
+  const engine = page.getByText(/choose your ai engine/i);
+  await engine.waitFor({ timeout: 15000 }).catch(() => {});
+  if (!(await engine.isVisible().catch(() => false))) {
+    await page.locator("#login-email").fill(email);
+    await page.locator("#login-password").fill(password);
+    await page.getByRole("button", { name: /access intelligence hub/i }).click();
+  }
   await expect(page.getByText(/choose your ai engine/i)).toBeVisible({ timeout: 20000 });
 }
 
@@ -51,7 +58,8 @@ test.describe("ARIA QA - connected flow", () => {
     attach(page, sink);
 
     await registerAndLogin(page, `qa_conn_${Date.now()}@aria.test`, "QaPass123!");
-    await chooseLLM(page, "Cloud AI");
+    // Cloud AI by default; ARIA_E2E_ENGINE="Local AI" where no valid Groq key exists.
+    await chooseLLM(page, process.env.ARIA_E2E_ENGINE || "Cloud AI");
 
     // ---- Connect a real CSV through the API ----
     const token = await page.evaluate(() => localStorage.getItem("aria_auth_token"));
@@ -67,14 +75,19 @@ test.describe("ARIA QA - connected flow", () => {
     expect(res.ok(), `connect_file failed: ${JSON.stringify(conn)}`).toBeTruthy();
     expect(conn.ok).toBeTruthy();
     console.log("CONNECTED_TABLE=" + conn.table + " ROWS=" + conn.rows);
+    // Connected behind the page's back (API, not the Data page UI): reload
+    // so the app restores the session and picks up the new connection.
+    await page.reload();
+    await expect(page.getByRole("button", { name: /dashboard/i }).first()).toBeVisible({ timeout: 30000 });
+    await page.waitForLoadState("networkidle");
 
     // ---- Analytics: run a real question ----
     sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
     await page.getByRole("button", { name: /ai analytics/i }).first().click();
     await page.waitForTimeout(500);
-    const box = page.getByLabel("Ask ARIA a business question");
+    const box = page.getByLabel("Ask a question").first();
     await box.fill("What is the total sales by product category?");
-    await page.getByRole("button", { name: /^analyze$/i }).click();
+    await page.getByRole("button", { name: /^(analyze|submit)$/i }).first().click();
     // Wait for a terminal state: Answer block, error block, or clarification.
     await page.waitForTimeout(30000);
     const analyticsHtml = await page.locator("#root").innerHTML();

@@ -42,7 +42,6 @@ import {
 } from "../services/api";
 import { clearAuthSession, getAuthUser } from "../utils/authStorage";
 import { KEYS, storage } from "../utils/storage";
-import { ToastProvider } from "../components/Toast";
 
 export type Page =
   | "dashboard"
@@ -122,6 +121,9 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", isDark);
+    // Native controls and scrollbars follow the theme too (index.html sets
+    // the same before first paint).
+    document.documentElement.style.colorScheme = isDark ? "dark" : "light";
     storage.set(KEYS.theme, isDark ? "dark" : "light");
   }, [isDark]);
 
@@ -155,6 +157,21 @@ export default function App() {
         });
         if (ctrl.signal.aborted) return;
         if (!body) return;
+        // A 200 here means the cookie session is still valid (the route is
+        // auth-only), so a reload returns the user to where they were
+        // instead of the login form. Only moves off the login screen - it
+        // never overrides a sign-in already in progress.
+        const mode = storage.getString(KEYS.llmMode, "");
+        if (mode) setSelectedLLM(mode);
+        setAppStage((s) => (s === "login" ? (mode ? "app" : "llm-selection") : s));
+        try {
+          const me: any = await apiFetch("/auth/me", { signal: ctrl.signal, suppressUnauthorized: true });
+          if (!ctrl.signal.aborted && me?.username) {
+            // Stored usernames encode the email ("a_at_b.com" -> "a@b.com").
+            const shown = String(me.username).replace("_at_", "@").replace(/_plus_/g, "+");
+            setCurrentUser((cur) => cur ?? { email: shown });
+          }
+        } catch { /* display name only */ }
         // Restore connection state from the live server session so a page
         // reload does not drop every page to "Connect a data source" while
         // the backend still holds the connection (connectionStatus is
@@ -442,7 +459,12 @@ export default function App() {
       formData.append("file", file);
       formData.append("provider", selectedLLM || "local");
       
-      let path = sourceType === 'csv' ? `/connect_file` : (sourceType === 'pdf' ? `/connect_pdf` : `/connect_${sourceType}`);
+      // File uploads only: CSV and PDF have dedicated routes. Any other
+      // type is a programming error, never a guessed "/connect_<type>" path.
+      if (sourceType !== 'csv' && sourceType !== 'pdf') {
+        throw new Error(`Unsupported file source type: ${sourceType}`);
+      }
+      const path = sourceType === 'csv' ? `/connect_file` : `/connect_pdf`;
       const data: any = await apiFetch(path, {
         method: "POST",
         body: formData,
@@ -612,9 +634,8 @@ export default function App() {
 
   return (
     <ThemeContext.Provider value={{ isDark, toggleTheme, page, setPage }}>
-      {/* ToastProvider mounts the toast region: figma/pages/Documents.tsx
-          already calls useToast(), which throws without a provider. */}
-      <ToastProvider>
+      {/* Toasts come from the single root <ToastProvider> in main.jsx
+          (it also covers Login); a second provider here would split them. */}
       <AppShell
         user={currentUser}
         selectedLLM={selectedLLM}
@@ -622,7 +643,7 @@ export default function App() {
         onChangeLLM={() => setAppStage("llm-selection")}
         onSignOut={handleSignOut}
       >
-        <div key={page} className="page-enter"><Suspense fallback={<PageFallback />}>{wrapPage(page, (() => {
+        <div key={page} className="page-enter h-full"><Suspense fallback={<PageFallback />}>{wrapPage(page, (() => {
           switch (page) {
             case "dashboard":
               return (
@@ -730,7 +751,6 @@ export default function App() {
       {page !== "copilot" && <MiniAria />}
       {/* Random RL feedback popup (probability + cooldown; /api/rl/feedback) */}
       <FeedbackPopup page={page} />
-      </ToastProvider>
     </ThemeContext.Provider>
   );
 }
