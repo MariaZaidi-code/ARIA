@@ -118,15 +118,19 @@ def worker_count() -> int:
     return 1
 
 
-def _shared_store_required() -> bool:
-    if worker_count() <= 1:
-        return False
+def shared_store_required() -> bool:
+    """Explicit opt-in, or production with multiple workers, requires Redis."""
     raw = (os.getenv("ARIA_REQUIRE_SHARED_STORE") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
     if raw in {"0", "false", "no", "off"}:
         return False
-    return raw in {"1", "true", "yes", "on"} or (
-        (os.getenv("ARIA_ENV", "") or "").strip().lower() == "production"
-    )
+    return worker_count() > 1 and (os.getenv("ARIA_ENV") or "").strip().lower() == "production"
+
+
+def _shared_store_required() -> bool:
+    """Back-compat alias for the deployment policy."""
+    return shared_store_required()
 
 
 def _check_shared_store() -> None:
@@ -198,7 +202,7 @@ def _redis_check_limit(bucket: str, key: str, max_calls: int, window_s: int) -> 
     try:
         client = get_redis_client()
         if client is None:
-            if _shared_store_required():
+            if _shared_store_required() or redis_url():
                 raise HTTPException(
                     status_code=503,
                     detail="Shared rate-limit store is unavailable. Retry shortly.",
@@ -219,7 +223,7 @@ def _redis_check_limit(bucket: str, key: str, max_calls: int, window_s: int) -> 
             res = pipe.execute()
             count = int(res[2]) if len(res) >= 3 else 0
         except Exception as exc:
-            if _shared_store_required():
+            if _shared_store_required() or redis_url():
                 raise HTTPException(
                     status_code=503,
                     detail="Shared rate-limit store is unavailable. Retry shortly.",
@@ -255,6 +259,13 @@ def check_limit(bucket: str, key: str, max_calls: int, window_s: int) -> None:
         raise
     except Exception:
         pass
+    if _shared_store_required() or redis_url():
+        # A configured shared store is authoritative: never silently fall
+        # back to per-process limits when it is unreachable.
+        raise HTTPException(
+            status_code=503,
+            detail="Shared rate-limit store is unavailable. Try again shortly.",
+        )
     now = time.monotonic()
     k = (bucket, key)
     # Mutate atomically: the FastAPI threadpool runs requests concurrently,

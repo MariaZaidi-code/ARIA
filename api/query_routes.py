@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 import auth
 from core.config import get_session, save_session, resolve_provider_key, PROCESSED_DIR
-from core.deps import require_data, require_writable
+from core.deps import require_data, require_writable, get_current_user
 from core.validation import validate_goal_text
 from goal_agent import GoalAgent
 from goal_agent.schema import load_user_overrides
@@ -350,6 +350,15 @@ def get_suggestions(request: Request, payload: dict | None = None, user: dict = 
         limit = 8
     # Cap to the 4-8 window.
     limit = max(4, min(8, limit))
+    from csv_engine.analyst import is_csv_session, suggestions_csv, CsvAnalysisError
+    if is_csv_session(session):
+        try:
+            result = suggestions_csv(session, user["user_id"], limit)
+        except CsvAnalysisError as exc:
+            raise HTTPException(status_code=502, detail={"message": str(exc), "llm_trace": exc.trace}) from None
+        save_session(user["user_id"], session)
+        return result
+
     try:
         # Read the schema mapping directly (no slow agent initialization) so
         # suggestions work instantly regardless of database size.
@@ -476,6 +485,49 @@ def get_suggestions(request: Request, payload: dict | None = None, user: dict = 
     return {"ok": True, "provider": session.get("provider_name", provider), "suggestions": suggestions}
 
 
+def _csv_chat_store(session):
+    from csv_engine.chat_store import ChatStore, dataset_key
+    from csv_engine.profiling import _fingerprint
+    return ChatStore(auth.DB_PATH.with_name("csv_chats.sqlite3")), dataset_key(_fingerprint(session))
+
+
+@router.get("/api/csv/conversation")
+def restore_csv_conversation(request: Request, conversation_id: str | None = None, user: dict = Depends(get_current_user)):
+    from csv_engine.analyst import is_csv_session
+    session = get_session(user["user_id"])
+    if not is_csv_session(session) or not session.get("db_uri"):
+        return {"ok": True, "conversation": None}
+    store, dataset = _csv_chat_store(session)
+    chat = store.load(user["user_id"], dataset, conversation_id)
+    return {"ok": True, "conversation": {k: v for k, v in chat.items() if k != "history"} if chat else None}
+
+
+@router.post("/api/csv/conversation/new")
+def new_csv_conversation(request: Request, user: dict = Depends(require_writable)):
+    from csv_engine.analyst import is_csv_session
+    import uuid
+    session = get_session(user["user_id"])
+    if not is_csv_session(session) or not session.get("db_uri"):
+        return {"ok": True, "conversation_id": str(uuid.uuid4())}
+    store, dataset = _csv_chat_store(session)
+    identifier = str(uuid.uuid4())
+    store.save(user["user_id"], dataset, identifier, new=True)
+    return {"ok": True, "conversation_id": identifier}
+
+
+@router.delete("/api/csv/conversation/{conversation_id}")
+def delete_csv_conversation(conversation_id: str, user: dict = Depends(require_writable)):
+    from csv_engine.analyst import is_csv_session
+    session = get_session(user["user_id"])
+    if not is_csv_session(session) or not session.get("db_uri"):
+        raise HTTPException(status_code=400, detail="Connect the CSV first")
+    store, dataset = _csv_chat_store(session)
+    deleted = store.delete(user["user_id"], dataset, conversation_id)
+    session.get("csv_conversations", {}).pop(conversation_id, None)
+    save_session(user["user_id"], session)
+    return {"ok": True, "deleted": deleted}
+
+
 @router.post("/api/ask")
 def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writable)):
     """Run the Goal Agent: goal -> SQL -> processed_data.json.
@@ -487,6 +539,88 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     """
     session = get_session(user["user_id"])
     provider = require_data(request)
+    if session.get("source_type") == "document" or session.get("db_type") == "document":
+        from api.insight_rag_routes import _capability
+        from insight_rag.analytics_adapter import analytics_answer
+        document_id = session.get("document_id")
+        if not document_id:
+            raise HTTPException(status_code=400, detail="Select an uploaded document first.")
+        try:
+            result = _capability(user["user_id"]).chat(
+                req.goal,
+                conversation_id=req.conversation_id or session.get("document_conversation_id"),
+                document_ids=[document_id],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            log.exception("Document question failed")
+            raise HTTPException(status_code=503, detail="Document chat could not complete. Check the provider and RAG connection, then retry.") from exc
+        session["document_conversation_id"] = result.get("conversation_id")
+        save_session(user["user_id"], session)
+        return analytics_answer(result, req.goal)
+    from csv_engine.analyst import is_csv_session, ask_csv, CsvAnalysisError, conversation_turn, _fingerprint
+    if is_csv_session(session):
+        import uuid
+        import os
+        import tempfile
+        conv_id = req.conversation_id or session.get("conversation_id") or f"conv_{uuid.uuid4().hex}"
+        if not isinstance(conv_id, str) or not 1 <= len(conv_id) <= 100:
+            raise HTTPException(status_code=400, detail="Invalid conversation identifier")
+        dataset_identity = _fingerprint(session)
+        chat_store, chat_dataset = _csv_chat_store(session)
+        conversations = dict(session.get("csv_conversations", {}))
+        active = conversations.get(conv_id, {})
+        history = list(active.get("history", [])) if active.get("dataset") == dataset_identity else []
+        if not history:
+            saved_chat = chat_store.load(user["user_id"], chat_dataset, conv_id)
+            if saved_chat:
+                history = saved_chat["history"]
+        try:
+            result = ask_csv(session, user["user_id"], req.goal, history=history,
+                             request_context={"metric": req.metric, "filters": req.filters,
+                                              "time_range": req.time_range, "grouping": req.grouping,
+                                              "previous_goal": req.previous_goal})
+        except CsvAnalysisError as exc:
+            raise HTTPException(status_code=502, detail={"message": str(exc), "llm_trace": exc.trace}) from None
+        except Exception:
+            log.exception("CSV LLM analysis failed")
+            raise HTTPException(status_code=502, detail="CSV AI analysis could not complete. No fallback answer was generated.") from None
+        result["conversation_id"] = conv_id
+        result["turn_number"] = len(history) + 1
+        session["conversation_id"] = conv_id
+        if result["status"] in ("success", "partial"):
+            history.append(conversation_turn(req.goal, result))
+            session["conversation_history"] = history[-10:]
+            path = Path(session["processed_path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(dir=path.parent, suffix=".json")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(result, stream, ensure_ascii=False, allow_nan=False)
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            result["history_id"] = auth.add_history(
+                user["user_id"], goal=req.goal, sql_used=result["sql_used"], row_count=result["row_count"],
+                columns=result["columns"], source_type=session.get("source_type"), db_name=session.get("db_name"),
+                dialect=session.get("dialect"), processed=result)
+            session["pending_history_id"] = result["history_id"]
+        else:
+            history.append(conversation_turn(req.goal, result))
+            session["conversation_history"] = history[-10:]
+        try:
+            chat_store.save(user["user_id"], chat_dataset, conv_id,
+                            context=conversation_turn(req.goal, result), display={"q": req.goal, "r": result})
+        except Exception:
+            log.exception("Could not persist CSV conversation")
+            result.setdefault("warnings", []).append("This answer could not be saved for chat restore.")
+        conversations.pop(conv_id, None)
+        conversations[conv_id] = {"dataset": dataset_identity, "history": history[-10:]}
+        session["csv_conversations"] = dict(list(conversations.items())[-8:])
+        save_session(user["user_id"], session)
+        return result
     # Fail fast: never query the wrong DB. A relational session without a
     # rebuilt db_uri (undecryptable/missing credentials) must reconnect.
     if session.get("source_type") == "relational" and not session.get("db_uri"):
@@ -693,8 +827,8 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             "sql_used": None,
             "row_count": 0,
             "data": [],
-            "message": f"Could not fully analyze: {_safe_exc}. The database connection and dynamic schema are working, but the analytical engine encountered an issue with this specific question. Try rephrasing or ask a simpler analytical question (e.g., counts, totals, top items, trends over time).",
-            "preprocessing": {"notes": ["Dynamic schema detected; analysis partially completed."]},
+            "message": f"Analysis could not complete: {_safe_exc}. No result was produced. Check the source and provider settings, then retry.",
+            "preprocessing": {"notes": ["Analysis failed before a usable result was produced."]},
             "missing_values_handled": "preserved (NULLs kept as-is)",
             "timestamp": datetime.now().isoformat(),
             "status": "query_failed",
@@ -1475,7 +1609,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             "interpreted_intent": {"primary": "descriptive_summary",
                                    "capabilities": ["descriptive_summary"],
                                    "confidence": "low"},
-            "metric": None, "dimensions": [], "filters": req.filters or [],
+            "metric": None, "metric_column": None, "dimensions": [], "filters": req.filters or [],
             "time_range": req.time_range or {},
             "comparison_period": {"granularity": "month",
                                   "description": "Comparison unavailable."},
@@ -1484,9 +1618,9 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             "confidence": "low", "limitations": [_san2(_env_exc)],
             "possible_drivers": [], "hypothesis": None, "recommendations": [],
             "follow_up_questions": list(all_suggestions or [])[:8],
-            "result_status": "partial",
-            "result_message": ("Partial result: extended analytics metadata "
-                               "was unavailable. Core findings above are intact."),
+            "result_status": "partial" if result_data else "backend-failure",
+            "result_message": ("Extended analytics metadata was unavailable. Review the partial results."
+                               if result_data else "Analysis did not produce a usable result. Please retry."),
         }
     # ── Business 360 (non-technical 360° view: what + why + what-to-do) ──
     # Best-effort, never fatal. Powers the AI Analytics inline card.

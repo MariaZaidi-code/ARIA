@@ -529,7 +529,7 @@ export const connectFile = async (file, provider = "local") => {
 // PDF DOCUMENT CONNECTION
 // =========================================================
 
-export const connectPdf = async (file, provider = "local") => {
+export const connectPdf = async (file, provider) => {
   if (!file) {
     return { success: false, message: "No file selected." };
   }
@@ -538,7 +538,7 @@ export const connectPdf = async (file, provider = "local") => {
   formData.append("file", file);
   try {
     const data = await request("/connect_pdf", { method: "POST", body: formData });
-    return { success: true, message: "PDF uploaded and processing started.", data };
+    return { success: true, message: "PDF indexed and ready.", data };
   } catch (error) {
     return { success: false, message: error?.message || "PDF upload failed." };
   }
@@ -653,6 +653,9 @@ export const fetchSchema = async () => {
   // reload unchanged datasets on every call.
   try {
     const cached = await request("/schema");
+    if (cached?.applicable === false && cached?.source === "document") {
+      return { success: true, data: cached.schema || { tables: {} }, applicable: false, source: "document" };
+    }
     const tables = cached?.schema?.tables || cached?.tables || {};
     if (cached?.schema && Object.keys(tables).length > 0) {
       return { success: true, data: cached?.schema || cached || {}, cached: true };
@@ -751,6 +754,13 @@ const deriveGoalType = (data) => {
 // GOAL AGENT
 // =========================================================
 
+/**
+ * @param {string} question
+ * @param {unknown} llmMode
+ * @param {Record<string, any>} sourceContext
+ * @param {{conversationId?: string, previousGoal?: string, previousResult?: any} | null} multiTurnContext
+ * @param {Record<string, any>} options
+ */
 export const analyzeQuestion = async (question, llmMode, sourceContext = {}, multiTurnContext = null, options = {}) => {
   void llmMode;
 
@@ -792,7 +802,7 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
     const sharedDs = shared && typeof shared === "object"
       ? normDs(shared.dataset || shared.table || (shared.source && shared.source.tables && shared.source.tables[0]))
       : "";
-    if (shared && typeof shared === "object" && (!explicitDs || !sharedDs || sharedDs === explicitDs)) {
+    if (options.useSharedContext !== false && shared && typeof shared === "object" && (!explicitDs || !sharedDs || sharedDs === explicitDs)) {
       if (!body.metric && shared.metric) body.metric = shared.metric;
       if (!body.grouping && (shared.dimensions || shared.dimension)) {
         body.grouping = shared.dimensions || shared.dimension;
@@ -810,6 +820,7 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
   } catch { /* best-effort */ }
 
   const data = await request("/ask", {
+    timeoutMs: 120000,
     method: "POST",
     body: JSON.stringify(body),
     ...(options.signal ? { signal: options.signal } : {}),
@@ -820,7 +831,9 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
   // Conversational turns (greetings/thanks/bye/help/empty) are NOT errors:
   // they carry a warm message + starter suggestions with empty data and
   // must flow to the UI like clarification (never throw).
-  const failed =
+  const preservedCsv = status === "partial" && data?.analysis_source === "csv_llm"
+    && data?.execution?.success === true && data?.narrative_status === "unavailable";
+  const failed = !preservedCsv &&
     status !== "success" && status !== "clarification" && status !== "conversation";
 
   if (failed) {
@@ -836,6 +849,15 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
       : [];
 
   const goalData = {
+    narrative_status: data?.narrative_status || null,
+    resolved_question: data?.resolved_question || null,
+    context_resolution: data?.context_resolution || null,
+    analysis_results: Array.isArray(data?.analysis_results) ? data.analysis_results : [],
+    analysis_plan: data?.analysis_plan || null,
+    dataset_profile: data?.dataset_profile || null,
+    dataset_understanding: data?.dataset_understanding || null,
+    llm_trace: data?.llm_trace || null,
+    verdict: data?.verdict || null,
     interpretedGoal:
       data?.question ||
       data?.user_goal ||

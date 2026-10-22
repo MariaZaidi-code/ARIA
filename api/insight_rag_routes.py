@@ -42,78 +42,27 @@ class PDFChatRequest(BaseModel):
 
 
 def _capability(user_id: str | int) -> InsightPDFRAG:
-    """Attach PDF-RAG to the session's selected provider (Cloud = user's Groq key, Local = Ollama fine-tunes).
-
-    Falls back to DeepSeek only when the session has no usable provider.
-    RAG chat roles (rag/rag_rewrite/...) are mapped onto the active
-    provider's own models so Cloud/Local never receive another
-    provider's model names.
-    """
+    """Attach PDF-RAG to the session's selected provider and models."""
     from core.config import get_session, resolve_provider_key
+    from insight_rag.providers import configure_rag_models
+    from llm_provider import PROVIDERS
+
+    session = get_session(int(user_id))
+    name = str(session.get("provider_name") or "local").strip().lower()
+    if name not in PROVIDERS:
+        raise ValueError("Selected AI provider is not supported.")
+    models = dict((session.get("provider_models") or {}).get(name) or {})
+    default_model = (models.get("semi") or models.get("story") or models.get("sql")
+                     or RAG_LLM_MODEL)
+    for role in ("rag", "rag_scope", "rag_rewrite", "rag_verify", "rag_plan"):
+        models.setdefault(role, default_model)
+    api_key = None if name == "local" else resolve_provider_key(
+        name, (session.get("api_keys") or {}))
+    provider = create_provider(name, api_key=api_key, models=models)
     try:
-        _session = get_session(int(user_id))
-    except Exception:
-        _session = {}
-    _pname = (_session.get("provider_name") or "local")
-    if _pname == "local" and not _session.get("provider_name"):
-        logging.getLogger("aria.insight_rag").warning(
-            "provider_name missing from session – falling back to local"
-        )
-    if _pname not in ("local", "cloud", "deepseek", "omniroute", "grok"):
-        _pname = "deepseek"
-    if _pname == "deepseek":
-        provider = create_provider(
-            "deepseek",
-            api_key=resolve_provider_key("deepseek", (_session.get("api_keys") or {})),
-            models={
-                "rag": RAG_LLM_MODEL,
-                "rag_rewrite": RAG_LLM_MODEL,
-                "rag_verify": RAG_LLM_MODEL,
-                "rag_plan": RAG_LLM_MODEL,
-            },
-        )
-    elif _pname == "local":
-        _ds_key = resolve_provider_key("deepseek", (_session.get("api_keys") or {}))
-        if _ds_key:
-            # Local Ollama models cannot run the hosted RAG pipeline
-            # (InsightPDFRAG requires a hosted LLM): DeepSeek is the
-            # documented fallback whenever a key is available.
-            provider = create_provider(
-                "deepseek",
-                api_key=_ds_key,
-                models={
-                    "rag": RAG_LLM_MODEL,
-                    "rag_rewrite": RAG_LLM_MODEL,
-                    "rag_verify": RAG_LLM_MODEL,
-                    "rag_plan": RAG_LLM_MODEL,
-                },
-            )
-        else:
-            from llm_provider import PROVIDERS as _PROVIDERS
-            _chat_model = (_PROVIDERS["local"]["models"].get("semi")
-                           or _PROVIDERS["local"]["models"].get("suggest")
-                           or "aria-goal")
-            provider = create_provider("local")
-            provider.models.update({
-                "rag": _chat_model,
-                "rag_scope": _chat_model,
-                "rag_rewrite": _chat_model,
-                "rag_verify": _chat_model,
-                "rag_plan": _chat_model,
-            })
-    else:
-        from llm_provider import PROVIDERS as _PROVIDERS
-        _key = resolve_provider_key(_pname, (_session.get("api_keys") or {}))
-        provider = create_provider(_pname, api_key=_key)
-        _fallback = provider.model_for("sql") or provider.model_for("story")
-        if _fallback:
-            provider.models.update({
-                "rag": _fallback,
-                "rag_scope": _fallback,
-                "rag_rewrite": _fallback,
-                "rag_verify": _fallback,
-                "rag_plan": _fallback,
-            })
+        configure_rag_models(provider)
+    except ValueError:
+        pass
     insight_agent = InsightAgent(provider=provider)
     return InsightPDFRAG(insight_agent=insight_agent, user_id=user_id)
 
@@ -147,26 +96,12 @@ def pdf_rag_health(user: dict = Depends(get_current_user)):
         str((document.get("ingestion_quality") or {}).get("grade") or "unknown")
         for document in documents
     )
-    # Readiness must reflect the session's ACTUAL provider (local/cloud/...),
-    # not just an env DeepSeek key: _capability() attaches the selected
-    # provider and only falls back to DeepSeek when none is usable.
-    provider_configured = False
-    try:
-        from core.config import get_session, resolve_provider_key
-        _session = get_session(user["user_id"])
-        _pname = str(_session.get("provider_name") or "").strip().lower()
-        _keys = _session.get("api_keys") or {}
-        if _pname in ("cloud", "omniroute", "grok", "deepseek"):
-            provider_configured = bool(resolve_provider_key(_pname, _keys))
-        else:
-            # Local Ollama cannot run the hosted RAG pipeline; _capability
-            # (and readiness) fall back to DeepSeek when a key is available,
-            # else uploads/chat return a clear 503.
-            provider_configured = bool(resolve_provider_key("deepseek", _keys))
-    except Exception:
-        provider_configured = False
-    if not provider_configured:
-        provider_configured = bool(os.getenv("DEEPSEEK_API_KEY", "").strip())
+    from core.config import get_session, resolve_provider_key
+    session = get_session(user["user_id"])
+    selected_provider = session.get("provider_name") or "local"
+    provider_configured = (selected_provider == "local" or bool(
+        resolve_provider_key(selected_provider, session.get("api_keys") or {})))
+    provider_configured = provider_configured and not bool(session.get("_provider_error"))
     database_configured = bool(RAG_DATABASE_URL)
     ready = not config_error and provider_configured and database_configured
     return {
@@ -174,7 +109,8 @@ def pdf_rag_health(user: dict = Depends(get_current_user)):
         "ready": ready,
         "status": "ready" if ready else "degraded",
         "pipeline_version": RAG_PIPELINE_VERSION,
-        "model": RAG_LLM_MODEL,
+        "model": RAG_LLM_MODEL if selected_provider == "deepseek" else None,
+        "provider_name": selected_provider,
         "provider_configured": provider_configured,
         "database_configured": database_configured,
         "config_valid": config_error is None,
@@ -185,7 +121,7 @@ def pdf_rag_health(user: dict = Depends(get_current_user)):
 
 
 @router.post("/upload")
-def upload_document(
+def upload_pdf(
     file: UploadFile = File(...),
     user: dict = Depends(require_writable),
 ):
@@ -214,10 +150,12 @@ def upload_document(
                     )
                 temp.write(chunk)
 
-        capability = _capability(user["user_id"])
         if extension == ".pdf":
-            return capability.ingest_pdf(temp_path, original_filename=filename)
+            from insight_rag.ingestion import PDFIngestion
+            return PDFIngestion(user["user_id"]).ingest_pdf(
+                temp_path, original_filename=filename)
 
+        capability = _capability(user["user_id"])
         element_count = 0
         if extension == ".csv":
             result = capability.ingest_tabular(temp_path, filename=filename, table_name=filename)
@@ -307,6 +245,10 @@ def upload_document(
             temp_path.unlink(missing_ok=True)
 
 
+# Backwards-compatible name used by the upload-format tests/callers.
+upload_document = upload_pdf
+
+
 @router.get("/documents")
 def list_pdf_documents(user: dict = Depends(get_current_user)):
     """List local PDF metadata without requiring a cloud LLM call."""
@@ -349,6 +291,8 @@ def chat_with_pdfs(request: PDFChatRequest, user: dict = Depends(require_writabl
             document_ids=request.document_ids,
             document_only=request.document_only,
         )
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=sanitize_error(exc))
     except RuntimeError as exc:

@@ -63,7 +63,7 @@ test.describe('Data source connection flow', () => {
       await cloudPage.getByRole('button', { name: /Cloud AI/i }).first().click();
       const content = await cloudPage.content();
       expect(/Groq|groq/i.test(content)).toBeTruthy();
-      await expect(cloudPage.locator('#llm-api-key')).toBeVisible();
+      await expect(cloudPage.locator('#provider-key')).toBeVisible();
     } finally {
       await cloudPage.close();
     }

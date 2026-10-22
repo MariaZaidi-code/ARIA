@@ -38,6 +38,8 @@ for _name, _value in list(os.environ.items()):
 # There is intentionally no cross-provider fallback (e.g. DeepSeek must never
 # silently pick up GROQ_API_KEY).
 PROVIDER_ENV_KEYS = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
     "cloud": "GROQ_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "omniroute": "OMNIROUTE_API_KEY",
@@ -264,13 +266,16 @@ def redis_url() -> str:
 
 
 def require_shared_store() -> bool:
-    """Return True when ARIA_REQUIRE_SHARED_STORE=1 (fail-closed prod mode)."""
-    try:
-        return (os.getenv("ARIA_REQUIRE_SHARED_STORE", "0") or "").strip().lower() in {
-            "1", "true", "yes", "on",
-        }
-    except Exception:
-        return False
+    """Sessions and rate limits use the same deployment policy."""
+    return _shared_store_required()
+
+
+def _session_store_unavailable():
+    from fastapi import HTTPException
+    raise HTTPException(
+        status_code=503,
+        detail="Shared session store is unavailable. Try again shortly.",
+    )
 
 
 def get_redis_client():
@@ -525,6 +530,8 @@ def _atomic_write_text(target: Path, text: str) -> None:
 
 def _coerce_user_id(user_id) -> int:
     """Validate user_id as an int (prevents path traversal via crafted ids)."""
+    if isinstance(user_id, bool) or not isinstance(user_id, (int, str)):
+        raise ValueError("Invalid user id.")
     try:
         uid = int(user_id)
     except (TypeError, ValueError):
@@ -643,7 +650,7 @@ def _ensure_user_paths(session: dict, user_id) -> dict:
     return session
 
 SOURCE_TYPES = {"relational", "semi-structured", "document"}
-PROVIDER_NAMES = {"local", "cloud", "deepseek", "omniroute", "grok"}
+PROVIDER_NAMES = {"local", "cloud", "deepseek", "omniroute", "grok", "openai", "anthropic"}
 DB_TYPES = {"postgresql", "mysql"}
 
 DEFAULT_SESSION = {
@@ -677,22 +684,12 @@ def session_store_status() -> dict:
 
 
 def _shared_store_required() -> bool:
-    """Whether multi-worker operation must fail closed without Redis."""
-    workers = 1
-    for name in ("UVICORN_WORKERS", "WEB_CONCURRENCY", "ARIA_WORKERS"):
-        try:
-            workers = max(workers, int(os.getenv(name, "1") or 1))
-        except (TypeError, ValueError):
-            continue
-    if workers <= 1:
+    """Whether shared state is authoritative (same policy as rate limits)."""
+    try:
+        from core.ratelimit import shared_store_required
+        return shared_store_required()
+    except Exception:
         return False
-    require_raw = (os.getenv("ARIA_REQUIRE_SHARED_STORE") or "").strip().lower()
-    if require_raw in {"0", "false", "no", "off"}:
-        return False
-    return (
-        require_raw in {"1", "true", "yes", "on"}
-        or (os.getenv("ARIA_ENV") or "").strip().lower() == "production"
-    )
 
 # Load persisted sessions from disk (survives server restarts).
 def _session_to_disk_dict(session: dict) -> dict:
@@ -748,11 +745,22 @@ def _disk_dict_to_session(loaded: dict) -> dict:
     return _decrypt_session_keys(loaded)
 
 
+def _session_store_authoritative() -> bool:
+    """True when a shared store is configured or required (fail closed)."""
+    return bool(redis_url()) or _shared_store_required()
+
+
 def _redis_save_one(user_id: int, created: float, session: dict) -> bool:
-    """Write one session to Redis and report whether the write succeeded."""
+    """Write one session to Redis and report whether the write succeeded.
+
+    When a shared store is configured/required, a failure raises 503 instead
+    of acknowledging a write that did not reach the shared state.
+    """
     try:
         client = get_redis_client()
         if client is None:
+            if _session_store_authoritative():
+                _session_store_unavailable()
             return False
         import json as _json
 
@@ -764,6 +772,8 @@ def _redis_save_one(user_id: int, created: float, session: dict) -> bool:
         return True
     except Exception as exc:
         _logger.warning("Redis session save failed (%s).", type(exc).__name__)
+        if _session_store_authoritative():
+            _session_store_unavailable()
         return False
 
 
@@ -772,12 +782,8 @@ def _redis_load_one(user_id: int):
     try:
         client = get_redis_client()
         if client is None:
-            if _shared_store_required():
-                from fastapi import HTTPException
-                raise HTTPException(
-                    status_code=503,
-                    detail="Shared session store is unavailable. Retry shortly.",
-                )
+            if _session_store_authoritative():
+                _session_store_unavailable()
             return None
         raw = client.get(_redis_session_key(user_id))
         if not raw:
@@ -789,12 +795,8 @@ def _redis_load_one(user_id: int):
         session = _disk_dict_to_session(dict(data.get("session") or {}))
         return (created, session)
     except Exception as exc:
-        if _shared_store_required():
-            from fastapi import HTTPException
-            raise HTTPException(
-                status_code=503,
-                detail="Shared session store is unavailable. Retry shortly.",
-            ) from exc
+        if _session_store_authoritative():
+            _session_store_unavailable()
         return None
 
 
@@ -905,35 +907,34 @@ def check_session_store_shared() -> None:
 
 
 def _ensure_provider(session):
-    """Reconstruct the LLMProvider instance if session['provider'] is a string
-    (happens after deserialization from disk where default=str serializes the
-    LLMProvider object to its string representation).
+    """Reconstruct only the user's selected provider, without a silent switch.
 
-    Fail-closed: if the configured provider cannot be reconstructed (missing
-    API key, consent, or package), fall back to local Ollama so downstream
-    agents never receive provider=None."""
-    from llm_provider import create_provider
+    A configured hosted provider that cannot be reconstructed must stay
+    visibly unavailable (surfaced via ``_provider_error``); silently falling
+    back to local Ollama would execute the user's prompt on a different
+    provider than the one they selected.
+    """
     prov = session.get("provider")
-    if prov is None or isinstance(prov, str):
-        name = session.get("provider_name")
-        if name:
-            api_key = resolve_provider_key(name, session.get("api_keys", {}))
-            try:
-                session["provider"] = create_provider(provider=name, api_key=api_key)
-                session.pop("_provider_error", None)
-                return
-            except Exception as exc:
-                _logger.warning("create_provider(%s) failed: %s – falling back to local", name, exc)
-                session["_provider_error"] = str(exc)
-        # Fall back to local Ollama so the provider is never None.
-        try:
-            session["provider"] = create_provider(provider="local")
-            session["provider_name"] = "local"
-            _logger.info("_ensure_provider: fallback to local Ollama")
-        except Exception:
-            _logger.warning("_ensure_provider: local fallback also failed – provider stays None")
-            session["provider"] = None
-            session["_provider_error"] = session.get("_provider_error") or "No provider available"
+    if prov is not None and not isinstance(prov, str):
+        return
+    name = session.get("provider_name")
+    if not name:
+        return
+    try:
+        from llm_provider import create_provider
+
+        api_key = resolve_provider_key(name, session.get("api_keys", {}))
+        models = (session.get("provider_models") or {}).get(name)
+        session["provider"] = create_provider(
+            provider=name, api_key=api_key, models=models,
+        )
+        session.pop("_provider_error", None)
+    except Exception as exc:
+        _logger.warning("Selected provider initialization failed (%s)", type(exc).__name__)
+        session["provider"] = None
+        session["_provider_error"] = (
+            "Selected AI provider is unavailable. Check its settings and credentials."
+        )
 
 
 def _copy_session(session):
@@ -984,11 +985,11 @@ def get_session(user_id=None):
     # Redis is network I/O: fetch outside SESSION_LOCK so one slow shared
     # store doesn't serialize every concurrent request (only dict/CPU work
     # runs under the lock).
-    _shared_required = _shared_store_required()
+    _shared_authoritative = _session_store_authoritative()
     try:
         _redis_hit = _redis_load_one(user_id)
     except Exception:
-        if _shared_required:
+        if _shared_authoritative:
             raise
         _redis_hit = None
     with SESSION_LOCK:
@@ -1007,10 +1008,10 @@ def get_session(user_id=None):
                     return _copy_session(_sess)
             except Exception:
                 pass
-        if _shared_required:
-            # Redis is authoritative in required multi-worker deployments.
-            # Never revive a potentially stale per-process or file copy,
-            # including when an expired Redis entry is present.
+        if _shared_authoritative:
+            # A configured shared store is authoritative. Never revive a
+            # potentially stale per-process or file copy on a miss, including
+            # when an expired Redis entry is present.
             SESSION_STORE.pop(user_id, None)
             fresh = dict(DEFAULT_SESSION)
             _ensure_user_paths(fresh, user_id)
@@ -1102,6 +1103,7 @@ def save_session(user_id, session):
             # replace the user's existing session file.
             _load_session_store()
         with SESSION_LOCK:
+            _previous_entry = SESSION_STORE.get(user_id)
             SESSION_STORE[user_id] = (now, session)
             _entry_created, _entry_sess = SESSION_STORE[user_id]
             try:
@@ -1116,13 +1118,19 @@ def save_session(user_id, session):
         except Exception as exc:
             _logger.warning("session store serialization failed (%s)", type(exc).__name__)
             return
-        if _shared_store_required():
-            if not _redis_save_one(user_id, _entry_created, _entry_sess):
-                from fastapi import HTTPException
-                raise HTTPException(
-                    status_code=503,
-                    detail="Shared session store is unavailable. Retry shortly.",
-                )
+        if _session_store_authoritative():
+            try:
+                if not _redis_save_one(user_id, _entry_created, _entry_sess):
+                    _session_store_unavailable()
+            except Exception:
+                # Fail closed: never expose a session this worker failed to
+                # commit to the shared store (even from local memory).
+                with SESSION_LOCK:
+                    if _previous_entry is None:
+                        SESSION_STORE.pop(user_id, None)
+                    else:
+                        SESSION_STORE[user_id] = _previous_entry
+                raise
             return
         if not _SESSION_STORE_STATUS["ok"]:
             _logger.error(

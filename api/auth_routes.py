@@ -168,20 +168,10 @@ def _prune_login_attempts(now: float | None = None) -> int:
 def _check_login_rate_limit(request: Request) -> None:
     now = time.monotonic()
     ip = request.client.host if request.client else "unknown"
-    # Shared enforcement first (multi-worker): Redis sliding window when
-    # ARIA_REDIS_URL is configured. Lazy import avoids a core↔api cycle.
-    # In-memory per-process budget below remains as defense-in-depth.
-    try:
-        from core.ratelimit import _redis_check_limit as _shared_login_check
-        try:
-            if _shared_login_check("login", ip, _LOGIN_MAX, _LOGIN_WINDOW_S):
-                pass
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-    except Exception:
-        pass
+    # Shared enforcement first (multi-worker): check_limit propagates the
+    # shared 429/503 instead of splitting the budget across workers.
+    from core.ratelimit import check_limit
+    check_limit("login", ip, _LOGIN_MAX, _LOGIN_WINDOW_S)
     # Mutations on _LOGIN_ATTEMPTS must be atomic: the threadpool runs
     # concurrent requests, and read-filter-append loses attempts under load.
     with _LOGIN_LOCK:

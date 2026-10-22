@@ -338,7 +338,7 @@ export default function App() {
     }
   };
 
-  const handleLLMSelect = async (mode: string, apiKey?: string) => {
+  const handleLLMSelect = async (mode: string, apiKey?: string, model?: string) => {
     // Persist the UI choice synchronously BEFORE the server round-trip: a
     // reload that races the /provider/switch call would otherwise kill the
     // in-flight continuation and lose the choice, stranding the user on the
@@ -353,7 +353,7 @@ export default function App() {
     try {
       await apiFetch("/provider/switch", {
         method: "POST",
-        body: JSON.stringify(apiKey ? { provider: mode, api_key: apiKey } : { provider: mode }),
+        body: JSON.stringify({ provider: mode, ...(mode !== "local" ? { api_key: apiKey, model } : {}) }),
       });
     } catch (err: any) {
       storage.remove(KEYS.llmMode);
@@ -366,6 +366,8 @@ export default function App() {
       // Surface the failure so the user knows the switch did not happen.
       throw new Error(err?.message || `Could not switch to ${mode}.`);
     }
+    setSelectedLLM(mode);
+    storage.set(KEYS.llmMode, mode);
     // Restore connection state from the stored session so the Dashboard
     // shows KPIs/charts without requiring a fresh connect.
     (async () => {

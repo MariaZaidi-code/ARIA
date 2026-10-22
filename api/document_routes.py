@@ -5,9 +5,8 @@ RRF) instead of the legacy FAISS ``document_processor``.  The adapter class
 below provides the thin interface these routes need (list / search / delete)
 while delegating storage and retrieval to the enterprise RAG stack.
 
-Legacy ``document_processor/`` is NOT deleted — ingestion still flows through
-its extraction pipeline — but search, listing and evidence now route through
-the canonical engine so we stop maintaining two retrieval systems.
+Upload and index repair both use insight_rag.ingestion. The legacy processor
+is retained for compatibility but is not invoked by these document routes.
 """
 
 import logging
@@ -1154,75 +1153,13 @@ def retry_document(
     document_id: str,
     user: dict = Depends(require_writable),
 ):
-    """Retry processing a failed document."""
+    """Repair the canonical index from owned saved text; never invoke OCR."""
     document_id = _sanitize_document_id(document_id)
-    processed_dir = PROCESSED_DIR / f"user_{user['user_id']}" / "documents"
-    doc_file = processed_dir / f"{document_id}.json"
-    
-    if not doc_file.exists():
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    import json
-    doc_data = json.loads(doc_file.read_text())
-    
-    if doc_data.get("user_id") != user["user_id"]:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    if doc_data.get("status") not in ("failed", "partial"):
-        raise HTTPException(status_code=400, detail="Document is not in a failed state")
-    
-    # Get the original file via the exact stored path (no glob on
-    # user-controlled original_name).
-    upload_dir = DATA_DIR / "uploads" / f"user_{user['user_id']}"
-    file_path = None
+    from insight_rag.ingestion import PDFIngestion
     try:
-        resolved_upload = upload_dir.resolve()
-        stored = doc_data.get("file_path")
-        if stored:
-            candidate = Path(stored)
-            if not candidate.is_absolute():
-                candidate = resolved_upload / Path(stored).name
-            candidate = candidate.resolve()
-            if candidate.parent == resolved_upload and candidate.suffix.lower() == ".pdf" and candidate.exists():
-                file_path = candidate
-    except Exception:
-        file_path = None
-    
-    if not file_path or not file_path.exists():
-        raise HTTPException(status_code=404, detail="Original file not found for retry")
-    
-    # Re-ingest through the CANONICAL insight_rag pipeline: listing and
-    # search read the canonical manifest (RAGMetadataStore), so a retry that
-    # indexed only into the legacy FAISS store would never appear in the UI.
-    from api.insight_rag_routes import _capability
-    try:
-        result = _capability(user["user_id"]).ingest_pdf(
-            file_path,
-            original_filename=doc_data.get("original_name") or file_path.name,
-        )
+        return PDFIngestion(user["user_id"]).reindex(document_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=sanitize_error(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=sanitize_error(exc))
-    except Exception:
-        logger.exception("Document retry failed for %s", document_id)
-        raise HTTPException(
-            status_code=503,
-            detail="I couldn't re-index that document right now. Please try again.",
-        )
-
-    # Keep the legacy record consistent so a retried document is not
-    # reported as failed forever (best effort — never fails the retry).
-    try:
-        if isinstance(result, dict) and result.get("ok"):
-            doc_data["status"] = "ready"
-            doc_file.write_text(json.dumps(doc_data), encoding="utf-8")
-    except Exception:
-        pass
-
-    document = result.get("document") if isinstance(result, dict) else None
-    return {
-        "ok": True,
-        "duplicate": bool(result.get("duplicate")) if isinstance(result, dict) else False,
-        "document": document,
-    }
+    except Exception as exc:
+        logger.exception("Document index repair failed")
+        raise HTTPException(status_code=503, detail="Document index repair failed. Check the RAG database and retry.") from exc

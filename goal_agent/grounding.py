@@ -340,26 +340,11 @@ class GroundingMixin:
         info = self.tables[table_name]
         pk = set(info.get("primary_key", []) or [])
         fk_cols = {fk.get("column") for fk in info.get("foreign_keys", [])}
-        fallback = None
         for col in info["columns"]:
             low = col.lower()
-            if col in pk or col in fk_cols or low == "id" \
-                    or low.endswith("_id") or low.endswith("id"):
+            if col in pk or col in fk_cols or low == "id" or low.endswith("_id") or low.endswith("id"):
                 continue
-            if self._classify_column(table_name, col) == "numeric":
-                if self._is_dimension_like(table_name, col):
-                    if fallback is None:
-                        fallback = col
-                    continue
-                return col
-        if fallback is not None:
-            return fallback
-        for col in info["columns"]:
-            low = col.lower()
-            if col in pk or col in fk_cols or low == "id" \
-                    or low.endswith("_id") or low.endswith("id"):
-                continue
-            if self._classify_column(table_name, col) == "numeric":
+            if self._classify_column(table_name, col) == "numeric" and not self._is_dimension_like(table_name, col):
                 return col
         return None
 
@@ -538,6 +523,10 @@ class GroundingMixin:
         look for a fact table with BOTH a quantity and a unit-price column and
         synthesize quantity * unit_price.  Also includes discount when present.
         Generic, schema-driven, no DB names."""
+        # Quantity times selling price estimates revenue, never profit/margin.
+        # Do not replace a matched profit column with a revenue expression.
+        if not set(concept_tokens or ()) & {"revenue", "sales"}:
+            return None
         for table in relevant:
             info = self.tables.get(table, {})
             cols = list(info.get("columns", {}))
@@ -1037,7 +1026,8 @@ class GroundingMixin:
                 from core.db import base_table as _bt2
             except Exception:
                 _bt2 = lambda n: str(n or "").split(".")[-1]  # noqa: E731
-            sql = (f"SELECT DISTINCT {quote(col)} FROM {quote(_bt2(table))} "
+            qualified = ".".join(quote(part) for part in str(table).split("."))
+            sql = (f"SELECT DISTINCT {quote(col)} FROM {qualified} "
                    f"LIMIT {int(cap)}")
             with self.engine.connect() as conn:
                 try:
@@ -1690,7 +1680,7 @@ class GroundingMixin:
                             list(relevant) + _all_tables, tokens)
                     except Exception:
                         computed = None
-                if not computed and monetary_bias:
+                if not computed and monetary_bias and concept != "profit kpi":
                     # Money-preferred fallback across the whole schema:
                     # first safe total/amount/sales-like column, never
                     # cost/fuel/id/counts. Generic, no DB names.

@@ -1,3 +1,4 @@
+import CsvStatisticalEvidence from "../components/CsvStatisticalEvidence";
 /* AI Analytics — Dashboard home + inline analysis results.
    Search bar and popular actions call /api/ask (Goal Agent) and display
    chart + insights + table directly on the page. No copilot redirect. */
@@ -909,6 +910,10 @@ export default function AIAnalytics({
   const [followUpQuery, setFollowUpQuery] = useState("");
   const [history, setHistory] = useState<{ q: string; r: any }[]>([]);
   const abortRef = useRef<AbortController | null>(null);
+  const [chatLoading, setChatLoading] = useState(true);
+  const [chatNotice, setChatNotice] = useState("");
+  const restoreGeneration = useRef(0);
+  const conversationRef = useRef<string>(crypto.randomUUID());
 
   /* ---- Workspace actions: show SQL / monitors / export / drill trail ---- */
   const [showSql, setShowSql] = useState(false);
@@ -946,7 +951,7 @@ export default function AIAnalytics({
   const prevDatasetRef = useRef<string | null>(null);
   const loadSuggestions = useCallback(async () => {
     try {
-      const data: any = await apiFetch("/copilot/suggestions");
+      const data: any = await apiFetch("/suggestions", { method: "POST", body: JSON.stringify({ limit: 4 }) });
       if (Array.isArray(data?.suggestions) && data.suggestions.length) setSuggestions(data.suggestions.slice(0, 4));
       else setSuggestions([]);
     } catch { /* keep previous chips on transient errors */ }
@@ -955,6 +960,8 @@ export default function AIAnalytics({
     loadSuggestions();
     if (prevDatasetRef.current !== null && prevDatasetRef.current !== datasetKey) {
       abortRef.current?.abort();
+      conversationRef.current = crypto.randomUUID();
+      setRunning(false);
       setResult(null); setError(""); setHistory([]); setAskedQuestion("");
       setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(false);
       setSidebarCtx({});
@@ -963,6 +970,29 @@ export default function AIAnalytics({
     }
     prevDatasetRef.current = datasetKey;
   }, [connectionStatus, datasetKey, loadSuggestions]);
+
+  useEffect(() => {
+    const generation = ++restoreGeneration.current;
+    const controller = new AbortController();
+    setChatLoading(true);
+    apiFetch("/csv/conversation", { signal: controller.signal }).then((data: any) => {
+      if (controller.signal.aborted || generation !== restoreGeneration.current) return;
+      const chat = data?.conversation;
+      if (chat) {
+        conversationRef.current = chat.conversation_id;
+        const turns = Array.isArray(chat.turns) ? chat.turns.map((turn: any) => ({ q: turn.q, r: { success: true, data: turn.r } })) : [];
+        setHistory(turns);
+        const latest = turns[turns.length - 1];
+        setResult(latest?.r || null); setAskedQuestion(latest?.q || "");
+        setChatNotice(turns.length ? "Restored your saved chat for this dataset." : "");
+      }
+    }).catch((err: any) => {
+      if (err?.name !== "AbortError" && generation === restoreGeneration.current) setChatNotice("Could not restore saved chat. You can start a new analysis.");
+    }).finally(() => {
+      if (generation === restoreGeneration.current) setChatLoading(false);
+    });
+    return () => controller.abort();
+  }, [datasetKey, connectionStatus]);
 
   /* ---- Navigation ---- */
   const gotoTab = useCallback((tab: string) => {
@@ -1045,7 +1075,7 @@ export default function AIAnalytics({
   /* ---- Run analysis on-page ---- */
   const runOnPage = useCallback(async (question: string) => {
     const q = question.trim();
-    if (!q || running) return;
+    if (!q || running || chatLoading) return;
     setAskedQuestion(q);
     setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(false);
     setRunning(true); setError(""); setResult(null);
@@ -1054,7 +1084,7 @@ export default function AIAnalytics({
     abortRef.current?.abort();
     const ctrl = new AbortController(); abortRef.current = ctrl;
     try {
-      const data = await analyzeQuestion(q, null, { dataset: datasetKey || undefined }, null, { signal: ctrl.signal, timeoutMs: 120000 });
+      const data = await analyzeQuestion(q, null, { dataset: datasetKey || undefined }, { conversationId: conversationRef.current }, { signal: ctrl.signal, timeoutMs: 120000, useSharedContext: false });
       if (ctrl.signal.aborted) return;
       setResult(data);
       setSidebarCtx({ metric: data?.analytics_envelope?.metric || data?.display?.metric, breakdown: (data?.analytics_envelope?.dimensions || [])[0] });
@@ -1063,7 +1093,7 @@ export default function AIAnalytics({
       if (e?.name === "AbortError") return;
       setError(e?.message || "Could not analyze this question.");
     } finally { if (abortRef.current === ctrl) setRunning(false); }
-  }, [running, datasetKey]);
+  }, [running, datasetKey, chatLoading]);
 
   /* ---- Follow-up submit ---- */
   const submitFollowUp = () => {
@@ -1098,14 +1128,28 @@ export default function AIAnalytics({
   };
 
   /* ---- Back to home ---- */
-  const goHome = () => {
-    setResult(null); setError(""); setHistory([]); setAskedQuestion("");
+  const goHome = async () => {
+    const generation = ++restoreGeneration.current;
+    setChatLoading(true); setChatNotice("");
+    abortRef.current?.abort(); abortRef.current = null;
+    conversationRef.current = crypto.randomUUID();
+    setRunning(false); setResult(null); setError(""); setHistory([]); setAskedQuestion("");
+    setSearchQuery(""); setFollowUpQuery(""); setSidebarCtx({});
     setDrillTrail([]); setShowSql(false); setMonitorOpen(false);
     setMonitorMsg(""); setExportMsg("");
+    try {
+      const data: any = await apiFetch("/csv/conversation/new", { method: "POST" });
+      if (generation === restoreGeneration.current) conversationRef.current = data.conversation_id;
+    } catch {
+      if (generation === restoreGeneration.current) setChatNotice("New chat is ready, but its empty state could not be saved yet.");
+    } finally {
+      if (generation === restoreGeneration.current) setChatLoading(false);
+    }
   };
 
   /* ---- Result normalization (analyzeQuestion returns {success, data: goalData}) ---- */
   const gd = result?.data || result;  // goalData or raw
+  const csvResults: any[] = Array.isArray(gd?.analysis_results) ? gd.analysis_results : [];
   const answerMessage = strOf(gd?.answer || gd?.message || "");
   const findings: string[] = asList(gd?.findings || []).map((f: any) => strOf(typeof f === "string" ? f : f?.text)).filter(Boolean);
   const vizData = gd?.visualization?.data || gd?.data || [];
@@ -1341,6 +1385,7 @@ export default function AIAnalytics({
       <div className="flex gap-6 p-4 md:p-6 max-w-[1440px] mx-auto">
         {/* ---- Main column ---- */}
         <div className="flex-1 min-w-0 space-y-5">
+          {(chatLoading || chatNotice) && <p role="status" className="text-xs text-muted-foreground">{chatLoading ? "Loading current chat…" : chatNotice}</p>}
           {/* Header */}
           <div>
             <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">ARIA <span className="text-muted-foreground font-normal tracking-normal">/ Analytics</span></p>
@@ -1360,7 +1405,7 @@ export default function AIAnalytics({
                     <Plus size={14} /> New analysis
                   </button>
                 ) : (
-                  <button onClick={() => gotoTab("explore")} className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[12.5px] font-semibold text-white bg-blue-700 hover:bg-blue-800 transition-colors">
+                  <button onClick={goHome} className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[12.5px] font-semibold text-white bg-blue-700 hover:bg-blue-800 transition-colors">
                     <Plus size={14} /> New analysis
                   </button>
                 )}
@@ -1383,7 +1428,7 @@ export default function AIAnalytics({
                   className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground"
                   aria-label="Ask a question"
                 />
-                <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
+                <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" disabled={chatLoading || running} aria-label="Submit">
                   <Send size={14} />
                 </button>
               </div>
@@ -1424,7 +1469,7 @@ export default function AIAnalytics({
                     className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground"
                     aria-label="Ask a question"
                   />
-                  <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
+                  <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" disabled={chatLoading || running} aria-label="Submit">
                     <ChevronRight size={15} />
                   </button>
                 </div>
@@ -1503,6 +1548,15 @@ export default function AIAnalytics({
                       })}
                     </div>
                   )}
+                  {history.length > 1 && <details className="rounded-xl border border-border p-4 text-sm">
+                    <summary className="cursor-pointer font-semibold">Current chat · {history.length} turns</summary>
+                    {history.slice(0, -1).map((turn, index) => <div key={index} className="mt-3 border-t pt-3">
+                      <p className="font-medium">You: {turn.q}</p>
+                      <p className="mt-1 text-muted-foreground">ARIA: {turn.r?.data?.answer || turn.r?.data?.message || turn.r?.answer || turn.r?.message}</p>
+                      <button type="button" className="mt-1 text-xs underline" onClick={() => { setResult(turn.r); setAskedQuestion(turn.q); }}>View this result</button>
+                    </div>)}
+                    <p className="mt-3 text-xs text-muted-foreground">Follow-ups use this chat’s context. Saved CSV chats restore after refresh while the same dataset is connected. New analysis starts a separate chat.</p>
+                  </details>}
                   {/* Asked question — stays until the user dismisses it */}
                   {askedQuestion && (
                     <div className="flex items-start gap-2.5 rounded-xl border border-border bg-secondary/70 px-4 py-3">
@@ -1586,6 +1640,9 @@ export default function AIAnalytics({
                       <pre className="mt-2 max-h-[260px] overflow-auto rounded-lg bg-secondary/70 border border-border px-3 py-2 text-[11.5px] leading-relaxed text-secondary-foreground whitespace-pre-wrap break-words">{sqlUsed}</pre>
                     </Card>
                   )}
+                  {gd?.context_resolution?.uses_history && <p className="text-xs text-muted-foreground px-1">Interpreted as: {gd.resolved_question}</p>}
+                  {gd?.narrative_status === "unavailable" && <p role="status" className="text-sm text-amber-700">Calculation available · AI explanation unavailable. The tables below contain the executed results.</p>}
+                  {gd?.context_resolution?.mode === "recall" && <p className="text-xs text-muted-foreground">Recalled from this chat · no new calculation performed</p>}
                   {/* Answer message */}
                   {answerMessage && (
                     <Card className="p-5">
@@ -1633,8 +1690,48 @@ export default function AIAnalytics({
                     );
                   })()}
 
+                  {csvResults.map((item: any, index: number) => {
+                    const rows: any[] = item.data || [];
+                    const spec = item.chart_spec || {};
+                    const chartRows = rows.filter(row => typeof row[spec.y] === "number");
+                    return <Card key={index} className="p-5">
+                      <CardHead title={item.title} sub={item.reason} />
+                      {spec.chart_type !== "table" && spec.x && spec.y && chartRows.length > 0 && <div className="h-[260px] mt-3">
+                        <DynamicChart data={chartRows} chartSpec={spec} metric={spec.y} />
+                      </div>}
+                      {chartRows.length !== rows.length && spec.chart_type !== "table" && <p className="text-xs mt-2 text-muted-foreground">Unavailable values are omitted from the chart; see the table for all values.</p>}
+                      {rows.length > 60 && spec.chart_type !== "table" && <p className="text-xs mt-2 text-muted-foreground">Chart shows the first 60 available points. The table contains all returned rows.</p>}
+                      <div className="overflow-auto max-h-80 mt-3">
+                        {rows.length ? <table className="w-full text-xs"><thead><tr>{item.columns.map((col: string) => <th key={col} className="text-left p-2 border-b">{humanize(col)}</th>)}</tr></thead>
+                          <tbody>{rows.map((row: any, i: number) => <tr key={i}>{item.columns.map((col: string) => <td key={col} className="p-2 border-b">{row[col] == null ? "Unavailable (NULL)" : typeof row[col] === "number" ? row[col].toLocaleString(undefined, { maximumSignificantDigits: 12 }) : String(row[col])}</td>)}</tr>)}</tbody></table>
+                          : !item.statistical_evidence && <p className="text-sm text-muted-foreground">No matching rows. This does not imply a zero total.</p>}
+                      </div>
+                      <CsvStatisticalEvidence result={item} />
+                      {item.sql && <details className="mt-3 text-xs"><summary className="cursor-pointer">How this was calculated</summary><pre className="overflow-auto whitespace-pre-wrap mt-2">{item.sql}</pre></details>}
+                    </Card>;
+                  })}
+                  {gd?.dataset_understanding && <Card className="p-5 text-sm space-y-2">
+                    <p>{gd.dataset_understanding.description}</p>
+                    {(gd.dataset_understanding.assumptions || []).map((text: string, i: number) => <p key={i}>Assumption: {text}</p>)}
+                    {(gd.limitations || []).map((text: string, i: number) => <p key={i} className="text-muted-foreground">{text}</p>)}
+                    {gd.dataset_profile?.profile && <p className="text-xs text-muted-foreground">Data quality profile: {gd.dataset_profile.profile.scope}. Analysis queries use the connected dataset.</p>}
+                  </Card>}
+                  {gd?.validation && <details className="text-xs rounded-xl border p-4">
+                    <summary className="cursor-pointer">Result checks and AI review</summary>
+                    {(gd.validation.checks || []).map((check: any, i: number) => <p key={i} className="mt-2">{check.detail}</p>)}
+                    <p className="mt-2">AI review: {gd.validation.semantic_review?.status}. {gd.validation.semantic_review?.reason}</p>
+                    <p className="mt-2 text-muted-foreground">This review is not independent verification of metric meaning.</p>
+                  </details>}
+                  {gd?.ranked_insights?.length > 0 && <details className="text-xs rounded-xl border p-4"><summary className="cursor-pointer">Patterns to investigate</summary>{gd.ranked_insights.map((item: any, i: number) => <p key={i} className="mt-2">{item.title} — {item.effect_measure.replace(/_/g, " ")}: {item.largest_absolute_effect ?? "Unavailable"}. {item.note}</p>)}</details>}
+                  {gd?.llm_trace && <details className="text-xs text-muted-foreground rounded-xl border p-4">
+                    <summary className="cursor-pointer">AI execution details</summary>
+                    <p className="mt-2">Provider: {gd.llm_trace.provider} · {gd.llm_trace.cached ? "Cached result" : "Fresh analysis"} · Provider invocations: {gd.llm_trace.cached ? 0 : gd.llm_trace.provider_invocation_count}</p>
+                    <p>Statistical tool invocations: {gd.llm_trace.statistical_tool_count || 0}</p>
+                    {(gd.llm_trace.calls || []).map((call: any, i: number) => <p key={i}>{call.stage} · {call.model} · {call.duration_ms} ms · {call.status}</p>)}
+                  </details>}
+
                   {/* Chart — adapts to result type: chart for visual data, table for tabular, nothing for text-only */}
-                  {showChart && (
+                  {!csvResults.length && showChart && (
                     <Card className="p-5">
                       <CardHead title={chartSpec.label || (chartMetric ? `${humanize(chartMetric)} Analysis` : "Analysis Results")} sub={`${vizData.length} data points`} />
                       <div className="h-[260px] mt-3">
@@ -1650,7 +1747,7 @@ export default function AIAnalytics({
                   )}
 
                   {/* Table — for table-type results or when chart axes are missing but data exists */}
-                  {!showChart && vizData.length > 0 && (() => {
+                  {!csvResults.length && !showChart && vizData.length > 0 && (() => {
                     const keys = vizData.length > 0 ? Object.keys(vizData[0]).filter((k) => k !== "_idx") : [];
                     if (keys.length === 0) return null;
                     return (
