@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from core.config import DATA_DIR
+
 log = logging.getLogger(__name__)
 
 IMPACT_UNKNOWN_NOTE = "Impact could not be reliably estimated from the available data."
@@ -36,7 +38,7 @@ PRIORITY_ORDER = [
 
 
 def _events_path(user_id: str | int, base_dir: Path | None = None) -> Path:
-    root = base_dir or (Path(__file__).resolve().parent.parent / "data" / "preferences")
+    root = base_dir or (DATA_DIR / "preferences")
     # Contain (mirrors core.config): only alnum/_/- tokens, so a crafted
     # user_id cannot escape preferences/ via ../ segments. Numeric IDs keep
     # the user_<id> convention; other safe tokens are used verbatim.

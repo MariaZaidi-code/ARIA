@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 import auth
-from core.config import get_session, save_session, resolve_provider_key
+from core.config import get_session, save_session, resolve_provider_key, PROCESSED_DIR
 from core.deps import require_data, require_writable
 from core.validation import validate_goal_text
 from goal_agent import GoalAgent
@@ -682,7 +682,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         # P3 §50: sanitize internal details before shaping the user message.
         from core.errors import sanitize_error as _san_q
         _safe_exc = _san_q(exc)
-        fallback_path = session.get("processed_path", Path("/tmp/fallback_processed.json"))
+        fallback_path = session.get("processed_path", PROCESSED_DIR / "fallback_processed.json")
         if isinstance(fallback_path, str):
             fallback_path = Path(fallback_path)
         fallback_path.parent.mkdir(parents=True, exist_ok=True)

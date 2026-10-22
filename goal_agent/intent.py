@@ -57,16 +57,16 @@ class IntentMixin:
     # follow-ups that name no measure of their own.
 
     @staticmethod
-    def _strip_history_marker(text):
+    def _strip_history_marker(_text):
         """Text after the last 'Current question:' marker, else text as-is."""
         try:
-            _m = re.search(r"current question\s*:\s*(.+)$", str(text or ""),
+            _m = re.search(r"current question\s*:\s*(.+)$", str(_text or ""),
                            re.IGNORECASE | re.DOTALL)
             if _m and _m.group(1).strip():
                 return _m.group(1).strip()
         except Exception:
             pass
-        return str(text or "")
+        return str(_text or "")
 
     def _current_question_text(self, user_goal):
         """Raw current question: explicit metadata wins, else the marker."""
@@ -89,12 +89,12 @@ class IntentMixin:
             pass
         return ""
 
-    def _is_count_explicit_text(self, text):
+    def _is_count_explicit_text(self, _text):
         """True when the text itself asks for a count (schema-agnostic)."""
         try:
             return bool(re.search(
                 r"\bhow many\b|\bnumber of\b|\bcount of\b|\bcounts\b|\bcount\b",
-                str(text or "").lower()))
+                str(_text or "").lower()))
         except Exception:
             return False
 

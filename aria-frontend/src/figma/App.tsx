@@ -314,6 +314,18 @@ export default function App() {
     // successful login with its stale unauthenticated result.
     bootSessionCheckRef.current?.abort();
     bootSessionCheckRef.current = null;
+    // Clear any cross-page context left by a previous account in this tab
+    // so stale metric/dataset/filters cannot pollute the new session.
+    try {
+      for (const k of ["aria_shared_context", "aria_forecast_prefill", "aria_insight_handoff", "aria_hypothesis_prefill", "aria_copilot_context", "aria_explore_prefill", "aria_whatif_prefill"]) {
+        sessionStorage.removeItem(k);
+      }
+    } catch { /* ignore */ }
+    try {
+      localStorage.removeItem("aria_analysis_context");
+      localStorage.removeItem("aria_forecast_context");
+      localStorage.removeItem("aria_dashboard_drill");
+    } catch { /* ignore */ }
     const user = getAuthUser();
     setCurrentUser(user
       ? { email: user.email || user.username, is_admin: user.is_admin === true }

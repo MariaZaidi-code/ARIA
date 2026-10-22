@@ -60,10 +60,10 @@ def _mint_token(user_id: int) -> str:
         username = ""
     # 5-minute credential: a loopback token that never enters revocation
     # state must be worthless long before anyone could harvest it (Slack
-    # logs, webhook payload dumps). auth.issue_token accepts fractional
-    # day TTLs.
+    # logs, webhook payload dumps). auth.issue_token takes a fractional
+    # TTL in hours (5 minutes = 5/24 h).
     return auth.issue_token(int(user_id), username or f"user_{user_id}",
-                            ttl_days=5 / 1440)
+                            ttl_hours=5 / 24)
 
 
 # Bounded ask concurrency: each command can hold a threadpool worker for up

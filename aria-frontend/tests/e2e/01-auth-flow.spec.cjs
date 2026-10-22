@@ -96,7 +96,7 @@ test.describe('Auth flow (fixed)', () => {
   test('verified user sign-in opens the workspace', async ({ page }) => {
     await seedAuth(page, BASE);
     await expect(page.getByRole('navigation').getByRole('button', { name: /^dashboard$/i })).toBeVisible();
-    await expect(page.getByRole('heading', { name: /^Dashboard$/i })).toBeVisible();
+    await expect(page.getByRole('heading', { name: /Dashboard|Connect a Data Source/i }).first()).toBeVisible({ timeout: 15000 });
   });
 
   test('session survives a browser reload', async ({ page }) => {

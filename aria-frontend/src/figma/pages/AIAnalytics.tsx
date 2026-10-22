@@ -936,6 +936,7 @@ export default function AIAnalytics({
       } catch { setAcOptions([]); }
     }, 200);
   }, []);
+  useEffect(() => () => { if (acTimer.current) clearTimeout(acTimer.current); }, []);
 
   /* ---- Suggestions (starter chips) — refreshed for the connected
      database, and stale analysis is cleared on dataset switch so old
@@ -1061,7 +1062,7 @@ export default function AIAnalytics({
     } catch (e: any) {
       if (e?.name === "AbortError") return;
       setError(e?.message || "Could not analyze this question.");
-    } finally { setRunning(false); }
+    } finally { if (abortRef.current === ctrl) setRunning(false); }
   }, [running, datasetKey]);
 
   /* ---- Follow-up submit ---- */

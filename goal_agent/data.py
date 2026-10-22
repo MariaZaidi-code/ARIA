@@ -59,15 +59,15 @@ _UNDEFINED_COLUMN_RES = (
 def _extract_undefined_column(exc):
     """Pull the offending column name out of a DB undefined-column error."""
     try:
-        text = str(exc or "")
+        exc_text = str(exc or "")
     except Exception:
         return None
     for rx in _UNDEFINED_COLUMN_RES:
-        m = rx.search(text)
+        m = rx.search(exc_text)
         if m:
             return m.group(1).strip().strip("\"'`[]")
-    if re.search(r"undefinedcolumn|undefined_column", text, re.IGNORECASE):
-        m = re.search(r'["`\'\[]?([\w.]+)["`\'\]]?', text)
+    if re.search(r"undefinedcolumn|undefined_column", exc_text, re.IGNORECASE):
+        m = re.search(r'["`\'\[]?([\w.]+)["`\'\]]?', exc_text)
         if m:
             return m.group(1)
     return None

@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import Any
 
-from core.config import get_session
+from core.config import get_session, PROCESSED_DIR
 from core.data_intelligence import hint_hit as _hint_hit
 from core.deps import require_writable, get_current_user, reject_document_sql
 from core.secret_box import decrypt as _decrypt_secret
@@ -1623,7 +1623,7 @@ def generate_prescription(req: PrescriptionRequest, request: Request, user: dict
         from goal_agent.schema import load_user_overrides
         from core.config import resolve_provider_key
 
-        output_dir = Path("artifacts/processed_data") / f"user_{user['user_id']}"
+        output_dir = PROCESSED_DIR / f"user_{user['user_id']}"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"prescription_input_{int(time.time())}.json"
 

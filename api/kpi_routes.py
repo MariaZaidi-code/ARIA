@@ -214,7 +214,7 @@ def _load_schema(session, user_id=None):
     if session.get("db") and session.get("db_type") in ("postgresql", "mysql"):
         try:
             import warnings as _warnings
-            import schema_agent  # noqa: DEPRECATED legacy fallback only
+            import schema_agent  # noqa: F401 — DEPRECATED legacy fallback only
             _warnings.warn(
                 "kpi_routes legacy schema_agent fallback in use; prefer schema_engine.",
                 DeprecationWarning, stacklevel=2)

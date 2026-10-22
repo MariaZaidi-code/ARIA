@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from core.deps import get_current_user, require_writable, reject_document_sql
-from core.config import get_session, save_session
+from core.config import get_session, save_session, PROCESSED_DIR
 from core.schema_intel import SchemaIntelligence, _is_id_like, _safe_name, _run_sql, AMOUNT_HINTS
 from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, sanitize_error
 from core.semantic import humanize
@@ -2297,9 +2297,11 @@ def ask_about_insight(insight_id: str, req: AskInsightRequest, request: Request,
     try:
         from goal_agent.agent import GoalAgent
         from goal_agent.schema import load_user_overrides
-        import time
 
-        output_dir = Path("artifacts/processed_data") / f"user_{user['user_id']}"
+        # `time` is deliberately NOT re-imported here: a function-local
+        # import would shadow the module-level binding and make the earlier
+        # `time.time()` in the id-only path an UnboundLocalError.
+        output_dir = PROCESSED_DIR / f"user_{user['user_id']}"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"insight_analysis_{int(time.time())}.json"
 
@@ -2325,7 +2327,6 @@ def ask_about_insight(insight_id: str, req: AskInsightRequest, request: Request,
         "question": question,
         "result": result,
     }
-
 
 @router.get("/api/insights/{insight_id}")
 def get_insight_detail(insight_id: str, request: Request, user: dict = Depends(get_current_user)):

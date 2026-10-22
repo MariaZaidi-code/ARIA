@@ -3,6 +3,13 @@
 **Date:** 2026-09-05  
 **Status:** Phase 1 Complete - Core Integration Done
 
+> **HISTORICAL (superseded):** this summary describes the earlier Figma-UI
+> integration handoff and is kept for context only. Corrections for the
+> current tree: there is no `aria-frontend/src/App.jsx`; the entry point is
+> `aria-frontend/src/main.jsx`, which renders `aria-frontend/src/figma/App.tsx`
+> directly. File/line references below are as of the original write date and
+> may have drifted.
+
 ## ✅ Completed Work
 
 ### Phase 1: Critical Backend Fixes

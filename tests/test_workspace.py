@@ -356,6 +356,20 @@ class TestWorkspaceRoutes(unittest.TestCase):
         self.assertEqual(r.json()["response_type"], "in_channel")
         self.assertIn("stub answer", r.json()["text"])
 
+    def test_slack_mint_token_ttl_contract(self):
+        """auth.issue_token takes hours; ttl_days kwargs used to TypeError
+        and killed every real Slack ask (the flow test above stubs
+        _ask_sync, which masked the defect)."""
+        import auth as _auth
+        from api import integrations_routes
+
+        with patch("auth.issue_token", wraps=_auth.issue_token) as mint:
+            token = integrations_routes._mint_token(424242)
+        kwargs = mint.call_args.kwargs
+        self.assertNotIn("ttl_days", kwargs)
+        self.assertAlmostEqual(float(kwargs.get("ttl_hours")), 5 / 24, places=9)
+        self.assertTrue(token)
+
     # ------------------------------------------------------------------
     # Story export
     # ------------------------------------------------------------------

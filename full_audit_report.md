@@ -1,5 +1,12 @@
 # ARIA Security & Quality Audit Report
 
+> **HISTORICAL SNAPSHOT (2025-09-15).** Several findings below have since been
+> remediated in newer code: PBKDF2 at 600k iterations with transparent hash
+> upgrades, SSRF host validation with IP pinning, atomic session writes under
+> file locks, Redis-backed shared stores for multi-worker deployments, and
+> per-user file isolation under `data/users/`. Read this report as context for
+> a prior state — verify each item against the current tree before acting on it.
+
 **Audit Date:** 2025-09-15
 **Files Reviewed:** ~100 Python files across core/, api/, agents/, copilot/, insight_rag/, document_processor/, hypothesis_engine/, prediction/, prescription_engine/, goal_agent/, models/, memory/, tests/
 **Coverage:** Security, architecture, code quality, error handling, dependencies, auth

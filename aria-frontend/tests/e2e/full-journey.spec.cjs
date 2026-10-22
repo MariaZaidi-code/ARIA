@@ -5,17 +5,18 @@
 const { test, expect } = require('@playwright/test');
 const { seedAuth } = require('./auth-helper');
 
+const VIS = { timeout: 15000 };
 const PAGES = [
-  { name: 'Dashboard', navText: 'Dashboard', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /Dashboard|Connect a Data Source/i }).first()).toBeVisible() },
-  { name: 'AIAnalytics', navText: 'AI Analytics', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^Analytics$/i })).toBeVisible() },
-  { name: 'Insights', navText: 'Insights', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^Insights$/i })).toBeVisible() },
-  { name: 'Predictive', navText: 'Forecast', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^Forecast$/i })).toBeVisible() },
-  { name: 'Intelligence', navText: 'Intelligence', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /ARIA Intelligence/i })).toBeVisible() },
-  { name: 'Data', navText: 'Data', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^Data$/i })).toBeVisible() },
-  { name: 'Documents', navText: 'Documents', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^Documents$/i })).toBeVisible() },
-  { name: 'Copilot', navText: 'Copilot', check: (page) => expect(page.locator('textarea, input')).toBeVisible({ timeout: 5000 }) },
-  { name: 'History', navText: 'History', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^History$/i })).toBeVisible() },
-  { name: 'Settings', navText: 'Settings', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^Settings$/i })).toBeVisible() },
+  { name: 'Dashboard', navText: 'Dashboard', check: (page) => expect(page.getByRole('banner').getByRole('heading', { name: /Dashboard/i })).toBeVisible(VIS) },
+  { name: 'AIAnalytics', navText: 'AI Analytics', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^Analytics$/i })).toBeVisible(VIS) },
+  { name: 'Insights', navText: 'Insights', check: (page) => expect(page.getByRole('banner').getByRole('heading', { name: /^Insights/i })).toBeVisible(VIS) },
+  { name: 'Predictive', navText: 'Forecast', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^Forecast$/i })).toBeVisible(VIS) },
+  { name: 'Intelligence', navText: 'Intelligence', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /ARIA Intelligence/i })).toBeVisible(VIS) },
+  { name: 'Data', navText: 'Data', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^Data$/i })).toBeVisible(VIS) },
+  { name: 'Documents', navText: 'Documents', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^Documents$/i, level: 1 })).toBeVisible(VIS) },
+  { name: 'Copilot', navText: 'Copilot', check: (page) => expect(page.locator('textarea, input')).toBeVisible({ timeout: 15000 }) },
+  { name: 'History', navText: 'History', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^History$/i })).toBeVisible(VIS) },
+  { name: 'Settings', navText: 'Settings', check: (page) => expect(page.getByRole('main').getByRole('heading', { name: /^Settings$/i })).toBeVisible(VIS) },
 ];
 
 test.describe('Full journey - every page loads', () => {

@@ -699,8 +699,6 @@ def validate_explore(engine, dialect: str, qm: str, qt: str,
                 _ok("breakdown_sum", _tr[0], _tr[1])
         except Exception as exc:
             _ok("breakdown_sum", False, f"check failed (fail-closed): {exc}")
-        except Exception as exc:
-            _ok("breakdown_sum", False, f"check failed (fail-closed): {exc}")
 
         # ---- arithmetic ----------------------------------------------------
         try:

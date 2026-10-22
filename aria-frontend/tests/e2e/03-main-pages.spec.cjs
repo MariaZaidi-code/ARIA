@@ -196,11 +196,11 @@ test.describe('Main App pages', () => {
     await expect(page.getByRole('figure', { name: 'Chart of Sales' })).toBeVisible();
     await expect(page.locator('.documents-answer-chart-row')).toHaveCount(2);
     await expect(page.locator('.documents-chat-answer > p').last()).not.toContainText('*');
-    const answerFontSize = await page.locator('.documents-chat-answer > p').evaluate((element) => (
+    const answerFontSize = await page.locator('.documents-chat-answer > p').last().evaluate((element) => (
       Number.parseFloat(getComputedStyle(element).fontSize)
     ));
     expect(answerFontSize).toBeGreaterThanOrEqual(14);
-    const questionFontSize = await page.locator('.documents-chat-question').evaluate((element) => (
+    const questionFontSize = await page.locator('.documents-chat-question').last().evaluate((element) => (
       Number.parseFloat(getComputedStyle(element).fontSize)
     ));
     expect(questionFontSize).toBeGreaterThanOrEqual(14);

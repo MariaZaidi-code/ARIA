@@ -48,7 +48,13 @@ def _users_dir() -> Path:
         _d.mkdir(parents=True, exist_ok=True)
         return _d
     except Exception:
-        d = Path("data") / "users"
+        # Fallback (core.config unavailable): honour ARIA_DATA_DIR and anchor
+        # the default to the repo root, never the process CWD — a CWD-relative
+        # "data/users" silently splits user data per working directory.
+        _configured = os.getenv("ARIA_DATA_DIR")
+        _root = (Path(_configured).expanduser().resolve() if _configured
+                 else Path(__file__).resolve().parent.parent / "data")
+        d = _root / "users"
         d.mkdir(parents=True, exist_ok=True)
         return d
 

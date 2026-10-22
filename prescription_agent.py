@@ -169,15 +169,17 @@ Rules:
         # Only an accuracy-validated forecast may influence prescriptions.
         if not predictions or not predictions.get("valid") or not predictions.get("points"):
             return None
+        # ``.get`` (never direct subscripts): a partial forecast payload must
+        # degrade to a summary, not raise KeyError out of prescribe().
         return {
-            "column": predictions["column"],
-            "period": predictions["period"],
-            "horizon": predictions["horizon"],
-            "method": predictions["method"],
-            "accuracy_pct": predictions["accuracy_pct"],
-            "projected_pct_change": predictions["projected_pct_change"],
-            "last_actual": predictions["last_actual"],
-            "points": predictions["points"][:4],
+            "column": predictions.get("column"),
+            "period": predictions.get("period"),
+            "horizon": predictions.get("horizon"),
+            "method": predictions.get("method"),
+            "accuracy_pct": predictions.get("accuracy_pct"),
+            "projected_pct_change": predictions.get("projected_pct_change"),
+            "last_actual": predictions.get("last_actual"),
+            "points": (predictions.get("points") or [])[:4],
         }
 
     @staticmethod
@@ -279,8 +281,11 @@ Rules:
             period_word = predictions.get("period") or "periods"
             if period_word in ("sequence", "daily", "weekly", "monthly"):
                 period_word = "periods"
-            actions.append(f"Plan for the projected change in {predictions['column']} over the next "
-                           f"{predictions['horizon']} {period_word}.")
+            _col = predictions.get("column") or "the forecast"
+            _hz = predictions.get("horizon")
+            _hz_txt = f"{_hz} " if _hz else ""
+            actions.append(f"Plan for the projected change in {_col} over the next "
+                           f"{_hz_txt}{period_word}.")
         if kpis and not actions:
             valid = [k for k in kpis if isinstance(k, dict) and k.get("column")]
             if valid:

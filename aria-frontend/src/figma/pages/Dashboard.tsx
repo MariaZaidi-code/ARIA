@@ -1171,6 +1171,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
   const inputRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<any>(null);
   const configBusy = useRef(false);
+  const configReqId = useRef(0);
   const prevDashDb = useRef<string | null>(null);
 
   /* Insight-focus state: clicking an insight/anomaly swaps in a live
@@ -1205,11 +1206,13 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
 
   const fetchConfig = useCallback(async () => {
     if (configBusy.current) return;
+    const reqId = ++configReqId.current;
     configBusy.current = true;
     setLoading(true);
     setError("");
     try {
       const data: any = await apiFetch("/dashboard/config");
+      if (reqId !== configReqId.current) return;
       if (data.ok) {
         let nextConfig = data.config;
         // Use the same database-backed quality scan as the Data page. The
@@ -1217,6 +1220,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
         // schema metadata to calculate a trustworthy score on its own.
         try {
           const qualityResponse: any = await apiFetch("/data/quality");
+          if (reqId !== configReqId.current) return;
           const quality = qualityResponse?.quality;
           if (qualityResponse?.ok && Number.isFinite(Number(quality?.overall))) {
             nextConfig = {
@@ -1234,19 +1238,24 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           // Keep the dashboard usable if the optional quality scan fails.
           console.debug("[ARIA] dashboard quality scan unavailable:", qualityError);
         }
+        if (reqId !== configReqId.current) return;
         setConfig(nextConfig);
         setLastUpdated(Date.now());
         setLastUpdatedIso(new Date().toISOString());
       } else {
+        if (reqId !== configReqId.current) return;
         setError(data?.error || "Failed to load dashboard.");
       }
     } catch (e: any) {
+      if (reqId !== configReqId.current) return;
       setError(e?.status === 401
         ? "Session expired. Please sign in again."
         : (e?.message || "Network error."));
     } finally {
-      setLoading(false);
-      configBusy.current = false;
+      if (reqId === configReqId.current) {
+        setLoading(false);
+        configBusy.current = false;
+      }
     }
   }, []);
 
@@ -1270,6 +1279,9 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
         setConfig(null); setSelection(null); clearFocus();
         setActiveFilter("all"); setResetKey((k) => k + 1);
       }
+      // Allow a new fetch even if a previous one is still in flight; the
+      // request-id guard in fetchConfig discards the stale response.
+      configBusy.current = false;
       fetchConfig();
       fetchAutocomplete("");
     }
@@ -1280,15 +1292,18 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
   useEffect(() => {
     if (connectionStatus !== "connected") return;
     if (dbName) return;
+    let dead = false;
     (async () => {
       try {
         const body: any = await apiFetch("/session/status");
+        if (dead) return;
         setSessionInfo({
           dbName: String(body?.db_name || ""),
           sourceType: String(body?.source_type || body?.db_type || ""),
         });
       } catch { /* card falls back to config summary labels */ }
     })();
+    return () => { dead = true; };
   }, [connectionStatus, dbName]);
 
   /* Workspace extras (KPI targets) — additive, must never block the
@@ -1771,7 +1786,8 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           const top = sev[0];
           const dismissed: string[] = (() => {
             try {
-              return JSON.parse(sessionStorage.getItem("aria_anom_dismissed") || "[]");
+              const v = JSON.parse(sessionStorage.getItem("aria_anom_dismissed") || "[]");
+              return Array.isArray(v) ? v : [];
             } catch {
               return [];
             }

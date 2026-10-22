@@ -2089,7 +2089,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         metrics = (ir or {}).get("metrics", []) or []
         dims = (ir or {}).get("dimensions", []) or []
         filters = (ir or {}).get("filters", []) or []
-        time = (ir or {}).get("time") if ir else None
+        time_ir = (ir or {}).get("time") if ir else None
         ranking = (ir or {}).get("ranking") if ir else None
         if ranking is None:
             try:
@@ -2281,7 +2281,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         except Exception:
             ir_intent = None
         wants_trend = bool(ir_intent == "trend" or trend_words
-                            or (isinstance(time, dict) and time.get("granularity")))
+                            or (isinstance(time_ir, dict) and time_ir.get("granularity")))
         # DEFECT 2: month-over-month decline ("in which month did revenue
         # decline/drop/fall"): trend intent + decline words forces a monthly
         # GROUP BY even when the phrasing uses bare "month" instead of
@@ -2459,7 +2459,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         # --- datetime for trends --------------------------------------------
         date_table, date_col, date_dtype = None, None, None
         if wants_trend:
-            tc = (time or {}).get("column") if isinstance(time, dict) else None
+            tc = (time_ir or {}).get("column") if isinstance(time_ir, dict) else None
             if tc and "." in str(tc):
                 t0, _, c0 = str(tc).partition(".")
                 if t0 in included:

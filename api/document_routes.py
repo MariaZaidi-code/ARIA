@@ -12,7 +12,7 @@ the canonical engine so we stop maintaining two retrieval systems.
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -277,6 +277,36 @@ def document_overview_stats(user: dict = Depends(get_current_user)):
             "categories": categories,
         },
     }
+
+
+# Registered BEFORE the `/api/documents/{document_id}` routes below: FastAPI
+# matches in declaration order, so the dynamic route would otherwise capture
+# "shared-with-me" and 404 this listing.
+@router.get("/api/documents/shared-with-me")
+def documents_shared_with_me(user: dict = Depends(get_current_user)):
+    """List documents shared with the current user by other users."""
+    username = user.get("username")
+    if not username:
+        return {"ok": True, "documents": []}
+    import json as _json
+    from insight_rag.config import RAG_USERS_DIR as base
+    out = []
+    if base.exists():
+        for ud in base.iterdir():
+            if not ud.is_dir():
+                continue
+            manifest = ud / "manifest.json"
+            if not manifest.exists():
+                continue
+            try:
+                m = _json.loads(manifest.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for d in (m.get("documents") or {}).values():
+                if username in (d.get("shared_with") or []):
+                    out.append({k: v for k, v in d.items()
+                                if k not in ("chunk_ids", "share_token", "shared_with", "shared", "share_expires_at")})
+    return {"ok": True, "documents": out}
 
 
 @router.get("/api/documents/{document_id}")
@@ -772,6 +802,26 @@ def export_document(
 
 import secrets as _secrets
 
+_SHARE_TTL_DAYS = 7
+
+
+def _share_expired(doc: dict) -> bool:
+    """True when a share link carries an expired stamp (fail-closed).
+
+    Tokens minted before expiry stamping existed carry no ``share_expires_at``
+    and remain valid; malformed timestamps are treated as expired.
+    """
+    raw = doc.get("share_expires_at")
+    if not raw:
+        return False
+    try:
+        expiry = datetime.fromisoformat(str(raw))
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return True
+    return datetime.now(timezone.utc) >= expiry
+
 
 @router.post("/api/documents/{document_id}/share")
 def share_document(
@@ -788,6 +838,9 @@ def share_document(
     token = doc.get("share_token") or _secrets.token_urlsafe(24)
     doc["share_token"] = token
     doc["shared"] = True
+    doc["share_expires_at"] = (
+        (datetime.now(timezone.utc) + timedelta(days=_SHARE_TTL_DAYS)).isoformat()
+    )
     meta.put_document(doc)
     return {"ok": True, "share_token": token,
             "share_url": f"/api/documents/shared/{token}"}
@@ -805,6 +858,7 @@ def unshare_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     doc.pop("share_token", None)
+    doc.pop("share_expires_at", None)
     doc["shared"] = False
     meta.put_document(doc)
     return {"ok": True}
@@ -813,10 +867,9 @@ def unshare_document(
 @router.get("/api/documents/shared/{token}")
 def get_shared_document(token: str):
     """Read-only access to a shared document (no auth required)."""
-    # Search across all users' manifests for the token.
-    from insight_rag.storage import user_dir
-    from pathlib import Path as _P
-    base = _P("data") / "insight_rag" / "users"
+    # Search across all users' manifests for the token. The base directory is
+    # RAG_USERS_DIR so custom ARIA_DATA_DIR installs resolve correctly.
+    from insight_rag.config import RAG_USERS_DIR as base
     if not base.exists():
         raise HTTPException(status_code=404, detail="Not found")
     for ud in base.iterdir():
@@ -831,23 +884,24 @@ def get_shared_document(token: str):
         except Exception:
             continue
         for d in (m.get("documents") or {}).values():
-            if d.get("share_token") == token:
-                chunks = []
-                cf = ud / "chunks" / f"{d.get('document_id')}.json"
-                if cf.exists():
-                    try:
-                        raw = _json.loads(cf.read_text(encoding="utf-8"))
-                        if isinstance(raw, list):
-                            for c in raw:
-                                if isinstance(c, dict):
-                                    chunks.append({"text": c.get("page_content") or c.get("content") or "",
-                                                   "metadata": c.get("metadata", {})})
-                    except Exception:
-                        pass
-                return {"ok": True, "document": {k: v for k, v in d.items()
-                                                if k not in ("chunk_ids", "share_token", "shared_with", "shared")},
-                        "chunks": chunks[:20],
-                        "summary": d.get("summary") or ""}
+            if d.get("share_token") != token or _share_expired(d):
+                continue
+            chunks = []
+            cf = ud / "chunks" / f"{d.get('document_id')}.json"
+            if cf.exists():
+                try:
+                    raw = _json.loads(cf.read_text(encoding="utf-8"))
+                    if isinstance(raw, list):
+                        for c in raw:
+                            if isinstance(c, dict):
+                                chunks.append({"text": c.get("page_content") or c.get("content") or "",
+                                               "metadata": c.get("metadata", {})})
+                except Exception:
+                    pass
+            return {"ok": True, "document": {k: v for k, v in d.items()
+                                            if k not in ("chunk_ids", "share_token", "shared_with", "shared", "share_expires_at")},
+                    "chunks": chunks[:20],
+                    "summary": d.get("summary") or ""}
     raise HTTPException(status_code=404, detail="Shared document not found or link expired")
 @router.post("/api/documents/{document_id}/translate")
 def translate_document_summary(
@@ -987,7 +1041,10 @@ def schedule_reingest(
     document_ids: Optional[List[str]] = None,
     user: dict = Depends(require_writable),
 ):
-    job = add_job(user["user_id"], interval_hours, document_ids)
+    try:
+        job = add_job(user["user_id"], interval_hours, document_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     return {"ok": True, "job": job}
 
 
@@ -1047,34 +1104,6 @@ def unshare_document_with(
     doc["shared_with"] = shared
     meta.put_document(doc)
     return {"ok": True, "shared_with": shared}
-
-
-@router.get("/api/documents/shared-with-me")
-def documents_shared_with_me(user: dict = Depends(get_current_user)):
-    """List documents shared with the current user by other users."""
-    username = user.get("username")
-    if not username:
-        return {"ok": True, "documents": []}
-    from pathlib import Path as _P
-    import json as _json
-    base = _P("data") / "insight_rag" / "users"
-    out = []
-    if base.exists():
-        for ud in base.iterdir():
-            if not ud.is_dir():
-                continue
-            manifest = ud / "manifest.json"
-            if not manifest.exists():
-                continue
-            try:
-                m = _json.loads(manifest.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            for d in (m.get("documents") or {}).values():
-                if username in (d.get("shared_with") or []):
-                    out.append({k: v for k, v in d.items()
-                                if k not in ("chunk_ids", "share_token", "shared_with", "shared")})
-    return {"ok": True, "documents": out}
 
 
 import re as _dre

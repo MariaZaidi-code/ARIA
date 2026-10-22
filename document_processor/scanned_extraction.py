@@ -227,9 +227,9 @@ class ScannedExtractor:
                 "y1": ocr_data["top"][i] + ocr_data["height"][i],
             })
         
-            # Build line objects (bboxes are pixel-space; normalized by the
-            # caller using the rendered image dimensions)
-            result = []
+        # Build line objects (bboxes are pixel-space; normalized by the
+        # caller using the rendered image dimensions)
+        result = []
         for key, data in sorted(lines.items()):
             # Calculate combined bbox
             bboxes = data["bboxes"]

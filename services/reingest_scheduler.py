@@ -7,6 +7,7 @@ logged and the job is retried on the next tick.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -20,6 +21,10 @@ JOBS_PATH = DATA_DIR / "reingest_jobs.json"
 _lock = threading.Lock()
 _thread = None
 _stop = threading.Event()
+# Smallest interval the scheduler will honour. Without a floor a job created
+# with a non-positive interval would re-run on every tick (every 60s) forever.
+_MIN_INTERVAL_HOURS = 1.0
+_DEFAULT_INTERVAL_HOURS = 24.0
 
 
 def _load_jobs() -> list:
@@ -52,13 +57,30 @@ def list_jobs(user_id=None) -> list:
     return jobs
 
 
+def _normalise_interval(interval_hours) -> float:
+    """Coerce an interval to a finite, positive number of hours.
+
+    Raises ValueError for NaN/Infinity/non-numeric input: ``timedelta`` blows
+    up on those (ValueError/OverflowError -> 500), and a non-positive interval
+    would schedule a job that re-runs on every scheduler tick.
+    """
+    try:
+        value = float(interval_hours)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("interval_hours must be a number of hours.") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("interval_hours must be a finite, positive number of hours.")
+    return value
+
+
 def add_job(user_id, interval_hours: float, document_ids: list | None = None) -> dict:
+    interval = _normalise_interval(interval_hours)
     job = {
         "id": uuid.uuid4().hex[:12],
         "user_id": str(user_id),
-        "interval_hours": float(interval_hours),
+        "interval_hours": interval,
         "document_ids": list(document_ids or []),
-        "next_run": (datetime.now(timezone.utc) + timedelta(hours=float(interval_hours))).isoformat(),
+        "next_run": (datetime.now(timezone.utc) + timedelta(hours=interval)).isoformat(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "last_run": None,
         "last_status": None,
@@ -118,7 +140,15 @@ def _tick() -> None:
                 status = _run_job(job)
                 job["last_run"] = now.isoformat()
                 job["last_status"] = status
-                job["next_run"] = (now + timedelta(hours=float(job.get("interval_hours", 24)))).isoformat()
+                # Floor the interval so a job stored with a non-positive
+                # interval cannot re-run on every tick forever.
+                try:
+                    _interval = float(job.get("interval_hours", _DEFAULT_INTERVAL_HOURS))
+                except (TypeError, ValueError):
+                    _interval = _DEFAULT_INTERVAL_HOURS
+                if not math.isfinite(_interval) or _interval < _MIN_INTERVAL_HOURS:
+                    _interval = _MIN_INTERVAL_HOURS
+                job["next_run"] = (now + timedelta(hours=_interval)).isoformat()
                 changed = True
         if changed:
             _save_jobs(jobs)

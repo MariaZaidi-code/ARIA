@@ -102,6 +102,19 @@ export const clearAuthSession = () => {
   currentAuthUser = null;
   clearLegacyAuthStorage();
   storage.remove(KEYS.authUser);
+  // Drop cross-page handoff context so a previous account's analysis
+  // context cannot pollute the next session in the same browser tab.
+  try {
+    for (const k of ["aria_shared_context", "aria_forecast_prefill", "aria_insight_handoff", "aria_hypothesis_prefill", "aria_copilot_context", "aria_explore_prefill", "aria_whatif_prefill", "aria_toast"]) {
+      sessionStorage.removeItem(k);
+    }
+  } catch { /* ignore */ }
+  try {
+    for (const k of [KEYS.analysisContext, KEYS.forecastContext, KEYS.sharedContext, KEYS.dashboardDrill, "aria_analysis_context", "aria_forecast_context", "aria_dashboard_drill"]) {
+      storage.remove(k);
+      localStorage.removeItem(k);
+    }
+  } catch { /* ignore */ }
 };
 
 // =========================================================

@@ -16,6 +16,13 @@ jobs:
           python-version: "3.11"
       - name: Install runtime + dev dependencies (pinned via constraints)
         run: pip install -c constraints.txt -r requirements.txt -r requirements-dev.txt
+      - name: Static import-safety lint (undefined names, local shadowing, syntax)
+        # Blocks the runtime-bug classes that are invisible to tests until a
+        # rarely used path executes: F821/F822 undefined names, F823
+        # local variable referenced before assignment (e.g. a function-local
+        # `import time` shadowing module-level use), E9 syntax errors.
+        # Style-level findings (F401/F841/...) stay out of the gate.
+        run: ruff check . --select F821,F822,F823,E9 --exclude .venv,_archive
       - name: Dependency vulnerability scan (pip-audit, blocking on High/Critical)
         # Blocking gate: pip-audit exits non-zero on any reported vuln, which
         # includes High/Critical. Triage by upgrading/pinning, or document a
