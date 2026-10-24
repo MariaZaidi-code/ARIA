@@ -3,7 +3,7 @@
 const path = require("path");
 const { test, expect } = require("@playwright/test");
 const {
-  BASE, SETS, attachSink, registerAndLogin, connectDataset, gotoPage, setDark,
+  BASE, SETS, attachSink, registerAndLogin, connectDataset, gotoPage, setDark, textProblems, textIssues,
 } = require("./helpers.cjs");
 
 const DATASETS = process.env.ARIA_AUDIT_DATASETS || path.resolve(__dirname, "../../../../work/datasets");
@@ -75,6 +75,59 @@ test("data: upload a CSV through the Data page UI", async ({ page }) => {
     await page.waitForTimeout(1500);
     await expect(page.getByText(/Something went wrong on this page/i)).toHaveCount(0);
   }
+  noServerErrors(sink);
+});
+
+test("documents: upload a PDF, find it, search it and ask about it", async ({ page }) => {
+  // Synthetic policy with known facts: 45-day returns, 12,500-unit warehouse.
+  const sink = attachSink(page);
+  await registerAndLogin(page);
+  await test.step("upload through the Data page", async () => {
+    await gotoPage(page, "Data");
+    await page.getByText("PDF Document", { exact: true }).first().click();
+    await page.locator('input[type=file][accept*="pdf"]').setInputFiles(
+      path.join(__dirname, "fixtures", "aria_test_policy.pdf"));
+    await page.getByRole("button", { name: /upload & analyze pdf/i }).click();
+    await expect(page.getByText(/processing/i)).toHaveCount(0, { timeout: 180000 });
+    await expect(page.getByText(/upload failed|couldn.?t|something went wrong/i)).toHaveCount(0);
+  });
+  await test.step("listed on the Documents page", async () => {
+    await gotoPage(page, "Documents");
+    await expect(page.getByText(/aria_test_policy/i).first()).toBeVisible({ timeout: 120000 });
+    expect(await textProblems(page, [])).toEqual([]);
+  });
+  await test.step("search finds the refund policy", async () => {
+    const box = page.getByPlaceholder(/search across all documents/i);
+    await box.fill("refund");
+    await box.press("Enter");
+    await expect(page.getByText(/45 days/i).first()).toBeVisible({ timeout: 60000 });
+  });
+  noServerErrors(sink);
+});
+
+test("documents: ask questions about an uploaded PDF", async ({ page }) => {
+  // KNOWN GAP (2026-10-24): on this branch document questions go to Copilot,
+  // which replies "The schema for this connection is not available yet"
+  // for a PDF connection. Maria's newer maria commit 92367d3 adds
+  // "Ask your documents" (/api/documents/ask). Marked as an expected failure
+  // so the suite stays honest: Playwright reports it as soon as it passes.
+  test.fail(true, "Document Q&A not on this branch yet (see report section 7)");
+  const sink = attachSink(page);
+  await registerAndLogin(page);
+  await gotoPage(page, "Data");
+  await page.getByText("PDF Document", { exact: true }).first().click();
+  await page.locator('input[type=file][accept*="pdf"]').setInputFiles(
+    path.join(__dirname, "fixtures", "aria_test_policy.pdf"));
+  await page.getByRole("button", { name: /upload & analyze pdf/i }).click();
+  await expect(page.getByText(/processing/i)).toHaveCount(0, { timeout: 180000 });
+  await gotoPage(page, "Copilot");
+  const box = page.getByPlaceholder(/ask aria anything about your data/i);
+  await box.fill("How many days do customers have to return items?");
+  await box.press("Enter");
+  await expect(page.getByText(/\b45\b/).last()).toBeVisible({ timeout: 60000 });
+  await box.fill("How many units can the warehouse store?");
+  await box.press("Enter");
+  await expect(page.getByText(/12,?500/).last()).toBeVisible({ timeout: 60000 });
   noServerErrors(sink);
 });
 
@@ -218,6 +271,57 @@ test("ask ARIA explains the dashboard with the numbers on screen", async ({ page
   noServerErrors(sink);
 });
 
+for (const key of ["A", "C", "B"]) {
+  test(`prescriptions: feed and case drawer on dataset ${key}`, async ({ page }) => {
+    const sink = attachSink(page);
+    const creds = await registerAndLogin(page);
+    await connectDataset(page, key, creds);
+    await gotoPage(page, "Intelligence");
+    await page.getByRole("tab", { name: /prescriptions/i }).click();
+    await expect(page.getByText("What needs attention").first()).toBeVisible({ timeout: 30000 });
+
+    const cardOpen = page.getByRole("button", { name: /^Open case:/ });
+    const empty = page.getByText(/nothing needs attention right now/i);
+    await test.step("feed settles on cards or an honest empty state, never an error", async () => {
+      await expect(cardOpen.first().or(empty.first())).toBeVisible({ timeout: 180000 });
+      await expect(page.getByText(/couldn.?t|something went wrong|failed to fetch/i)).toHaveCount(0);
+      expect(await textProblems(page, SETS[key].raw)).toEqual([]);
+    });
+    if (!(await cardOpen.first().isVisible().catch(() => false))) {
+      test.info().annotations.push({ type: "note", description: `dataset ${key}: no cases (empty state shown)` });
+      noServerErrors(sink);
+      return;
+    }
+
+    await test.step("case drawer: plain wording, real figures, closes cleanly", async () => {
+      await cardOpen.first().click();
+      const drawer = page.getByRole("dialog", { name: /^Case:/ });
+      await expect(drawer).toBeVisible();
+      const text = await drawer.innerText();
+      expect(textIssues(text, SETS[key].raw)).toEqual([]);
+      expect(text, "the case shows at least one figure").toMatch(/\d/);
+      await page.keyboard.press("Escape");
+      await expect(drawer).toBeHidden();
+    });
+
+    await test.step("tracking a case: track, mark achieved, stop tracking", async () => {
+      await cardOpen.first().click();
+      const drawer = page.getByRole("dialog", { name: /^Case:/ });
+      const track = drawer.getByRole("button", { name: "Track this action" });
+      if (!(await track.isVisible().catch(() => false))) return; // already tracked
+      await track.click();
+      await page.keyboard.press("Escape").catch(() => {});
+      const achieved = page.getByRole("button", { name: /^Mark achieved:/ }).first();
+      await expect(achieved).toBeVisible({ timeout: 30000 });
+      await achieved.click();
+      const stop = page.getByRole("button", { name: /^Stop tracking:/ }).first();
+      await stop.click();
+      await expect(page.getByText(/couldn.?t save|failed to fetch/i)).toHaveCount(0);
+    });
+    noServerErrors(sink);
+  });
+}
+
 test("intelligence: every tab opens and Explore runs", async ({ page }) => {
   const sink = attachSink(page);
   const creds = await registerAndLogin(page);
@@ -248,6 +352,21 @@ test("forecast, insights, documents, history and settings work", async ({ page }
   await test.step("Forecast renders a setup and a result or an honest message", async () => {
     await gotoPage(page, "Forecast");
     await expect(page.getByText(/forecast setup/i).first()).toBeVisible({ timeout: 60000 });
+  });
+  await test.step("Forecast details are plain English (no math jargon), also when expanded", async () => {
+    // Open every collapsed detail: confidence panel, evidence and its
+    // "Technical details" box, then check the visible text.
+    const conf = page.getByRole("button", { name: /forecast confidence/i }).first();
+    await expect(conf).toBeVisible({ timeout: 120000 });
+    await conf.click();
+    await expect(page.getByText(/typical miss/i).first()).toBeVisible();
+    const evidence = page.getByRole("button", { name: /^evidence/i }).first();
+    if (await evidence.isVisible().catch(() => false)) {
+      await evidence.click();
+      const tech = page.locator("summary", { hasText: /technical details/i }).first();
+      if (await tech.isVisible().catch(() => false)) await tech.click();
+    }
+    expect(await textProblems(page, SETS.A.raw, { allowRaw: false })).toEqual([]);
   });
   await test.step("Insights lists insights or an empty state", async () => {
     await gotoPage(page, "Insights");

@@ -465,6 +465,8 @@ export default function App() {
         throw new Error(`Unsupported file source type: ${sourceType}`);
       }
       const path = sourceType === 'csv' ? `/connect_file` : `/connect_pdf`;
+      // A PDF has no tables, so there is no schema to read after upload.
+      const isDocument = sourceType === 'pdf';
       const data: any = await apiFetch(path, {
         method: "POST",
         body: formData,
@@ -503,14 +505,14 @@ export default function App() {
               }
               if (prog?.done && prog?.result) {
                 const res: any = prog.result;
-                await handleSchemaFetch();
+                if (!isDocument) await handleSchemaFetch();
                 setConnectionStatus("connected");
                 setDbName(res?.table || res?.file || file.name.replace(/\.[^.]+$/, ""));
                 setSelectedSourceType(res?.source_type || "semi-structured");
                 return;
               }
               if (prog?.done) {
-                await handleSchemaFetch();
+                if (!isDocument) await handleSchemaFetch();
                 setConnectionStatus("connected");
                 return;
               }
@@ -523,8 +525,10 @@ export default function App() {
           return;
         }
         // After successful file connect, fetch schema and mark connected
-        setConnectionStatus("schema-loading");
-        await handleSchemaFetch();
+        if (!isDocument) {
+          setConnectionStatus("schema-loading");
+          await handleSchemaFetch();
+        }
         setConnectionStatus("connected");
         setDbName(data?.table || data?.file || file.name.replace(/\.[^.]+$/, ""));
         setSelectedSourceType(data?.source_type || "semi-structured");

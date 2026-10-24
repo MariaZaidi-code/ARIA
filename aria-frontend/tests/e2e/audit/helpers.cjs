@@ -19,7 +19,9 @@ const SETS = {
     kind: "csv", file: "dataset_C_messy_txns.csv",
     question: "What is the total amt?", expectText: "1,071,222",
     raw: ["txn_id", "txn_dt", "cust_nm", "store_cd", "prod_cat", "prod_nm",
-          "disc_pct", "pay_mthd", "dataset_c_messy_txns"],
+          "disc_pct", "pay_mthd", "dataset_c_messy_txns",
+          // Bare shorthand must read as plain words ("amount", "quantity").
+          "amt", "Amt", "qty", "Qty"],
   },
   B: {
     kind: "postgres", db: "aria_test", port: Number(process.env.ARIA_AUDIT_PG_PORT || 55432),
@@ -162,13 +164,24 @@ async function setDark(page, dark) {
   }
 }
 
-/** Visible-text problems: NaN/undefined/etc. and raw identifiers. */
-async function textProblems(page, rawNames, { allowRaw = false } = {}) {
+/** Statistics terms and formula notation a business user should not see. */
+const MATH_JARGON = /\b(MAE|RMSE|MAPE|SMAPE|R²|R\^2|p-value|z-score|std\.? ?dev|standard deviation|regression|coefficient|holdout|walk-forward|backtest|ARIMA|SARIMA|heteroscedastic|autocorrelation|stationarity|log-transform)\b|σ|√|Σ/gi;
+
+/** Visible-text problems: NaN/undefined/etc., math jargon and raw identifiers. */
+async function textProblems(page, rawNames, opts = {}) {
   const text = await page.locator("main").innerText().catch(() => "");
+  return textIssues(text, rawNames, opts);
+}
+
+/** Same checks on any text (e.g. a dialog that sits outside <main>). */
+function textIssues(text, rawNames, { allowRaw = false } = {}) {
   const problems = [];
   const bad = text.match(/\b(NaN|undefined|Infinity)\b|\[object Object\]|\bnull\b/g);
   if (bad) problems.push(`bad tokens: ${[...new Set(bad)].join(", ")}`);
   if (/Something went wrong on this page/i.test(text)) problems.push("error boundary shown");
+  // Ground rule: plain English, no math jargon or formulas on screen.
+  const jargon = text.match(MATH_JARGON);
+  if (jargon) problems.push(`math jargon: ${[...new Set(jargon)].join(", ")}`);
   if (!allowRaw) {
     const leaks = rawNames.filter((r) => new RegExp(`(?<![\\w])${r}(?![\\w])`).test(text));
     if (leaks.length) {
@@ -217,5 +230,5 @@ async function headingContrast(page) {
 
 module.exports = {
   BASE, SETS, PAGES, attachSink, registerAndLogin, loginUI, connectDataset, gotoPage, setDark,
-  textProblems, headingContrast,
+  textProblems, textIssues, headingContrast,
 };

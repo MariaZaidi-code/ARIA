@@ -12,7 +12,8 @@
 
 | Check | Before fixes | After fixes |
 |---|---|---|
-| Audit Playwright tests (15, now 16) | 12 passed, 3 failed | ✅ **16 passed** (incl. new Ask ARIA Dashboard test) |
+| Audit Playwright tests (15, now 21) | 12 passed, 3 failed | ✅ **21 passed** (incl. Ask ARIA Dashboard, Prescriptions ×3, PDF tests; one records the document-Q&A gap as an expected failure) |
+| Shorthand (`amt`, `qty`) and math jargon on pages | Not checked | ✅ **None** on every page × theme × dataset, and in the expanded Forecast details |
 | Pages × light/dark × datasets A/B/C, raw database names | Shown on Forecast, Dashboard, Insights, Intelligence | ✅ **None** |
 | Team's existing Playwright tests (49) | 2 passed, 7 failed, 40 skipped | ✅ **48 passed in a full run; the 49th (Reports PDF) passes on its own.** In a full run it is rate-limited, see Open #1 |
 | Backend tests | 745 passed | ✅ **749 passed** (4 new regression tests) |
@@ -35,9 +36,13 @@
 | New | Intelligence tab content could stay stuck on the previous tab after quick switches | Removed the exit-wait animation | `pages/Intelligence.tsx` |
 | New | Explore offered date columns (e.g. Transaction date) as a category breakdown | Date-named columns go to the time axis only | `services/intelligence_service.py` |
 | New | Ask ARIA couldn't explain the Dashboard to a confused user (it only knew the page name) | The Dashboard publishes what is on screen; the bot explains cards, charts, % changes, data quality, K/M and insights with those exact numbers, offers Dashboard starter questions, and marks such answers "Explained from what's on your screen". Data questions still go to the engine. Frontend only | `lib/screenContext.ts` (new), `pages/Dashboard.tsx`, `components/MiniAria.tsx`, audit test "ask ARIA explains the dashboard…" |
+| New (24 Oct) | Forecast confidence details showed MAE / RMSE / MAPE, "Backend valid: true", raw method names | Plain English ("Typical miss", "Average miss", "Quality checks passed: Yes", "Repeat last season's pattern") | `pages/Predictive.tsx` |
+| New (24 Oct) | PDF upload triggered a table-schema request that crashed the server (500) | Frontend skips the schema step for PDFs | `App.tsx` |
 | Cleanup | README listed a deprecated route; misleading docstring; guessed `/connect_<type>` path | Corrected | `README.md`, `api/autocomplete_routes.py`, `App.tsx` |
 
 ### Open: needs a team decision
+
+0. **Document questions (PDF Q&A) not on this branch.** Upload, list and search work; asking about a PDF on Copilot replies "schema not available". Maria's newer `maria` commit `92367d3` adds "Ask your documents" (`/api/documents/ask`). Merge it into `semal`. Also for Aryan: `/api/extract_schema` returns 500 (missing schema file) on a PDF connection instead of a clear 4xx (`api/schema_routes.py:39`).
 
 1. **Rate limit too tight for normal browsing.** Most routers share one "heavy" budget: **60 requests/min per user and 240/min per IP** (`app.py:251-266`, `core/ratelimit.py:305-306`). It includes simple page reads (`GET /api/intelligence/analyses`, `/what-if/scenarios`, `/prescriptions/alerts`). Quickly moving through Intelligence tabs hit it ("Too many requests. Slow down and try again shortly."). Behind a reverse proxy, every user shares one IP, so the 240/min limit would apply to everyone together. **Suggestion:** a separate, higher budget for reads; keep the heavy budget for writes, analysis and LLM calls; use the forwarded client IP behind a trusted proxy. Owner: Aryan.
 2. **Forecast time grain.** Daily data is forecast by day (730 points) while "Monthly" is shown as selected; the x-axis reads "Dec, Dec, Dec…"; the likely range can go below zero for sales. Needs a decision in the forecast engine (`prediction/agent.py` `_infer_period`). Owner: Aryan.

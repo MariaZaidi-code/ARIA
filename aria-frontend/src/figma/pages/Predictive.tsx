@@ -29,6 +29,25 @@ const BASELINE_C = CATEGORY_COLORS[4];
 
 const plainName = (c: string) => (c || "").split(" (")[0].trim();
 
+/* Plain-English names for forecast methods and statuses (no math jargon on
+   screen). Unknown values fall back to readable words. */
+const METHOD_WORDS: Record<string, string> = {
+  naive: "Repeat the latest value",
+  seasonal_naive: "Repeat last season's pattern",
+  drift: "Continue the average recent change",
+  linear_trend: "Straight-line trend",
+  moving_average: "Recent average",
+  sarima: "Seasonal pattern model",
+  theta: "Smoothed trend",
+};
+const plainMethod = (m: string | null) =>
+  !m ? "—" : METHOD_WORDS[String(m).toLowerCase()] || humanizeLabel(String(m));
+const RELIABILITY_WORDS: Record<string, string> = {
+  high: "High", limited: "Limited", insufficient_data: "Not enough history", not_available: "Not available",
+};
+const plainReliability = (r: string | null) =>
+  !r ? "—" : RELIABILITY_WORDS[String(r).toLowerCase()] || humanizeLabel(String(r));
+
 const fmtNum = (v: any) => {
   if (v === null || v === undefined || isNaN(Number(v))) return "—";
   const n = Number(v);
@@ -949,8 +968,16 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   const whyItems: { title: string; body: string; source: string }[] = useMemo(() => {
     if (!hasPredictions) return [];
     const items: { title: string; body: string; source: string }[] = [];
-    if (selectionStatement) items.push({ title: "Model selection", body: selectionStatement, source: "selection_statement" });
-    if (modelName && modelName !== "none") items.push({ title: "Approach", body: `Projected with ${modelName}, the approach that held up best against past actuals.`, source: "model" });
+    // The backend statement is technical ("Selected seasonal_naive based on
+    // best holdout"); say the same thing in plain words.
+    if (selectionStatement) items.push({
+      title: "How the method was chosen",
+      body: /insufficient history/i.test(selectionStatement)
+        ? "There isn't enough history yet to test methods on past periods, so treat this as an early estimate."
+        : "ARIA tested several methods on earlier periods and kept the one that predicted the later periods most closely.",
+      source: "selection_statement",
+    });
+    if (modelName && modelName !== "none") items.push({ title: "Approach", body: `Projected with "${plainMethod(modelName)}", the method that held up best against past results.`, source: "model" });
     for (const d of backendDrivers) {
       const name = String(d?.name || "").trim();
       if (!name) continue;
@@ -1790,17 +1817,19 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               </p>
               {confidenceOpen && (
                 <div className="pt-1 space-y-1.5 text-xs border-t border-border mt-2">
-                  <div className="flex justify-between pt-2"><span className="text-muted-foreground">Historical observations</span><span className="font-bold text-foreground">{historyCount}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Backend reliability</span><span className="font-bold text-foreground">{backendReliability ?? "—"}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Backend valid</span><span className="font-bold text-foreground">{backendValid === null ? "—" : String(backendValid)}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Stage</span><span className="font-bold text-foreground">{forecastStage ?? "—"}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Backtest accuracy</span><span className="font-bold text-foreground">{accuracy !== null ? `${accuracy.toFixed(1)}%` : "—"}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">MAE</span><span className="font-bold text-foreground">{contractMetrics?.mae ?? "—"}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">RMSE</span><span className="font-bold text-foreground">{contractMetrics?.rmse ?? "—"}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">MAPE</span><span className="font-bold text-foreground">{contractMetrics?.mape !== null && contractMetrics?.mape !== undefined ? `${contractMetrics.mape}%` : "—"}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Walk-forward coverage</span><span className="font-bold text-foreground">{coverage && coverage.evaluated !== null ? `${coverage.evaluated}/${coverage.origins ?? "?"} evaluated${coverage.zeroSkipped ? ` (${coverage.zeroSkipped} zero-demand skipped)` : ""}` : "—"}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Model</span><span className="font-bold text-foreground">{modelName || "—"}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Horizon</span><span className="font-bold text-foreground">{fwdVals.length} {fwdVals.length === 1 ? "period" : "periods"}</span></div>
+                  {/* Plain English only: same figures, no statistics jargon. */}
+                  <div className="flex justify-between pt-2"><span className="text-muted-foreground">Past periods used</span><span className="font-bold text-foreground">{historyCount}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Reliability</span><span className="font-bold text-foreground">{plainReliability(backendReliability)}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Quality checks passed</span><span className="font-bold text-foreground">{backendValid === null ? "—" : backendValid ? "Yes" : "No"}</span></div>
+                  {forecastStage && forecastStage !== "none" && (
+                    <div className="flex justify-between"><span className="text-muted-foreground">Status</span><span className="font-bold text-foreground">{forecastStage === "preliminary" ? "Early estimate" : humanizeLabel(forecastStage)}</span></div>
+                  )}
+                  <div className="flex justify-between"><span className="text-muted-foreground">Accuracy on past periods</span><span className="font-bold text-foreground">{accuracy !== null ? `${accuracy.toFixed(1)}%` : "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Typical miss</span><span className="font-bold text-foreground">{contractMetrics?.mae !== null && contractMetrics?.mae !== undefined ? fmtNum(contractMetrics.mae) : "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Average miss</span><span className="font-bold text-foreground">{contractMetrics?.mape !== null && contractMetrics?.mape !== undefined ? `${contractMetrics.mape}%` : "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Past periods tested</span><span className="font-bold text-foreground">{coverage && coverage.evaluated !== null ? `${coverage.evaluated} of ${coverage.origins ?? "?"}${coverage.zeroSkipped ? ` (${coverage.zeroSkipped} with no activity skipped)` : ""}` : "—"}</span></div>
+                  <div className="flex justify-between gap-3"><span className="text-muted-foreground">Method</span><span className="font-bold text-foreground text-right">{plainMethod(modelName)}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Forecast length</span><span className="font-bold text-foreground">{fwdVals.length} {fwdVals.length === 1 ? "period" : "periods"}</span></div>
                 </div>
               )}
             </div>
@@ -1885,7 +1914,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 { title: "Confidence", body: accuracy !== null ? `${accuracy >= 70 ? "Reliable" : "Weak"} in backtesting (${Math.round(accuracy)}% accuracy). Uncertainty grows further out — treat distant points as directional.` : "Backtesting could not score this series — treat the projection as directional." },
                 { title: "Assumptions", body: "Past patterns continue; no shocks, price changes, or seasonality shifts are modeled. A forecast is an estimate, not a promise." },
               ]}
-              technical={`How ARIA calculated this: ${modelName ? `selected approach ${modelName}` : "best of several candidate approaches"}${selectionStatement ? ` — ${selectionStatement}` : ""}${contractMetrics && (contractMetrics.mae !== null || contractMetrics.mape !== null) ? ` Holdout error: ${contractMetrics.mape !== null ? `MAPE ${contractMetrics.mape}%` : ""}${contractMetrics.mape !== null && contractMetrics.rmse !== null ? ", " : ""}${contractMetrics.rmse !== null ? `RMSE ${contractMetrics.rmse}` : ""}${contractMetrics.mae !== null ? `, MAE ${contractMetrics.mae}` : ""}.` : ""}${intervalMethod === "summed_bounds_approx" ? " Approximate range from regrouping." : ""}${uncertaintyNote ? ` ${uncertaintyNote}.` : ""} For analyst review.`}
+              technical={`How ARIA calculated this: ARIA tried several methods on your past data and chose "${plainMethod(modelName) === "—" ? "the best of several methods" : plainMethod(modelName)}", the one that predicted past periods most closely.${contractMetrics && (contractMetrics.mae != null || contractMetrics.mape != null) ? ` On those past periods it was off by${contractMetrics.mape != null ? ` about ${contractMetrics.mape}% on average` : ""}${contractMetrics.mape != null && contractMetrics.mae != null ? "," : ""}${contractMetrics.mae != null ? ` a typical miss of ${fmtNum(contractMetrics.mae)}` : ""}.` : ""}${intervalMethod === "summed_bounds_approx" ? " The likely range is approximate because periods were regrouped." : ""}${uncertaintyNote ? ` ${uncertaintyNote}.` : ""}`}
             />
           </div>
         </div>
