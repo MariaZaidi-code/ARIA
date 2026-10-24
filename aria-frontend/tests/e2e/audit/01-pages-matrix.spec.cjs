@@ -5,7 +5,7 @@
 const { test, expect } = require("@playwright/test");
 const {
   SETS, PAGES, attachSink, registerAndLogin, connectDataset, gotoPage, setDark,
-  textProblems, headingContrast,
+  textProblems, hoverTextProblems, headingContrast,
 } = require("./helpers.cjs");
 
 const datasets = (process.env.ARIA_AUDIT_SETS || "A,C,B").split(",").map((s) => s.trim());
@@ -25,6 +25,7 @@ for (const key of datasets) {
           await gotoPage(page, p.nav);
           const problems = await textProblems(page, SETS[key].raw,
             { allowRaw: p.id === "data" });   // the Data page shows the schema itself
+          problems.push(...await hoverTextProblems(page, SETS[key].raw, { allowRaw: p.id === "data" }));
           const contrast = await headingContrast(page);
           const lowContrast = contrast.filter((c) => c.ratio < 3);
           if (lowContrast.length) {

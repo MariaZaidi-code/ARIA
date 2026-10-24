@@ -173,11 +173,38 @@ async function textProblems(page, rawNames, opts = {}) {
   return textIssues(text, rawNames, opts);
 }
 
+/** Hover texts: every title / aria-label in <main>, plus the tooltip of the
+ *  first charts (pointer moved over their middle). Same checks as the
+ *  visible text: no raw names, NaN/null or math jargon. */
+async function hoverTextProblems(page, rawNames, opts = {}) {
+  const main = page.locator("main");
+  const attrs = await main.evaluate((el) => Array.from(el.querySelectorAll("[title],[aria-label]"))
+    .map((n) => `${n.getAttribute("title") || ""} ${n.getAttribute("aria-label") || ""}`.trim())
+    .filter(Boolean)).catch(() => []);
+  const tips = [];
+  const charts = main.locator(".recharts-surface");
+  const n = Math.min(await charts.count().catch(() => 0), 3);
+  for (let i = 0; i < n; i++) {
+    const box = await charts.nth(i).boundingBox().catch(() => null);
+    if (!box) continue;
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.waitForTimeout(400);
+    const tip = page.locator(".recharts-tooltip-wrapper").filter({ hasText: /\S/ });
+    if (await tip.count()) tips.push(await tip.first().innerText().catch(() => ""));
+  }
+  await page.mouse.move(0, 0);
+  const problems = textIssues([...attrs, ...tips].join("\n"), rawNames, opts);
+  return problems.map((x) => `hover text: ${x}`);
+}
+
 /** Same checks on any text (e.g. a dialog that sits outside <main>). */
 function textIssues(text, rawNames, { allowRaw = false } = {}) {
   const problems = [];
   const bad = text.match(/\b(NaN|undefined|Infinity)\b|\[object Object\]|\bnull\b/g);
-  if (bad) problems.push(`bad tokens: ${[...new Set(bad)].join(", ")}`);
+  if (bad) {
+    const i = text.search(/\b(NaN|undefined|Infinity)\b|\[object Object\]|\bnull\b/);
+    problems.push(`bad tokens: ${[...new Set(bad)].join(", ")} in "…${text.slice(Math.max(0, i - 60), i + 30).replace(/\s+/g, " ")}…"`);
+  }
   if (/Something went wrong on this page/i.test(text)) problems.push("error boundary shown");
   // Ground rule: plain English, no math jargon or formulas on screen.
   const jargon = text.match(MATH_JARGON);
@@ -230,5 +257,5 @@ async function headingContrast(page) {
 
 module.exports = {
   BASE, SETS, PAGES, attachSink, registerAndLogin, loginUI, connectDataset, gotoPage, setDark,
-  textProblems, textIssues, headingContrast,
+  textProblems, textIssues, hoverTextProblems, headingContrast,
 };

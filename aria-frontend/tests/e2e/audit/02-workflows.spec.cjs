@@ -224,8 +224,12 @@ test("ask ARIA explains the dashboard with the numbers on screen", async ({ page
   const bot = page.getByRole("dialog", { name: "Ask ARIA" });
   const footnotes = bot.getByText("Explained from what's on your screen");
   const ask = async (q) => {
-    await bot.getByLabel("Ask ARIA a question").fill(q);
-    await bot.getByLabel("Ask ARIA a question").press("Enter");
+    const input = bot.getByLabel("Ask ARIA a question");
+    await input.fill(q);
+    await expect(input).toHaveValue(q);
+    // Click Send once the typed text has registered (pressing Enter in the
+    // same instant the panel reopens can submit an empty box).
+    await bot.getByRole("button", { name: "Send question" }).click();
   };
 
   await test.step("dashboard starters are offered", async () => {

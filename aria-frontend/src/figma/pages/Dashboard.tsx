@@ -314,8 +314,10 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy, target }: { kpi: an
         <p className="text-[13px] font-medium text-muted-foreground truncate">{kpi.label || "Metric"}</p>
       </div>
       <div className="flex items-end justify-between gap-3">
-        <div className="min-w-0">
-          <p className="text-[28px] leading-tight font-semibold text-foreground tracking-tight tabular-nums truncate">
+        {/* The number always shows in full ("$2.14M", never "$2.1…"): it
+            never shrinks, and long values use a slightly smaller size. */}
+        <div className="flex-shrink-0">
+          <p className={`${String(displayValue).length > 5 ? "text-[24px]" : "text-[28px]"} leading-tight font-semibold text-foreground tracking-tight tabular-nums whitespace-nowrap`}>
             {displayValue}
           </p>
           {showChange ? (
@@ -328,7 +330,7 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy, target }: { kpi: an
           )}
         </div>
         {spark.length > 0 && (
-          <div className="w-24 h-11 flex-shrink-0" aria-hidden>
+          <div className="w-24 min-w-0 h-11 flex-shrink" aria-hidden>
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={spark} margin={{ top: 2, right: 0, bottom: 0, left: 0 }}>
                 <defs>
