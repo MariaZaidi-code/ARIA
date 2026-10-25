@@ -1382,6 +1382,33 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 return name, dt
         return None, None
 
+    _YEARLY_RE = re.compile(r"\b(yearly|annual(ly)?|by year|per year|each year|"
+                            r"year by year|by years|year over year|yoy)\b")
+
+    def _period_expr(self, table, col, dtype, goal=""):
+        """Period key for a time grouping: the year when the question asks
+        for years ('by year', 'yearly', 'annual'), else the month. The year
+        is the first four characters of the TEXT-date-safe month key
+        ('2024-03' / '2024-03-01 00:00:00' -> '2024'), so it works for every
+        dialect and date storage the month key supports."""
+        month = self._month_expr(table, col, dtype)
+        if not self._YEARLY_RE.search(str(goal or "").lower()):
+            return month
+        if getattr(self, "dialect", "postgresql") == "mysql":
+            return f"SUBSTRING({month}, 1, 4)"
+        return f"SUBSTR(CAST({month} AS TEXT), 1, 4)"
+
+    def _current_question_text(self, user_goal):
+        """The user's own words for this turn: history-augmented goals
+        ('Conversation context: ... Current question: X') must never let an
+        earlier turn's 'by year' change this turn's grouping."""
+        cur = str(getattr(self, "_active_current_question", "") or "").strip()
+        if cur:
+            return cur
+        m = re.search(r"current question\s*:\s*(.+)$", str(user_goal or ""),
+                      re.IGNORECASE | re.DOTALL)
+        return m.group(1).strip() if m else str(user_goal or "")
+
     def _month_expr(self, table, col, dtype):
         """Dialect-aware month truncation, TEXT-date safe (DD-MM-YYYY + ISO)."""
         try:
@@ -2589,7 +2616,8 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         # --- assemble --------------------------------------------------------
         if wants_trend and date_col is not None:
             try:
-                month_expr = self._month_expr(date_table, date_col, date_dtype)
+                month_expr = self._period_expr(date_table, date_col, date_dtype,
+                                               self._current_question_text(user_goal))
             except Exception:
                 month_expr = self._qcol(date_table, date_col)
             sql = (f"SELECT {month_expr} AS period, {value_list} "
@@ -2613,8 +2641,9 @@ Use date_trunc('quarter', date_col) for quarter filtering.
             lim = f" LIMIT {int(limit_n)}"
             if date_col is not None:
                 try:
-                    month_expr = self._month_expr(
-                        date_table, date_col, date_dtype)
+                    month_expr = self._period_expr(
+                        date_table, date_col, date_dtype,
+                        self._current_question_text(user_goal))
                 except Exception:
                     month_expr = self._qcol(date_table, date_col)
                 sql = (f"SELECT {month_expr} AS period, {value_list} "
@@ -2867,7 +2896,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 date_col, date_dtype = self._date_col_for_table(t)
                 if not date_col:
                     continue
-                month_expr = self._month_expr(t, date_col, date_dtype)
+                month_expr = self._period_expr(t, date_col, date_dtype, goal)
                 sum_expr, _col = _measure_sum(t)
                 if sum_expr:
                     return (f"SELECT {month_expr} AS period, "

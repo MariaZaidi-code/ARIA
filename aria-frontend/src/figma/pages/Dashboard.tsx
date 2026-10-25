@@ -8,8 +8,13 @@ import { TimeRangeSelector } from "../components/TimeRangeSelector";
 import { ChartBrush } from "../components/ChartBrush";
 import { colorForName } from "../lib/charts";
 import { fmtBiz } from "../lib/format";
+import { humanizeLabel } from "../lib/labels";
 import { fmtPeriod, validateDashboardCharts } from "../components/charts";
 import { apiFetch, workspaceApi } from "../../services/api";
+import { localStore, sessionStore } from "../../utils/storage.js";
+import { datasetLabel } from "../lib/labels";
+import { clearScreen, publishScreen, type ScreenChart, type ScreenInsight, type ScreenKpi, type ScreenSnapshot } from "../lib/screenContext";
+import { ANALYTICS_QUESTION_KEY } from "../lib/analysisContext";
 
 interface DashboardProps {
   setPage: (p: Page) => void;
@@ -110,12 +115,7 @@ const fmtExact = (n: number | null | undefined, prefix = "") => {
   return `${prefix}${Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 };
 
-const humanize = (s: string) =>
-  String(s || "")
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase())
-    .trim();
+const humanize = (s: string) => humanizeLabel(s, { titleCase: true });
 
 /** Business-worded error copy: never leak raw fetch/stack text to the UI. */
 function businessError(raw: string): string {
@@ -240,7 +240,7 @@ function useAnimatedNumber(target: number | null, duration = 550) {
 /** Shared drill context: stored for handoff, then the caller navigates. */
 function storeDrillContext(ctx: Record<string, any>) {
   try {
-    localStorage.setItem("aria_dashboard_drill", JSON.stringify({ at: Date.now(), ...ctx }));
+    localStore.setItem("aria_dashboard_drill", JSON.stringify({ at: Date.now(), ...ctx }));
   } catch { /* private mode: navigation still works */ }
 }
 
@@ -315,8 +315,10 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy, target }: { kpi: an
         <p className="text-[13px] font-medium text-muted-foreground truncate">{kpi.label || "Metric"}</p>
       </div>
       <div className="flex items-end justify-between gap-3">
-        <div className="min-w-0">
-          <p className="text-[28px] leading-tight font-semibold text-foreground tracking-tight tabular-nums truncate">
+        {/* The number always shows in full ("$2.14M", never "$2.1…"): it
+            never shrinks, and long values use a slightly smaller size. */}
+        <div className="flex-shrink-0">
+          <p className={`${String(displayValue).length > 5 ? "text-[24px]" : "text-[28px]"} leading-tight font-semibold text-foreground tracking-tight tabular-nums whitespace-nowrap`}>
             {displayValue}
           </p>
           {showChange ? (
@@ -329,7 +331,7 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy, target }: { kpi: an
           )}
         </div>
         {spark.length > 0 && (
-          <div className="w-24 h-11 flex-shrink-0" aria-hidden>
+          <div className="w-24 min-w-0 h-11 flex-shrink" aria-hidden>
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={spark} margin={{ top: 2, right: 0, bottom: 0, left: 0 }}>
                 <defs>
@@ -390,12 +392,12 @@ function MetricCard({ kpi, index = 0, onDrill, onAsk, onWhy, target }: { kpi: an
           try {
             const key = "aria_report_draft";
             const title = String(kpi?.label || "Dashboard metric");
-            const raw = localStorage.getItem(key);
+            const raw = localStore.getItem(key);
             const cur = Array.isArray(JSON.parse(raw || "[]")) ? JSON.parse(raw || "[]") : [];
             const exists = cur.some((x: any) => String(x?.title || "") === title);
             if (!exists) {
               cur.push({ id: String(kpi?.id || ""), title });
-              localStorage.setItem(key, JSON.stringify(cur));
+              localStore.setItem(key, JSON.stringify(cur));
               setDraftMsg("Added to the report draft.");
             } else {
               setDraftMsg("Already in the report draft.");
@@ -439,6 +441,8 @@ interface SelectedViz {
   periodLabel: string;
   current: number | null;
   trendPct: number | null;
+  /** What trendPct compares, shown next to the badge ("vs previous month"). */
+  trendLabel?: string;
   peakLabel: string;
   peakValue: number | null;
   annotation: string;
@@ -489,6 +493,17 @@ function trendOf(data: any[], yKey: string): number | null {
   const vals = data.map((r) => Number(r?.[yKey])).filter((v) => Number.isFinite(v));
   if (vals.length < 2 || vals[0] === 0) return null;
   const pct = ((vals[vals.length - 1] - vals[0]) / Math.abs(vals[0])) * 100;
+  return Number.isFinite(pct) ? pct : null;
+}
+
+/** Latest period vs the one before - the same comparison the KPI cards
+ *  make, so a chart header never contradicts the card above it. */
+function periodChange(data: any[], yKey: string): number | null {
+  const vals = data.map((r) => Number(r?.[yKey])).filter((v) => Number.isFinite(v));
+  if (vals.length < 2) return null;
+  const prev = vals[vals.length - 2];
+  if (prev === 0) return null;
+  const pct = ((vals[vals.length - 1] - prev) / Math.abs(prev)) * 100;
   return Number.isFinite(pct) ? pct : null;
 }
 
@@ -552,8 +567,13 @@ function toSelectedViz(c: any, kind: VizKind, insights: any[], anomalies: any[])
     : kind === "category"
       ? `${data.length} groups · ranked`
       : String(c?.subtitle || "");
-  const current = data.length ? Number(data[data.length - 1]?.[yKey]) : NaN;
-  const trendPct = trendOf(data, yKey);
+  // Time charts: latest period and its change vs the previous period.
+  // Category charts: the leading group, with no "trend" - comparing the
+  // smallest group with the largest is not a change over time.
+  const current = !data.length ? NaN
+    : kind === "category" ? Number(data[0]?.[yKey]) : Number(data[data.length - 1]?.[yKey]);
+  const trendPct = kind === "time" ? periodChange(data, yKey) : null;
+  const overallPct = trendOf(data, yKey);
   const peak = peakOf(data, xKey, yKey);
   const fromBackend = backendAnnotationFor(measure, insights, anomalies);
   let annotation = fromBackend;
@@ -562,7 +582,7 @@ function toSelectedViz(c: any, kind: VizKind, insights: any[], anomalies: any[])
     annotationFromBackend = false;
     if (kind === "time") {
       const first = fmtPeriod(String(data[0]?.[xKey] ?? ""));
-      annotation = `Peak ${fmtExact(peak.value, prefix)} in ${fmtPeriod(peak.label)}${trendPct !== null ? ` (${trendPct >= 0 ? "+" : ""}${trendPct.toFixed(1)}% since ${first})` : ""}.`;
+      annotation = `Peak ${fmtExact(peak.value, prefix)} in ${fmtPeriod(peak.label)}${overallPct !== null ? ` (${overallPct >= 0 ? "+" : ""}${overallPct.toFixed(1)}% since ${first})` : ""}.`;
     } else if (data.length) {
       const total = data.reduce((s, r) => s + (Number(r?.[yKey]) || 0), 0);
       const share = sharePct(peak.value, total);
@@ -585,6 +605,7 @@ function toSelectedViz(c: any, kind: VizKind, insights: any[], anomalies: any[])
     periodLabel: subtitle,
     current: isNaN(current) ? null : current,
     trendPct,
+    trendLabel: kind === "time" && grain ? `vs previous ${grain.toLowerCase()}` : "",
     peakLabel: peak.label,
     peakValue: peak.value,
     annotation,
@@ -648,6 +669,80 @@ function derivedViz(from: SelectedViz): SelectedViz {
     };
   }
   return emptyViz("category", "derived-empty");
+}
+
+/** The (up to) 4 KPI cards shown. Date/range/period labels are metadata,
+ *  not KPIs — drop them and backfill from further real metrics so all 4
+ *  cards stay useful on every dataset. Shared with the Ask ARIA snapshot so
+ *  the bot explains exactly the cards on screen. */
+function visibleKpiCards(metrics: any[]): any[] {
+  const isDateCard = (k: any) =>
+    /date|range|period|calendar|time\b/i.test(String(k?.label || "")) &&
+    (k?.rawValue === null || k?.rawValue === undefined);
+  const useful = metrics.filter((k: any) => !isDateCard(k));
+  return (useful.length ? useful : metrics).slice(0, 4);
+}
+
+/** Plain summary of what the Dashboard shows, for Ask ARIA (the same
+ *  numbers and wording as the cards and chart headers). */
+function dashboardSnapshot(config: any, extraInsights: any[], extraAnomalies: any[], dataset: string): ScreenSnapshot {
+  const metrics: any[] = config?.metrics || [];
+  const rawInsights: any[] = config?.insights?.length > 0 ? config.insights : extraInsights;
+  const anomalies: any[] = config?.anomalies?.length > 0 ? config.anomalies : extraAnomalies;
+  const kpis: ScreenKpi[] = visibleKpiCards(metrics).map((k: any) => {
+    const isText = k?.format === "text" || k?.format === "percent";
+    const prefix = k?.format === "currency" ? "$" : (typeof k?.prefix === "string" ? k.prefix : "");
+    const raw = k?.rawValue === null || k?.rawValue === undefined ? NaN : Number(k.rawValue);
+    const ch = k?.change === null || k?.change === undefined || k?.change === "" ? NaN : Number(k.change);
+    return {
+      label: String(k?.label || "Metric"),
+      display: isText || !Number.isFinite(raw) ? String(k?.value ?? "—") : fmt(raw, prefix),
+      // Whole numbers stay whole; money-like decimals always show 2 places
+      // (1,805,810.30), matching the Analytics and Copilot answers.
+      exact: !isText && Number.isFinite(raw)
+        ? `${prefix}${raw.toLocaleString(undefined, Number.isInteger(raw) ? {} : { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+        : "",
+      change: !isText && Number.isFinite(ch) && ch !== 0 ? ch : null,
+      comparedWith: /prev/i.test(String(k?.period || "")) ? "the previous period" : "",
+    };
+  });
+  const [v1, v2] = selectDashboardViz(config?.visualizations || [], rawInsights, anomalies);
+  const charts: ScreenChart[] = [v1, v2]
+    .filter((v) => v && v.kind !== "empty" && v.data.length > 0)
+    .map((v) => {
+      const prefix = v.format === "currency" ? "$" : "";
+      return {
+        title: v.title,
+        subtitle: v.subtitle || v.periodLabel || "",
+        kind: v.kind === "time" || v.kind === "category" ? v.kind : "other",
+        measure: v.measure || v.title,
+        dim: v.dim || "",
+        grain: (v.grain || "").toLowerCase(),
+        latest: v.current !== null ? fmt(v.current, prefix) : "",
+        change: v.trendPct,
+        note: v.annotation || "",
+        peakLabel: v.kind === "time" ? fmtPeriod(String(v.peakLabel || "")) : String(v.peakLabel || ""),
+        peak: v.peakValue !== null ? fmt(v.peakValue, prefix) : "",
+      };
+    });
+  const insights: ScreenInsight[] = [
+    ...rawInsights.map((i: any) => ({ title: String(i?.title || "Insight"), detail: String(i?.description || i?.explanation || ""), type: String(i?.type || i?.category || "Insight") })),
+    ...anomalies.map((a: any) => ({ title: String(a?.title || `${a?.metric || a?.column || "Metric"} anomaly`), detail: String(a?.explanation || a?.description || ""), type: String(a?.type || "Anomaly") })),
+  ].slice(0, 6);
+  const summary = config?.summary || {};
+  const q = config?.quality;
+  const completeness = Number(q?.metrics?.completeness);
+  return {
+    page: "dashboard",
+    dataset,
+    records: Number.isFinite(Number(summary.totalRows)) && Number(summary.totalRows) > 0 ? Number(summary.totalRows) : null,
+    tables: Number.isFinite(Number(summary.tableCount)) && Number(summary.tableCount) > 0 ? Number(summary.tableCount) : null,
+    quality: typeof q?.score === "number" ? q.score : null,
+    completeness: Number.isFinite(completeness) ? completeness : null,
+    kpis,
+    charts,
+    insights,
+  };
 }
 
 function selectDashboardViz(charts: any[], insights: any[], anomalies: any[]): [SelectedViz, SelectedViz] {
@@ -732,7 +827,9 @@ function insightToFocusViz(raw: any, insightTitle: string): SelectedViz | null {
     title: String(spec?.title || insightTitle),
     subtitle: `Focused view · ${insightTitle.slice(0, 90)}`,
     data, xKey, yKey, format, measure: humanize(measure), dim: humanize(xKey), grain: "", periodLabel: "",
-    current: Number((anomaly || data[data.length - 1])?.[yKey]) || null, trendPct: trendOf(data, yKey),
+    current: Number((anomaly || (kind === "category" ? data[0] : data[data.length - 1]))?.[yKey]) || null,
+    trendPct: kind === "time" ? periodChange(data, yKey) : null,
+    trendLabel: kind === "time" ? "vs previous period" : "",
     peakLabel: anomaly ? String(anomaly[xKey]) : peak.label,
     peakValue: anomaly ? Number(anomaly[yKey]) : peak.value,
     annotation: anomaly ? `${humanize(measure)} anomaly in ${anomaly[xKey]}` : `Focused from this insight: ${insightTitle}`,
@@ -939,6 +1036,9 @@ function VizCard({ viz, grid, axis, onSelect, selection, contextChip, onClearCon
               {viz.trendPct >= 0 ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
               {Math.abs(viz.trendPct).toFixed(1)}%
             </span>
+          )}
+          {viz.trendPct !== null && viz.trendLabel && (
+            <span className="text-[10px] text-muted-foreground whitespace-nowrap">{viz.trendLabel}</span>
           )}
         </div>
       </div>
@@ -1351,6 +1451,21 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     onAsk?.(q);
   };
 
+  /* Ask ARIA screen context: publish what the Dashboard shows so the bot
+     can explain cards, charts and badges with the same numbers. */
+  useEffect(() => {
+    if (connectionStatus !== "connected" || !config) { clearScreen("dashboard"); return; }
+    try {
+      publishScreen(dashboardSnapshot(
+        config,
+        insightResult?.keyInsights || insightResult?.insights || [],
+        insightResult?.anomalies || analysisResult?.anomalies || [],
+        datasetLabel(dbName || config?.summary?.database || sessionInfo.dbName || ""),
+      ));
+    } catch { clearScreen("dashboard"); }
+  }, [config, connectionStatus, insightResult, analysisResult, dbName, sessionInfo.dbName]);
+  useEffect(() => () => clearScreen("dashboard"), []);
+
   if (connectionStatus !== "connected") {
     // App.tsx connection states: not-connected | connecting | connected |
     // schema-loading | error. Transient states show loading (never a stale
@@ -1444,6 +1559,16 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
 
   const drillKpi = (kpi: any) => {
     storeDrillContext({ kind: "kpi", metric: kpi?.label || "Metric", value: kpi?.rawValue ?? kpi?.value ?? null, period: kpi?.period || "" });
+    // Land on an answer, not an empty page: Analytics runs this question
+    // on arrival (one-shot handoff). Counts and ranges get a plain
+    // question; measures get their change over time.
+    const label = String(kpi?.label || "").trim();
+    if (label) {
+      const q = /\b(records|count|range)\b/i.test(label)
+        ? `What is the ${label.toLowerCase()}?`
+        : `How has ${label.toLowerCase()} changed over time?`;
+      try { sessionStore.setItem(ANALYTICS_QUESTION_KEY, q); } catch { /* best-effort */ }
+    }
     setPage("analytics");
   };
   const askAbout = (q: string) => {
@@ -1454,7 +1579,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
       return;
     }
     try {
-      sessionStorage.setItem("aria_copilot_context", JSON.stringify({ origin: "dashboard", question }));
+      sessionStore.setItem("aria_copilot_context", JSON.stringify({ origin: "dashboard", question }));
     } catch { /* best-effort */ }
     setPage("copilot");
   };
@@ -1462,7 +1587,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     const m = (metricLabel || "").trim();
     if (!m) return;
     try {
-      sessionStorage.setItem("aria_hypothesis_prefill", JSON.stringify({ metric: m }));
+      sessionStore.setItem("aria_hypothesis_prefill", JSON.stringify({ metric: m }));
     } catch { /* best-effort */ }
     try {
       window.location.hash = "#/intelligence?tab=hypotheses";
@@ -1667,7 +1792,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
     setShowSuggestions(true);
   };
 
-  const displayDbName = dbName || summary.database || sessionInfo.dbName || "";
+  const displayDbName = datasetLabel(dbName || summary.database || sessionInfo.dbName || "");
   const displaySourceType = sessionInfo.sourceType || config?.sourceType || summary.sourceType || summary.db_type || "";
   const qualityScore = typeof config?.quality?.score === "number" ? config.quality.score : null;
   const analyzing = loading && metrics.length === 0 && charts.length === 0 && pool.length === 0;
@@ -1745,7 +1870,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
         {(() => {
           let tracked: any[] = [];
           try {
-            const v = JSON.parse(localStorage.getItem("aria_tracked_numbers") || "[]");
+            const v = JSON.parse(localStore.getItem("aria_tracked_numbers") || "[]");
             if (Array.isArray(v)) tracked = v.slice(0, 6);
           } catch { /* best-effort */ }
           if (!tracked.length) return null;
@@ -1754,7 +1879,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
               <div className="flex items-center justify-between">
                 <h2 className="text-[14px] font-semibold tracking-tight">Tracked numbers</h2>
                 <button
-                  onClick={() => { try { localStorage.removeItem("aria_tracked_numbers"); } catch {} window.location.reload(); }}
+                  onClick={() => { try { localStore.removeItem("aria_tracked_numbers"); } catch {} window.location.reload(); }}
                   className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400"
                   aria-label="Clear tracked numbers"
                 >
@@ -1787,7 +1912,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           const top = sev[0];
           const dismissed: string[] = (() => {
             try {
-              const v = JSON.parse(sessionStorage.getItem("aria_anom_dismissed") || "[]");
+              const v = JSON.parse(sessionStore.getItem("aria_anom_dismissed") || "[]");
               return Array.isArray(v) ? v : [];
             } catch {
               return [];
@@ -1815,8 +1940,8 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
               <button
                 onClick={() => {
                   try {
-                    const cur = JSON.parse(sessionStorage.getItem("aria_anom_dismissed") || "[]");
-                    sessionStorage.setItem("aria_anom_dismissed", JSON.stringify([...cur, String(top.id)]));
+                    const cur = JSON.parse(sessionStore.getItem("aria_anom_dismissed") || "[]");
+                    sessionStore.setItem("aria_anom_dismissed", JSON.stringify([...cur, String(top.id)]));
                   } catch { /* best-effort */ }
                   setAnomDismiss((n) => n + 1);
                 }}
@@ -1882,14 +2007,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
               ))}
             </div>
           ) : (() => {
-            // Date/range/period labels are metadata, not KPIs — drop them
-            // and backfill from further real metrics so all 4 cards stay
-            // useful on every dataset.
-            const isDateCard = (k: any) =>
-              /date|range|period|calendar|time\b/i.test(String(k?.label || "")) &&
-              (k?.rawValue === null || k?.rawValue === undefined);
-            const useful = metrics.filter((k: any) => !isDateCard(k));
-            const cards = (useful.length ? useful : metrics).slice(0, 4);
+            const cards = visibleKpiCards(metrics);
             return cards.length > 0 ? (
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                 {cards.map((kpi: any, i: number) => (

@@ -56,6 +56,11 @@ test.describe("ARIA QA - connected flow", () => {
     expect(res.ok(), `connect_file failed: ${JSON.stringify(conn)}`).toBeTruthy();
     expect(conn.ok).toBeTruthy();
     console.log("CONNECTED_TABLE=" + conn.table + " ROWS=" + conn.rows);
+    // Connected behind the page's back (API, not the Data page UI): reload
+    // so the app restores the session and picks up the new connection.
+    await page.reload();
+    await expect(page.getByRole("button", { name: /dashboard/i }).first()).toBeVisible({ timeout: 30000 });
+    await page.waitForLoadState("networkidle");
 
     // The connect happened through the API (not the UI wizard), so the SPA
     // still holds its pre-connect state — reload so the boot probe picks up

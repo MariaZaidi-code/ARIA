@@ -65,13 +65,110 @@ def normalize_identifier(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", canonical_identifier(value))
 
 
+# Words whose singular and plural are spelled the same (or that only look
+# plural). General English, not schema names.
+_INVARIANT_WORDS = {"news", "series", "species", "gas", "bias", "alias",
+                    "atlas", "canvas", "data", "media", "chassis"}
+_IRREGULAR_PLURALS = {"person": "people", "child": "children", "man": "men",
+                      "woman": "women"}
+_IRREGULAR_SINGULARS = {v: k for k, v in _IRREGULAR_PLURALS.items()}
+
+
 def singularize(name: str) -> str:
-    """Best-effort singular of an English identifier."""
-    if name.endswith("ies") and len(name) > 4:
+    """Best-effort singular of an English identifier.
+
+    'categories' -> 'category', 'addresses' -> 'address', 'boxes' -> 'box',
+    'statuses' -> 'status', 'analyses' -> 'analysis'; already-singular words
+    ending in -us / -is / -ss ('status', 'analysis', 'address') and
+    invariant words ('series', 'news') are left alone.
+    """
+    low = name.lower()
+    tail = re.split(r"[^a-z0-9]+", low)[-1]
+    if tail in _INVARIANT_WORDS:
+        return name
+    if tail in _IRREGULAR_SINGULARS:
+        return name[:len(name) - len(tail)] + _IRREGULAR_SINGULARS[tail]
+    if low.endswith("ies") and len(name) > 4:
         return name[:-3] + "y"
-    if name.endswith("s") and not name.endswith("ss") and len(name) > 2:
+    if low.endswith("yses") and len(name) > 5:
+        return name[:-2] + "is"
+    if low.endswith(("sses", "xes", "ches", "shes", "zzes")) and len(name) > 4:
+        return name[:-2]
+    if low.endswith("uses") and len(name) > 4 and low[-5] not in "aeiou":
+        return name[:-2]
+    if low.endswith(("ss", "us", "is")):
+        return name
+    if low.endswith("s") and len(name) > 2:
         return name[:-1]
     return name
+
+
+def pluralize(word: str) -> str:
+    """Best-effort English plural of a single word ('category' ->
+    'categories', 'status' -> 'statuses', 'analysis' -> 'analyses')."""
+    w = str(word or "")
+    low = w.lower()
+    if not w or low in _INVARIANT_WORDS:
+        return w
+    if low in _IRREGULAR_PLURALS:
+        return _IRREGULAR_PLURALS[low]
+    if low.endswith("is") and len(w) > 3:
+        return w[:-2] + "es"
+    if low.endswith("y") and len(w) > 1 and low[-2] not in "aeiou":
+        return w[:-1] + "ies"
+    if low.endswith(("s", "x", "z", "ch", "sh")):
+        return w + "es"
+    return w + "s"
+
+
+# Common data-shorthand tokens -> plain English (generic naming conventions,
+# not business or schema names). Used for user-facing labels and so goal
+# words match abbreviated columns ("amount" <-> "amt").
+ABBREVIATIONS = {
+    "amt": "amount", "amnt": "amount", "qty": "quantity", "qnty": "quantity",
+    "cnt": "count", "avg": "average", "tot": "total", "val": "value",
+    "num": "number", "nbr": "number", "pct": "percent", "perc": "percent",
+    "desc": "description", "cat": "category", "yr": "year", "yrs": "years",
+    "mth": "month", "dt": "date", "ts": "timestamp", "txn": "transaction",
+    "trx": "transaction", "txns": "transactions", "cust": "customer",
+    "nm": "name", "cd": "code", "addr": "address", "acct": "account",
+    "mthd": "method", "pmt": "payment", "pymt": "payment", "prod": "product",
+    "dept": "department", "emp": "employee", "mgr": "manager", "ord": "order",
+    "qtr": "quarter", "wk": "week", "disc": "discount", "rev": "revenue",
+    "prc": "price", "bal": "balance", "loc": "location", "curr": "currency",
+    "ccy": "currency", "freq": "frequency", "uom": "unit of measure",
+    "src": "source", "dest": "destination", "ref": "reference",
+}
+
+
+def expand_abbreviation(token: str) -> str:
+    """Plain-English word for a shorthand token ('amt' -> 'amount');
+    unknown tokens are returned lowercased and unchanged."""
+    low = str(token or "").lower()
+    return ABBREVIATIONS.get(low, low)
+
+
+def identifier_words(name: str) -> List[str]:
+    """Lowercase words of an identifier with shorthand expanded.
+
+    Splits snake_case, kebab-case, spaces and CamelCase, and drops any
+    schema/table qualifier: 'sales.SalesOrderHeader' -> ['sales', 'order',
+    'header']; 'pay_mthd' -> ['payment', 'method']. Multi-word expansions
+    ('uom') are split into their words.
+    """
+    bare = _strip_outer_quotes(str(name or "")).split(".")[-1]
+    out: List[str] = []
+    for tok in tokenize_words(bare):
+        out.extend(expand_abbreviation(tok).split())
+    return out
+
+
+def humanize_identifier(name: str) -> str:
+    """Plain-English phrase for an identifier: 'TotalDue' -> 'total due',
+    'txn_dt' -> 'transaction date', 'cust_nm' -> 'customer name'.
+    Falls back to the raw text when it has no word characters."""
+    words = identifier_words(name)
+    return " ".join(words) if words else str(name or "").strip()
 
 
 def is_ref_flavored(name) -> bool:

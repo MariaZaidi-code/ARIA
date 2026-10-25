@@ -216,11 +216,13 @@ def build_business360(*, question, result_data, columns, metric_label=None,
                        for c in likely_causes):
                     continue
                 sh = round(v / tot * 100, 1) if tot else None
+                lever = (" — the biggest lever in view." if not likely_causes
+                         else " — the next lever to watch.")
                 likely_causes.append({
                     "cause": nm,
                     "why_plain": (f"{nm} contributes {_fmt_money(v)}"
                                   + (f" ({sh}% of the total)" if sh is not None else "")
-                                  + " — the biggest lever in view."),
+                                  + lever),
                     "share_pct": sh,
                 })
                 if len(likely_causes) >= 3:

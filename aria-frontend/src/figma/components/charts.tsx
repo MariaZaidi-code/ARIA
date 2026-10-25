@@ -7,6 +7,7 @@ import {
   ScatterChart, Scatter, PieChart, Pie, Cell,
 } from "recharts";
 import { fmtBiz } from "../lib/format";
+import { humanizeLabel } from "../lib/labels";
 import { colorForName, CATEGORY_COLORS } from "../lib/charts";
 import { ChartBrush } from "./ChartBrush";
 
@@ -159,17 +160,7 @@ export function BizTooltip({
   metricNames?: Record<string, string>;
 }) {
   if (!active || !payload?.length) return null;
-  const humanizeKey = (key: string): string => {
-    const raw = metricNames?.[key];
-    const s = String(raw ?? key ?? "").trim();
-    if (!s) return "";
-    const spaced = s
-      .replace(/[_-]+/g, " ")
-      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-      .replace(/\s+/g, " ")
-      .trim();
-    return spaced.charAt(0).toUpperCase() + spaced.slice(1);
-  };
+  const humanizeKey = (key: string): string => humanizeLabel(metricNames?.[key] ?? key);
   const fmtTooltipNumber = (n: number): string => {
     if (!isFinite(n)) return "—";
     const a = Math.abs(n);

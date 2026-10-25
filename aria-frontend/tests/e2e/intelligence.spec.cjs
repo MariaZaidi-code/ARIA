@@ -57,7 +57,7 @@ test.describe('Intelligence module', () => {
 
   async function openIntelligence() {
     await page.waitForLoadState('networkidle');
-    await page.getByRole('button', { name: /^intelligence$/i }).click();
+    await page.getByRole('button', { name: /^intelligence$/i }).first().click();
     await expect(page.getByRole('heading', { name: 'ARIA Intelligence' })).toBeVisible({ timeout: 8000 });
   }
 

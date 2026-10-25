@@ -7,8 +7,8 @@ import AIProcessingIndicator from "../components/AIProcessingIndicator";
 import { BizTooltip } from "../components/charts";
 import { colorForName } from "../lib/charts";
 import { fmtBiz } from "../lib/format";
-import { apiFetch } from "../../services/api";
-import { KEYS, storage } from "../../utils/storage";
+import { apiFetch, AI_ANSWER_TIMEOUT_MS } from "../../services/api";
+import { KEYS, storage, sessionStore } from "../../utils/storage";
 import { useReadOnly, READ_ONLY_HINT } from "../lib/readonly";
 
 type Message = {
@@ -233,14 +233,14 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
       // evidence travels with the question so Copilot answers about THIS chart.
       let chartCtx: any = null;
       try {
-        const raw = sessionStorage.getItem("aria_copilot_context");
-        if (raw) { chartCtx = JSON.parse(raw); sessionStorage.removeItem("aria_copilot_context"); }
+        const raw = sessionStore.getItem("aria_copilot_context");
+        if (raw) { chartCtx = JSON.parse(raw); sessionStore.removeItem("aria_copilot_context"); }
       } catch { chartCtx = null; }
       const data: any = await apiFetch("/copilot", {
         method: "POST",
         body: JSON.stringify(chartCtx ? { question: content, context: chartCtx } : { question: content }),
         // Cold local models can take minutes on first load — don't cut them off.
-        timeoutMs: 300000,
+        timeoutMs: AI_ANSWER_TIMEOUT_MS,
       });
       // Response headers arrived — analysis running server-side.
       setCopilotStage(1);

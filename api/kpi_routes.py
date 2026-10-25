@@ -880,6 +880,13 @@ def get_dashboard_summaries(request: Request, user: dict = Depends(get_current_u
 
 # ── Unified dashboard config (backend-driven, frontend renders) ───────────
 
+def _dataset_phrase(name) -> str:
+    """'dataset_c_messy_txns' -> 'Dataset c messy transactions'."""
+    from schema_engine.lexical import humanize_identifier
+    text = humanize_identifier(str(name or "")) if name else ""
+    return (text[:1].upper() + text[1:]) if text else "your data"
+
+
 @router.get("/api/dashboard/config")
 def get_dashboard_config(request: Request, user: dict = Depends(get_current_user)):
     """Return a structured dashboard configuration generated from the connected data.
@@ -1743,8 +1750,12 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
 
     config = {
         "summary": {
-            "title": f"Data Analysis: {db_name}",
-            "description": f"ARIA analyzed {len(tables_list)} tables with {_fmt(total_rows)} total records.",
+            # Plain-English dataset name ("dataset_c_messy_txns" -> "Dataset c
+            # messy transactions"); singular/plural follows the count.
+            "title": f"Data Analysis: {_dataset_phrase(db_name)}",
+            "description": (f"ARIA analyzed {len(tables_list)} "
+                            f"{'table' if len(tables_list) == 1 else 'tables'} with "
+                            f"{_fmt(total_rows)} total records."),
             "tableCount": len(tables_list),
             "totalRows": total_rows,
             "database": db_name,

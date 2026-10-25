@@ -337,6 +337,52 @@ def _is_blocked_suggestion(text: str) -> bool:
     return any(p.search(s) for p in _BLOCKED_SUGGESTION_RES)
 
 
+_VAGUE_SUGGESTION_RE = None
+
+
+def _scrub_suggestions(items, session) -> list:
+    """User-facing suggestion prose only: raw schema identifiers are
+    replaced by their plain-English labels ('txn_dt' -> 'transaction
+    date'); items that still carry SQL/identifier plumbing ('_', '(',
+    quotes) or say nothing specific ('the most important metrics') are
+    dropped. Works for template and LLM-written suggestions alike."""
+    import re as _re
+    global _VAGUE_SUGGESTION_RE
+    if _VAGUE_SUGGESTION_RE is None:
+        _VAGUE_SUGGESTION_RE = _re.compile(
+            r"\b(most important metrics|top items|main (metric|category|numeric)|"
+            r"primary measure|categories appear)\b", _re.IGNORECASE)
+    from core.analytical_result import natural_label as _nl
+    names: set = set()
+    try:
+        _sp = Path(str((session or {}).get("schema_path", "")))
+        if _sp.exists():
+            _m = json.loads(_sp.read_text(encoding="utf-8"))
+            for _t, _info in (_m.get("tables") or {}).items():
+                names.add(str(_t).split(".")[-1])
+                _cols = _info.get("columns") or {}
+                for _c in (_cols if isinstance(_cols, dict) else
+                           [x.get("column", "") for x in _cols if isinstance(x, dict)]):
+                    names.add(str(_c))
+    except Exception:
+        names = set()
+    out = []
+    for item in items or []:
+        text_ = str(item or "").strip()
+        if not text_ or _VAGUE_SUGGESTION_RE.search(text_):
+            continue
+        for raw in sorted((n for n in names if len(n) >= 3), key=len, reverse=True):
+            label = _nl(raw)
+            if label.lower() == raw.lower():
+                continue
+            text_ = _re.sub(rf"(?<![\w]){_re.escape(raw)}s?(?![\w])", label, text_,
+                            flags=_re.IGNORECASE)
+        if _re.search(r"[_()`\"\[\]]", text_):
+            continue
+        out.append(text_)
+    return out
+
+
 @router.post("/api/suggestions")
 def get_suggestions(request: Request, payload: dict | None = None, user: dict = Depends(require_writable)):
     """LLM-driven + template-driven suggested search goals. Works with any
@@ -405,10 +451,10 @@ def get_suggestions(request: Request, payload: dict | None = None, user: dict = 
                     dt = None
                 if measure:
                     _ml = _nl(measure)
-                    if _ml.strip().lower() in ("total", "sum", "count", "value", "amount"):
+                    if _ml.strip().lower() in ("total", "sum", "count"):
                         suggestions.append("What is the overall total value?")
                     else:
-                        suggestions.append(f"What is the total {_ml}?")
+                        suggestions.append((f"What is the {_ml}?" if "total" in _ml.lower().split() else f"What is the total {_ml}?"))
                 else:
                     suggestions.append("How many records are in the data?")
                 if dim:
@@ -418,15 +464,13 @@ def get_suggestions(request: Request, payload: dict | None = None, user: dict = 
                 if measure and dim:
                     suggestions.append(f"What are the top {_pl(_nl(dim))} by {_nl(measure)}?")
 
-            # Pad with answerable patterns only if we need more (never
-            # outlier / correlation / forecast / what-if / data-quality).
-            generic = [
-                "How many records are in the data?",
-                "Which categories appear most frequently?",
-                "What are the top items by value?",
-            ]
-            for g in generic:
-                if len(suggestions) < limit and g not in suggestions:
+            # Pad from the shared pool of questions this data can answer
+            # (never outlier / correlation / forecast / what-if / quality).
+            from api.autocomplete_routes import answerable_questions
+            for g in answerable_questions(session, user["user_id"]):
+                if len(suggestions) >= limit:
+                    break
+                if g not in suggestions:
                     suggestions.append(g)
 
             suggestions = suggestions[:limit]
@@ -756,7 +800,11 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     if _is_convo:
         goal = str(full_goal or "").strip()
     else:
-        goal = validate_goal_text(full_goal)
+        # Validate only what the user typed: the history prefix carries raw
+        # table/column names ('txns', 'pay_mthd') that are not the user's
+        # words and must never make a real question look like gibberish.
+        validate_goal_text(req.goal)
+        goal = str(full_goal or "").strip()
     # Explicit-intent-wins (§12): a fresh COUNT/ranking-of-records question
     # must not inherit measures from previous turns ("most readings" means
     # COUNT, even after discussing averages). Only when no measure word is
@@ -1089,36 +1137,31 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     from core.analytical_result import natural_label as _nl
     base_suggestions = [s for s in (processed.get("suggested_questions", []) or [])
                         if s and not _is_blocked_suggestion(str(s))]
+    base_suggestions = _scrub_suggestions(base_suggestions, session)
+    # Follow-ups about the measure just answered come first. The result's
+    # own columns are SQL aliases ('total', 'value'), so the measure is
+    # read from the aggregate in the executed SQL ('SUM("amt")' ->
+    # 'amount'), then matched to the shared pool of answerable questions.
     proactive_suggestions = []
-    if result_data and columns:
-        first_row = result_data[0] if result_data else {}
-        num_cols = []
-        cat_cols = []
-        for c in columns:
-            # Raw SQL expressions (SUM(x), COUNT(*)) and keys are data
-            # plumbing, never suggestion prose. ID-like columns (any
-            # separator: order_id, "Order ID") are never suggested as
-            # measures or breakdowns.
-            if "(" in str(c) or "*" in str(c):
-                continue
-            try:
-                from core.schema_intel import _is_id_like as _id_like
-                if _id_like(str(c)):
-                    continue
-            except Exception:
-                if str(c).lower() == "id" or str(c).lower().endswith("_id"):
-                    continue
-            v = first_row.get(c) if isinstance(first_row, dict) else None
-            if isinstance(v, (int, float)):
-                num_cols.append(c)
-            elif v:
-                cat_cols.append(c)
-        if num_cols:
-            proactive_suggestions.append(f"What is the average {_nl(num_cols[0])}?")
-            proactive_suggestions.append(f"How is {_nl(num_cols[0])} distributed?")
-        if cat_cols and num_cols:
-            proactive_suggestions.append(f"Show {_nl(num_cols[0])} by {_nl(cat_cols[0])}")
-            proactive_suggestions.append(f"Which {_nl(cat_cols[0])} has the highest {_nl(num_cols[0])}?")
+    try:
+        import re as _re_fu
+        from api.autocomplete_routes import answerable_questions
+        _agg_cols = _re_fu.findall(
+            r'\b(?:SUM|AVG|MIN|MAX)\s*\(\s*(?:[\w"`\[\]]+\.)?["`\[]?(\w+)["`\]]?\s*\)',
+            str(processed.get("sql_used") or ""), _re_fu.IGNORECASE)
+        _focus = _nl(_agg_cols[0]) if _agg_cols else None
+        from schema_engine.lexical import expand_abbreviation as _xa
+
+        def _plain(t):
+            # 'What is the total qty?' and 'What is the total quantity?'
+            # are the same question.
+            return " ".join(_xa(w) for w in _re_fu.findall(r"[a-z0-9]+", str(t).lower()))
+        _asked = _plain(req.goal)
+        proactive_suggestions = [
+            q for q in answerable_questions(session, user["user_id"], focus=_focus)
+            if _plain(q) != _asked][:5]
+    except Exception as exc:
+        log.warning("Measure-focused follow-ups failed: %s", exc, exc_info=True)
     # Schema-derived fallback suggestions (spec §21): built from the actual
     # connected schema, never a static generic list.
     general_suggestions = []
@@ -1145,10 +1188,10 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
                     general_suggestions.append(f"Which {_nl(_d)} has the highest {_nl(_m)}?")
                 elif _m:
                     _ml2 = _nl(_m)
-                    if _ml2.strip().lower() in ("total", "sum", "count", "value", "amount"):
+                    if _ml2.strip().lower() in ("total", "sum", "count"):
                         general_suggestions.append("What is the overall total value?")
                     else:
-                        general_suggestions.append(f"What is the total {_ml2}?")
+                        general_suggestions.append((f"What is the {_ml2}?" if "total" in _ml2.lower().split() else f"What is the total {_ml2}?"))
                 else:
                     general_suggestions.append("How many records are in the data?")
                 if _m and _dt:
@@ -1161,7 +1204,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         # No schema context at all: say so honestly instead of inventing specifics.
         general_suggestions = ["What data is currently connected?"]
     all_suggestions = list(dict.fromkeys(
-        [s for s in (base_suggestions + proactive_suggestions + general_suggestions)
+        [s for s in (proactive_suggestions + base_suggestions + general_suggestions)
          if s and not _is_blocked_suggestion(str(s))]))[:8]
 
     # ── Preference-aware follow-up ranking ──────────────────────────────

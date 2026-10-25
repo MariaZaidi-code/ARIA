@@ -4,7 +4,10 @@ import { useTheme } from "../App";
 import { InsightChart, normalizeInsightViz } from "../components/charts";
 import type { DrillSelection } from "../components/charts";
 import { saveAnalysisContext } from "../lib/analysisContext";
+import { humanizeLabel } from "../lib/labels";
 import { apiFetch, normalizeApiError } from "../../services/api";
+import { localStore, sessionStore } from "../../utils/storage.js";
+import { datasetLabel } from "../lib/labels";
 
 /* =====================================================================
    ARIA Insights — premium list + explain experience (PNG 1 + PNG 2).
@@ -144,13 +147,7 @@ function typeLabel(type: string): string {
    to the UI. humanize("total_amt") -> "Total amt" via schema-friendly words.
    Table-qualified refs ("orders.total_amt") resolve to the column label. ---- */
 function humanize(v: unknown): string {
-  const raw = String(v ?? "").trim();
-  if (!raw) return "";
-  const s = raw.includes(".") ? raw.slice(raw.lastIndexOf(".") + 1) : raw;
-  if (!s) return "";
-  const spaced = s.replace(/[_-]+/g, " ").replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/\s+/g, " ").trim();
-  if (/^[A-Z0-9_()%. ]+$/.test(s) && s.length <= 8) return s.replace(/_/g, " ");
-  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+  return humanizeLabel(v);
 }
 
 /* ---- Plain business language: backend prose can carry detector jargon
@@ -546,7 +543,7 @@ function writeCopilotContext(ins: Insight, question: string, segment?: string | 
   try {
     const dims = ins.recommendedNextAnalysis?.dimensions || [];
     const seg = (segment || dims[0] || "").trim() || null;
-    sessionStorage.setItem("aria_copilot_context", JSON.stringify({
+    sessionStore.setItem("aria_copilot_context", JSON.stringify({
       metric: (ins.metric || "").split(" (")[0] || null,
       period: ins.affectedPeriod || null,
       segment: seg,
@@ -799,7 +796,7 @@ function whyShownFor(kind: string): string {
    (localStorage `aria_dashboard_drill`), then the caller navigates. */
 function storeDrillContextLocal(ctx: Record<string, unknown>): void {
   try {
-    localStorage.setItem("aria_dashboard_drill", JSON.stringify({ at: Date.now(), ...ctx }));
+    localStore.setItem("aria_dashboard_drill", JSON.stringify({ at: Date.now(), ...ctx }));
   } catch { /* private mode: navigation still works */ }
 }
 
@@ -1005,7 +1002,7 @@ export default function Insights({
 
   const persistHandoff = (ins: Insight) => {
     try {
-      sessionStorage.setItem("aria_insight_handoff", JSON.stringify(handoffContext(ins)));
+      sessionStore.setItem("aria_insight_handoff", JSON.stringify(handoffContext(ins)));
     } catch { /* storage full: navigation still works */ }
     // Shared cross-module context (metric/dataset/date/filters/dimension
     // preserved; targets preselect without re-analyzing).
@@ -1053,13 +1050,13 @@ export default function Insights({
     // Copilot context preserved across Why/investigate (CopilotRequest.context).
     writeCopilotContext(ins, q, dims[0] || null);
     try {
-      const prev = JSON.parse(sessionStorage.getItem("aria_shared_context") || "{}");
-      sessionStorage.setItem("aria_shared_context", JSON.stringify({
+      const prev = JSON.parse(sessionStore.getItem("aria_shared_context") || "{}");
+      sessionStore.setItem("aria_shared_context", JSON.stringify({
         ...prev, question: q, metric: ins.metric, dimensions: dims,
         period: ins.affectedPeriod || prev.period, origin: "insights",
         updatedAt: Date.now(),
       }));
-      sessionStorage.setItem("aria_insight_handoff", JSON.stringify({
+      sessionStore.setItem("aria_insight_handoff", JSON.stringify({
         origin: "insights", question: q, metric: ins.metric,
       }));
     } catch { /* ignore */ }
@@ -1070,10 +1067,10 @@ export default function Insights({
   const openForecast = (ins: Insight) => {
     persistHandoff(ins);
     try {
-      sessionStorage.setItem("aria_forecast_prefill", JSON.stringify({ metric: ins.metric, period: ins.affectedPeriod, source: ins.source }));
+      sessionStore.setItem("aria_forecast_prefill", JSON.stringify({ metric: ins.metric, period: ins.affectedPeriod, source: ins.source }));
       // Shared Forecast context: metric + dataset + date preselected on the
       // Forecast page (localStorage key, consumed once).
-      localStorage.setItem("aria_forecast_context", JSON.stringify({
+      localStore.setItem("aria_forecast_context", JSON.stringify({
         metric: ins.metric,
         dataset: ins.source?.tables?.[0] || undefined,
         date: ins.affectedPeriod || undefined,
@@ -1132,13 +1129,13 @@ export default function Insights({
     const q = askText.trim();
     if (!q) return;
     try {
-      sessionStorage.setItem("aria_copilot_context", JSON.stringify({ origin: "insights", question: q }));
+      sessionStore.setItem("aria_copilot_context", JSON.stringify({ origin: "insights", question: q }));
     } catch { /* best-effort */ }
     setAskText("");
     if (onAskQuestion) onAskQuestion(q);
   };
 
-  const displayDbName = sessionInfo.dbName || propDbName || "";
+  const displayDbName = datasetLabel(sessionInfo.dbName || propDbName || "");
   const displaySourceType = sessionInfo.sourceType || propSourceType || "";
 
   const recentItems = useMemo(() => {
@@ -1275,7 +1272,7 @@ export default function Insights({
             key={id}
             onClick={() => { setActiveFilter(id); }}
             aria-pressed={on}
-            className={`text-[11px] font-semibold px-3.5 py-1.5 rounded-full border transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1 ${on ? "bg-blue-700 text-white border-blue-700 shadow-md ring-1 ring-blue-700/30" : "bg-white/80 text-secondary-foreground border-border hover:border-blue-300 dark:hover:border-blue-500/25 hover:text-foreground hover:shadow-sm"}`}
+            className={`text-[11px] font-semibold px-3.5 py-1.5 rounded-full border transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1 ${on ? "bg-blue-700 text-white border-blue-700 shadow-md ring-1 ring-blue-700/30" : "bg-white/80 dark:bg-white/5 text-secondary-foreground border-border hover:border-blue-300 dark:hover:border-blue-500/25 hover:text-foreground hover:shadow-sm"}`}
           >
             {f.label}{id !== "all" ? ` · ${n}` : ""}
           </button>
@@ -1322,7 +1319,7 @@ export default function Insights({
         </p>
       </div>
       <button onClick={() => setPage?.("data")} className="mt-3 w-full text-left rounded-xl hover:bg-secondary p-2 -m-1 transition-colors" title="Open data center">
-        <p className="text-[13px] font-semibold truncate">{displayDbName || selected?.source?.tables?.[0] || "Connected source"}</p>
+        <p className="text-[13px] font-semibold truncate">{displayDbName || datasetLabel(selected?.source?.tables?.[0]) || "Connected source"}</p>
         {displaySourceType && <p className="text-[11px] text-muted-foreground">{humanize(displaySourceType)}</p>}
       </button>
       <div className="mt-2 pt-2 border-t border-border flex items-center justify-between text-[11px] text-muted-foreground">

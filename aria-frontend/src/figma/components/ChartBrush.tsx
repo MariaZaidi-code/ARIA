@@ -3,10 +3,14 @@ import type { BrushProps } from "recharts";
 
 /** A shared, clearly-grabbable range control for every Recharts chart. */
 export function ChartBrush(props: BrushProps) {
-  const { className = "", height = 30, travellerWidth = 18, ...rest } = props;
+  // Plain screen-reader label: Recharts' default reads "Min value:
+  // undefined, Max value: undefined" when data points have no `name`.
+  const { className = "", height = 30, travellerWidth = 18,
+    ariaLabel = "Chart range: drag the handles to zoom in", ...rest } = props;
   return (
     <Brush
       {...rest}
+      ariaLabel={ariaLabel}
       className={`aria-chart-brush ${className}`.trim()}
       height={height}
       travellerWidth={travellerWidth}

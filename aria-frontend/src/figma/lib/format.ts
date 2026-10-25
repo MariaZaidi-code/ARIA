@@ -2,7 +2,7 @@
    rounded to human scale. No excessive precision anywhere in the UI. */
 
 export function fmtBiz(v: number | null | undefined): string {
-  if (v === null || v === undefined || isNaN(Number(v))) return "—";
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return "—";
   const n = Number(v);
   const a = Math.abs(n);
   if (a >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
@@ -15,12 +15,12 @@ export function fmtBiz(v: number | null | undefined): string {
 }
 
 export function fmtMoneyBiz(v: number | null | undefined): string {
-  if (v === null || v === undefined || isNaN(Number(v))) return "—";
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return "—";
   return `$${fmtBiz(v)}`;
 }
 
 export function fmtPctBiz(v: number | null | undefined): string {
-  if (v === null || v === undefined || isNaN(Number(v))) return "—";
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return "—";
   const n = Number(v);
   return `${n >= 0 ? "+" : ""}${Math.round(n * 10) / 10}%`;
 }

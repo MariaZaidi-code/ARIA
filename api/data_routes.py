@@ -197,8 +197,20 @@ def get_connection_health(request: Request, user: dict = Depends(get_current_use
     generated_at = mapping.get("generated_at", "") if mapping else ""
 
     host_info = ""
-    if config and isinstance(config, dict):
-        host_info = f"{config.get('host', '')}:{config.get('port', '')}"
+    if config and isinstance(config, dict) and config.get("host"):
+        # File uploads have no server: never render an empty "host:port".
+        # Loopback addresses (connect may pin 'localhost' to '::1') read as
+        # "localhost"; other IPv6 hosts are bracketed ("[fe80::1]:5432").
+        _host = str(config["host"]).strip()
+        if _host in ("::1", "127.0.0.1", "[::1]"):
+            _host = "localhost"
+        elif ":" in _host and not _host.startswith("["):
+            _host = f"[{_host}]"
+        _port = config.get("port")
+        host_info = f"{_host}:{_port}" if _port else _host
+    # The schemas actually in use (connect may discover populated schemas
+    # when the requested one is empty), not just the one typed in the form.
+    _schemas = [str(s) for s in (session.get("schemas") or []) if str(s or "").strip()]
 
     return {
         "ok": True,
@@ -207,7 +219,8 @@ def get_connection_health(request: Request, user: dict = Depends(get_current_use
         "db_type": db_type,
         "database": db_name,
         "host": host_info,
-        "schema": config.get("db_schema", "") if config and isinstance(config, dict) else "",
+        "schema": ", ".join(_schemas) if _schemas else (
+            config.get("db_schema", "") if config and isinstance(config, dict) else ""),
         "table_count": table_count,
         "column_count": total_columns,
         "declared_relationships": declared_fk,

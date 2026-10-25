@@ -44,7 +44,6 @@ import {
 import { clearAuthSession, getAuthUser } from "../utils/authStorage";
 import { KEYS, storage } from "../utils/storage";
 import { ReadOnlyContext, looksLikeMobile } from "./lib/readonly";
-import { ToastProvider } from "../components/Toast";
 
 export type Page =
   | "dashboard"
@@ -130,6 +129,9 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", isDark);
+    // Native controls and scrollbars follow the theme too (index.html sets
+    // the same before first paint).
+    document.documentElement.style.colorScheme = isDark ? "dark" : "light";
     storage.set(KEYS.theme, isDark ? "dark" : "light");
   }, [isDark]);
 
@@ -556,7 +558,14 @@ export default function App() {
       formData.append("file", file);
       formData.append("provider", selectedLLM || "local");
       
-      let path = sourceType === 'csv' ? `/connect_file` : (sourceType === 'pdf' ? `/connect_pdf` : `/connect_${sourceType}`);
+      // File uploads only: CSV and PDF have dedicated routes. Any other
+      // type is a programming error, never a guessed "/connect_<type>" path.
+      if (sourceType !== 'csv' && sourceType !== 'pdf') {
+        throw new Error(`Unsupported file source type: ${sourceType}`);
+      }
+      const path = sourceType === 'csv' ? `/connect_file` : `/connect_pdf`;
+      // A PDF has no tables, so there is no schema to read after upload.
+      const isDocument = sourceType === 'pdf';
       const data: any = await apiFetch(path, {
         method: "POST",
         body: formData,
@@ -595,14 +604,14 @@ export default function App() {
               }
               if (prog?.done && prog?.result) {
                 const res: any = prog.result;
-                await handleSchemaFetch();
+                if (!isDocument) await handleSchemaFetch();
                 setConnectionStatus("connected");
                 setDbName(res?.table || res?.file || file.name.replace(/\.[^.]+$/, ""));
                 setSelectedSourceType(res?.source_type || "semi-structured");
                 return;
               }
               if (prog?.done) {
-                await handleSchemaFetch();
+                if (!isDocument) await handleSchemaFetch();
                 setConnectionStatus("connected");
                 return;
               }
@@ -615,8 +624,10 @@ export default function App() {
           return;
         }
         // After successful file connect, fetch schema and mark connected
-        setConnectionStatus("schema-loading");
-        await handleSchemaFetch();
+        if (!isDocument) {
+          setConnectionStatus("schema-loading");
+          await handleSchemaFetch();
+        }
         setConnectionStatus("connected");
         setDbName(data?.table || data?.file || file.name.replace(/\.[^.]+$/, ""));
         setSelectedSourceType(data?.source_type || "semi-structured");
@@ -733,9 +744,8 @@ export default function App() {
   return (
     <ReadOnlyContext.Provider value={readOnly}>
     <ThemeContext.Provider value={{ isDark, toggleTheme, page, setPage }}>
-      {/* ToastProvider mounts the toast region: figma/pages/Documents.tsx
-          already calls useToast(), which throws without a provider. */}
-      <ToastProvider>
+      {/* Toasts come from the single root <ToastProvider> in main.jsx
+          (it also covers Login); a second provider here would split them. */}
       <AppShell
         user={currentUser}
         isAdmin={currentUser?.is_admin === true}
@@ -744,7 +754,7 @@ export default function App() {
         onChangeLLM={() => setAppStage("llm-selection")}
         onSignOut={handleSignOut}
       >
-        <div key={page} className="page-enter"><Suspense fallback={<PageFallback />}>{wrapPage(page, (() => {
+        <div key={page} className="page-enter h-full"><Suspense fallback={<PageFallback />}>{wrapPage(page, (() => {
           switch (page) {
             case "admin":
               return currentUser?.is_admin
@@ -866,7 +876,6 @@ export default function App() {
       {page !== "copilot" && page !== "documents" && <MiniAria />}
       {/* Random RL feedback popup (probability + cooldown; /api/rl/feedback) */}
       <FeedbackPopup page={page} />
-      </ToastProvider>
     </ThemeContext.Provider>
     </ReadOnlyContext.Provider>
   );

@@ -71,15 +71,69 @@ natural-English questions. Never mention raw table or column identifiers
                                     temperature=0.5, num_predict=300, timeout=5)
             content = re.sub(r"```json\s*", "", content)
             content = re.sub(r"```\s*", "", content)
-            start, end = content.find("["), content.rfind("]")
-            if start != -1 and end != -1:
-                suggestions = json.loads(content[start:end + 1])
-                if isinstance(suggestions, list) and suggestions:
-                    return [str(s) for s in suggestions][:limit]
+            cleaned = self._clean_llm_suggestions(self._salvage_json_list(content))
+            if cleaned:
+                # Template questions top up a short LLM list.
+                return list(dict.fromkeys(cleaned + template))[:limit]
         except Exception as exc:
             logging.warning("Suggestion generation failed: %s. Using template suggestions.", exc)
 
         return template
+
+    @staticmethod
+    def _salvage_json_list(content):
+        """Strings from an LLM reply that should be a JSON array.
+
+        Small models often return almost-JSON (trailing commas, single
+        quotes, a numbered list). Parse the array when possible, else
+        recover the quoted items, else the list lines.
+        """
+        text = str(content or "")
+        start, end = text.find("["), text.rfind("]")
+        if start != -1 and end > start:
+            body = text[start:end + 1]
+            try:
+                data = json.loads(body)
+                if isinstance(data, list):
+                    return [str(s) for s in data if isinstance(s, (str, int, float))]
+            except ValueError:
+                body = re.sub(r",\s*([\]}])", r"\1", body)
+                try:
+                    data = json.loads(body)
+                    if isinstance(data, list):
+                        return [str(s) for s in data if isinstance(s, (str, int, float))]
+                except ValueError:
+                    pass
+        quoted = re.findall(r'"([^"\n]{8,200})"|\'([^\'\n]{8,200})\'', text)
+        items = [a or b for a, b in quoted]
+        if items:
+            return items
+        lines = [re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", ln).strip()
+                 for ln in text.splitlines()]
+        return [ln for ln in lines if ln.endswith("?") and len(ln) >= 8]
+
+    def _clean_llm_suggestions(self, items):
+        """Keep only plain, answerable questions from LLM output: no raw
+        identifiers (underscores, dotted names, SQL), no blocked plain-ask
+        types (outliers / correlation / forecast / what-if), no duplicates."""
+        blocked = re.compile(
+            r"\b(outlier\w*|anomal\w*|correlat\w*|forecast\w*|predict\w*|"
+            r"what[- ]if|scenario)\b", re.IGNORECASE)
+        out, seen = [], set()
+        for raw in items or []:
+            s = re.sub(r"\s+", " ", str(raw or "")).strip().strip(",")
+            if len(s) < 8 or len(s) > 160:
+                continue
+            if re.search(r"[_`{}\[\]]|\w\.\w|\bselect\b|\bfrom\b\s+\w+\s+\bwhere\b", s,
+                         re.IGNORECASE):
+                continue
+            if blocked.search(s):
+                continue
+            key = s.lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(s[:1].upper() + s[1:])
+        return out
 
     # ---- _measure_noun (_measure_noun) ----
 
@@ -141,12 +195,23 @@ natural-English questions. Never mention raw table or column identifiers
                 # ("diag sales" for a file upload) leak filenames into prose.
                 # Referenced (real domain) tables keep table nouns; standalone
                 # tables use their text dimension.
-                dim_col = next(
-                    (c for c in info["columns"]
-                     if c.lower() != "id" and not c.lower().endswith("_id")
-                     and self._classify_column(table_name, c) == "text"),
-                    None,
-                )
+                # A grouping is a real text dimension: never a date stored
+                # as text ('txn_dt') and, when profiling knows it, never
+                # near-unique text (names, free text) while a real one exists.
+                _stats = info.get("null_stats") or {}
+
+                def _distinct(c):
+                    try:
+                        return int((_stats.get(c) or {}).get("distinct_count") or 0)
+                    except (TypeError, ValueError):
+                        return 0
+                _dims = [c for c in info["columns"]
+                         if c.lower() != "id" and not c.lower().endswith("_id")
+                         and self._classify_column(table_name, c) == "text"
+                         and not ({"date", "time", "timestamp"}
+                                  & set(self._natural_label(c).split()))]
+                dim_col = next((c for c in _dims if 0 < _distinct(c) <= 50),
+                               _dims[0] if _dims else None)
                 if fact_refs or not dim_col:
                     dim_plural, dim_single = plural, singular
                 else:

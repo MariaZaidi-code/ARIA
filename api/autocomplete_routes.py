@@ -183,41 +183,139 @@ def _column_iter(table_info):
                 yield str(item), {}
 
 
-def _looks_like_date(col_name, col_info):
-    low = col_name.lower()
-    if _hint_hit(col_name, ("date", "time", "created", "updated", "day",
-                            "month", "year", "period", "quarter", "week")):
-        return True
-    dtype = str(col_info.get("dtype", col_info.get("data_type", ""))).lower()
-    return any(t in dtype for t in ("date", "time", "timestamp"))
+def _dtype(col_info) -> str:
+    return str(col_info.get("dtype", col_info.get("data_type", "")) or "").lower()
 
 
-def _looks_like_numeric(col_name, col_info):
-    if _looks_like_date(col_name, col_info):
-        return False
+def _words(col_name) -> set:
+    """Plain words of a column name, shorthand expanded ('txn_dt' ->
+    {'transaction', 'date'}); generic naming conventions only."""
+    from schema_engine.lexical import identifier_words
+    return set(identifier_words(col_name))
+
+
+# Calendar parts ('yr', 'month', 'quarter') are time groupings, never
+# measures: summing a year column is meaningless.
+_PERIOD_WORDS = {"year", "years", "month", "quarter", "week", "weekday",
+                 "day", "hour", "period"}
+_DATE_WORDS = {"date", "time", "timestamp", "datetime", "created", "updated"}
+# Measures whose total is meaningless: ratios, rates and unit prices are
+# averaged instead ("average discount percent", never "total discount").
+_AVERAGE_WORDS = {"percent", "percentage", "rate", "ratio", "price", "score",
+                  "rating", "age", "margin", "avg", "average", "mean"}
+_MONEY_WORDS = {"amount", "total", "revenue", "sales", "sale", "price",
+                "cost", "value", "profit", "income", "balance", "due",
+                "spend", "payment", "fee", "tax", "freight"}
+_QUANTITY_WORDS = {"quantity", "units", "unit", "count", "number", "volume"}
+_NUMERIC_TYPES = ("int", "float", "decimal", "numeric", "double", "real", "number")
+_TEXT_TYPES = ("char", "text", "string", "varchar", "clob")
+
+
+def _column_role(col_name, col_info, column_class=None):
+    """'date' | 'period' | 'metric' | 'category' | None for one column.
+
+    The profiled class / declared type is the truth; name words are only
+    used when neither is known. So a TEXT column named 'pay_mthd' is never
+    a measure and an INTEGER 'yr' is a period, never a measure.
+    """
     if _is_id_like(col_name):
-        return False
-    if _hint_hit(col_name, _NUMERIC_HINT):
-        return True
-    dtype = str(col_info.get("dtype", col_info.get("data_type", ""))).lower()
-    return any(t in dtype for t in ("int", "float", "decimal", "numeric",
-                                    "bigint", "double", "real"))
+        return None
+    words = _words(col_name)
+    dt = _dtype(col_info)
+    cls = str(column_class or "").lower()
+    if cls == "date" or any(t in dt for t in ("date", "time"))             or (words & _DATE_WORDS and not any(t in dt for t in _NUMERIC_TYPES)):
+        return "date"
+    if words & _PERIOD_WORDS:
+        return "period"
+    if cls == "numeric" or any(t in dt for t in _NUMERIC_TYPES):
+        return "metric"
+    if cls in ("categorical", "text") or any(t in dt for t in _TEXT_TYPES):
+        return "category"
+    if not dt and not cls:
+        if _hint_hit(col_name, _NUMERIC_HINT):
+            return "metric"
+        return "category"
+    return None
 
 
-def _looks_like_categorical(col_name, col_info):
-    """Heuristic: text/string column with short, label-like values."""
-    if _looks_like_numeric(col_name, col_info) or _looks_like_date(col_name, col_info):
-        return False
-    if _hint_hit(col_name, ("name", "type", "category", "region", "status",
-                            "group", "kind", "label", "tag", "class")):
-        return True
-    dtype = str(col_info.get("dtype", col_info.get("data_type", ""))).lower()
-    return any(t in dtype for t in ("char", "text", "varchar", "string"))
+_HEADLINE_WORDS = {"total", "due", "revenue", "sales", "sale", "turnover"}
+_COMPONENT_WORDS = {"sub", "tax", "freight", "shipping", "fee", "cost",
+                    "discount", "price", "unit", "line"}
+
+
+def _metric_rank(words) -> int:
+    """Headline money totals first ('total due', 'revenue'), then other
+    money amounts, then components (sub total, tax, freight), then
+    quantities; averaged measures (rates, prices) last."""
+    if words & _AVERAGE_WORDS:
+        return 4
+    if words & _COMPONENT_WORDS:
+        return 2
+    if words & _HEADLINE_WORDS:
+        return 0
+    if words & _MONEY_WORDS:
+        return 1
+    return 3
+
+
+def _measure_phrase(m) -> str:
+    """'total amount', 'average discount percent', 'total due', 'sub total':
+    the aggregate word is added only when the label does not carry it."""
+    lab = m["label"]
+    word = "average" if m.get("agg") == "average" else "total"
+    return lab if word in lab.split() else f"{word} {lab}"
 
 
 # ---------------------------------------------------------------------------
 # Data index construction
 # ---------------------------------------------------------------------------
+def _index_from_mapping(tables: dict) -> dict:
+    """Classify every column of a schema mapping into measures, groupings,
+    dates and calendar periods, with plain-English labels. Pure (no DB):
+    value sampling is layered on top by _build_data_index."""
+    from schema_engine.lexical import humanize_identifier
+    metrics: list[dict] = []
+    categories: list[dict] = []
+    dates: list[dict] = []
+    periods: list[dict] = []
+    table_names: list[str] = []
+
+    for tname, tinfo in tables.items():
+        table_names.append(tname)
+        classes = tinfo.get("column_classes") or {}
+        stats = tinfo.get("null_stats") or {}
+        rows_total = int(tinfo.get("row_count") or 0)
+        for col_name, col_info in _column_iter(tinfo):
+            if not col_name:
+                continue
+            role = _column_role(col_name, col_info or {}, classes.get(col_name))
+            if role is None:
+                continue
+            words = _words(col_name)
+            entry = {"table": tname, "column": col_name, "name": col_name,
+                     "label": humanize_identifier(col_name)}
+            if role == "date":
+                dates.append(entry)
+            elif role == "period":
+                periods.append(entry)
+            elif role == "metric":
+                entry["agg"] = "average" if words & _AVERAGE_WORDS else "total"
+                entry["rank"] = _metric_rank(words)
+                metrics.append(entry)
+            else:
+                distinct = int((stats.get(col_name) or {}).get("distinct_count") or 0)
+                entry["distinct"] = distinct
+                # Near-unique text (names, free text, row keys) is searchable
+                # by value but is never a useful breakdown.
+                entry["groupable"] = not distinct or (
+                    distinct <= 50 and (not rows_total or distinct < rows_total))
+                categories.append(entry)
+    metrics.sort(key=lambda m: m["rank"])
+    categories.sort(key=lambda c: (not c["groupable"], c.get("distinct") or 999))
+    return {"tables": table_names, "metrics": metrics, "categories": categories,
+            "dates": dates, "periods": periods}
+
+
 def _build_data_index(session, schema_path: Path):
     """Read schema mapping + sample distinct values to build a small
     in-memory index describing the actual database.  Cached per
@@ -244,27 +342,17 @@ def _build_data_index(session, schema_path: Path):
         return {"tables": [], "metrics": [], "categories": [],
                 "dates": [], "values": [], "ready": False}
 
-    metric_cols: list[tuple[str, str]] = []     # (table, col)
-    cat_cols: list[tuple[str, str]] = []        # (table, col)
-    date_cols: list[tuple[str, str]] = []       # (table, col)
-    table_names: list[str] = []
-
-    for tname, tinfo in tables.items():
-        table_names.append(tname)
-        for col_name, col_info in _column_iter(tinfo):
-            if not col_name:
-                continue
-            if _looks_like_date(col_name, col_info):
-                date_cols.append((tname, col_name))
-            elif _looks_like_numeric(col_name, col_info):
-                metric_cols.append((tname, col_name))
-            elif _looks_like_categorical(col_name, col_info):
-                cat_cols.append((tname, col_name))
+    structure = _index_from_mapping(tables)
+    metrics, categories = structure["metrics"], structure["categories"]
+    dates, periods, table_names = structure["dates"], structure["periods"], structure["tables"]
+    cat_cols = [(c["table"], c["column"]) for c in categories]
 
     # Sample distinct values from categorical columns — this is the
     # "actual data" feed that makes autocomplete data-aware (section 56).
     distinct_values: list[dict] = []
-    if cat_cols:
+    if not cat_cols:
+        engine.dispose()
+    else:
         try:
             with engine.connect() as conn:
                 # Cap total samples to keep the index small.
@@ -301,9 +389,10 @@ def _build_data_index(session, schema_path: Path):
 
     return {
         "tables": table_names,
-        "metrics": [{"table": t, "column": c, "name": c} for t, c in metric_cols],
-        "categories": [{"table": t, "column": c, "name": c} for t, c in cat_cols],
-        "dates": [{"table": t, "column": c, "name": c} for t, c in date_cols],
+        "metrics": metrics,
+        "categories": categories,
+        "dates": dates,
+        "periods": periods,
         "values": distinct_values,
         "ready": True,
     }
@@ -401,163 +490,181 @@ def _is_id_like(name: str) -> bool:
     return bool(_is_id_like_name(name))
 
 
+# Words that carry no meaning on their own when matching typed text.
+_FILLER = {"the", "a", "an", "is", "are", "of", "in", "on", "for", "to",
+           "what", "which", "show", "me", "how", "has", "have", "my",
+           "our", "was", "were", "do", "does", "give", "tell", "list", "and"}
+
+
+def _question_pool(index):
+    """Full plain-English questions this schema can actually answer.
+
+    Built only from the connected data's own measures, groupings and dates
+    (labels humanized: 'txn_dt' -> 'transaction date'). Ordered so the
+    first items cover the most important measure, then the next, so the
+    list stays varied. Every entry: (text, kind, metric_label or None).
+    """
+    from schema_engine.lexical import pluralize
+    mets = index.get("metrics", [])[:4]
+    cats = [c for c in index.get("categories", []) if c.get("groupable", True)][:6]
+    dates = index.get("dates", [])[:1]
+    periods = index.get("periods", [])[:2]
+
+    measure = _measure_phrase
+
+    def plural_phrase(label):
+        head, _sep, last = label.rpartition(" ")
+        return f"{head} {pluralize(last)}" if head else pluralize(last)
+
+    tiers: list[list[tuple[str, str, str | None]]] = []
+    for m in mets:
+        mm = measure(m)
+        t = [(f"What is the {mm}?", "template", m["label"])]
+        for c in cats:
+            t.append((f"What is the {mm} by {c['label']}?", "template", m["label"]))
+            t.append((f"Which {c['label']} has the highest {mm}?", "template", m["label"]))
+        if dates:
+            t.append((f"How has {mm} changed over time?", "template", m["label"]))
+        for pd in periods:
+            t.append((f"What is the {mm} by {pd['label']}?", "template", m["label"]))
+        for c in cats:
+            t.append((f"Top 10 {plural_phrase(c['label'])} by {mm}", "template", m["label"]))
+        if m.get("agg") != "average":
+            t.append((f"What is the average {m['label']}?", "template", m["label"]))
+        tiers.append(t)
+    general = [("How many records are there?", "template", None)]
+    for c in cats:
+        general.append((f"Which {c['label']} has the most records?", "template", None))
+        general.append((f"How many records are there per {c['label']}?", "template", None))
+    tiers.append(general)
+    # Round-robin across measures so one measure never fills the list.
+    pool, i = [], 0
+    while any(i < len(t) for t in tiers):
+        for t in tiers:
+            if i < len(t):
+                pool.append(t[i])
+        i += 1
+    return pool
+
+
+def answerable_questions(session, user_id=None, focus=None) -> list[str]:
+    """Plain-English questions the connected data can answer, best first.
+
+    Shared by every suggestion surface (starter chips, follow-ups, the
+    assistant) so they all speak the same humanized, dimension-aware
+    language. `focus` (a measure label such as 'amount') moves questions
+    about that measure to the front. Never raises: returns [] when the
+    index is unavailable.
+    """
+    try:
+        index = _get_data_index(session, user_id)
+        if not index.get("ready"):
+            return []
+        pool = [t for t, _k, _m in _question_pool(index)]
+    except Exception:
+        return []
+    if focus:
+        f = str(focus).lower()
+        pool = [q for q in pool if f in q.lower()] + [q for q in pool if f not in q.lower()]
+    return [q[:1].upper() + q[1:] for q in pool]
+
+
+def _expand_tokens(tokens):
+    from schema_engine.lexical import expand_abbreviation
+    out = []
+    for t in tokens:
+        out.extend(expand_abbreviation(t).split())
+    return out
+
+
+def _continuation_score(partial_n, cand):
+    """How well `cand` continues what the user typed (0 = not at all).
+
+    1.0  the question starts with the typed text ('what is' ->
+         'What is the total amount?'), shorthand expanded ('total amt').
+    0.85 every typed word appears in the question, the last one possibly
+         half-typed ('amount sto' -> '... by store code').
+    0.6  the same, allowing small typos ('amout').
+    """
+    cand_n = _normalize(cand)
+    p_tokens = partial_n.split()
+    if not p_tokens:
+        return 0.0
+    expanded = " ".join(_expand_tokens(p_tokens))
+    if cand_n.startswith(partial_n) or cand_n.startswith(expanded):
+        return 1.0
+    c_tokens = cand_n.split()
+    content = [t for t in _expand_tokens(p_tokens) if t not in _FILLER] or _expand_tokens(p_tokens)
+    head, last = content[:-1], content[-1]
+    if all(t in c_tokens for t in head) and any(c.startswith(last) for c in c_tokens):
+        return 0.85
+    def near(t):
+        return any(c.startswith(t) or (len(t) >= 4 and _fuzzy_ratio(t, c) >= 0.8)
+                   for c in c_tokens)
+    if all(near(t) for t in content):
+        return 0.6
+    return 0.0
+
+
 def _rank_suggestions(index, partial, limit):
-    """Build ranked list of suggestion dicts based on the partial input.
+    """Ranked suggestion dicts for the typed text.
 
-    Each suggestion has the shape:
-        {"text": "<full question>", "kind": "value"|"template"|"metric", "score": float}
-
-    The score is in [0, 1] for client-side ranking transparency.  All
-    suggestions must come from the actual data — never static strings.
+    Each suggestion: {"text": "<full question>", "kind": "template"|"value",
+    "score": float in [0, 1]}. Suggestions continue what the user typed and
+    are built only from the connected data (its measures, groupings and
+    real values) - never static strings, never raw column names, never a
+    total of a year, a text column or a percentage.
     """
     partial_n = _normalize(partial)
     if len(partial_n) < 1:
         return []
 
-    suggestions: list[dict] = []
+    scored: list[tuple[float, int, dict]] = []
     seen: set[str] = set()
 
     def _add(text, kind, score):
         key = text.lower().strip()
-        if not key or key in seen:
+        if not key or key in seen or score <= 0:
             return
         seen.add(key)
-        suggestions.append({"text": text, "kind": kind, "score": round(score, 3)})
+        scored.append((score, len(scored), {"text": text, "kind": kind,
+                                            "score": round(score, 3)}))
 
-    # 1) Value-level matches: actual distinct values from the database.
-    #    This is the highest signal — typing "ali" should surface
-    #    "Ali Traders" if it exists in the data (section 58).
-    #    Scores follow match quality so a prefix hit outranks a typo-level
-    #    fuzzy hit, and pairs are capped so intent/metric templates below
-    #    always have room in the limit window.
-    _value_pairs = 0
-    _best_value_q = 0
-    if partial_n:
+    # 1) Whole questions that continue the typed text.
+    for text_, kind, _m in _question_pool(index):
+        _add(text_, kind, _continuation_score(partial_n, text_))
+
+    # 2) Real values from the data: typing 'card' offers 'Card' answers.
+    #    Only the last typed word is matched, so a value never hijacks a
+    #    question the user is clearly writing.
+    last = partial_n.split()[-1]
+    if len(last) >= 2 and last not in _FILLER:
+        mets = index.get("metrics", [])
+        lead = _measure_phrase(mets[0]) if mets else None
+        labels = {(c["table"], c["column"]): c.get("label", "")
+                  for c in index.get("categories", [])}
+        hits = 0
         for v in index.get("values", []):
-            if _value_pairs >= 3:
+            if hits >= 3:
                 break
-            val = v["value"]
-            q = _match_quality(partial_n, val)
-            if q == 0:
-                # Also try matching against the *first* word of multi-word
-                # values (e.g. typing "ali" -> "Ali Traders").
-                q = _match_quality(partial_n, val.split(" ")[0])
-                if q == 0:
-                    continue
-            _best_value_q = max(_best_value_q, q)
-            col = v.get("column", "value")
-            # Dimension columns (text values) get contextual suggestions.
-            # Wording is neutral (no hardcoded business nouns like "Sales").
-            if q >= 3:
-                _add(f"Filter {col} to {val}", "value", 0.95)
-                _add(f"Show details for {val}", "value", 0.85)
-            elif q == 2:
-                _add(f"Filter {col} to {val}", "value", 0.82)
-                _add(f"Show details for {val}", "value", 0.76)
-            else:
-                _add(f"Filter {col} to {val}", "value", 0.68)
-                _add(f"Show details for {val}", "value", 0.62)
-            _value_pairs += 1
-
-    # 2) Template matches: build "Top {category} by {metric}" only if
-    #    we actually have a category + a metric.  Triggered by typing
-    #    intent words like "top", "best", "highest" (section 57).
-    tokens = partial_n.split()
-    intent_tokens = [t for t in tokens if t in _INTENT_WORDS]
-    # Prefix expansion: incomplete words still signal intent ("tot"→total,
-    # "ave"→average, "tre"→trend) so mid-typing always offers something.
-    for _tok in tokens:
-        if _tok in _INTENT_WORDS or len(_tok) < 3:
-            continue
-        for _word, _canon in _INTENT_WORDS.items():
-            if _word.startswith(_tok):
-                if _canon not in intent_tokens:
-                    intent_tokens.append(_canon)
-                break
-    # Prefer non-ID dimensions for breakdowns (grouping by an ID column
-    # is analytically weak). Fall back to all categories if needed.
-    _cats = [c for c in index.get("categories", []) if not _is_id_like(c.get("name", ""))]
-    _cats = _cats or index.get("categories", [])
-    if intent_tokens and (_cats or index["metrics"]):
-        for cat in _cats[:5]:
-            for met in index.get("metrics", [])[:5]:
-                if "top" in intent_tokens or "best" in intent_tokens or "highest" in intent_tokens:
-                    _add(f"Top {cat['name'].replace('_', ' ')} by {met['name'].replace('_', ' ')}",
-                         "template", 0.78)
-                if "total" in intent_tokens or "sum" in intent_tokens:
-                    _add(f"Total {met['name'].replace('_', ' ')} by {cat['name'].replace('_', ' ')}",
-                         "template", 0.76)
-                if "average" in intent_tokens or "avg" in intent_tokens:
-                    _add(f"Average {met['name'].replace('_', ' ')} by {cat['name'].replace('_', ' ')}",
-                         "template", 0.74)
-                if "count" in intent_tokens or "how" in intent_tokens:
-                    _add(f"Count of {cat['name'].replace('_', ' ')}", "template", 0.72)
-
-    # 3) Column-level matches: typing the start of a column name.
-    #    A prefix of a real column name is a strong signal (typing "sal"
-    #    means the Sales column), so it outranks fuzzy value hits.
-    if partial_n:
-        for met in index.get("metrics", []):
-            name = met["name"].replace("_", " ")
-            qm = _match_quality(partial_n, name)
-            if qm == 0:
+            q = _match_quality(last, v["value"])
+            if q < 2:
                 continue
-            _first_cat = _cats[0]["name"].replace("_", " ") if _cats else "category"
-            _add(f"Show {name} by {_first_cat}",
-                 "metric", 0.90 if qm >= 3 else 0.68)
-        for cat in _cats:
-            name = cat["name"].replace("_", " ")
-            qc = _match_quality(partial_n, name)
-            if qc == 0:
-                continue
-            if index["metrics"]:
-                m = index["metrics"][0]["name"].replace("_", " ")
-                _add(f"Top {name} by {m}", "metric", 0.88 if qc >= 3 else 0.66)
-        # Date columns: typing "order"/"month" should surface the trend the
-        # schema can actually plot (only offered when a metric exists).
-        for dt in index.get("dates", [])[:3]:
-            name = dt["name"].replace("_", " ")
-            qd = _match_quality(partial_n, name)
-            if qd == 0:
-                continue
-            if index["metrics"]:
-                m = index["metrics"][0]["name"].replace("_", " ")
-                _add(f"{m.title()} by {name}", "metric", 0.88 if qd >= 3 else 0.66)
+            hits += 1
+            # Below whole-question continuations (0.85+): a value only leads
+            # when nothing in the schema continues the typed words.
+            score = 0.8 if q >= 3 else 0.62
+            col_label = labels.get((v.get("table"), v.get("column")), "")
+            subject = f"{col_label} {v['value']}".strip()
+            if lead:
+                _add(f"What is the {lead} for {subject}?", "value", score)
+            _add(f"How many records have {subject}?", "value", score - 0.05)
 
-    # 4) Time-aware fallback (section 74).  If a date column exists and
-    #    the user types a time word not already covered, offer a trend
-    #    template.  This is data-driven (we only suggest it when we
-    #    actually have a date column to plot).
-    if any(w in partial_n for w in ("trend", "over", "by month", "by day", "over time")) \
-            or "trend" in intent_tokens:
-        if index["dates"] and index["metrics"]:
-            m = index["metrics"][0]["name"].replace("_", " ")
-            _add(f"{m.title()} trend over time", "template", 0.70)
-
-    # 5) Question-starter fallback: "what", "which", "show…" carry no intent
-    #    word, yet the dropdown must still respond with grounded starters
-    #    from THIS schema rather than going blank. Also fires when the only
-    #    hits so far are typo-level fuzzy matches — the user is clearly
-    #    starting a fresh question, not filtering to that value.
-    if not suggestions or _best_value_q < 2:
-        _starts = ("what", "which", "show", "tell", "give", "list", "is",
-                   "are", "how", "compare", "find", "get")
-        _pn = partial_n.strip()
-        _is_starter = any(_pn == w or _pn.startswith(w + " ") or (len(_pn) >= 2 and w.startswith(_pn))
-                          for w in _starts)
-        if _is_starter:
-            _m0 = index["metrics"][0]["name"].replace("_", " ") if index.get("metrics") else None
-            _c0 = _cats[0]["name"].replace("_", " ") if _cats else None
-            if _m0 and _c0:
-                _add(f"Top {_c0} by {_m0}", "template", 0.60)
-                _add(f"Total {_m0} by {_c0}", "template", 0.59)
-            elif _m0:
-                _add(f"What is the total {_m0}?", "template", 0.60)
-            if _c0:
-                _add(f"Which {_c0} has the most records?", "template", 0.58)
-
-    suggestions.sort(key=lambda s: s["score"], reverse=True)
-    return suggestions[:limit]
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    out = [d for _s, _i, d in scored[:limit]]
+    for d in out:
+        d["text"] = d["text"][:1].upper() + d["text"][1:]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -671,9 +778,9 @@ def store_conversation(request: Request, payload: dict,
                        user: dict = Depends(require_writable)):
     """Persist a Q/A pair as the most recent conversation turn.
 
-    The frontend calls this after rendering an Ask ARIA answer so that
-    subsequent follow-up questions can resolve against this context
-    (section 61).  The endpoint is intentionally lightweight — it only
+    Intended for API clients after rendering an answer so follow-ups can
+    resolve against this context (section 61). Note: the web UI does not
+    call this - /api/ask keeps its own conversation_history instead.  The endpoint is intentionally lightweight — it only
     stores what the UI tells it, and the goal agent re-derives the
     answer from the database when the follow-up is asked.
     """

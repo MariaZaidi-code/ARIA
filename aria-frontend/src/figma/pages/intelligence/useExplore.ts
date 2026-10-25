@@ -7,6 +7,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { intelligenceApi, normalizeApiError } from "../../../services/api";
 import { asList, strOf, humanize, businessError } from "../../lib/intelHelpers";
 import { useReadOnly } from "../../lib/readonly";
+import { localStore, sessionStore } from "../../../utils/storage.js";
 
 export type RangeKey = "3m" | "6m" | "12m" | "all";
 
@@ -173,19 +174,19 @@ export function useExplore(meta: any) {
     if (!metrics.length && !breakdowns.length) return;
     let prefill: { metric?: string; breakdown?: string } | null = null;
     try {
-      const raw = sessionStorage.getItem("aria_explore_prefill");
+      const raw = sessionStore.getItem("aria_explore_prefill");
       if (raw) {
         const parsed = JSON.parse(raw);
         prefill = {
           ...(parsed?.metric ? { metric: String(parsed.metric) } : {}),
           ...(parsed?.breakdown ? { breakdown: String(parsed.breakdown) } : {}),
         };
-        sessionStorage.removeItem("aria_explore_prefill");
+        sessionStore.removeItem("aria_explore_prefill");
       }
     } catch { prefill = null; }
     if (!prefill?.metric && !prefill?.breakdown) {
       try {
-        const raw = localStorage.getItem("aria_dashboard_drill");
+        const raw = localStore.getItem("aria_dashboard_drill");
         if (raw) {
           const parsed = JSON.parse(raw);
           if (parsed?.kind === "hypothesis" || parsed?.kind === "hypothesis-factor") {

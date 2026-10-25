@@ -17,6 +17,7 @@ import hashlib
 import logging
 import math
 import re
+import threading
 from typing import Protocol
 
 log = logging.getLogger(__name__)
@@ -87,6 +88,14 @@ class SentenceTransformerEmbedder:
         return self._gen.generate_single(text)
 
 
+# Loading the neural model takes seconds; it was being reloaded on every
+# Copilot question. One instance per (model, cache_dir) is shared by the
+# process (inference is read-only), and a failed load is not retried on
+# every request either.
+_EMBEDDER_CACHE: dict[tuple, Embedder] = {}
+_EMBEDDER_LOCK = threading.Lock()
+
+
 def create_embedder(model_name: str = "minilm",
                     cache_dir: str | None = None,
                     prefer_local: bool = True) -> Embedder:
@@ -94,14 +103,25 @@ def create_embedder(model_name: str = "minilm",
 
     Local neural model when importable (offline-capable), otherwise the
     deterministic hashing embedder. `prefer_local` documents intent: this
-    function never reaches for a cloud embedding API.
+    function never reaches for a cloud embedding API. The result is cached
+    for the life of the process.
     """
-    if prefer_local:
-        try:
-            return SentenceTransformerEmbedder(model_name=model_name, cache_dir=cache_dir)
-        except Exception as exc:
-            log.info("Local neural embedder unavailable (%s); using hashing embedder.", exc)
-    return HashingEmbedder()
+    key = (model_name, cache_dir, bool(prefer_local))
+    cached = _EMBEDDER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with _EMBEDDER_LOCK:
+        cached = _EMBEDDER_CACHE.get(key)
+        if cached is not None:
+            return cached
+        embedder: Embedder = HashingEmbedder()
+        if prefer_local:
+            try:
+                embedder = SentenceTransformerEmbedder(model_name=model_name, cache_dir=cache_dir)
+            except Exception as exc:
+                log.info("Local neural embedder unavailable (%s); using hashing embedder.", exc)
+        _EMBEDDER_CACHE[key] = embedder
+        return embedder
 
 
 def cosine(a: list[float], b: list[float]) -> float:
