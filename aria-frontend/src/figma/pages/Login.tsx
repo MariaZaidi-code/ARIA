@@ -78,8 +78,13 @@ export default function Login({ onLogin }: LoginProps) {
           return;
         }
         setMode("login");
-        setVerificationEmail(email.trim());
-        setNotice(reg.message || "Check your email for a verification link before signing in.");
+        if (reg.verificationRequired) {
+          setVerificationEmail(email.trim());
+          setNotice(reg.message || "Check your email for a verification link before signing in.");
+        } else {
+          setVerificationEmail("");
+          setNotice(reg.message || "Account created. You can now sign in.");
+        }
         return;
       }
 
@@ -257,7 +262,11 @@ export default function Login({ onLogin }: LoginProps) {
                   className="login-password-toggle"
                   aria-label={passwordVisible ? "Hide password" : "Show password"}
                   aria-pressed={passwordVisible}
-                  onClick={() => setPasswordVisible((visible) => !visible)}
+                  onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setPasswordVisible((visible) => !visible);
+                    }}
                 >
                   {passwordVisible
                     ? <EyeOff size={18} aria-hidden="true" />
@@ -283,7 +292,11 @@ export default function Login({ onLogin }: LoginProps) {
                     className="login-password-toggle"
                     aria-label={confirmPasswordVisible ? "Hide confirm password" : "Show confirm password"}
                     aria-pressed={confirmPasswordVisible}
-                    onClick={() => setConfirmPasswordVisible((visible) => !visible)}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setConfirmPasswordVisible((visible) => !visible);
+                    }}
                   >
                     {confirmPasswordVisible
                       ? <EyeOff size={18} aria-hidden="true" />

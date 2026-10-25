@@ -237,6 +237,16 @@ def register(auth_req: AuthRequest, request: Request):
     try:
         auth.send_email_verification(email, token)
     except (OSError, RuntimeError, smtplib.SMTPException) as exc:
+        # Dev fallback: when SMTP is not configured, verification email
+        # cannot be delivered. Mark the account verified so local users can
+        # still sign in; production deployments must configure SMTP.
+        if isinstance(exc, RuntimeError) and "not configured" in str(exc).lower():
+            auth.verify_email_token(token)
+            return {
+                "ok": True,
+                "verification_required": False,
+                "message": "Account created. You can now sign in.",
+            }
         raise HTTPException(
             status_code=503,
             detail="Your account is pending verification, but the email could not be sent. Try resending after checking mail settings.",

@@ -176,7 +176,7 @@ export const registerLocalUser = async (email, password) => {
 
     return {
       success: true,
-      verificationRequired: true,
+      verificationRequired: data?.verification_required !== false,
       email: currentEmail,
       message: data?.message || "Check your email for a verification link.",
     };

@@ -1211,24 +1211,6 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
                   </Card>
                 </div>
 
-                {/* Cost of doing nothing — engine run-rate. */}
-                {(() => {
-                  if (!inaction?.headline) return null;
-                  const burn = numOf(inaction?.monthly_burn);
-                  return (
-                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                      <Card className="p-4 md:p-5 lg:col-span-2">
-                        <h3 className="text-[14px] font-semibold text-foreground tracking-tight">Cost of doing nothing</h3>
-                        <p className="mt-1.5 text-[12.5px] text-secondary-foreground leading-relaxed">{strOf(inaction.headline)}</p>
-                        {burn !== null && burn > 0 && (
-                          <p className="mt-1 text-[18px] font-bold text-rose-700 dark:text-rose-400 tabular-nums">~{fmtMetric(burn, metric)}<span className="text-[12px] font-medium text-muted-foreground">/month at stake</span></p>
-                        )}
-                        {strOf(inaction?.note) && <p className="mt-1 text-[11px] text-muted-foreground">{strOf(inaction.note)}</p>}
-                      </Card>
-                    </div>
-                  );
-                })()}
-
                 <Card className="p-4 md:p-5">
                   <h3 className="text-[14px] font-semibold text-foreground tracking-tight flex items-center gap-1.5">
                     <Send size={13} className="text-blue-700 dark:text-blue-400" /> Next Steps

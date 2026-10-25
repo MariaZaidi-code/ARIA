@@ -639,39 +639,22 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                         </div>
                       )}
                       {(() => {
-                        const pts = asList(pattern?.series || pattern?.points).map((v: any, i: number) => ({ i, label: strOf(v?.label || v?.period || `P${i + 1}`), v: numOf(typeof v === "number" ? v : v?.value ?? v?.v) ?? 0 }));
                         const bd = numOf(pattern?.before ?? pattern?.before_value);
                         const ad = numOf(pattern?.after ?? pattern?.after_value);
-                        const showBars = bd !== null && ad !== null;
-                        return (<>
-                          {showBars && (
-                            <div className="h-32 mt-2" role="img" aria-label={`Before ${strOf(pattern?.before_display)} versus after ${strOf(pattern?.after_display)}`}>
-                              <ResponsiveContainer width="100%" height="100%">
-                                <BarChart data={[{ label: "Before", value: bd as number }, { label: "After", value: ad as number }]} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                                  <XAxis dataKey="label" tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} />
-                                  <YAxis tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => fmtMetric(v, strOf(ctx?.metric || h?.metric || ""))} />
-                                  <Tooltip formatter={(v: any) => [fmtMetric(numOf(v) ?? 0, strOf(ctx?.metric || h?.metric || "")), "Value"]} cursor={{ fill: "var(--secondary)" }} contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8, fontSize: 12 }} />
-                                  <Bar dataKey="value" radius={[6, 6, 0, 0]} isAnimationActive animationDuration={600}>
-                                    <Cell fill="#B9D0E8" /><Cell fill="#2F6FAD" />
-                                  </Bar>
-                                </BarChart>
-                              </ResponsiveContainer>
+                        const max = Math.max(bd ?? 0, ad ?? 0, 1);
+                        if (bd === null || ad === null) return null;
+                        return (
+                          <div className="mt-3 space-y-2">
+                            <div>
+                              <div className="flex justify-between text-[11px] mb-1"><span className="text-muted-foreground">Before</span><span className="font-semibold tabular-nums">{strOf(pattern?.before_display || "—")}</span></div>
+                              <div className="h-2 rounded-full bg-secondary overflow-hidden"><div className="h-full bg-slate-300 dark:bg-slate-500 rounded-full" style={{ width: `${(bd / max) * 100}%` }} /></div>
                             </div>
-                          )}
-                          {pts.length > 1 && (
-                            <div className="h-28 mt-2" role="img" aria-label="Pattern over time">
-                              <ResponsiveContainer width="100%" height="100%">
-                                <LineChart data={pts} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
-                                  <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} minTickGap={20} />
-                                  <YAxis tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={48} tickFormatter={(v: number) => fmtMetric(v, strOf(ctx?.metric || h?.metric || ""))} />
-                                  <Tooltip formatter={(v: any) => [fmtMetric(numOf(v) ?? 0, strOf(ctx?.metric || h?.metric || "")), "Value"]} labelFormatter={(l) => `Point ${l}`} />
-                                  <Line type="monotone" dataKey="v" stroke="#4F46E5" strokeWidth={2} dot={false} isAnimationActive animationDuration={600} />
-                                </LineChart>
-                              </ResponsiveContainer>
+                            <div>
+                              <div className="flex justify-between text-[11px] mb-1"><span className="text-muted-foreground">After</span><span className="font-semibold tabular-nums">{strOf(pattern?.after_display || "—")}</span></div>
+                              <div className="h-2 rounded-full bg-secondary overflow-hidden"><div className="h-full bg-blue-600 rounded-full" style={{ width: `${(ad / max) * 100}%` }} /></div>
                             </div>
-                          )}
-                        </>);
+                          </div>
+                        );
                       })()}
                       {strOf(pattern?.detail || pattern?.description) && <p className="text-[12px] text-secondary-foreground mt-2 leading-relaxed">{strOf(pattern.detail || pattern.description)}</p>}
                     </div>

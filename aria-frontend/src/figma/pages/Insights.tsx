@@ -1434,8 +1434,6 @@ export default function Insights({
       { id: "evidence", label: "Evidence" },
       ...(factors.length ? [{ id: "factors", label: "Associated Factors" }] : []),
       ...(recoDetail || recoText ? [{ id: "reco", label: "Recommendation" }] : []),
-      { id: "whatif", label: "What If" },
-      { id: "monitor", label: "Monitor" },
     ];
     const tabId = tabs.some((t) => t.id === activeTab) ? activeTab : "changed";
 
@@ -1800,32 +1798,6 @@ export default function Insights({
                         />
                       </label>
                     </div>
-                  </div>
-                )}
-
-                {tabId === "whatif" && (
-                  <div className="rounded-xl border border-border p-4 max-w-3xl">
-                    <p className="text-[12px] font-semibold">What If</p>
-                    {scenarioAvailable ? (
-                      <p className="mt-1 text-[12px] text-secondary-foreground">{plainBusiness(selected.scenario?.label) || selected.scenario?.label || "Scenario modeling is available for this insight — ask ARIA to model a change."}</p>
-                    ) : (
-                      <p className="mt-1 text-[12px] text-muted-foreground">Scenario modeling isn&apos;t available for this insight yet.</p>
-                    )}
-                  </div>
-                )}
-
-                {tabId === "monitor" && (
-                  <div className="rounded-xl border border-border p-4 max-w-3xl">
-                    <p className="text-[12px] font-semibold">Watch this</p>
-                    {monitorAvailable ? (
-                      <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
-                        {selected.monitoring?.metric && <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Metric</p><p className="font-semibold">{plainBusiness(humanize(selected.monitoring.metric)) || humanize(selected.monitoring.metric)}</p></div>}
-                        {rangePlain ? <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Usual range</p><p className="font-semibold">{rangePlain}</p></div> : null}
-                        {selected.monitoring?.nextReview && <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Next review</p><p className="font-semibold">{selected.monitoring.nextReview}</p></div>}
-                      </div>
-                    ) : (
-                      <p className="mt-1 text-[12px] text-muted-foreground">Monitoring isn&apos;t configured for this insight yet.</p>
-                    )}
                   </div>
                 )}
 
