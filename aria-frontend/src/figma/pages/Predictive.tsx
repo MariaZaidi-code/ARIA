@@ -458,6 +458,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     try {
       const data: any = await apiFetch("/predictive/scenario", {
         method: "POST",
+        timeoutMs: 300000,
         body: JSON.stringify({
           column: plainName(selectedTarget) || undefined,
           pct_change: Number(scenarioPct) || 0,
@@ -517,6 +518,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       const data: any = await apiFetch("/predictive/forecast", {
         method: "POST",
         signal: ctrl.signal,
+        timeoutMs: 300000,
         body: JSON.stringify({
           question: buildQuestion(t, td, useFlt),
           column: t,
