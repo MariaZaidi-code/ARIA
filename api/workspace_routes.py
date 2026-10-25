@@ -31,6 +31,7 @@ def _ws():
 # ---------------------------------------------------------------------------
 
 class MonitorCreate(BaseModel):
+    model_config = ConfigDict(extra="allow")
     question: str | None = None
     name: str | None = None
     sql: str | None = None
@@ -46,6 +47,7 @@ class MonitorCreate(BaseModel):
 
 
 class MonitorPatch(BaseModel):
+    model_config = ConfigDict(extra="allow")
     name: str | None = None
     enabled: bool | None = None
     cadence: str | None = None
@@ -56,24 +58,28 @@ class MonitorPatch(BaseModel):
 
 
 class MonitorPreview(BaseModel):
+    model_config = ConfigDict(extra="allow")
     text: str = ""
 
     model_config = ConfigDict(extra="allow")
 
 
 class TargetsPut(BaseModel):
+    model_config = ConfigDict(extra="allow")
     targets: list[dict] = []
 
     model_config = ConfigDict(extra="allow")
 
 
 class GlossaryPut(BaseModel):
+    model_config = ConfigDict(extra="allow")
     entries: list[dict] = []
 
     model_config = ConfigDict(extra="allow")
 
 
 class NotificationsRead(BaseModel):
+    model_config = ConfigDict(extra="allow")
     ids: list[str] = []
     all: bool = False
 
@@ -81,6 +87,7 @@ class NotificationsRead(BaseModel):
 
 
 class WebhookCreate(BaseModel):
+    model_config = ConfigDict(extra="allow")
     name: str | None = None
     url: str
 
@@ -88,6 +95,7 @@ class WebhookCreate(BaseModel):
 
 
 class IntegrationsPatch(BaseModel):
+    model_config = ConfigDict(extra="allow")
     regenerate_slack_token: bool = False
     clear_slack_token: bool = False
 
@@ -238,10 +246,48 @@ def list_webhooks(request: Request, user: dict = Depends(get_current_user)):
     return {"ok": True, "items": items, "data": items, "total": len(items)}
 
 
+def _validate_webhook_url(url: str) -> None:
+    from urllib.parse import urlparse
+    import ipaddress
+    import socket
+    if not isinstance(url, str) or not url.strip():
+        raise HTTPException(status_code=400, detail="Webhook URL is required.")
+    parts = urlparse(url.strip())
+    if parts.scheme not in ("https", "http") or not parts.hostname:
+        raise HTTPException(status_code=400, detail="Webhook URL must be an http(s) URL.")
+    # Outbound webhooks should not target private/loopback/link-local hosts (SSRF guard).
+    host = parts.hostname.strip().lower().rstrip(".")
+    if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        raise HTTPException(status_code=400, detail="Webhook URL host is not allowed.")
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise HTTPException(status_code=400, detail="Webhook URL host is not allowed.")
+    except ValueError:
+        # hostname, not IP — resolve and check
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Webhook URL host could not be resolved.")
+        for info in infos:
+            try:
+                ip = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                continue
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                raise HTTPException(status_code=400, detail="Webhook URL host is not allowed.")
+    # Require https for non-loopback in production; allow http only for tests/local.
+    if parts.scheme != "https":
+        # Permit http only for explicit local/dev hosts.
+        if host not in {"localhost", "127.0.0.1"}:
+            raise HTTPException(status_code=400, detail="Webhook URL must use https://.")
+
+
 @router.post("/webhooks")
 def create_webhook(req: WebhookCreate, request: Request,
                    user: dict = Depends(require_writable)):
     """Register an outbound webhook URL."""
+    _validate_webhook_url(req.url)
     try:
         item = _ws().create_webhook(user["user_id"], req.model_dump())
     except ValueError as exc:

@@ -15,9 +15,12 @@ callers) the answer is returned synchronously.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import threading
+import time
 from html import escape as _escape
 
 from fastapi import APIRouter, HTTPException, Request
@@ -31,6 +34,31 @@ router = APIRouter(prefix="/api/integrations", tags=["integrations"])
 _ASK_TIMEOUT = 120
 _MAX_TEXT = 3500
 _SLACK_RESPONSE_PREFIX = "https://hooks.slack.com/"
+_SLACK_TIMESTAMP_TOLERANCE = 300  # 5 minutes, per Slack docs
+
+
+def _verify_slack_signature(raw_body: bytes, timestamp: str, signature: str) -> bool:
+    """Verify a Slack request signature (HMAC-SHA256 over 'v0:ts:body').
+
+    Returns True when no signing secret is configured (backward compat) so
+    existing deployments/tests that never set SLACK_SIGNING_SECRET keep
+    working. When a secret IS configured, the signature must be present and
+    valid and the timestamp must be within the tolerance window.
+    """
+    secret = os.getenv("SLACK_SIGNING_SECRET", "").strip()
+    if not secret:
+        return True
+    if not timestamp or not signature:
+        return False
+    try:
+        ts = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    if abs(time.time() - ts) > _SLACK_TIMESTAMP_TOLERANCE:
+        return False
+    base = b"v0:" + timestamp.encode("ascii", "ignore") + b":" + raw_body
+    digest = "v0=" + hmac.new(secret.encode("utf-8"), base, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, signature)
 
 
 def _base_url() -> str:
@@ -143,11 +171,25 @@ async def slack_command(request: Request):
     """
     from services.workspace_service import resolve_user_by_slack_token
 
+    raw_body = b""
+    try:
+        raw_body = await request.body()
+    except Exception:
+        raw_body = b""
+    ts_header = request.headers.get("X-Slack-Request-Timestamp", "")
+    sig_header = request.headers.get("X-Slack-Signature", "")
+    if not _verify_slack_signature(raw_body, ts_header, sig_header):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature.")
     form = {}
     try:
-        form = dict(await request.form())
+        # Re-parse form from the already-read body so we don't lose it.
+        from urllib.parse import parse_qsl
+        form = dict(parse_qsl(raw_body.decode("utf-8", "replace"), keep_blank_values=True))
     except Exception:
-        form = {}
+        try:
+            form = dict(await request.form())
+        except Exception:
+            form = {}
     token = str(form.get("token") or "").strip()
     user_id = resolve_user_by_slack_token(token)
     if not user_id:

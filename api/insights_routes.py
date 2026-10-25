@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 
 from core.deps import get_current_user, require_writable, reject_document_sql
 from core.config import get_session, save_session, PROCESSED_DIR
@@ -1949,6 +1949,7 @@ class InsightsEngine:
 # ── API Endpoints ─────────────────────────────────────────────────────────
 
 class SaveInsightRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     insight_id: str
     title: str
     insight_type: str
@@ -1958,6 +1959,7 @@ class SaveInsightRequest(BaseModel):
 
 
 class AskInsightRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     question: str = ""
     insight_id: str = ""
     # Cheap path: frontend already holds the full insight card, so it may

@@ -334,6 +334,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   // Single auto-fetch guard: one ref gates both auto-run effects so StrictMode
   // double-invoke and competing effects never fire two initial requests.
   const autoFetchRef = useRef<string>("");
+  const useAutomaticTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /* So-consider actions: top prescriptions for the forecast target, fetched
      once per forecast from the existing engine. Honest omission on refusal. */
   const [rxItems, setRxItems] = useState<any[]>([]);
@@ -700,7 +701,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     setForecastVerdict(null);
     autoFetchRef.current = "";
     setError("");
-    setTimeout(() => fetchForecast(rec.measure, rec.time_dim, horizon, []), 50);
+    if (useAutomaticTimerRef.current) clearTimeout(useAutomaticTimerRef.current);
+    useAutomaticTimerRef.current = setTimeout(() => fetchForecast(rec.measure, rec.time_dim, horizon, []), 50);
   };
 
   const predictions = forecast || insightPredictions;

@@ -30,7 +30,10 @@ from llm_provider import LLMProvider, create_provider
 from core.validation import clean_llm_text, validate_chart_choice
 from .chart_catalog import compatible_chart_options
 from prediction import PredictionAgent
-from prescription_agent import PrescriptionAgent
+try:
+    from prescription_agent import PrescriptionAgent as _PrescriptionAgent
+except Exception:  # legacy shim removed; prescriptions become optional
+    _PrescriptionAgent = None
 
 logging.basicConfig(level=logging.INFO)
 
@@ -127,7 +130,7 @@ class InsightAgent:
             )
         self.llm = provider
         self.prediction = PredictionAgent()
-        self.prescription = PrescriptionAgent(provider=self.llm)
+        self.prescription = _PrescriptionAgent(provider=self.llm) if _PrescriptionAgent is not None else None
         self._templates = None
         self.last_story_status = "SUCCESS"
 
@@ -1429,13 +1432,14 @@ Rules:
                 warnings.append(f"prediction: {exc}")
 
         prescriptions = None
-        try:
-            prescriptions = self.prescription.prescribe(
-                processed_data, kpis, trends, anomalies, hypotheses, predictions
-            )
-        except Exception as exc:
-            logging.warning("Prescription Agent failed: %s", exc)
-            warnings.append(f"prescription: {exc}")
+        if self.prescription is not None:
+            try:
+                prescriptions = self.prescription.prescribe(
+                    processed_data, kpis, trends, anomalies, hypotheses, predictions
+                )
+            except Exception as exc:
+                logging.warning("Prescription Agent failed: %s", exc)
+                warnings.append(f"prescription: {exc}")
 
         story = safe(
             "generate_business_story",

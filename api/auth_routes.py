@@ -7,7 +7,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 
 import auth
 from core.deps import get_current_user, is_mobile, require_admin, require_writable
@@ -189,19 +189,23 @@ def _check_login_rate_limit(request: Request) -> None:
 
 
 class AuthRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     email: str
     password: str
 
 
 class VerificationRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     token: str
 
 
 class ResendVerificationRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     email: str
 
 
 class PageVisitRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     page: str
 
 

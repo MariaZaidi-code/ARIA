@@ -98,6 +98,10 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<{ email?: string; is_admin?: boolean } | null>(null);
   const [selectedLLM, setSelectedLLM] = useState("");
   const bootSessionCheckRef = useRef<AbortController | null>(null);
+  const uploadCancelledRef = useRef(false);
+  useEffect(() => {
+    return () => { uploadCancelledRef.current = true; };
+  }, []);
   const lastPageVisitRef = useRef("");
 
   // Mobile read-only: server verdict (session/status) with a UA guess until
@@ -117,6 +121,8 @@ export default function App() {
       window.location.hash = `#/${p}`;
     } catch { /* ignore */ }
   };
+  const pageRef = useRef(page);
+  useEffect(() => { pageRef.current = page; }, [page]);
 
   useEffect(() => {
     const onHash = () => {
@@ -202,7 +208,7 @@ export default function App() {
           setCurrentUser({ email: identity, is_admin: isAdmin });
           const savedMode = storage.getString(KEYS.llmMode, "");
           if (isAdmin) {
-            if (page === "dashboard") setPage("admin");
+            if (pageRef.current === "dashboard") setPage("admin");
             setAppStage("app");
           } else if (savedMode) {
             setSelectedLLM(savedMode);
@@ -591,10 +597,12 @@ export default function App() {
           /* Large file: backend processes in background. Poll progress
              (30s cap per round, up to ~20 min) until ready or error. */
           setConnectionStatus("schema-loading");
+          uploadCancelledRef.current = false;
           const deadline = Date.now() + 20 * 60 * 1000;
           let done = false;
-          while (Date.now() < deadline && !done) {
+          while (Date.now() < deadline && !done && !uploadCancelledRef.current) {
             await new Promise((r) => setTimeout(r, 3000));
+            if (uploadCancelledRef.current) return;
             try {
               const prog: any = await apiFetch("/upload/progress");
               if (prog?.error) {
@@ -619,6 +627,7 @@ export default function App() {
               /* transient poll failure — keep waiting */
             }
           }
+          if (uploadCancelledRef.current) return;
           setConnectionStatus("error");
           setConnectionError("Processing is taking longer than expected — check Data for progress.");
           return;

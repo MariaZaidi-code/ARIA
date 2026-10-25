@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 
 from core.deps import get_current_user
 
@@ -104,6 +104,7 @@ def _bound_text_keys(mapping: dict, cap: int = _MAX_TEXT_KEYS) -> dict:
 # ── Models ──────────────────────────────────────────────────────────────
 
 class InsightRating(BaseModel):
+    model_config = ConfigDict(extra="allow")
     insight_id: str = ""
     question: str = ""
     rating: str  # "useful" | "not_useful"
@@ -111,16 +112,19 @@ class InsightRating(BaseModel):
 
 
 class SuggestionClick(BaseModel):
+    model_config = ConfigDict(extra="allow")
     suggestion_text: str
     source: str = "dashboard"  # dashboard | analytics | idle
 
 
 class ChartPreference(BaseModel):
+    model_config = ConfigDict(extra="allow")
     chart_type: str
     context: str = ""  # e.g. "bar_chart_default", "time_series"
 
 
 class GeneralFeedback(BaseModel):
+    model_config = ConfigDict(extra="allow")
     message: str = ""
     category: str = "general"
 

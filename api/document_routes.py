@@ -169,12 +169,14 @@ def _sanitize_document_id(document_id: str) -> str:
 
 
 class DocumentSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     query: str
     document_ids: Optional[List[str]] = None
     k: int = 10
 
 
 class DocumentSearchResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
     ok: bool
     results: List[dict]
 
@@ -661,6 +663,7 @@ def ask_documents(
     }
 
 class DocumentMetaUpdate(BaseModel):
+    model_config = ConfigDict(extra="allow")
     tags: Optional[List[str]] = None
     collection: Optional[str] = None
 
@@ -1061,6 +1064,7 @@ def delete_reingest_schedule(job_id: str, user: dict = Depends(require_writable)
 
 
 class ShareWithRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     username: str
 
 

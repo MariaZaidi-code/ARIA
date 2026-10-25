@@ -20,7 +20,7 @@ from typing import Optional
 from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 from sqlalchemy import create_engine, text
 
 from core.config import get_session, save_session
@@ -35,6 +35,7 @@ router = APIRouter()
 
 
 class AutocompleteRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     partial: str = ""
     limit: int = 8
 

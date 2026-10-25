@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 from typing import Any
 
 from core.config import get_session, PROCESSED_DIR
@@ -23,6 +23,7 @@ router = APIRouter()
 
 
 class ForecastFilter(BaseModel):
+    model_config = ConfigDict(extra="allow")
     """Structured row filter: applied as SQL WHERE + in-memory post-filter.
 
     Additive-only: optional ``filters`` on ForecastRequest. Generic —
@@ -36,6 +37,7 @@ class ForecastFilter(BaseModel):
 
 
 class ForecastRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     question: str = ""
     column: str | None = None
     time_dim: str | None = None
@@ -49,10 +51,12 @@ class ForecastRequest(BaseModel):
 
 
 class PrescriptionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     insight_id: str = ""
 
 
 class ScenarioRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     column: str | None = None
     pct_change: float = 10.0
     periods: int = 3

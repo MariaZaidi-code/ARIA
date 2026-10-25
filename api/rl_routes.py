@@ -9,7 +9,7 @@ while these routes and the telemetry storage stay stable.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import ConfigDict, BaseModel, Field
 
 from api.feedback_routes import load_preferences
 from core.config import get_session  # noqa: F401  (session scope parity)
@@ -23,6 +23,7 @@ _COMMENT_MAX = 500
 
 
 class FeedbackEvent(BaseModel):
+    model_config = ConfigDict(extra="allow")
     event: str = Field(min_length=1, max_length=64)
     state: dict = Field(default_factory=dict)
     action: dict = Field(default_factory=dict)
@@ -31,6 +32,7 @@ class FeedbackEvent(BaseModel):
 
 
 class PopupFeedback(BaseModel):
+    model_config = ConfigDict(extra="allow")
     rating: int = Field(ge=1, le=5, description="Popup check-in, 1-5 stars")
     comment: str = ""
     page: str = ""
@@ -38,6 +40,7 @@ class PopupFeedback(BaseModel):
 
 
 class RankRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     candidates: list[dict] = []
     state: dict = {}
 

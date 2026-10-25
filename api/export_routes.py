@@ -30,6 +30,7 @@ _MAX_SLIDE_ROWS = 25
 
 
 class StoryExport(BaseModel):
+    model_config = ConfigDict(extra="allow")
     format: str = "html"
     question: str = ""
     answer: str = ""

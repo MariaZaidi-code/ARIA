@@ -5,7 +5,7 @@ import logging
 import os
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 
 from core.config import get_session, save_session
 from core.deps import get_current_user, require_writable
@@ -33,12 +33,14 @@ PROVIDER_ALIASES = {
 
 
 class ProviderConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     provider: str
     api_key: str
     is_default: bool = False
 
 
 class GeneralSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     language: str = "en"
     theme: str = "light"
 

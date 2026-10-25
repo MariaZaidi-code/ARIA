@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import ConfigDict, BaseModel, Field
 
 from core.deps import get_current_user, require_writable
 from core.config import get_session
@@ -24,6 +24,7 @@ router = APIRouter(prefix="/api/copilot", tags=["copilot"])
 
 
 class CopilotRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     question: str = Field(max_length=4000)
     conversation_id: Optional[str] = Field(default=None, max_length=80)
     context: Optional[dict[str, Any]] = None

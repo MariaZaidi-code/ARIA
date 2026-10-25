@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, field_validator
+from pydantic import ConfigDict, BaseModel, field_validator
 from sqlalchemy import create_engine, text
 
 import schema_agent
@@ -336,6 +336,7 @@ MAX_PREVIEW_SEARCH = 200
 
 
 class PreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     table: str
     limit: int = 50
     offset: int = 0
@@ -942,6 +943,7 @@ def get_data_quality(request: Request, user: dict = Depends(get_current_user)):
 # =============================================================
 
 class OverrideRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     action: str  # "set_pk" | "remove_pk" | "set_fk" | "remove_fk" | "confirm_relationship" | "reject_relationship"
     table: str
     column: str = ""

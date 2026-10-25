@@ -26,6 +26,7 @@ router = APIRouter(prefix="/api/intelligence", tags=["intelligence"])
 # ---------------------------------------------------------------------------
 
 class ExploreRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     metric: str
     breakdown: str | None = None
     secondary_breakdown: str | None = None
@@ -43,6 +44,7 @@ class ExploreRequest(BaseModel):
 
 
 class WhatIfRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     variable: str | None = None
     metric: str | None = None
     column: str | None = None
@@ -58,6 +60,7 @@ class WhatIfRequest(BaseModel):
 
 
 class GoalRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     title: str | None = None
     name: str | None = None
     metric: str | None = None
@@ -76,6 +79,7 @@ class GoalRequest(BaseModel):
 
 
 class ReportRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     name: str = "ARIA Report"
     description: str = ""
     date_range: str | None = None
@@ -87,6 +91,7 @@ class ReportRequest(BaseModel):
 
 
 class AnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     title: str = "Untitled Analysis"
     name: str | None = None
     metric: str | None = None
@@ -100,6 +105,7 @@ class AnalysisRequest(BaseModel):
 
 
 class ScenarioRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     title: str | None = None
     name: str | None = None
     variable: str | None = None
@@ -111,6 +117,7 @@ class ScenarioRequest(BaseModel):
 
 
 class TemplateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     name: str = "Untitled template"
     description: str = ""
     sections: list | None = None
@@ -120,6 +127,7 @@ class TemplateRequest(BaseModel):
 
 
 class DigestRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     name: str = "Daily Digest"
     description: str = ""
     frequency: str = "daily"
@@ -131,6 +139,7 @@ class DigestRequest(BaseModel):
 
 
 class DigestPatch(BaseModel):
+    model_config = ConfigDict(extra="allow")
     name: str | None = None
     description: str | None = None
     frequency: str | None = None

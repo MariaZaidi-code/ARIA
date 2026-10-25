@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 
 import auth
 from core.config import get_session, save_session, resolve_provider_key, PROCESSED_DIR
@@ -24,6 +24,7 @@ router = APIRouter()
 
 
 class GoalRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     goal: str
     previous_goal: str | None = None
     previous_result: dict | None = None

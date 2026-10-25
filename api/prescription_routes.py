@@ -13,7 +13,7 @@ import time
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 
 from core.config import get_session, save_session
 from core.deps import get_current_user, require_writable
@@ -86,11 +86,13 @@ def _strip_prescription_response(out):
 
 
 class SegmentRef(BaseModel):
+    model_config = ConfigDict(extra="allow")
     field: str | None = None
     value: str | int | float | None = None
 
 
 class AnalyzeContext(BaseModel):
+    model_config = ConfigDict(extra="allow")
     origin: str | None = None
     insight_id: str | None = None
     metric: str | None = None
@@ -100,6 +102,7 @@ class AnalyzeContext(BaseModel):
 
 
 class AnalyzeRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     context: AnalyzeContext | None = None
     metric: str | None = None
     driver: str | None = None
@@ -110,24 +113,28 @@ class AnalyzeRequest(BaseModel):
 
 
 class ScenarioChange(BaseModel):
+    model_config = ConfigDict(extra="allow")
     field: str
     operation: str
     value: float
 
 
 class ScenarioFilter(BaseModel):
+    model_config = ConfigDict(extra="allow")
     field: str
     operator: str = "equals"
     value: str | int | float
 
 
 class ScenarioJoin(BaseModel):
+    model_config = ConfigDict(extra="allow")
     table: str
     self_col: str
     other_col: str
 
 
 class ScenarioRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     table: str
     metric: str
     driver: str
@@ -137,6 +144,7 @@ class ScenarioRequest(BaseModel):
 
 
 class SaveRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     prescription: dict = {}
     question: str | None = None
 
@@ -830,6 +838,7 @@ def prescription_unsave(sid: str, user: dict = Depends(require_writable)):
 
 
 class SavedUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     owner: str | None = None
     priority: str | None = None
     due: str | None = None
@@ -878,6 +887,7 @@ def prescription_saved_update(sid: str, req: SavedUpdateRequest,
 
 
 class InactionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     metric: str | None = None
     table: str | None = None
 

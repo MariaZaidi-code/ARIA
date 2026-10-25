@@ -13,7 +13,7 @@ from collections import Counter
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import ConfigDict, BaseModel, Field
 
 from core.deps import get_current_user, require_writable
 from core.errors import sanitize_error
@@ -35,6 +35,7 @@ _DOCUMENT_MAX_ARCHIVE_ENTRIES = 20_000
 
 
 class PDFChatRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     question: str = Field(min_length=2, max_length=4000)
     conversation_id: str | None = Field(default=None, max_length=80)
     document_ids: list[str] | None = Field(default=None, max_length=20)

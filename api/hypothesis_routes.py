@@ -3,7 +3,7 @@
 import re
 import math
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 from sqlalchemy import create_engine, text
 from urllib.parse import quote_plus
 import numpy as np
@@ -40,11 +40,13 @@ def _quote_identifier(name, dialect="postgresql"):
 
 
 class HypothesisRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     hypothesis: str
     dataset: str = "Connected dataset"
 
 
 class InvestigateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     question: str
 
 
@@ -181,6 +183,7 @@ def auto_hypotheses(request: Request, user: dict = Depends(get_current_user)):
 
 
 class AnalyzeRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     question: str
     table: str | None = None
     metric: str | None = None
@@ -188,6 +191,7 @@ class AnalyzeRequest(BaseModel):
 
 
 class ParseRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     question: str
     metric: str | None = None
     driver: str | None = None

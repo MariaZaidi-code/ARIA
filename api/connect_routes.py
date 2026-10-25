@@ -15,7 +15,7 @@ from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 
 import csv_orchestrator
 import schema_agent
@@ -551,6 +551,7 @@ def _validate_hosted_base_url(base_url: str | None) -> None:
 
 
 class ProviderSwitchRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     provider: str = "local"
     api_key: str | None = None      # optional key override for hosted providers
     base_url: str | None = None     # optional endpoint override for hosted providers
@@ -658,6 +659,7 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
 
 
 class ConnectRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     provider: str | None = None
     source_type: str = "relational"
     db_type: str = "postgresql"   # 'postgresql' | 'mysql'
@@ -1422,6 +1424,7 @@ def disconnect_source(user: dict = Depends(require_writable)):
     return {"ok": True, "message": "Data source disconnected"}
 
 class DatabaseTestRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     host: str = "localhost"
     port: int = 5432
     db: str = ""
