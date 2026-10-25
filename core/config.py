@@ -16,7 +16,7 @@ _logger = logging.getLogger("uvicorn.error")
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(override=True)
 except ImportError:
     pass
 
