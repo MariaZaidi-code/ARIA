@@ -943,7 +943,10 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
         raise HTTPException(status_code=400, detail="No database connected.")
 
     db_config = dict(session.get("db") or {})
-    if not db_config:
+    # CSV / SQLite sessions may carry only a db_uri (or legacy csv_db_path)
+    # rather than a db dict. Match _build_engine's behaviour instead of
+    # rejecting a source that eligibility already reported as forecastable.
+    if not db_config and not (session.get("db_uri") or session.get("csv_db_path")):
         raise HTTPException(status_code=400, detail="No database configuration found.")
     if db_config.get("password"):
         try:

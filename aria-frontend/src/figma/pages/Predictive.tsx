@@ -660,8 +660,13 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       if (empty && !hasInsightPredictions) {
         const key = `ctx:${table.table}|${metric}|${timeDim}|${hz}`;
         if (autoFetchRef.current !== key) {
-          autoFetchRef.current = key;
-          const timer = setTimeout(() => fetchForecast(metric, timeDim, hz, flt), 300);
+          // Mark the key only when the timer actually fires. If this effect
+          // re-runs first, its cleanup clears the timer and a later run can
+          // still schedule the fetch (otherwise the page deadlocks empty).
+          const timer = setTimeout(() => {
+            autoFetchRef.current = key;
+            fetchForecast(metric, timeDim, hz, flt);
+          }, 300);
           return () => clearTimeout(timer);
         }
       }
@@ -682,8 +687,10 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     if (!hasInsightPredictions && empty) {
       const key = `auto:${selectedTable}|${selectedTarget}|${selectedTime}`;
       if (autoFetchRef.current === key) return;
-      autoFetchRef.current = key;
-      const timer = setTimeout(() => fetchForecast(), 500);
+      const timer = setTimeout(() => {
+        autoFetchRef.current = key;
+        fetchForecast();
+      }, 500);
       return () => clearTimeout(timer);
     }
   }, [connectionStatus, elig, selectedTarget, hasInsightPredictions, fetchForecast, pendingCtx, ctxApplied]);
