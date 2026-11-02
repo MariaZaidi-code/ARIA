@@ -432,7 +432,6 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
               const ranked = [...factors].sort((a, b) => rankScore(b) - rankScore(a));
               const top = ranked[0];
               const topName = top ? strOf(top?.factor || top?.name) : "";
-              const verdictRaw = strOf(h?.verdict || h?.status || "").toLowerCase();
               const verdictWord = "Pattern to investigate";
               return (
                 <>
