@@ -6,6 +6,8 @@ causality. Counterevidence must be measured, not a missing-data caveat.
 
 from __future__ import annotations
 
+import math
+
 ORDER = ["Strong evidence", "Moderate evidence", "Limited evidence",
          "Insufficient evidence", "Contradictory evidence"]
 
@@ -65,7 +67,7 @@ def assess_observed_pattern(kind: str, pattern: dict | None) -> dict:
             vals = [float(x["value"]) for x in points]
         except (KeyError, TypeError, ValueError):
             return out
-        if not all(__import__("math").isfinite(v) for v in vals):
+        if not all(math.isfinite(v) for v in vals):
             return out
         high, low = max(vals), min(vals)
         if high <= 0:
@@ -99,7 +101,7 @@ def assess_observed_pattern(kind: str, pattern: dict | None) -> dict:
             vals = [float(x["value"]) for x in points]
         except (KeyError, TypeError, ValueError):
             return out
-        if not all(__import__("math").isfinite(v) for v in vals):
+        if not all(math.isfinite(v) for v in vals):
             return out
         cut = max(1, len(vals) // 2)
         early, late = sum(vals[:cut]), sum(vals[cut:])
