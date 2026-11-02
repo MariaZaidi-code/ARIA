@@ -759,18 +759,27 @@ def _document_candidates(question, metric, documents):
     """Document passages as Limited-evidence candidates (never higher)."""
     scored = []
     for doc in documents or []:
-        for ch in (doc.get("chunks") or [])[:20]:
+        if not isinstance(doc, dict):
+            continue
+        # Session storage supplies one flat {text, page} record per chunk,
+        # while callers may supply a document containing a chunks list.
+        chunks = doc.get("chunks")
+        if not chunks and doc.get("text"):
+            chunks = [doc]
+        for ch in (chunks or [])[:20]:
             text = ch.get("text", "") if isinstance(ch, dict) else str(ch)
+            if not text.strip():
+                continue
             s = _doc_score(question + " " + str(metric), text)
             if s > 0:
-                scored.append((s, doc, text))
+                page = ch.get("page", doc.get("page")) if isinstance(ch, dict) else doc.get("page")
+                scored.append((s, doc, text, page))
     if not scored:
         return []
     scored.sort(key=lambda t: t[0], reverse=True)
-    s, doc, text = scored[0]
+    s, doc, text, page = scored[0]
     snippet = " ".join(text.split())[:350]
     fname = doc.get("filename", "document")
-    page = doc.get("page")
     label = f"{fname}" + (f" p.{page}" if page is not None else "")
     return [{
         "title": "External factor mentioned in documents",
