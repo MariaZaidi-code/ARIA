@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,9 @@ def document_upload(monkeypatch):
     class MetadataStore:
         def __init__(self, _user_id):
             pass
+
+        def mutation_lock(self):
+            return nullcontext()
 
         def get_document(self, document_id):
             return stored if document_id == stored["document_id"] else None

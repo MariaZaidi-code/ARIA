@@ -1,15 +1,22 @@
-import { useState, useRef, useEffect, useMemo } from "react";
-import { Send, Plus, MoreHorizontal, Sparkles } from "lucide-react";
+import { useState, useRef, useEffect, useMemo, useCallback } from "react";
+import {
+  Send, Plus, MoreHorizontal, Sparkles, Search, Trash2, PanelLeft, Copy, Check,
+  RotateCcw, AlertTriangle, MessageSquare, User,
+} from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, LineChart, Line, PieChart, Pie, Cell } from "recharts";
 import { useTheme } from "../App";
 import Evidence from "../components/Evidence";
 import AIProcessingIndicator from "../components/AIProcessingIndicator";
 import { BizTooltip } from "../components/charts";
+import { DocumentAnswer } from "../components/documents/DocumentAnswer";
+import { ConfirmDialog } from "../components/documents/ConfirmDialog";
 import { colorForName } from "../lib/charts";
 import { fmtBiz } from "../lib/format";
 import { apiFetch, AI_ANSWER_TIMEOUT_MS } from "../../services/api";
 import { KEYS, storage, sessionStore } from "../../utils/storage";
 import { useReadOnly, READ_ONLY_HINT } from "../lib/readonly";
+import "../components/documents/documents-ui.css";
+import "./Copilot.css";
 
 type Message = {
   id: string;
@@ -21,6 +28,10 @@ type Message = {
   providerFailed?: boolean;
   rows?: Record<string, any>[];
   chart?: { type: string; x: string; y: string; reason?: string } | null;
+  /** The request failed (network/server); the bubble offers "Try again". */
+  error?: boolean;
+  /** Question this reply answered, so a failed reply can be retried. */
+  question?: string;
 };
 
 /** Provider/LLM failure signals in a copilot payload or error text. */
@@ -35,6 +46,9 @@ interface Conversation {
   subtitle: string;
   date: string;
   messages: Message[];
+  // Epoch ms; absent on chats saved before the redesign (grouped as "Earlier").
+  createdAt?: number;
+  updatedAt?: number;
 }
 
 const FALLBACK_SUGGESTIONS = [
@@ -43,6 +57,49 @@ const FALLBACK_SUGGESTIONS = [
   "Which categories have the most records?",
   "What trends do you see in the data?",
 ];
+
+const NEW_TITLE = "New conversation";
+const MAX_QUESTION = 4000; // matches CopilotRequest.question max_length
+const DAY = 86_400_000;
+
+const clock = () => new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const titleFrom = (text: string) => {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > 48 ? `${flat.slice(0, 48).trimEnd()}…` : flat;
+};
+
+/** One-line preview without Markdown markers (bold, bullets, headings, table pipes). */
+function plainPreview(text: string): string {
+  return text
+    .replace(/^\s{0,3}(?:#{1,6}|[-*•]|\d+[.)])\s+/gm, "")
+    .replace(/\*\*|__|`/g, "")
+    .replace(/\|/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function relativeTime(ts?: number): string {
+  if (!ts) return "";
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return "Just now";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} min ago`;
+  const date = new Date(ts);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  if (ts >= today.getTime()) return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (ts >= today.getTime() - DAY) return "Yesterday";
+  return date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function historyGroup(ts?: number): string {
+  if (!ts) return "Earlier";
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const start = today.getTime();
+  if (ts >= start) return "Today";
+  if (ts >= start - DAY) return "Yesterday";
+  if (ts >= start - 7 * DAY) return "Previous 7 days";
+  return "Older";
+}
+const GROUP_ORDER = ["Today", "Yesterday", "Previous 7 days", "Older", "Earlier"];
 
 // Render the chart-ready payload returned by the backend as a fully
 // interactive chart (hover tooltips, axis formatting). The type is chosen
@@ -124,6 +181,28 @@ function renderChart(msg: Message, isDark?: boolean) {
   );
 }
 
+/** Copy-to-clipboard with a short "Copied" confirmation. */
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+  return (
+    <button
+      type="button"
+      className="cpl-copy"
+      aria-label={copied ? "Answer copied" : "Copy answer"}
+      onClick={async () => {
+        try { await navigator.clipboard.writeText(text); setCopied(true); } catch { /* clipboard blocked */ }
+      }}
+    >
+      {copied ? <Check size={11} /> : <Copy size={11} />} {copied ? "Copied" : "Copy"}
+    </button>
+  );
+}
+
 export default function Copilot({ initialQuestion = "", analysisResult = null, goalResult = null }: { initialQuestion?: string; analysisResult?: any; goalResult?: any }) {
   void analysisResult; void goalResult;
   const { isDark } = useTheme();
@@ -155,15 +234,23 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
   const [conversations, setConversations] = useState<Conversation[]>(loadChats);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [input, setInput] = useState("");
-  const [isTyping, setIsTyping] = useState(false);
+  // Conversation awaiting an answer (one request at a time).
+  const [pendingId, setPendingId] = useState<string | null>(null);
   // Lifecycle-driven AI stage (real request milestones, never timers):
   // 0 = request sent · 1 = response headers arrived · 2 = payload parsed,
-  // rendering the answer. Unmounted when isTyping flips false.
+  // rendering the answer. Unmounted when the request settles.
   const [copilotStage, setCopilotStage] = useState(0);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [toDelete, setToDelete] = useState<Conversation | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const consumedPrefill = useRef("");
 
   const active = conversations.find((c) => c.id === activeId) || conversations[0] || null;
+  const isTyping = pendingId !== null && pendingId === active?.id;
 
   // Persist on every change (trimmed: 10 chats, 30 messages each, 24 rows).
   // Versioned key + quota-guarded write; overflow stays session-only.
@@ -180,54 +267,55 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
   }, [conversations]);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [active?.messages.length, isTyping]);
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [active?.id, active?.messages.length, isTyping]);
 
-  // Handoff from other pages ("Ask ARIA" buttons): prefill once per
-  // distinct question and send it, so the conversation continues here.
+  // Grow the composer with its content (capped by CSS max-height).
   useEffect(() => {
-    const q = (initialQuestion || "").trim();
-    if (q && consumedPrefill.current !== q) {
-      consumedPrefill.current = q;
-      setInput(q);
-      send(q);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialQuestion]);
+    const box = inputRef.current;
+    if (!box) return;
+    box.style.height = "auto";
+    box.style.height = `${Math.min(box.scrollHeight, 168)}px`;
+  }, [input]);
 
-  const send = async (text?: string) => {
-    const content = text || input;
-    if (readOnly || !content.trim()) return;
-    setInput("");
-
-    let targetId = activeId;
-    if (!targetId || !conversations.find(c => c.id === targetId)) {
-      const id = `c${Date.now()}`;
-      const newConv: Conversation = {
-        id,
-        title: content.length > 30 ? content.substring(0, 30) + "..." : content,
-        subtitle: "Just now",
-        date: "Today",
-        messages: [],
-      };
-      setConversations(prev => [newConv, ...prev]);
-      targetId = id;
-      setActiveId(id);
-    }
-
-    const userMsg: Message = {
-      id: Date.now().toString(),
-      role: "user",
-      content,
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+  // Options menu: close on outside click or Escape.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) setMenuOpen(false);
     };
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setMenuOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [menuOpen]);
 
-    setConversations((prev) =>
-      prev.map((c) => c.id === targetId ? { ...c, messages: [...c.messages, userMsg] } : c)
-    );
-    setIsTyping(true);
+  // History drawer (tablet/phone): Escape closes it.
+  useEffect(() => {
+    if (!historyOpen) return;
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setHistoryOpen(false); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [historyOpen]);
+
+  /** Apply a change to one conversation and move it to the top (most recent). */
+  const touch = useCallback((id: string, change: (c: Conversation) => Conversation) => {
+    setConversations((prev) => {
+      const target = prev.find((c) => c.id === id);
+      if (!target) return prev; // deleted while the answer was pending
+      const updated = { ...change(target), updatedAt: Date.now() };
+      return [updated, ...prev.filter((c) => c.id !== id)];
+    });
+  }, []);
+
+  /** Ask the backend and append the assistant reply to ``targetId``. */
+  const request = async (targetId: string, content: string) => {
+    setPendingId(targetId);
     setCopilotStage(0);
-
+    let reply: Message;
     try {
       // Chart context stashed by Decision Center / other pages (§38): measured
       // evidence travels with the question so Copilot answers about THIS chart.
@@ -246,152 +334,311 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
       setCopilotStage(1);
       // Payload parsed — building the answer rendering.
       setCopilotStage(2);
-      const reply: Message = {
-        id: (Date.now() + 1).toString(),
+      reply = {
+        id: `${Date.now()}-a`,
         role: "assistant",
         content: data.answer || data.detail || "I couldn't generate a response.",
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        timestamp: clock(),
         sql: data.sql || null,
         provider: data.provider || null,
         providerFailed: !data.ok && isProviderFailure(data),
         rows: Array.isArray(data.data) ? data.data : [],
         chart: data.chart || null,
+        question: content,
       };
-      setConversations((prev) =>
-        prev.map((c) => c.id === targetId ? { ...c, messages: [...c.messages, reply] } : c)
-      );
     } catch {
-      const reply: Message = {
-        id: (Date.now() + 1).toString(),
+      reply = {
+        id: `${Date.now()}-a`,
         role: "assistant",
-        content: "Sorry, I encountered an error. Please try again.",
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        content: "I couldn't get an answer just now. Check your connection or AI engine, then try again.",
+        timestamp: clock(),
+        error: true,
+        question: content,
       };
-      setConversations((prev) =>
-        prev.map((c) => c.id === targetId ? { ...c, messages: [...c.messages, reply] } : c)
-      );
-    } finally {
-      setIsTyping(false);
     }
+    touch(targetId, (c) => ({ ...c, messages: [...c.messages, reply] }));
+    setPendingId(null);
   };
+
+  const send = async (text?: string) => {
+    const content = (text ?? input).trim();
+    if (readOnly || !content || pendingId || content.length > MAX_QUESTION) return;
+    setInput("");
+
+    let targetId = active?.id || null;
+    if (!targetId) {
+      const now = Date.now();
+      const id = `c${now}`;
+      setConversations((prev) => [{
+        id, title: titleFrom(content), subtitle: "", date: "", messages: [], createdAt: now, updatedAt: now,
+      }, ...prev]);
+      targetId = id;
+    }
+    setActiveId(targetId);
+
+    const userMsg: Message = { id: `${Date.now()}-u`, role: "user", content, timestamp: clock() };
+    touch(targetId, (c) => ({
+      ...c,
+      title: !c.messages.length && (c.title === NEW_TITLE || !c.title) ? titleFrom(content) : c.title,
+      messages: [...c.messages, userMsg],
+    }));
+    await request(targetId, content);
+  };
+
+  /** Drop a failed reply and ask the same question again. */
+  const retry = async (conversationId: string, msg: Message) => {
+    if (!msg.question || pendingId || readOnly) return;
+    touch(conversationId, (c) => ({ ...c, messages: c.messages.filter((m) => m.id !== msg.id) }));
+    await request(conversationId, msg.question);
+  };
+
+  const switchToLocalAndRetry = async (conversationId: string, msg: Message) => {
+    try {
+      await apiFetch("/provider/switch", {
+        method: "POST",
+        body: JSON.stringify({ provider: "local" }),
+      });
+    } catch { /* best-effort; the retry reports its own outcome */ }
+    await retry(conversationId, msg);
+  };
+
+  // Handoff from other pages ("Ask ARIA" buttons): send once per distinct
+  // question, so the conversation continues here.
+  useEffect(() => {
+    const q = (initialQuestion || "").trim();
+    if (q && consumedPrefill.current !== q) {
+      consumedPrefill.current = q;
+      send(q);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialQuestion]);
 
   const newChat = () => {
-    const id = `c${Date.now()}`;
-    setConversations((prev) => [{ id, title: "New conversation", subtitle: "Just now", date: "Today", messages: [] }, ...prev]);
-    setActiveId(id);
     setMenuOpen(false);
+    setHistoryOpen(false);
+    // Reuse an untouched empty chat instead of stacking blank ones.
+    const blank = conversations.find((c) => !c.messages.length);
+    if (blank) {
+      setActiveId(blank.id);
+    } else {
+      const now = Date.now();
+      const id = `c${now}`;
+      setConversations((prev) => [{ id, title: NEW_TITLE, subtitle: "", date: "", messages: [], createdAt: now, updatedAt: now }, ...prev]);
+      setActiveId(id);
+    }
     refreshSuggestions();
+    window.setTimeout(() => inputRef.current?.focus(), 0);
   };
 
-  const deleteActiveChat = () => {
-    if (!activeId) return;
-    setConversations((prev) => prev.filter((c) => c.id !== activeId));
-    setActiveId(null);
+  const deleteConversation = (id: string) => {
+    setConversations((prev) => prev.filter((c) => c.id !== id));
+    if (active?.id === id) setActiveId(null);
+    setToDelete(null);
     setMenuOpen(false);
   };
 
-  const [menuOpen, setMenuOpen] = useState(false);
+  const openConversation = (id: string) => {
+    setActiveId(id);
+    setHistoryOpen(false);
+  };
+
+  const groups = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    const matches = conversations.filter((c) => !needle
+      || c.title.toLowerCase().includes(needle)
+      || c.messages.some((m) => m.content.toLowerCase().includes(needle)));
+    const byGroup = new Map<string, Conversation[]>();
+    for (const conv of matches) {
+      const key = historyGroup(conv.updatedAt);
+      byGroup.set(key, [...(byGroup.get(key) || []), conv]);
+    }
+    return GROUP_ORDER.filter((g) => byGroup.has(g)).map((g) => ({ label: g, items: byGroup.get(g)! }));
+  }, [conversations, query]);
+
+  const lastProvider = active
+    ? [...active.messages].reverse().find((m) => m.role === "assistant" && m.provider)?.provider
+    : null;
+  const tooLong = input.length > MAX_QUESTION;
+  const canSend = !readOnly && !pendingId && !!input.trim() && !tooLong;
+  const showWelcome = !active || (!active.messages.length && !isTyping);
 
   return (
-    <div className="flex h-full">
-      {/* Conversation list */}
-      <div className="w-64 border-r border-border bg-card/80 backdrop-blur-sm flex flex-col flex-shrink-0">
-        <div className="px-3 py-3 border-b border-border">
-          <div className="flex items-center justify-between mb-2">
-            <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Conversations</p>
-            <button onClick={newChat} className="premium-btn p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground transition-all duration-150">
-              <Plus size={13} />
-            </button>
+    <div className={`cpl-page${historyOpen ? " history-open" : ""}`}>
+      <div className="cpl-backdrop" onClick={() => setHistoryOpen(false)} aria-hidden="true" />
+
+      {/* Conversation history */}
+      <aside className="cpl-sidebar" aria-label="Conversation history">
+        <div className="cpl-sidebar-head">
+          <div className="cpl-sidebar-title">
+            <h2>Conversations</h2>
           </div>
+          <button type="button" className="cpl-new-chat" onClick={newChat}>
+            <Plus size={15} /> New chat
+          </button>
+          {conversations.length > 0 && (
+            <label className="cpl-search">
+              <Search size={13} />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search conversations"
+                aria-label="Search conversations"
+              />
+            </label>
+          )}
         </div>
-        <div className="flex-1 overflow-y-auto custom-scroll">
-          {conversations.map((conv) => (
-            <button key={conv.id} onClick={() => setActiveId(conv.id)}
-              className={`w-full text-left px-3 py-3 border-b border-border/50 transition-all duration-150 ${conv.id === activeId ? "bg-primary/8 border-l-2 border-l-primary" : "hover:bg-secondary/50 border-l-2 border-l-transparent"}`}>
-              <p className="text-sm font-medium text-foreground truncate">{conv.title}</p>
-              <p className="text-[11px] text-muted-foreground truncate mt-0.5">{conv.subtitle}</p>
-              <p className="text-[10px] text-muted-foreground/60 mt-0.5">{conv.date}</p>
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Chat area */}
-      <div className="flex-1 flex flex-col min-w-0">
-        {active ? (
-          <>
-            <div className="px-5 py-3 border-b border-border flex items-center justify-between flex-shrink-0">
-              <div>
-                <p className="text-sm font-semibold text-foreground">{active.title}</p>
-                <p className="text-[11px] text-muted-foreground">
-                  {active.subtitle}
-                  {(() => {
-                    const lastAssistant = [...active.messages].reverse().find(m => m.role === "assistant" && m.provider);
-                    return lastAssistant?.provider ? ` · ${lastAssistant.provider} mode` : "";
-                  })()}
-                </p>
-              </div>
-              <div className="relative">
-                <button
-                  onClick={() => setMenuOpen((o) => !o)}
-                  aria-label="Conversation options"
-                  className="p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  <MoreHorizontal size={14} />
-                </button>
-                {menuOpen && (
-                  <div className="absolute right-0 top-9 w-44 bg-card border border-border rounded-xl shadow-lg py-1 z-50">
-                    <button
-                      onClick={newChat}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-xs text-foreground hover:bg-secondary transition-colors"
-                    >
-                      <Plus size={13} /> New chat
-                    </button>
-                    <button
-                      onClick={deleteActiveChat}
-                      className="w-full flex items-center gap-2.5 px-3 py-2 text-xs text-negative hover:bg-secondary transition-colors"
-                    >
-                      Delete conversation
-                    </button>
-                  </div>
-                )}
-              </div>
+        <nav className="cpl-history custom-scroll" aria-label="Saved conversations">
+          {conversations.length === 0 ? (
+            <div className="cpl-history-empty">
+              <strong>No conversations yet</strong>
+              Your chats with ARIA will appear here.
             </div>
-
-            <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4 custom-scroll">
-              {active.messages.length === 0 && !isTyping && (
-                <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in">
-                  <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center mb-3">
-                    <Sparkles size={18} className="text-primary" />
+          ) : groups.length === 0 ? (
+            <div className="cpl-history-empty">
+              <strong>No matches</strong>
+              No conversation mentions “{query.trim()}”.
+            </div>
+          ) : groups.map((group) => (
+            <section className="cpl-history-group" key={group.label}>
+              <h3>{group.label}</h3>
+              {group.items.map((conv) => {
+                const last = conv.messages[conv.messages.length - 1];
+                const preview = last
+                  ? `${last.role === "user" ? "You: " : ""}${plainPreview(last.content)}`
+                  : "No messages yet";
+                const when = relativeTime(conv.updatedAt) || conv.date;
+                return (
+                  <div key={conv.id} className={`cpl-history-item${conv.id === active?.id ? " active" : ""}`}>
+                    <button
+                      type="button"
+                      className="cpl-history-open"
+                      onClick={() => openConversation(conv.id)}
+                      aria-current={conv.id === active?.id ? "true" : undefined}
+                    >
+                      <strong>{conv.title || NEW_TITLE}</strong>
+                      <span>{preview}</span>
+                      <small>
+                        {[when, conv.messages.length ? `${conv.messages.length} message${conv.messages.length === 1 ? "" : "s"}` : ""]
+                          .filter(Boolean).join(" · ")}
+                      </small>
+                    </button>
+                    <button
+                      type="button"
+                      className="cpl-history-delete"
+                      aria-label={`Delete conversation ${conv.title || NEW_TITLE}`}
+                      onClick={() => setToDelete(conv)}
+                    >
+                      <Trash2 size={13} />
+                    </button>
                   </div>
-                  <p className="text-sm font-medium text-foreground">ARIA Copilot</p>
-                  <p className="text-xs text-muted-foreground mt-1">Ask me anything about your data</p>
+                );
+              })}
+            </section>
+          ))}
+        </nav>
+      </aside>
+
+      {/* Chat */}
+      <section className="cpl-main" aria-label="Copilot chat">
+        <header className="cpl-header">
+          <button
+            type="button"
+            className="cpl-icon-button cpl-history-toggle"
+            aria-label="Show conversation history"
+            aria-expanded={historyOpen}
+            onClick={() => setHistoryOpen(true)}
+          >
+            <PanelLeft size={16} />
+          </button>
+          <div className="cpl-header-text">
+            <h2>{active && active.messages.length ? active.title : "ARIA Copilot"}</h2>
+            <p>
+              {active && active.messages.length
+                ? [relativeTime(active.updatedAt) || active.subtitle, lastProvider ? `${lastProvider} mode` : ""].filter(Boolean).join(" · ")
+                : "Ask questions about your connected data"}
+            </p>
+          </div>
+          {active && (
+            <div className="cpl-menu-wrap" ref={menuRef}>
+              <button
+                type="button"
+                className="cpl-icon-button"
+                onClick={() => setMenuOpen((o) => !o)}
+                aria-label="Conversation options"
+                aria-haspopup="menu"
+                aria-expanded={menuOpen}
+              >
+                <MoreHorizontal size={16} />
+              </button>
+              {menuOpen && (
+                <div className="cpl-menu" role="menu">
+                  <button type="button" role="menuitem" onClick={newChat}>
+                    <Plus size={14} /> New chat
+                  </button>
+                  <button type="button" role="menuitem" className="danger" onClick={() => { setMenuOpen(false); setToDelete(active); }}>
+                    <Trash2 size={14} /> Delete conversation
+                  </button>
                 </div>
               )}
+            </div>
+          )}
+        </header>
 
-              {active.messages.map((msg) =>
+        <div className="cpl-messages custom-scroll">
+          {showWelcome ? (
+            <div className="cpl-welcome">
+              <span className="cpl-welcome-icon"><Sparkles size={24} /></span>
+              <h2>ARIA Copilot</h2>
+              <p>Ask anything about your connected data. I can summarise it, compare groups, spot trends and show the evidence behind each answer.</p>
+              <div className="cpl-suggestions">
+                {suggestions.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    className="cpl-suggestion"
+                    onClick={() => send(s)}
+                    disabled={readOnly || !!pendingId}
+                    title={readOnly ? READ_ONLY_HINT : undefined}
+                  >
+                    <MessageSquare size={14} /> {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="cpl-thread" role="log" aria-live="polite" aria-label="Conversation">
+              {active!.messages.map((msg) =>
                 msg.role === "assistant" ? (
-                  <div key={msg.id} className="flex items-start gap-2.5 max-w-2xl animate-slide-in-left">
-                    <div className="flex-shrink-0 w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center mt-0.5">
-                      <Sparkles size={11} className="text-primary" />
-                    </div>
-                    <div className="flex-1 space-y-1.5">
-                      <div className="bg-card/90 border border-border/80 rounded-2xl rounded-tl-md px-4 py-3 shadow-sm backdrop-blur-sm">
-                        <p className="text-[13px] text-foreground leading-relaxed">{msg.content}</p>
-                        {(msg as any).providerFailed && (
-                          <button
-                            onClick={async () => {
-                              try {
-                                await apiFetch("/provider/switch", {
-                                  method: "POST",
-                                  body: JSON.stringify({ provider: "local" }),
-                                });
-                              } catch { /* best-effort; user can retry regardless */ }
-                            }}
-                            className="mt-2 inline-flex items-center gap-1.5 text-[12px] font-semibold text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/25 rounded-lg px-3 py-1.5 hover:bg-blue-50 dark:hover:bg-blue-500/10"
-                          >
-                            Switch to on-device AI and retry your question
-                          </button>
+                  <div key={msg.id} className="cpl-row assistant">
+                    <span className="cpl-avatar assistant" aria-hidden="true"><Sparkles size={14} /></span>
+                    <div className="cpl-bubble-wrap">
+                      <div className={`cpl-bubble assistant${msg.error ? " error" : ""}`}>
+                        {msg.error && (
+                          <div className="cpl-error-title"><AlertTriangle size={13} /> Something went wrong</div>
+                        )}
+                        <DocumentAnswer text={msg.content} />
+                        {(msg.error || msg.providerFailed) && msg.question && (
+                          <div className="cpl-bubble-actions">
+                            {msg.providerFailed ? (
+                              <button
+                                type="button"
+                                className="cpl-action"
+                                disabled={!!pendingId || readOnly}
+                                onClick={() => switchToLocalAndRetry(active!.id, msg)}
+                              >
+                                <RotateCcw size={12} /> Switch to on-device AI and retry your question
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className="cpl-action"
+                                disabled={!!pendingId || readOnly}
+                                onClick={() => retry(active!.id, msg)}
+                              >
+                                <RotateCcw size={12} /> Try again
+                              </button>
+                            )}
+                          </div>
                         )}
                         {renderChart(msg, isDark)}
                         {msg.sql && (
@@ -409,82 +656,93 @@ export default function Copilot({ initialQuestion = "", analysisResult = null, g
                           </div>
                         )}
                       </div>
-                      <p className="text-[10px] text-muted-foreground px-1">{msg.timestamp}</p>
+                      <div className="cpl-meta">
+                        <span>{msg.timestamp}</span>
+                        {!msg.error && <CopyButton text={msg.content} />}
+                      </div>
                     </div>
                   </div>
                 ) : (
-                  <div key={msg.id} className="flex items-start gap-2.5 max-w-2xl ml-auto flex-row-reverse animate-slide-in-right">
-                    <div className="flex-shrink-0 w-6 h-6 rounded-full bg-primary/20 flex items-center justify-center text-[10px] font-semibold text-primary mt-0.5">A</div>
-                    <div className="space-y-1">
-                      <div
-                        className="rounded-2xl rounded-tr-md px-4 py-3 shadow-md text-white"
-                        style={{ background: "var(--gradient-primary)" }}
-                      >
-                        <p className="text-[13px] leading-relaxed">{msg.content}</p>
-                      </div>
-                      <p className="text-[10px] text-muted-foreground px-1 text-right">{msg.timestamp}</p>
+                  <div key={msg.id} className="cpl-row user">
+                    <span className="cpl-avatar user" aria-hidden="true"><User size={14} /></span>
+                    <div className="cpl-bubble-wrap">
+                      <div className="cpl-bubble user">{msg.content}</div>
+                      <div className="cpl-meta"><span>{msg.timestamp}</span></div>
                     </div>
                   </div>
-                )
+                ),
               )}
 
               {isTyping && (
-                <div className="px-1 py-1 max-w-2xl">
-                  <AIProcessingIndicator compact stage={copilotStage} />
-                </div>
-              )}
-              {isTyping && (
-                <div className="flex items-start gap-2.5 max-w-2xl animate-slide-in-left">
-                  <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center">
-                    <Sparkles size={11} className="text-primary" />
-                  </div>
-                  <div className="bg-card/90 border border-border/80 rounded-2xl rounded-tl-md px-4 py-3 shadow-sm backdrop-blur-sm flex items-center gap-1.5">
-                    <span className="typing-dot" />
-                    <span className="typing-dot" />
-                    <span className="typing-dot" />
+                <div className="cpl-row assistant" aria-label="ARIA is thinking">
+                  <span className="cpl-avatar assistant" aria-hidden="true"><Sparkles size={14} /></span>
+                  <div className="cpl-bubble-wrap">
+                    <div className="cpl-bubble assistant cpl-thinking">
+                      <span className="cpl-dots" aria-hidden="true">
+                        <span className="typing-dot" />
+                        <span className="typing-dot" />
+                        <span className="typing-dot" />
+                      </span>
+                      <AIProcessingIndicator compact stage={copilotStage} />
+                    </div>
                   </div>
                 </div>
               )}
               <div ref={endRef} />
             </div>
-          </>
-        ) : (
-          <div className="flex-1 flex flex-col items-center justify-center text-center animate-fade-in">
-            <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center mb-4">
-              <Sparkles size={22} className="text-primary" />
-            </div>
-            <p className="text-base font-medium text-foreground">ARIA Copilot</p>
-            <p className="text-sm text-muted-foreground mt-1.5 max-w-xs">Ask me anything about your connected data. I can help you analyze, explore, and understand your information.</p>
-          </div>
-        )}
-
-        {/* Suggestion chips */}
-        <div className="px-5 pb-2 flex flex-wrap gap-1.5">
-          {suggestions.map((s) => (
-            <button key={s} onClick={() => send(s)} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
-              className="text-[11px] px-2.5 py-1 bg-secondary border border-border rounded-full text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors disabled:opacity-50">
-              {s}
-            </button>
-          ))}
-        </div>
-
-        {/* Input */}
-        <div className="px-5 pb-4 flex-shrink-0">
-          <div className="flex items-end gap-2 bg-card border border-border rounded-xl px-3.5 py-2.5 focus-within:border-primary/50 transition-colors">
-            <input value={input} onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-              placeholder={readOnly ? "Read-only on mobile — ask ARIA on desktop." : "Ask ARIA anything about your data..."}
-              className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none" />
-            <button onClick={() => send()} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
-              className={`p-1.5 rounded-lg transition-all disabled:opacity-50 ${input.trim() && !readOnly ? "bg-primary text-primary-foreground hover:opacity-90" : "bg-secondary text-muted-foreground"}`}>
-              <Send size={13} />
-            </button>
-          </div>
-          {readOnly && (
-            <p className="mt-2 text-[11px] text-amber-700 dark:text-amber-400">Copilot is read-only on mobile — open ARIA on desktop to ask questions.</p>
           )}
         </div>
-      </div>
+
+        {/* Composer */}
+        <div className="cpl-composer">
+          <div className="cpl-composer-inner">
+            <div className="cpl-input-box">
+              <textarea
+                ref={inputRef}
+                rows={1}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); }
+                }}
+                placeholder={readOnly ? "Read-only on mobile — ask ARIA on desktop." : "Ask ARIA anything about your data..."}
+                aria-label="Message ARIA Copilot"
+                disabled={readOnly}
+              />
+              <button
+                type="button"
+                className="cpl-send"
+                onClick={() => send()}
+                disabled={!canSend}
+                aria-label={pendingId ? "Waiting for ARIA's answer" : "Send question"}
+                title={readOnly ? READ_ONLY_HINT : undefined}
+              >
+                <Send size={15} />
+              </button>
+            </div>
+            <div className="cpl-composer-hint">
+              <span className="keys">{pendingId ? "ARIA is working on your question…" : "Enter to send · Shift + Enter for a new line"}</span>
+              {input.length > MAX_QUESTION - 500 && (
+                <span className={tooLong ? "over" : undefined}>
+                  {input.length.toLocaleString()} / {MAX_QUESTION.toLocaleString()}
+                </span>
+              )}
+            </div>
+            {readOnly && (
+              <p className="cpl-readonly">Copilot is read-only on mobile — open ARIA on desktop to ask questions.</p>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {toDelete && (
+        <ConfirmDialog
+          title="Delete this conversation?"
+          message={`“${toDelete.title || NEW_TITLE}” and its messages will be removed from this device.`}
+          onConfirm={() => deleteConversation(toDelete.id)}
+          onCancel={() => setToDelete(null)}
+        />
+      )}
     </div>
   );
 }

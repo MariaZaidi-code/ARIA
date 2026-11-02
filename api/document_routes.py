@@ -25,7 +25,7 @@ from core.errors import sanitize_error
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-DOCUMENT_SUMMARY_VERSION = 3
+DOCUMENT_SUMMARY_VERSION = 4
 
 
 # ── Canonical RAG adapter ─────────────────────────────────────────────
@@ -60,42 +60,69 @@ class _CanonicalRAGAdapter:
         document_ids: list[str] | None = None,
         k: int = 10,
     ) -> list[dict]:
-        """Search the canonical vector index, with an offline lexical fallback."""
-        results = []
+        """Hybrid search: pgvector dense + BM25 lexical fused with RRF.
+
+        Uses the same fusion as the chat pipeline so search results and chat
+        evidence rank consistently. When the vector store is unavailable the
+        saved chunks are ranked lexically (``score_type == "bm25"``).
+        Quarantined (instruction-like) chunks are never returned.
+        """
+        from insight_rag.config import RETRIEVAL_FETCH_K
+
+        k = max(1, int(k))
+        fetch_k = max(k, RETRIEVAL_FETCH_K)
+        dense = []
         try:
             store = self._get_vector_store(self.user_id)
-            results = store.search(query, k=k, document_ids=document_ids)
+            dense = store.search(query, k=fetch_k, document_ids=document_ids) or []
         except Exception as exc:
             logger.warning("Canonical RAG search failed: %s", type(exc).__name__)
-        if results:
-            out: list[dict] = []
-        else:
-            out = self._search_local_chunks(query, document_ids=document_ids, k=k)
-            if out:
-                return out
-        out = []
-        for doc, score in results:
-            meta = doc.metadata if hasattr(doc, "metadata") else {}
-            out.append({
-                "chunk_id": meta.get("chunk_id", ""),
-                "document_id": meta.get("document_id", ""),
-                "content": doc.page_content[:500] if hasattr(doc, "page_content") else "",
-                "score": round(float(score), 6),
-                "page_number": meta.get("page", meta.get("page_number")),
-                "section": meta.get("section"),
-                "content_type": meta.get("content_type", "text"),
-                "filename": meta.get("filename"),
-            })
+        lexical = self._lexical_chunks(query, document_ids=document_ids, limit=fetch_k)
+        if not dense:
+            return [self._result(chunk, score=chunk.metadata["retrieval_bm25_score"], score_type="bm25")
+                    for chunk in lexical[:k]]
+
+        from insight_rag.service import InsightPDFRAG, _split_quarantined
+        fused, _quarantined = _split_quarantined(InsightPDFRAG._hybrid_rrf(query, dense, lexical))
+        return [self._result(doc, score=doc.metadata.get("retrieval_hybrid_score", 0.0),
+                             score_type="hybrid_rrf")
+                for doc in fused[:k]]
+
+    @staticmethod
+    def _result(doc, *, score, score_type: str) -> dict:
+        meta = dict(getattr(doc, "metadata", None) or {})
+        out = {
+            "chunk_id": meta.get("chunk_id", ""),
+            "document_id": meta.get("document_id", ""),
+            "content": (getattr(doc, "page_content", "") or "")[:500],
+            # Higher is better for every score_type ("hybrid_rrf" or "bm25").
+            "score": round(float(score), 8),
+            "score_type": score_type,
+            "page_number": meta.get("page", meta.get("page_number")),
+            "section": meta.get("section"),
+            "content_type": meta.get("content_type", "text"),
+            "filename": meta.get("filename"),
+        }
+        for source_key, out_key in (
+            ("retrieval_dense_distance", "dense_distance"),
+            ("retrieval_dense_rank", "dense_rank"),
+            ("retrieval_bm25_score", "bm25_score"),
+            ("retrieval_lexical_rank", "lexical_rank"),
+            ("retrieval_channel_votes", "channel_votes"),
+        ):
+            if meta.get(source_key) is not None:
+                out[out_key] = meta[source_key]
+        try:
+            from insight_rag.locations import source_location
+            out.update(source_location(meta))
+        except Exception:
+            pass
         return out
 
-    def _search_local_chunks(
-        self,
-        query: str,
-        document_ids: list[str] | None = None,
-        k: int = 10,
-    ) -> list[dict]:
-        """Rank saved chunks lexically when the remote vector store is absent."""
+    def _lexical_chunks(self, query: str, document_ids: list[str] | None = None, limit: int = 10):
+        """BM25-rank the user's saved chunks (scoped, quarantine-filtered)."""
         from insight_rag.retrieval import bm25_search
+        from insight_rag.service import _doc_is_quarantined
         from insight_rag.storage import RAGMetadataStore
 
         metadata = RAGMetadataStore(self.user_id)
@@ -109,22 +136,20 @@ class _CanonicalRAGAdapter:
                 chunk.metadata = dict(chunk.metadata or {})
                 chunk.metadata["document_id"] = document_id
                 chunk.metadata.setdefault("filename", record.get("filename"))
+                if _doc_is_quarantined(chunk):
+                    continue
                 chunks.append(chunk)
+        return bm25_search(query, chunks, limit=max(1, int(limit)))
 
-        ranked = bm25_search(query, chunks, limit=max(1, int(k)))
-        return [
-            {
-                "chunk_id": chunk.metadata.get("chunk_id", ""),
-                "document_id": chunk.metadata.get("document_id", ""),
-                "content": chunk.page_content[:500],
-                "score": float(chunk.metadata["retrieval_bm25_score"]),
-                "page_number": chunk.metadata.get("page", chunk.metadata.get("page_number")),
-                "section": chunk.metadata.get("section"),
-                "content_type": chunk.metadata.get("content_type", "text"),
-                "filename": chunk.metadata.get("filename"),
-            }
-            for chunk in ranked
-        ]
+    def _search_local_chunks(
+        self,
+        query: str,
+        document_ids: list[str] | None = None,
+        k: int = 10,
+    ) -> list[dict]:
+        """Rank saved chunks lexically when the remote vector store is absent."""
+        return [self._result(chunk, score=chunk.metadata["retrieval_bm25_score"], score_type="bm25")
+                for chunk in self._lexical_chunks(query, document_ids=document_ids, limit=k)]
 
     def search_single_document(
         self,
@@ -144,19 +169,18 @@ class _CanonicalRAGAdapter:
                 if not record:
                     return False
                 chunk_ids = record.get("chunk_ids", []) or []
-                if chunk_ids:
-                    try:
-                        from insight_rag.storage import UserPGVectorStore
-                        UserPGVectorStore(self.user_id).delete_chunks(chunk_ids)
-                    except Exception:
-                        pass
+                if chunk_ids and record.get("vector_indexed", True) is not False:
+                    # Raises on failure: the manifest entry is kept so the
+                    # user can retry instead of orphaning vectors silently.
+                    from insight_rag.storage import UserPGVectorStore
+                    UserPGVectorStore(self.user_id).delete_chunks(chunk_ids)
                 self._metadata.remove_document(document_id)
                 self._metadata.document_file_path(document_id).unlink(missing_ok=True)
                 self._metadata.chunks_path(document_id).unlink(missing_ok=True)
                 return True
         except Exception as exc:
-            logger.error("Canonical RAG delete failed for %s: %s", document_id, exc)
-            return False
+            logger.error("Canonical RAG delete failed for %s: %s", document_id, type(exc).__name__)
+            raise
 
 _DOCUMENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{8,80}$")
 
@@ -206,15 +230,20 @@ def list_documents(
             "status": doc.get("status", "ready"),
             "created_at": doc.get("created_at"),
             "completed_at": doc.get("created_at"),
-                "element_count": doc.get("element_count", 0),
+            "element_count": doc.get("element_count", 0),
             "chunk_count": doc.get("total_chunks", 0),
             "table_count": doc.get("tables", 0),
             "processing_method": doc.get("processing_method"),
             "error_message": doc.get("error_message"),
             "sha256": doc.get("sha256"),
             "pipeline_version": doc.get("rag_schema_version"),
-            "summary": doc.get("summary") if doc.get("summary_version") == 2 else "",
-            "summary_version": doc.get("summary_version", 0),
+            # PDFs from before geometry-aware tables can be re-extracted (retry?rechunk=true).
+            "needs_reextract": (doc.get("source_type") or "pdf") == "pdf"
+            and int(doc.get("rag_schema_version") or 0) < 3,
+            # An outdated cached summary is reported as version 0 so the page
+            # requests a fresh one from POST /api/documents/{id}/summary.
+            "summary": doc.get("summary") if _summary_current(doc) else "",
+            "summary_version": doc.get("summary_version", 0) if _summary_current(doc) else 0,
             "tags": doc.get("tags") or [],
             "collection": doc.get("collection"),
             "language": doc.get("language") or "en",
@@ -280,34 +309,63 @@ def document_overview_stats(user: dict = Depends(get_current_user)):
     }
 
 
-# Registered BEFORE the `/api/documents/{document_id}` routes below: FastAPI
-# matches in declaration order, so the dynamic route would otherwise capture
-# "shared-with-me" and 404 this listing.
+# Static paths (shared-with-me, tags, collections, upload-jobs) are registered
+# BEFORE the `/api/documents/{document_id}` routes below: FastAPI matches in
+# declaration order, so the dynamic route would otherwise capture them.
 @router.get("/api/documents/shared-with-me")
 def documents_shared_with_me(user: dict = Depends(get_current_user)):
     """List documents shared with the current user by other users."""
     username = user.get("username")
     if not username:
         return {"ok": True, "documents": []}
-    import json as _json
-    from insight_rag.config import RAG_USERS_DIR as base
-    out = []
-    if base.exists():
-        for ud in base.iterdir():
-            if not ud.is_dir():
-                continue
-            manifest = ud / "manifest.json"
-            if not manifest.exists():
-                continue
-            try:
-                m = _json.loads(manifest.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            for d in (m.get("documents") or {}).values():
-                if username in (d.get("shared_with") or []):
-                    out.append({k: v for k, v in d.items()
-                                if k not in ("chunk_ids", "share_token", "shared_with", "shared", "share_expires_at")})
+    from insight_rag.storage import documents_shared_with
+    out = [{k: v for k, v in d.items()
+            if k not in ("chunk_ids", "share_token", "shared_with", "shared", "share_expires_at")}
+           for d in documents_shared_with(username)]
     return {"ok": True, "documents": out}
+
+
+@router.get("/api/documents/tags")
+def list_document_tags(user: dict = Depends(get_current_user)):
+    from insight_rag.storage import RAGMetadataStore
+    meta = RAGMetadataStore(user["user_id"])
+    tags = set()
+    for d in meta.list_documents():
+        for t in (d.get("tags") or []):
+            tags.add(str(t))
+    return {"ok": True, "tags": sorted(tags)}
+
+
+@router.get("/api/documents/collections")
+def list_document_collections(user: dict = Depends(get_current_user)):
+    from insight_rag.storage import RAGMetadataStore
+    meta = RAGMetadataStore(user["user_id"])
+    cols = set()
+    for d in meta.list_documents():
+        if d.get("collection"):
+            cols.add(str(d["collection"]))
+    return {"ok": True, "collections": sorted(cols)}
+
+
+@router.get("/api/documents/upload-jobs")
+def list_upload_jobs(batch_id: Optional[str] = Query(None, max_length=64),
+                     user: dict = Depends(get_current_user)):
+    """Per-file progress for multi-file uploads (POST /api/insight/pdf/upload-batch).
+
+    Served here, under the general limiter, so frequent progress polling never
+    consumes the per-user AI chat budget of the /api/insight/pdf router.
+    """
+    from insight_rag.jobs import UPLOAD_JOBS
+    return {"ok": True, "jobs": UPLOAD_JOBS.list(user["user_id"], batch_id=batch_id)}
+
+
+@router.get("/api/documents/upload-jobs/{job_id}")
+def get_upload_job(job_id: str, user: dict = Depends(get_current_user)):
+    from insight_rag.jobs import UPLOAD_JOBS
+    job = UPLOAD_JOBS.get(user["user_id"], job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Upload job not found.")
+    return {"ok": True, "job": job}
 
 
 @router.get("/api/documents/{document_id}")
@@ -323,6 +381,8 @@ def get_document(
     doc = meta.get_document(document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+    if not _summary_current(doc):
+        doc = {**doc, "summary": "", "summary_version": 0}
     return {"ok": True, "document": doc}
 
 @router.get("/api/documents/{document_id}/chunks")
@@ -359,6 +419,10 @@ def get_document_chunks(
         logger.warning("chunk read failed: %s", type(exc).__name__)
     return {"ok": True, "chunks": chunks, "chunk_count": len(chunks)}
 
+
+
+def _summary_current(doc: dict) -> bool:
+    return int(doc.get("summary_version") or 0) == DOCUMENT_SUMMARY_VERSION and bool(doc.get("summary"))
 
 
 def _summary_text_for_chunk(chunk: dict) -> str:
@@ -401,7 +465,9 @@ def _extractive_summary(chunks: list, max_chars: int = 400) -> str:
             line = re.sub(r"^\s*[-*+]\s+", "", line).strip()
             if not line or re.match(r"^(?:section|chapter|table|appendix|figure)\s+\w", line, re.I):
                 continue
-            if index == 0 and len(line) < 80 and not re.search(r"[.!?]$", line):
+            # Headings/titles (short, no closing punctuation) would otherwise be
+            # glued onto the next sentence ("…scenario All data used…").
+            if len(line) < 100 and not re.search(r"[.!?]$", line):
                 continue
             lines.append(line)
         text = " ".join(" ".join(lines).split())
@@ -647,11 +713,18 @@ def ask_documents(
                 answer_mode = "ai"
         except Exception as exc:
             logger.warning("Document answer provider unavailable: %s", type(exc).__name__)
+    if answer:
+        # Citation integrity: drop markers that point at no supplied passage.
+        allowed = len(norm[:6])
+        answer = re.sub(r"\[(\d+)\]", lambda m: m.group(0) if 1 <= int(m.group(1)) <= allowed else "",
+                        answer)
+        answer = re.sub(r"[ \t]{2,}", " ", answer).strip()
     if not answer:
         answer = _evidence_only_answer(norm)
     citations = [
         {"index": i + 1, "document_id": pp.get("document_id"), "filename": pp.get("filename"),
-         "page_number": pp.get("page_number"), "chunk_id": pp.get("chunk_id")}
+         "page_number": pp.get("page_number"), "chunk_id": pp.get("chunk_id"),
+         "location_label": pp.get("location_label")}
         for i, pp in enumerate(norm[:6])
     ]
     return {
@@ -688,28 +761,6 @@ def update_document_meta(
     return {"ok": True, "document": doc}
 
 
-@router.get("/api/documents/tags")
-def list_document_tags(user: dict = Depends(get_current_user)):
-    from insight_rag.storage import RAGMetadataStore
-    meta = RAGMetadataStore(user["user_id"])
-    tags = set()
-    for d in meta.list_documents():
-        for t in (d.get("tags") or []):
-            tags.add(str(t))
-    return {"ok": True, "tags": sorted(tags)}
-
-
-@router.get("/api/documents/collections")
-def list_document_collections(user: dict = Depends(get_current_user)):
-    from insight_rag.storage import RAGMetadataStore
-    meta = RAGMetadataStore(user["user_id"])
-    cols = set()
-    for d in meta.list_documents():
-        if d.get("collection"):
-            cols.add(str(d["collection"]))
-    return {"ok": True, "collections": sorted(cols)}
-
-
 @router.post("/api/documents/search")
 def search_all_documents(
     request: DocumentSearchRequest,
@@ -738,9 +789,16 @@ def delete_document(
     doc = meta.get_document(document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    success = adapter.delete_document(document_id)
+    try:
+        success = adapter.delete_document(document_id)
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="I couldn't remove that document from the search index right now. "
+                   "Nothing was deleted; please try again.",
+        )
     if not success:
-        raise HTTPException(status_code=500, detail="Failed to delete document")
+        raise HTTPException(status_code=404, detail="Document not found")
     return {"ok": True, "message": "Document deleted"}
 
 
@@ -869,42 +927,30 @@ def unshare_document(
 @router.get("/api/documents/shared/{token}")
 def get_shared_document(token: str):
     """Read-only access to a shared document (no auth required)."""
-    # Search across all users' manifests for the token. The base directory is
-    # RAG_USERS_DIR so custom ARIA_DATA_DIR installs resolve correctly.
-    from insight_rag.config import RAG_USERS_DIR as base
-    if not base.exists():
-        raise HTTPException(status_code=404, detail="Not found")
-    for ud in base.iterdir():
-        if not ud.is_dir():
-            continue
-        manifest = ud / "manifest.json"
-        if not manifest.exists():
-            continue
+    # Token lookup spans all users (metadata table, or every manifest on the
+    # file backend); chunk files live in the owner's RAG_USERS_DIR folder.
+    import json as _json
+    from insight_rag.storage import find_shared_document
+    found = find_shared_document(token)
+    if found is None or _share_expired(found[1]):
+        raise HTTPException(status_code=404, detail="Shared document not found or link expired")
+    ud, d = found
+    chunks = []
+    cf = ud / "chunks" / f"{d.get('document_id')}.json"
+    if _DOCUMENT_ID_RE.match(str(d.get("document_id") or "")) and cf.exists():
         try:
-            import json as _json
-            m = _json.loads(manifest.read_text(encoding="utf-8"))
+            raw = _json.loads(cf.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                for c in raw:
+                    if isinstance(c, dict):
+                        chunks.append({"text": c.get("page_content") or c.get("content") or "",
+                                       "metadata": c.get("metadata", {})})
         except Exception:
-            continue
-        for d in (m.get("documents") or {}).values():
-            if d.get("share_token") != token or _share_expired(d):
-                continue
-            chunks = []
-            cf = ud / "chunks" / f"{d.get('document_id')}.json"
-            if cf.exists():
-                try:
-                    raw = _json.loads(cf.read_text(encoding="utf-8"))
-                    if isinstance(raw, list):
-                        for c in raw:
-                            if isinstance(c, dict):
-                                chunks.append({"text": c.get("page_content") or c.get("content") or "",
-                                               "metadata": c.get("metadata", {})})
-                except Exception:
-                    pass
-            return {"ok": True, "document": {k: v for k, v in d.items()
-                                            if k not in ("chunk_ids", "share_token", "shared_with", "shared", "share_expires_at")},
-                    "chunks": chunks[:20],
-                    "summary": d.get("summary") or ""}
-    raise HTTPException(status_code=404, detail="Shared document not found or link expired")
+            pass
+    return {"ok": True, "document": {k: v for k, v in d.items()
+                                    if k not in ("chunk_ids", "share_token", "shared_with", "shared", "share_expires_at")},
+            "chunks": chunks[:20],
+            "summary": d.get("summary") or ""}
 @router.post("/api/documents/{document_id}/translate")
 def translate_document_summary(
     document_id: str,
@@ -1126,11 +1172,17 @@ def document_dashboard(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     chunks = _load_chunks_for(user["user_id"], document_id)
-    text = "\n".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in chunks)
-    # Extract "label: number" or "label number" patterns.
+    # ARIA's own table-summary chunks ("Table summary for X.docx: 129 rows")
+    # are generated text, not document content, so they never yield metrics.
+    text = "\n".join(c.get("text", "") for c in chunks
+                     if isinstance(c, dict) and not (c.get("metadata") or {}).get("table_summary"))
+    # "Label: 123" or "Label - 123". The label must end in a letter and the
+    # value must not start a range ("seen at 17-50") or carry on as a word.
     metrics = []
     seen = set()
-    for m in _dre.finditer(r"([A-Za-z][A-Za-z0-9 _\-]{2,40})[:\-]\s*([\d][\d,\.]*)", text):
+    pattern = (r"([A-Za-z][A-Za-z0-9 _\-]{1,39}[A-Za-z])(?::\s*|\s+[-–]\s+)"
+               r"(\d[\d,]*(?:\.\d+)?)(?![\d,.]*\s*[-–]\s*\d)(?![A-Za-z])")
+    for m in _dre.finditer(pattern, text):
         label = m.group(1).strip()
         try:
             val = float(m.group(2).replace(",", ""))
@@ -1155,13 +1207,19 @@ def document_dashboard(
 @router.post("/api/documents/{document_id}/retry")
 def retry_document(
     document_id: str,
+    rechunk: bool = Query(False),
     user: dict = Depends(require_writable),
 ):
-    """Repair the canonical index from owned saved text; never invoke OCR."""
+    """Repair the canonical index from owned saved text; never invoke OCR.
+
+    ``rechunk=true`` re-extracts a stored PDF with the current (geometry-aware)
+    extractor, migrating documents ingested by older versions.
+    """
     document_id = _sanitize_document_id(document_id)
     from insight_rag.ingestion import PDFIngestion
     try:
-        return PDFIngestion(user["user_id"]).reindex(document_id)
+        ingestion = PDFIngestion(user["user_id"])
+        return ingestion.rechunk(document_id) if rechunk else ingestion.reindex(document_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=sanitize_error(exc))
     except Exception as exc:

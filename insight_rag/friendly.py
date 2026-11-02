@@ -17,6 +17,7 @@ from .context_engine import ContextEngineer, ContextPlan
 from .retrieval import deduplicate_chunks, fuse_ranked_lists
 from .reranker import LocalCrossEncoderReranker
 from .service import InsightPDFRAG as BaseInsightPDFRAG
+from .source_view import clean_snippet, source_extras
 from .table_reasoner import build_table_facts
 
 
@@ -271,7 +272,8 @@ class InsightPDFRAG(BaseInsightPDFRAG):
             "content_type": meta.get("content_type", "text"),
             "table_index": meta.get("table_index"),
             "chunk_id": meta.get("chunk_id"),
-            "snippet": doc.page_content[:280].replace("\n", " "),
+            "snippet": clean_snippet(doc.page_content),
+            **source_extras(meta, doc.page_content),
         }
 
     def _exact_text_answer(self, term: str, matches: list[Document]) -> tuple[str, list[dict]]:

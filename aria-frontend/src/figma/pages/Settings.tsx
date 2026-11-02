@@ -321,7 +321,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
             </div>
             <div className="py-3 border-t border-border">
               <p className="text-sm text-foreground">API Key Security</p>
-              <p className="text-xs text-muted-foreground mt-1">API keys are sent to ARIA for verification and encrypted storage, then used only with the selected hosted provider.</p>
+              <p className="text-xs text-muted-foreground mt-1">ARIA checks your API key, stores it encrypted, and uses it only with the cloud AI service you chose.</p>
             </div>
           </div>
         )}

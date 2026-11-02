@@ -1,10 +1,12 @@
 // Shared Playwright helper: real backend auth + LLM selection.
-// Single-host policy: everything runs against http://localhost:8000.
+// Single-host policy: everything runs against http://localhost:8000
+// (override with ARIA_E2E_BASE_URL to test an isolated server on another port).
+const DEFAULT_BASE = process.env.ARIA_E2E_BASE_URL || 'http://localhost:8000';
 // E2E uses a pre-provisioned verified non-admin account so tests exercise
 // real cookie auth without bypassing the email-verification requirement.
 const { expect } = require('@playwright/test');
 
-async function signInVerified(page, base = 'http://localhost:8000') {
+async function signInVerified(page, base = DEFAULT_BASE) {
   const email = process.env.ARIA_E2E_EMAIL;
   const pass = process.env.ARIA_E2E_PASSWORD;
   if (!email || !pass) {
@@ -19,7 +21,7 @@ async function signInVerified(page, base = 'http://localhost:8000') {
   await page.getByText('Choose your AI engine').waitFor({ timeout: 20000 });
 }
 
-async function seedAuth(page, base = 'http://localhost:8000', mode = 'Local AI') {
+async function seedAuth(page, base = DEFAULT_BASE, mode = 'Local AI') {
   await signInVerified(page, base);
   await page.getByText(mode, { exact: false }).first().click();
   await page.getByRole('button', { name: /continue/i }).click();

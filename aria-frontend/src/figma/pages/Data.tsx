@@ -274,10 +274,10 @@ export default function Data({
         // Reload schema
         onSchemaRetry?.();
       } else {
-        setOverrideMsg(r.detail || r.message || "Failed");
+        setOverrideMsg(r.detail || r.message || "Couldn't save your change. Please try again.");
       }
     } catch (e: any) {
-      setOverrideMsg(e.message || "Override failed");
+      setOverrideMsg(e.message || "Couldn't save your change. Please try again.");
     }
   };
 
@@ -312,14 +312,14 @@ export default function Data({
                   {[
                     connHealth.source_type === "relational" ? connHealth.db_type?.toUpperCase() : "Uploaded file",
                     connHealth.source_type === "relational" ? (String(connHealth.host || "").trim() || null) : null,
-                    connHealth.schema ? `${String(connHealth.schema).includes(",") ? "Schemas" : "Schema"}: ${connHealth.schema}` : null,
+                    connHealth.schema ? `${String(connHealth.schema).includes(",") ? "Database sections" : "Database section"}: ${connHealth.schema}` : null,
                     `${connHealth.table_count ?? 0} ${connHealth.table_count === 1 ? "table" : "tables"}`,
                     `${connHealth.column_count ?? 0} ${connHealth.column_count === 1 ? "column" : "columns"}`,
                   ].filter(Boolean).join(" · ")}
                 </p>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  Last scan: {connHealth.last_schema_scan ? new Date(connHealth.last_schema_scan).toLocaleString() : "Never"}
-                  {connHealth.provider ? ` · AI: ${connHealth.provider === "local" ? "Local (on this computer)" : connHealth.provider === "cloud" ? "Cloud (Groq)" : connHealth.provider}` : ""}
+                  Last scan: {connHealth.last_schema_scan ? new Date(connHealth.last_schema_scan).toLocaleString() : "Never"} · Changed your tables? Use Rescan tables.
+                  {connHealth.provider ? ` · AI: ${connHealth.provider === "local" ? "Local (on this computer)" : connHealth.provider === "cloud" ? "Cloud AI service" : connHealth.provider}` : ""}
                 </p>
               </div>
             </div>
@@ -329,8 +329,9 @@ export default function Data({
                 <RefreshCw size={11} /> Refresh
               </button>
               <button onClick={handleRefreshSchema}
+                title="Run this after you add, rename or remove tables or columns in your database, so ARIA sees the change."
                 className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground px-3 py-1.5 rounded-lg hover:bg-secondary transition-all">
-                <Columns3 size={11} /> Rescan Schema
+                <Columns3 size={11} /> Rescan tables
               </button>
               <button onClick={handleDisconnect} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
                 className="flex items-center gap-1.5 text-[11px] text-negative hover:text-negative/80 px-3 py-1.5 rounded-lg hover:bg-negative/5 transition-all disabled:opacity-50">
@@ -1196,7 +1197,7 @@ export default function Data({
           <div className="bg-card border border-border rounded-xl p-8 text-center">
             <Loader2 size={24} className="mx-auto animate-spin text-primary mb-3" />
             <p className="text-xs text-muted-foreground">Scanning tables...</p>
-            <p className="text-[10px] text-muted-foreground mt-1">Checking null values, duplicates, relationships...</p>
+            <p className="text-[10px] text-muted-foreground mt-1">Checking for missing values, duplicates and links between tables…</p>
           </div>
         ) : error ? (
           <div className="bg-card border border-border rounded-xl p-8 text-center">

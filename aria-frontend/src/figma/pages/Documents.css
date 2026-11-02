@@ -10,10 +10,6 @@
   font-size: 14px;
 }
 
-.dark .documents-page {
-  background: var(--background);
-}
-
 .documents-page button,
 .documents-page input {
   font: inherit;
@@ -1735,93 +1731,10 @@
   font-size: 15px !important;
 }
 
-.documents-page .documents-chat-answer > p {
+.documents-page .documents-chat-answer > p,
+.documents-page .documents-chat-answer .doc-answer-markdown {
   font-size: 14px !important;
   line-height: 1.6;
-}
-
-.documents-answer-chart {
-  margin: 12px 0 0;
-  padding: 10px;
-  border: 1px solid #e5eaf4;
-  border-radius: 6px;
-  background: #f9fbff;
-}
-
-.dark .documents-answer-chart {
-  border-color: var(--border);
-  background: var(--secondary);
-}
-
-.documents-answer-chart figcaption {
-  margin-bottom: 9px;
-  color: #536481;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.dark .documents-answer-chart figcaption {
-  color: var(--foreground);
-}
-
-.documents-answer-chart-bars {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.documents-answer-chart-row {
-  display: grid;
-  grid-template-columns: minmax(54px, 0.8fr) minmax(44px, 1.5fr) auto;
-  align-items: center;
-  gap: 7px;
-  color: #64728a;
-  font-size: 12px;
-}
-
-.documents-answer-chart-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.documents-answer-chart-track {
-  display: block;
-  overflow: hidden;
-  height: 9px;
-  border-radius: 5px;
-  background: #e8edf7;
-}
-
-.dark .documents-answer-chart-track {
-  background: var(--muted);
-}
-
-.documents-answer-chart-bar {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: #5275d7;
-}
-
-.documents-answer-chart-value {
-  color: #435782;
-  font-variant-numeric: tabular-nums;
-  font-weight: 600;
-}
-
-.dark .documents-answer-chart-value {
-  color: var(--foreground);
-}
-
-.documents-page .documents-answer-chart-source {
-  margin-top: 9px;
-  padding: 0;
-  border: 0;
-  color: #4263b4;
-  background: transparent;
-  font-size: 11px !important;
-  cursor: pointer;
 }
 
 .documents-page {
