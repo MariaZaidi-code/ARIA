@@ -375,6 +375,9 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
   const gradeOf = (h: any, factors: any[], evidenceCount: number): { label: string; reason: string; tone: string } => {
     const g = strOf(h?.evidence_grade || "").toLowerCase();
     const reason = strOf(h?.evidence_reason || "");
+    if (/contradictory/.test(g)) return { label: "Contradictory evidence", reason: reason || "Measured results point against this explanation.", tone: "bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/25" };
+    if (/insufficient/.test(g)) return { label: "Insufficient evidence", reason: reason || "Not enough measured data to assess this yet.", tone: "bg-secondary text-secondary-foreground border-border" };
+    if (/limited/.test(g)) return { label: "Limited evidence", reason: reason || "A measured pattern exists, but the cause is unknown.", tone: "bg-secondary text-secondary-foreground border-border" };
     if (/strong/.test(g)) return { label: "Strong evidence", reason: reason || "Strong — the pattern is backed by comparatively strong supporting signs.", tone: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25" };
     if (/mixed|moderate|medium/.test(g)) return { label: "Mixed evidence", reason: reason || "Mixed — there are supporting signs, but also reasons to keep checking.", tone: "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" };
     if (/weak/.test(g)) return { label: "Weak evidence", reason: reason || "Weak — only early signs so far, treat this as a question to explore.", tone: "bg-secondary text-secondary-foreground border-border" };
@@ -430,14 +433,13 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
               const top = ranked[0];
               const topName = top ? strOf(top?.factor || top?.name) : "";
               const verdictRaw = strOf(h?.verdict || h?.status || "").toLowerCase();
-              const verdictWord = /support/i.test(verdictRaw) && !/not support|unsupport/i.test(verdictRaw)
-                ? "Likely cause" : /inconclus|needs|more data/i.test(verdictRaw) ? "Possible cause" : "Leading suspect";
+              const verdictWord = "Pattern to investigate";
               return (
                 <>
                   {topName ? (
                     <>
                       <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">{verdictWord.toUpperCase()}</p>
-                      <h3 className="text-[17px] font-semibold text-foreground tracking-tight">{topName}: the main reason {metricLabel} {direction}</h3>
+                      <h3 className="text-[17px] font-semibold text-foreground tracking-tight">{topName}: a possible factor associated with {metricLabel} {direction}</h3>
                       <p className="text-[12px] text-muted-foreground mt-0.5">{headerQ}</p>
                     </>
                   ) : (
@@ -560,7 +562,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                 if (!rivals.length && factors.length > 1) {
                   const r1 = factors[1];
                   const r1Name = strOf(r1?.factor || r1?.name);
-                  if (r1Name) fallbackRivals.push(`Another possibility is ${r1Name} — checked against the same data, it explains less on its own because its supporting signs are weaker.`);
+                  if (r1Name) fallbackRivals.push(`Another factor worth checking is ${r1Name}; its causal role has not been established.`);
                 }
                 if (!rivals.length && !fallbackRivals.length && factors.length <= 1) {
                   fallbackRivals.push("One rival explanation is that the pattern is spread across many small contributors, so no single one drives it.");
@@ -577,7 +579,23 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                       <span className={`text-[10.5px] font-semibold px-2 py-0.5 rounded-full border ${grade.tone}`} title={grade.reason}>{grade.label}</span>
                     </div>
                     <p className="mt-1.5 text-[12px] text-secondary-foreground leading-relaxed">{grade.reason}</p>
-                    <p className="mt-2 text-[12px] font-semibold text-foreground">Other possibilities checked</p>
+                    {asList(h?.measured_contradictions).length > 0 && (
+                      <div className="mt-2" role="note" aria-label="Contradicting measured evidence">
+                        <p className="text-[12px] font-semibold text-foreground">Evidence pointing the other way</p>
+                        <ul className="mt-1 space-y-1">
+                          {asList(h?.measured_contradictions).map((s: any, i: number) => (
+                            <li key={i} className="text-[12px] text-secondary-foreground">• {strOf(s)}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {asList(h?.settled_data_notes).length > 0 && (
+                      <p className="mt-2 text-[12px] text-muted-foreground">
+                        <span className="font-semibold text-secondary-foreground">Measured so far: </span>
+                        {asList(h?.settled_data_notes).map((s: any) => strOf(s)).join(" ")}
+                      </p>
+                    )
+                    <p className="mt-2 text-[12px] font-semibold text-foreground">Other possibilities to test</p>
                     <ul className="mt-1 space-y-1">
                       {allRivals.map((r, i) => (
                         <li key={i} className="text-[12px] text-secondary-foreground leading-relaxed">· {r}</li>
