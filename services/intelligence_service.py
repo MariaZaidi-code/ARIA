@@ -2619,14 +2619,18 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                         half = max(1, len(pts) // 2)
                         before = sum(v for _, v in pts[:half]) or 0
                         after = sum(v for _, v in pts[half:]) or 0
-                        pct = ((after - before) / before * 100) if before else 0
-                        direction = "declined" if pct < 0 else "increased" if pct > 0 else "held steady"
+                        pct = ((after - before) / abs(before) * 100) if before else None
+                        direction = ("declined" if pct < 0 else "increased" if pct > 0
+                                     else "held steady") if pct is not None else "cannot be compared"
                         ml = found.get("metric_label") or display_name(str(m), str(m))
                         series = [{"label": p, "value": v} for p, v in pts]
+                        headline = (f"{ml} {direction} by {abs(pct):.1f}%"
+                                    if pct is not None else
+                                    f"{ml} change cannot be expressed as a percentage (zero baseline)")
                         found["observed_pattern"] = {
-                            "headline": f"{ml} {direction} by {abs(pct):.1f}%",
+                            "headline": headline,
                             "detail": f"{_human_total(before)} → {_human_total(after)} across the window.",
-                            "change_pct": round(pct, 1),
+                            "change_pct": round(pct, 1) if pct is not None else None,
                             "direction": direction,
                             "before": before,
                             "after": after,
@@ -2636,7 +2640,10 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                             "points": series,
                         }
                         found["key_takeaways"] = [
-                            f"{ml} {direction} by about {abs(pct):.0f} percent ({_human_total(before)} → {_human_total(after)}).",
+                            (f"{ml} {direction} by about {abs(pct):.0f} percent"
+                             if pct is not None else
+                             f"{ml} has no comparable percentage change because the earlier total is zero")
+                            + f" ({_human_total(before)} → {_human_total(after)}).",
                             *found.get("key_takeaways", [])[:2],
                         ]
     except Exception:
