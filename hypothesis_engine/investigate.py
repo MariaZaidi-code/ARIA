@@ -57,6 +57,59 @@ def _strength_for(share: float, n: int) -> str:
     return "Insufficient evidence"
 
 
+def _assess_candidates(candidates: list[dict], observation: dict | None) -> None:
+    """Add measured grades and bounded rival explanations in place.
+
+    Existing `contradictory` may contain unmeasured limitations (notably
+    document mentions without a demonstrated link). Only explicit measured
+    counterevidence changes the grade.
+    """
+    from .evidence_ladder import normalize
+
+    note = str((observation or {}).get("text") or "").strip()
+    for candidate in candidates:
+        raw = candidate.get("strength", "Insufficient evidence")
+        supports = 1 if candidate.get("supporting") and raw != "Insufficient evidence" else 0
+        against = list(candidate.get("measured_contradictions") or [])
+        grade = normalize(raw, supports, len(against))
+        candidate["strength"] = grade
+        candidate["evidence_grade"] = grade
+        candidate["evidence_reason"] = (
+            "Measured observations point the other way."
+            if grade == "Contradictory evidence" else
+            "Measured observations disagree; the assessment was downgraded."
+            if against else
+            "Evidence is descriptive; a causal explanation is not established."
+            if supports else
+            "Not enough measured support is available to assess this explanation."
+        )
+        candidate["settled_data_notes"] = [note] if note else []
+        if against:
+            candidate["contradictory"] = list(dict.fromkeys(
+                [*candidate.get("contradictory", []), *against]))
+
+    for candidate in candidates:
+        others = [
+            other for other in candidates
+            if other is not candidate and other.get("title") != candidate.get("title")
+        ]
+        candidate["rival_explanations"] = [
+            {"title": other["title"], "evidence_grade": other["evidence_grade"],
+             "status": "Alternative measured pattern, not a proven cause"}
+            for other in others[:2]
+        ]
+        if others:
+            candidate["rivals"] = [
+                f"{other['title']} (alternative pattern; causation unproven)"
+                for other in others[:2]
+            ]
+        else:
+            candidate["rivals"] = [
+                "A shift in group mix could also explain the pattern; test it with a breakdown.",
+                "A timing effect could explain it; compare additional time periods.",
+            ]
+
+
 def _doc_score(question: str, text: str) -> int:
     stop = {"what", "does", "the", "this", "that", "about", "why", "did",
             "are", "our", "your", "how", "when", "which", "explain", "does",
@@ -178,6 +231,8 @@ def _investigate(engine, dialect, intel, tables, question, documents, llm,
             "chart": None,
         })
 
+    # Grade measured support before ranking; rivals refer to real candidates.
+    _assess_candidates(candidates, obs)
     # Rank: strongest evidence first, cap at 4.
     candidates.sort(key=lambda c: (_STRENGTH_ORDER.get(c["strength"], 3), c["title"]))
     candidates = candidates[:4]
@@ -410,6 +465,7 @@ def _investigate_count(engine, dialect, intel, table, question):
                       "limitations": ["Pace change is measured; the reason is not yet identified."],
                       "needed_data": ["segment history to see whose activity changed"],
                       "chart": None}]
+        _assess_candidates(cands, obs)
         return {"ok": True,
                 "insufficient": all(c["strength"] == "Insufficient evidence" for c in cands),
                 "observation": obs, "hypotheses": cands,
@@ -645,6 +701,11 @@ def _volume_split(engine, dialect, table, metric, obs):
     if direction == "down" and vol > -5:
         return [{
             "title": "Volume held steady — pricing or mix likely",
+            "measured_contradictions": (
+                ["The measured transaction count and average value both increased, "
+                 "so these measurements do not support a volume or value decline."]
+                if vol >= 0 and aov >= 0 else []
+            ),
             "strength": "Limited evidence",
             "explanation": (f"Transaction volume barely moved ({vol:+.0f}%), so the "
                             f"decline more likely reflects lower values per transaction "
