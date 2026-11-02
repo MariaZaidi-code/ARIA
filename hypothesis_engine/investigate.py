@@ -20,7 +20,8 @@ log = logging.getLogger(__name__)
 MIN_OBS = 10
 
 _STRENGTH_ORDER = {"Strong evidence": 0, "Moderate evidence": 1,
-                   "Limited evidence": 2, "Insufficient evidence": 3}
+                   "Limited evidence": 2, "Insufficient evidence": 3,
+                   "Contradictory evidence": 4}
 
 
 def _biz(v) -> str:
