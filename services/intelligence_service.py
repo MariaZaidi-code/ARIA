@@ -2398,6 +2398,13 @@ def generate_hypotheses(session: dict, request: dict) -> dict:
     """Generate hypothesis candidates — supports search/sort/page (server-side)."""
     request = request or {}
     items = _hypothesis_items(session)
+    # These are suggested investigations, not tested claims. Never present
+    # schema-derived templates as already-verified evidence.
+    for item in items:
+        item["evidence_grade"] = "Insufficient evidence"
+        item["evidence_reason"] = (
+            "Suggested hypothesis — open the detail to check measured evidence."
+        )
     if not items and not _load_schema_mapping(session):
         return {"ok": False, "detail": "No data connected.", "code": "NO_DATA",
                 "candidates": [], "items": [], "data": [],
@@ -2634,6 +2641,14 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                         ]
     except Exception:
         pass
+    from hypothesis_engine.evidence_ladder import assess_observed_pattern
+    assessment = assess_observed_pattern(
+        str(found.get("type") or ""), found.get("observed_pattern"))
+    found.update(assessment)
+    # The detail card's previous strength was a schema-only placeholder;
+    # replace it with the grade derived from live observations.
+    found["evidence_strength"] = assessment["evidence_grade"]
+    found["strength"] = assessment["evidence_grade"]
     return found
 
 
