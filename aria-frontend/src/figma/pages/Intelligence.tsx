@@ -926,7 +926,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                 <p className="text-[12px] text-muted-foreground mt-1 line-clamp-2 leading-relaxed">{strOf(h?.summary || h?.observed_pattern?.headline || h?.description || "")}</p>
                 <div className="mt-2 flex items-center gap-2 flex-wrap">
                   {strOf(h?.evidence_grade || h?.evidence_strength || h?.strength) && (
-                    <span className="text-[10.5px] font-semibold px-2 py-0.5 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-100 dark:border-blue-500/20">{humanize(strOf(h.evidence_strength || h.strength))} evidence</span>
+                    <span className="text-[10.5px] font-semibold px-2 py-0.5 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-100 dark:border-blue-500/20">{humanize(strOf(h?.evidence_grade || h?.evidence_strength || h?.strength || ""))}</span>
                   )}
                   {strOf(h?.status) && <span className="text-[10.5px] text-muted-foreground">{humanize(strOf(h.status))}</span>}
                   {sort === "severity" && severityOf(h) > 0 && (
