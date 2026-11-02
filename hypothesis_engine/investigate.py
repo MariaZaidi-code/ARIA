@@ -96,7 +96,7 @@ def _assess_candidates(candidates: list[dict], observation: dict | None) -> None
         ]
         candidate["rival_explanations"] = [
             {"title": other["title"], "evidence_grade": other["evidence_grade"],
-             "status": "Alternative measured pattern, not a proven cause"}
+             "status": "Other measured pattern; may coexist, not a proven cause"}
             for other in others[:2]
         ]
         if others:
