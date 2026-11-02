@@ -2542,8 +2542,8 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                                 "kind": "Dimension",
                                 "association": f"{'Higher' if v >= total / len(pairs) else 'Lower'} total ({sh:.0f}% share)",
                                 "relationship": "Segment difference",
-                                "evidence_strength": "Strong" if sh >= 25 else "Moderate",
-                                "strength": "Strong" if sh >= 25 else "Moderate",
+                                "evidence_strength": "Limited evidence",
+                                "strength": "Limited evidence",
                                 "explore": {"metric": m, "breakdown": d},
                                 "whatif": {"variable": m},
                             })
