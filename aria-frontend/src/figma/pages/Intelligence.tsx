@@ -241,7 +241,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
   /* Severity ranking (client-side, dynamic): |change%| x evidence weight.
      Reason chip explains each rank in plain words. */
   const strengthOf = (h: any): number => {
-    const s = strOf(h?.evidence_strength || h?.strength || "").toLowerCase();
+    const s = strOf(h?.evidence_grade || h?.evidence_strength || h?.strength || "").toLowerCase();
     if (/strong/.test(s)) return 3;
     if (/moderate|medium/.test(s)) return 2;
     if (s) return 1;
@@ -255,7 +255,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
   };
   const severityReason = (h: any): string => {
     const c = changeOf(h);
-    const s = strOf(h?.evidence_strength || h?.strength || "").toLowerCase();
+    const s = strOf(h?.evidence_grade || h?.evidence_strength || h?.strength || "").toLowerCase();
     const move = c === null ? "" : `${Math.abs(c)}% move`;
     const sign = /strong/.test(s) ? "strong signs" : /moderate|medium/.test(s) ? "moderate signs" : s ? "early signs" : "unrated signs";
     return [move, sign].filter(Boolean).join(" · ");
@@ -381,7 +381,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
     if (/strong/.test(g)) return { label: "Strong evidence", reason: reason || "Strong — the pattern is backed by comparatively strong supporting signs.", tone: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25" };
     if (/mixed|moderate|medium/.test(g)) return { label: "Mixed evidence", reason: reason || "Mixed — there are supporting signs, but also reasons to keep checking.", tone: "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" };
     if (/weak/.test(g)) return { label: "Weak evidence", reason: reason || "Weak — only early signs so far, treat this as a question to explore.", tone: "bg-secondary text-secondary-foreground border-border" };
-    const s = strOf(h?.evidence_strength || h?.strength || "").toLowerCase();
+    const s = strOf(h?.evidence_grade || h?.evidence_strength || h?.strength || "").toLowerCase();
     if (/strong/.test(s)) return { label: "Strong evidence", reason: "Strong — the supporting signs behind this pattern look comparatively strong.", tone: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25" };
     if (/moderate|medium/.test(s)) return { label: "Mixed evidence", reason: "Mixed — some supporting signs, but the picture is not yet firm.", tone: "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" };
     if (/weak|limited|early/.test(s)) return { label: "Weak evidence", reason: "Weak — only early signs so far, treat this as a question to explore.", tone: "bg-secondary text-secondary-foreground border-border" };
@@ -925,7 +925,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                 <p className="text-[13px] font-semibold text-foreground leading-snug">{strOf(h?.title || h?.question || "Hypothesis")}</p>
                 <p className="text-[12px] text-muted-foreground mt-1 line-clamp-2 leading-relaxed">{strOf(h?.summary || h?.observed_pattern?.headline || h?.description || "")}</p>
                 <div className="mt-2 flex items-center gap-2 flex-wrap">
-                  {strOf(h?.evidence_strength || h?.strength) && (
+                  {strOf(h?.evidence_grade || h?.evidence_strength || h?.strength) && (
                     <span className="text-[10.5px] font-semibold px-2 py-0.5 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-100 dark:border-blue-500/20">{humanize(strOf(h.evidence_strength || h.strength))} evidence</span>
                   )}
                   {strOf(h?.status) && <span className="text-[10.5px] text-muted-foreground">{humanize(strOf(h.status))}</span>}
