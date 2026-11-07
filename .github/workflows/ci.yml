@@ -150,8 +150,11 @@ jobs:
         working-directory: aria-frontend
         run: npm run typecheck && npm run build
       - name: Start backend on :8000 and probe health
+        env:
+          ARIA_ENV: dev
+          ARIA_COOKIE_SECURE: '0'  # Local HTTP E2E; production cookies remain Secure
         run: |
-          python app.py > /tmp/aria_e2e.log 2>&1 &
+          ARIA_ENV=dev ARIA_COOKIE_SECURE=0 python app.py > /tmp/aria_e2e.log 2>&1 &
           echo $! > /tmp/aria_e2e.pid
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:8000/api/health >/dev/null; then break; fi

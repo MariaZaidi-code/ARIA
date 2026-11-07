@@ -1,12 +1,10 @@
 // QA: real connected-source flow. Registers, selects Cloud AI, connects a real
 // CSV through the API, then drives every AI page and captures runtime errors.
 const { test, expect } = require("@playwright/test");
-const fs = require("fs");
-const path = require("path");
+const { seedAuth } = require("./auth-helper");
 
 const BASE = process.env.ARIA_BASE || "http://localhost:8000";
-const CSV = process.env.ARIA_CSV ||
-  "C:\\Users\\Go\\Desktop\\ARIA\\data\\kaggle_retail_sales\\abbas829__ecommerce-sales-dataset\\ecommerce_sales_analytics_5000.csv";
+const CSV_FIXTURE = ["order_id,product_category,sales,quantity", "1,Home,120,2", "2,Electronics,280,1", "3,Home,75,1", "4,Grocery,42,5"].join("\\n") + "\\n";
 
 const BENIGN = [/favicon/i, /React DevTools/i];
 
@@ -24,42 +22,20 @@ function attach(page, sink) {
   });
 }
 
-async function registerAndLogin(page, email, password) {
-  await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded" });
-  await page.getByRole("button", { name: /create account/i }).first().click();
-  await page.locator("#login-email").fill(email);
-  await page.locator("#login-password").fill(password);
-  await page.locator("#login-confirm").fill(password);
-  await page.getByRole("button", { name: /create account/i }).last().click();
-  await page.waitForTimeout(800);
-  await page.locator("#login-email").fill(email);
-  await page.locator("#login-password").fill(password);
-  await page.getByRole("button", { name: /access intelligence hub/i }).click();
-  await expect(page.getByText(/choose your ai engine/i)).toBeVisible({ timeout: 20000 });
-}
-
-async function chooseLLM(page, label) {
-  await page.getByRole("button", { name: new RegExp(label, "i") }).first().click();
-  await page.getByRole("button", { name: /^continue$/i }).click();
-  await expect(page.getByRole("button", { name: /dashboard/i }).first()).toBeVisible({ timeout: 20000 });
-}
-
 test.describe("ARIA QA - connected flow", () => {
   test("connect CSV then every AI page works", async ({ page }) => {
     test.setTimeout(300000);
     const sink = { consoleErrors: [], pageErrors: [], failedResponses: [] };
     attach(page, sink);
 
-    await registerAndLogin(page, `qa_conn_${Date.now()}@aria.test`, "QaPass123!");
-    await chooseLLM(page, "Cloud AI");
+    await seedAuth(page, BASE);
 
     // ---- Connect a real CSV through the API ----
-    const token = await page.evaluate(() => localStorage.getItem("aria_auth_token"));
+    // APIRequestContext shares the authenticated browser session cookie.
     const res = await page.request.post(`${BASE}/api/connect_file`, {
-      headers: { Authorization: `Bearer ${token}` },
       multipart: {
-        provider: "cloud",
-        file: { name: path.basename(CSV), mimeType: "text/csv", buffer: fs.readFileSync(CSV) },
+        provider: "local",
+        file: { name: "aria_e2e_retail.csv", mimeType: "text/csv", buffer: Buffer.from(CSV_FIXTURE, "utf8") },
       },
       timeout: 120000,
     });
@@ -116,10 +92,10 @@ test.describe("ARIA QA - connected flow", () => {
 
     // ---- Decision Center: recommendations integration (prescription contract) ----
     sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /decision center/i }).first().click();
+    await page.getByRole("button", { name: /^intelligence$/i }).first().click();
     await page.waitForTimeout(40000);
     const dcHtml = await page.locator("#root").innerHTML();
-    console.log("DECISION_HAS_CONTENT=" + /Decision Center|No decisions yet|No strong recommendations|Analyzing|Insufficient evidence|recommendation/i.test(dcHtml));
+    console.log("DECISION_HAS_CONTENT=" + /ARIA Intelligence|Explore|Hypotheses|Reports|Analyzing|Insufficient evidence|recommendation/i.test(dcHtml));
     const decisionProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
     if (decisionProblems.ce.length || decisionProblems.pe.length || decisionProblems.fr.length)
       console.log("DECISION_PROBLEMS=" + JSON.stringify(decisionProblems));

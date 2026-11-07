@@ -59,10 +59,10 @@ test.describe('Data source connection flow', () => {
   test('Cloud LLM selection shows Groq info', async ({ browser }) => {
     const cloudPage = await browser.newPage();
     try {
-      await seedAuth(cloudPage, BASE, 'Cloud AI');
-      const content = await cloudPage.content();
-      const hasCloud = /Cloud|cloud|Groq|groq/i.test(content);
-      expect(hasCloud).toBeTruthy();
+      await seedAuth(cloudPage, BASE, 'Local AI', { stopAtSelection: true });
+      await cloudPage.getByRole('button', { name: /Cloud AI/i }).first().click();
+      await expect(cloudPage.getByLabel(/Groq API key/i)).toBeVisible();
+      await expect(cloudPage.getByText(/Groq-powered/i)).toBeVisible();
     } finally {
       await cloudPage.close();
     }
