@@ -112,7 +112,7 @@ jobs:
         run: |
           go install github.com/zricethezav/gitleaks/v8@v8.24.3
           git cat-file -e "${BASE_SHA}^{commit}"
-          "$(go env GOPATH)/bin/gitleaks" git --redact --exit-code 1 --log-opts="${BASE_SHA}..HEAD"
+          "$(go env GOPATH)/bin/gitleaks" git --redact -v --exit-code 1 --log-opts="${BASE_SHA}..HEAD"
       - uses: gitleaks/gitleaks-action@v3
         if: github.event_name == 'push'
         env:
