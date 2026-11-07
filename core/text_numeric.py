@@ -223,29 +223,18 @@ def coercion_sql(dialect: str, quoted_col: str, use_regexp=None) -> str:
     """
     d = str(dialect or "").lower()
     col = quoted_col
-    # Strict-cast guard: stripping non-numeric characters can still leave a
-    # malformed residue ("1.2.3", "1-2", "-", "."), which a strict CAST
-    # (PostgreSQL) rejects at runtime. Only residues that fully match a
-    # numeric shape are cast; everything else becomes NULL.
-    _shape = r"^-?([0-9]+([.][0-9]+)?|[.][0-9]+)$"
     if use_regexp is None:
         use_regexp = _REGEXP_SUPPORT.get(d, True) if d in (
             "postgresql", "mysql") else False
     if d == "postgresql":
         if use_regexp:
-            _stripped = f"REGEXP_REPLACE({col}, '[^0-9.\\-]', '', 'g')"
-            # Mirrors services/intelligence_service's hardened shape: only a
-            # fully numeric residue survives the CASE; NULLIF handles the
-            # empty string, and the CAST(NULLIF( shape stays detectable by
-            # sql_references_coerced_measure.
-            return (f"CAST(NULLIF(CASE WHEN {_stripped} ~ '{_shape}' "
-                    f"THEN {_stripped} END, '') AS DOUBLE PRECISION)")
+            return (f"CAST(NULLIF(REGEXP_REPLACE({col}, '[^0-9.\\-]', '', 'g'), '')"
+                    f" AS DOUBLE PRECISION)")
         return f"CAST(NULLIF({_replace_chain(col)}, '') AS DOUBLE PRECISION)"
     if d == "mysql":
         if use_regexp:
-            _stripped = f"REGEXP_REPLACE({col}, '[^0-9.\\-]', '')"
-            return (f"CAST(NULLIF(CASE WHEN {_stripped} REGEXP '{_shape}' "
-                    f"THEN {_stripped} END, '') AS DOUBLE)")
+            return (f"CAST(NULLIF(REGEXP_REPLACE({col}, '[^0-9.\\-]', ''), '')"
+                    f" AS DOUBLE)")
         return f"CAST(NULLIF({_replace_chain(col)}, '') AS DOUBLE)"
     # sqlite (and any other dialect): no REGEXP_REPLACE -- REPLACE chain.
     return f"CAST(NULLIF({_replace_chain(col)}, '') AS REAL)"

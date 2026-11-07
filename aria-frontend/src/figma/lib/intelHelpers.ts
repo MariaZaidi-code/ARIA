@@ -3,8 +3,6 @@
    here: every number rendered with these helpers comes from a backend
    result. Imported by Intelligence.tsx + intelligence/* (no duplication). */
 
-import { humanizeLabel } from "./labels";
-
 import { fmtBiz, fmtMoneyBiz } from "./format";
 
 export const asList = (v: unknown): any[] => (Array.isArray(v) ? v : []);
@@ -43,8 +41,15 @@ export function fmtMetric(v: number | null | undefined, metricName?: unknown): s
 }
 
 export function humanize(v: unknown): string {
-  // One label everywhere (shorthand expanded: "pay_mthd" -> "Pay method").
-  return humanizeLabel(v);
+  const s = String(v ?? "").trim();
+  if (!s) return "";
+  const spaced = s
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (/^[A-Z0-9_()%. ]+$/.test(s) && s.length <= 10) return s.replace(/_/g, " ");
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
 /* Title-case for table/heading labels ("Product Category",

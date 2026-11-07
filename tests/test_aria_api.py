@@ -24,7 +24,6 @@ class TestAuthFlow(unittest.TestCase):
 
     def test_register_login_me(self):
         import os
-        from unittest.mock import patch
         from fastapi.testclient import TestClient
         import app as app_module
 
@@ -34,52 +33,43 @@ class TestAuthFlow(unittest.TestCase):
         _prev_cookie_secure = os.environ.get("ARIA_COOKIE_SECURE")
         os.environ["ARIA_COOKIE_SECURE"] = "0"
         try:
-            c = TestClient(app_module.app, raise_server_exceptions=False,
-                           headers={"Origin": "http://127.0.0.1:8000"})
-            user = f"apitest_{int(time.time() * 1000) % 1000000}@example.test"
-            sent = {}
-            with patch(
-                "auth.send_email_verification",
-                side_effect=lambda recipient, token: sent.update(token=token),
-            ):
-                r = c.post("/api/auth/register", json={"email": user, "password": "Secret123!"})
+            c = TestClient(app_module.app, raise_server_exceptions=False)
+            user = f"apitest_{int(time.time() * 1000) % 1000000}"
+            r = c.post("/api/auth/register", json={"username": user, "password": "Secret123!"})
             self.assertEqual(r.status_code, 200, r.text[:200])
             body = r.json()
             self.assertTrue(body.get("ok"))
-            self.assertTrue(body["verification_required"])
+            self.assertEqual(body.get("username"), user)
+            # HttpOnly cookie flow: raw JWT must NOT be exposed in JSON.
             self.assertNotIn("token", body)
-            self.assertFalse(c.cookies.get("aria_token"))
 
-            # A correct password still cannot create a session before email verification.
-            r = c.post("/api/auth/login", json={"email": user, "password": "Secret123!"})
-            self.assertEqual(r.status_code, 403)
-            verified = c.post("/api/auth/verify-email", json={"token": sent["token"]})
-            self.assertEqual(verified.status_code, 200, verified.text[:200])
+            # Cookie was set on the client jar (dev name: aria_token).
+            token = c.cookies.get("aria_token") or c.cookies.get("__Host-aria_token")
+            self.assertTrue(token)
 
-            r = c.post("/api/auth/login", json={"email": user, "password": "Secret123!"})
+            r = c.post("/api/auth/login", json={"username": user, "password": "Secret123!"})
             self.assertEqual(r.status_code, 200)
-            self.assertEqual(r.json().get("email"), user)
             self.assertNotIn("token", r.json())
             token = c.cookies.get("aria_token") or c.cookies.get("__Host-aria_token")
             self.assertTrue(token)
 
-            r = c.post("/api/auth/login", json={"email": user, "password": "wrong"})
+            r = c.post("/api/auth/login", json={"username": user, "password": "wrong"})
             self.assertEqual(r.status_code, 401)
 
-            r = c.post("/api/auth/register", json={"email": user, "password": "Secret123!"})
-            self.assertEqual(r.status_code, 200)
+            r = c.post("/api/auth/register", json={"username": user, "password": "Secret123!"})
+            self.assertEqual(r.status_code, 400)
 
             # Cookie flow: /me works without an explicit Authorization header.
             r = c.get("/api/auth/me")
             self.assertEqual(r.status_code, 200)
-            self.assertEqual(r.json()["email"], user)
+            self.assertEqual(r.json()["username"], user)
 
             # Bearer flow still works (token extracted from cookie jar).
             from fastapi.testclient import TestClient as _TC2
             c2 = _TC2(app_module.app, raise_server_exceptions=False)
             r = c2.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
             self.assertEqual(r.status_code, 200)
-            self.assertEqual(r.json()["email"], user)
+            self.assertEqual(r.json()["username"], user)
 
             # Unauthenticated fresh client (no cookie/header) => 401.
             r = c2.get("/api/auth/me")
@@ -95,95 +85,6 @@ class TestAuthFlow(unittest.TestCase):
                 os.environ.pop("ARIA_COOKIE_SECURE", None)
             else:
                 os.environ["ARIA_COOKIE_SECURE"] = _prev_cookie_secure
-
-    def test_admin_allowlist_and_overview(self):
-        import os
-        from fastapi.testclient import TestClient
-        import app as app_module
-
-        previous_admins = os.environ.get("ARIA_ADMIN_EMAIL")
-        previous_cookie_secure = os.environ.get("ARIA_COOKIE_SECURE")
-        os.environ["ARIA_ADMIN_EMAIL"] = "admin_user@example.test"
-        os.environ["ARIA_COOKIE_SECURE"] = "0"
-        try:
-            client = TestClient(
-                app_module.app,
-                raise_server_exceptions=False,
-                headers={"Origin": "http://127.0.0.1:8000"},
-            )
-            from unittest.mock import patch
-            sent = {}
-            with patch(
-                "auth.send_email_verification",
-                side_effect=lambda recipient, token: sent.update(token=token),
-            ), patch("api.auth_routes._check_login_rate_limit"):
-                admin = client.post(
-                    "/api/auth/register",
-                    json={"email": "admin_user@example.test", "password": "Secret123!"},
-                )
-            self.assertEqual(admin.status_code, 200, admin.text[:200])
-            self.assertTrue(admin.json()["verification_required"])
-            client.post("/api/auth/verify-email", json={"token": sent["token"]})
-            with patch("api.auth_routes._check_login_rate_limit"):
-                login = client.post(
-                    "/api/auth/login",
-                    json={"email": "admin_user@example.test", "password": "Secret123!"},
-                )
-            self.assertEqual(login.status_code, 200, login.text[:200])
-            self.assertTrue(client.get("/api/auth/me").json()["is_admin"])
-
-            visit = client.post("/api/admin/page-visit", json={"page": "dashboard"})
-            self.assertEqual(visit.status_code, 200, visit.text[:200])
-            visit = client.post("/api/admin/page-visit", json={"page": "documents"})
-            self.assertEqual(visit.status_code, 200, visit.text[:200])
-            overview = client.get("/api/admin/overview")
-            self.assertEqual(overview.status_code, 200, overview.text[:200])
-            data = overview.json()["overview"]
-            self.assertEqual(data["users_total"], 1)
-            self.assertEqual(data["users_new_7d"], 1)
-            self.assertEqual(data["analyses_total"], 0)
-            self.assertEqual(data["logins_total"], 1)
-            self.assertEqual(data["page_visits_total"], 2)
-            self.assertEqual(
-                {row["page"] for row in data["page_visits_by_page"]},
-                {"dashboard", "documents"},
-            )
-            self.assertIn("session_store", data["system"])
-            self.assertIn("email_delivery", data["system"])
-
-            regular = TestClient(
-                app_module.app,
-                raise_server_exceptions=False,
-                headers={"Origin": "http://127.0.0.1:8000"},
-            )
-            regular_sent = {}
-            with patch(
-                "auth.send_email_verification",
-                side_effect=lambda recipient, token: regular_sent.update(token=token),
-            ), patch("api.auth_routes._check_login_rate_limit"):
-                registered = regular.post(
-                    "/api/auth/register",
-                    json={"email": "regular_user@example.test", "password": "Secret123!"},
-                )
-            self.assertEqual(registered.status_code, 200, registered.text[:200])
-            regular.post("/api/auth/verify-email", json={"token": regular_sent["token"]})
-            with patch("api.auth_routes._check_login_rate_limit"):
-                regular_login = regular.post(
-                    "/api/auth/login",
-                    json={"email": "regular_user@example.test", "password": "Secret123!"},
-                )
-            self.assertEqual(regular_login.status_code, 200, regular_login.text[:200])
-            denied = regular.get("/api/admin/overview")
-            self.assertEqual(denied.status_code, 403)
-        finally:
-            if previous_admins is None:
-                os.environ.pop("ARIA_ADMIN_EMAIL", None)
-            else:
-                os.environ["ARIA_ADMIN_EMAIL"] = previous_admins
-            if previous_cookie_secure is None:
-                os.environ.pop("ARIA_COOKIE_SECURE", None)
-            else:
-                os.environ["ARIA_COOKIE_SECURE"] = previous_cookie_secure
 
     def test_ttl_env_parsing(self):
         import importlib

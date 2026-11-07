@@ -216,16 +216,6 @@ class GoalAgent(ConstantsMixin, SemanticMixin, IntentMixin, SchemaMixin,
             except Exception:
                 pass
             corrected_goal, corrections = self._correct_goal(user_goal)
-            # Business shorthand ('amt', 'qty', 'txn') becomes the word the
-            # planner understands; the user's own question line is kept in
-            # sync so multi-turn isolation still finds it.
-            corrected_goal = self._expand_goal_shorthand(corrected_goal)
-            try:
-                if getattr(self, "_active_current_question", ""):
-                    self._active_current_question = self._expand_goal_shorthand(
-                        self._active_current_question)
-            except Exception:
-                pass
             # A conversational turn that only became visible after typo
             # correction (e.g. 'helo' -> greeting) is still conversational:
             # never let it fall through to data.

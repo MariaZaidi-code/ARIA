@@ -30,7 +30,7 @@ python -m pytest tests/ -q    # backend suite must stay green
 
 | Layer | Location | Role |
 |---|---|---|
-| API | `app.py`, `api/` (23 routers) | FastAPI routes, auth, CORS, static serving |
+| API | `app.py`, `api/` (19 routers) | FastAPI routes, auth, CORS, static serving |
 | Auth | `auth.py`, `api/auth_routes.py` | PBKDF2 passwords, HS256 JWT, per-user history |
 | Shared | `core/` | config+DPAPI secrets, session store, guards, semantic helpers (`semantic.py`), RL (`rl.py`) |
 | NL→SQL | `goal_agent/` | intent → semantic grounding → SQL contract → execution + validation |
@@ -46,9 +46,7 @@ python -m pytest tests/ -q    # backend suite must stay green
 
 ## Secrets
 
-API keys in `.env` are stored **DPAPI-encrypted** (`enc2:<base64>`, Windows-only,
-machine scope protected by private file ACLs; legacy `enc1` values still decrypt
-under their original Windows identity) and
+API keys in `.env` are stored **DPAPI-encrypted** (`enc1:<base64>`, Windows-only) and
 decrypted transparently at startup (`core/config.py`). To encrypt a new key:
 
 ```bash
@@ -56,52 +54,19 @@ python -c "import sys; sys.path.insert(0,'.'); from core.secret_box import encry
 ```
 
 Never commit `.env`, `data/.jwt_secret`, `*.db`, or token files (all gitignored).
-`TOKEN_TTL_HOURS` (default 12, clamped to 1-168) and login rate limits live in `auth.py` /
+`TOKEN_TTL_DAYS` (default 1, clamped to 1-7) and login rate limits live in `auth.py` /
 `api/auth_routes.py`. Relational `db_uri` is never written to disk (rebuilt from
 encrypted `db` config on restart). Rotate provider keys in their dashboards if ever exposed.
-Email verification is required before sign-in. Configure Gmail-compatible SMTP
-with `ARIA_SMTP_HOST`, `ARIA_SMTP_PORT`, `ARIA_SMTP_USERNAME`,
-`ARIA_SMTP_PASSWORD` (a Google App Password), and `ARIA_SMTP_FROM`; set
-`ARIA_PUBLIC_URL` to the public HTTPS origin in production. Verification links
-expire after 24 hours and can only be used once.
-
-Only the verified address configured in `ARIA_ADMIN_EMAIL` receives admin
-access. Set that value to the owner’s exact email in the server environment;
-there is no UI/API operation to grant another administrator. Admin endpoints
-recheck this server-side setting on each request. The separate Admin Dashboard
-records successful logins and authenticated page visits (180-day retention),
-and reports aggregate usage plus API, auth database, session/shared store,
-SMTP configuration, local Ollama, and default database status.
-Application-level admin access control cannot prevent a repository collaborator
-with write access from changing the source or deployment settings; enforce that
-separately with protected branches, required owner review, and restricted
-deployment-secret access.
-
-Playwright tests that exercise authenticated backend flows use an existing,
-verified non-admin test account supplied through `ARIA_E2E_EMAIL` and
-`ARIA_E2E_PASSWORD`. Do not use a production account for E2E runs.
 
 ## Key API contracts
 
-- `POST /api/auth/register` → sends a verification email; no session until verified
-- `POST /api/auth/verify-email` and `POST /api/auth/resend-verification`
-- `POST /api/auth/login` → verified email/password; sets the HttpOnly session cookie
-- `GET /api/admin/overview` → aggregate account/login/page-visit/system metrics; requires `ARIA_ADMIN_EMAIL`
-- `POST /api/admin/page-visit` → records an authenticated page visit for admin aggregates
+- `POST /api/auth/register|login` → `{ok, token, username}` (30 req / 5 min / IP)
 - `POST /api/connect_file` (multipart CSV) → `{ok, table, rows, columns, quality}`
 - `GET /api/schema`, `POST /api/data/preview` (`{table, limit, offset, search, sort_*}`)
 - `POST /api/data/schema/override` — user PK/FK corrections outrank inference
 - `POST /api/ask` → answer + `provenance {sql, tables, methodology, confidence, timestamp}`
-- `POST /api/predictive/forecast`, `POST /api/prescriptions/analyze` (`/api/prescription/generate` is deprecated), `POST /api/hypothesis`
+- `POST /api/predictive/forecast`, `POST /api/prescription/generate`, `POST /api/hypothesis`
 - `POST /api/rl/event`, `GET /api/rl/events` — RL telemetry (summaries only, never raw datasets)
-- `POST /api/rl/feedback` (random popup reward, 1-5 stars -> [-1, +1]), `GET /api/rl/status` (policy/observability), `POST /api/rl/rank` (replaceable policy ranks pre-validated candidates)
-- `GET/POST/PATCH/DELETE /api/workspace/monitors[/{id}[/check]]`, `POST /api/workspace/monitors/preview` (plain English -> condition + cadence)
-- `GET/PUT /api/workspace/targets`, `GET/PUT /api/workspace/glossary` (`{term, maps_to}`; matched terms rewrite `/api/ask` questions, echoed as `glossary_applied`)
-- `GET /api/workspace/notifications`, `POST /api/workspace/notifications/read`, `DELETE /api/workspace/notifications`
-- `GET/POST/DELETE /api/workspace/webhooks[/{id}[/test]]` (Slack/Teams URLs get native payload shapes)
-- `GET/POST /api/workspace/integrations` (Slack command token: masked on GET, full only on regenerate)
-- `POST /api/export/story` — `format: pptx|xlsx|html` renders the exact in-app envelope (no recomputation); pptx needs `python-pptx`, xlsx `openpyxl`
-- `POST /api/integrations/slack/command?token=…` — Slack slash command; resolves the workspace token to the ARIA user and answers via the same `/api/ask` pipeline, optionally deferring through `response_url` (hooks.slack.com only)
 
 ## Honesty rules (enforced)
 
@@ -125,17 +90,8 @@ ARIA_REQUIRE_SHARED_STORE=1
 UVICORN_WORKERS=4   # or WEB_CONCURRENCY / ARIA_WORKERS
 ```
 
-With >1 workers, production (or `ARIA_REQUIRE_SHARED_STORE=1`) requires
-reachable Redis for both sessions and rate limits. Startup fails fast
-(`RuntimeError`) if Redis is missing or unreachable, and requests fail closed
-(`503`) if Redis becomes unavailable; they never fall back to per-process
-state. Without Redis, >1 workers diverge per-process in development. Startup
-then fails fast (`RuntimeError`) and requests fail closed (`503`) when
+Without `ARIA_REDIS_URL`, >1 workers diverge per-process. Startup then
+fails fast (`RuntimeError`) and requests fail closed (`503`) when
 `ARIA_REQUIRE_SHARED_STORE=1`, or when `ARIA_ENV=production` without an
 explicit `ARIA_REQUIRE_SHARED_STORE=0` opt-out. Single-worker runs never
 fail this check.
-
-The local `data/session_store.json` is loaded at startup. If it is unreadable,
-ARIA reports the degraded state in authenticated `/api/health` and pauses
-disk writes until it can successfully read the existing store, avoiding an
-incomplete snapshot overwriting persisted sessions.

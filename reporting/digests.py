@@ -81,23 +81,10 @@ def _load_schedules(user_id: int) -> list:
 
 def _save_schedules(user_id: int, items: list) -> None:
     try:
-        with _lock:
-            # Atomic replace: the scheduler thread and API CRUD never
-            # observe (or write) a half-written schedules file.
-            path = _schedules_path(user_id)
-            tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex[:8]}")
-            try:
-                tmp.write_text(
-                    json.dumps(items or [], default=str, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                tmp.replace(path)
-            except Exception:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                raise
+        _schedules_path(user_id).write_text(
+            json.dumps(items or [], default=str, ensure_ascii=False),
+            encoding="utf-8",
+        )
     except Exception as exc:
         log.warning("digest: could not persist schedules for user=%s (%s)", user_id, exc)
 
@@ -314,7 +301,10 @@ def generate_digest_now(user_id: int, digest_or_id: Any,
         from core.config import get_session
         from services import intelligence_service as intel
 
-        session = get_session(user_id)
+        try:
+            session = get_session(user_id)
+        except Exception:
+            session = {}
         did = dataset_id or digest.get("dataset_id") or intel._dataset_id(session or {})
 
         definition = digest_to_definition(digest)
@@ -325,8 +315,6 @@ def generate_digest_now(user_id: int, digest_or_id: Any,
             definition["forecast_snapshot"] = snapshot
 
         report = intel.generate_report(user_id, did, definition)
-        if not isinstance(report, dict) or report.get("ok") is False or not report.get("id"):
-            raise RuntimeError("Report generation did not produce a saved report.")
         # Tag the report back to its digest for the UI (best-effort; the
         # definition already carries digest_id for re-run).
         try:
@@ -365,11 +353,7 @@ def _due(digest: dict, now_ts: float) -> bool:
         if not last:
             return True  # newly created / never run -> run on next tick
         try:
-            last_dt = datetime.fromisoformat(str(last))
-            if last_dt.tzinfo is None:
-                # Legacy naive timestamps were written as UTC.
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-            last_ts = last_dt.timestamp()
+            last_ts = datetime.fromisoformat(str(last)).timestamp()
         except Exception:
             return True
         freq = str(digest.get("frequency") or "daily").lower()

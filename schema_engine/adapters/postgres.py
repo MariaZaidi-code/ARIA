@@ -34,7 +34,7 @@ class PostgreSQLAdapter(DatabaseAdapter):
         return self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     def _quote_ident(self, name: str) -> str:
-        return '"' + str(name).replace('"', '""') + '"'
+        return '"' + str(name).replace('"', "") + '"'
 
     # ------------------------------------------------------------------ #
 

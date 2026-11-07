@@ -164,19 +164,19 @@ class ContextEngineer:
     def inventory_answer(kind: str, *, documents: list[dict]) -> str:
         docs = list(documents)
         if not docs:
-            return "You don't have any documents uploaded yet."
+            return "You don't have any PDFs uploaded yet."
 
         count = len(docs)
-        noun = "document" if count == 1 else "documents"
+        noun = "PDF" if count == 1 else "PDFs"
         if kind == "INVENTORY_COUNT":
-            names = ", ".join(str(doc.get("filename") or "Untitled document") for doc in docs[:5])
+            names = ", ".join(str(doc.get("filename") or "Untitled PDF") for doc in docs[:5])
             suffix = "" if count <= 5 else f", and {count - 5} more"
             return f"You currently have {count} {noun}: {names}{suffix}."
 
         lines = [f"You currently have {count} {noun}:"]
         for index, doc in enumerate(docs, start=1):
             lines.append(
-                f"{index}. {doc.get('filename') or 'Untitled document'} "
+                f"{index}. {doc.get('filename') or 'Untitled PDF'} "
                 f"({doc.get('pages', 0)} pages, {doc.get('tables', 0)} tables)"
             )
         return "\n".join(lines)
@@ -185,14 +185,14 @@ class ContextEngineer:
     def metadata_answer(kind: str, *, documents: list[dict]) -> str:
         docs = list(documents)
         if not docs:
-            return "I don't have an uploaded document to inspect yet."
+            return "I don't have an uploaded PDF to inspect yet."
 
         kind = str(kind or "").lower()
         if kind == "name":
             if len(docs) == 1:
-                return f"The document is {docs[0].get('filename') or 'Untitled document'}."
-            return "The selected documents are: " + ", ".join(
-                str(document.get("filename") or "Untitled document") for document in docs
+                return f"The PDF is {docs[0].get('filename') or 'Untitled PDF'}."
+            return "The selected PDFs are: " + ", ".join(
+                str(document.get("filename") or "Untitled PDF") for document in docs
             ) + "."
 
         field = {"pages": "pages", "tables": "tables", "chunks": "total_chunks"}.get(kind)
@@ -201,9 +201,9 @@ class ContextEngineer:
             return "I couldn't determine that document property."
         if len(docs) == 1:
             document = docs[0]
-            return f"{document.get('filename') or 'This document'} has {document.get(field, 0)} {label}."
+            return f"{document.get('filename') or 'This PDF'} has {document.get(field, 0)} {label}."
         return "\n".join(
-            f"- {document.get('filename') or 'Untitled document'}: {document.get(field, 0)} {label}"
+            f"- {document.get('filename') or 'Untitled PDF'}: {document.get(field, 0)} {label}"
             for document in docs
         )
 
@@ -258,62 +258,28 @@ class ContextEngineer:
         chosen_ids: set[int] = set()
 
         if broad_query:
-            # Sample pages first, then retain additional chunks from the same
-            # page. Tabular formats commonly store every chunk on page 1.
+            # Sample pages across each complete document, then round-robin PDFs.
             groups = []
             for document_id in selected_document_ids:
-                document_chunks = sorted(
-                    (doc for doc in unique if str(doc.metadata.get("document_id")) == document_id),
-                    key=lambda d: (d.metadata.get("content_type") != "text",
-                                   not bool(d.metadata.get("table_summary"))),
-                )
-                pages: dict[int, list[Document]] = {}
-                for doc in document_chunks:
-                    page = int(doc.metadata.get("page", 0) or 0)
-                    pages.setdefault(page, []).append(doc)
-                representatives = [pages[page][0] for page in sorted(pages)]
-                if len(representatives) > max_docs:
-                    indices = [
-                        round(i * (len(representatives) - 1) / (max_docs - 1))
-                        for i in range(max_docs)
-                    ]
-                    representatives = [representatives[i] for i in indices]
-                representative_ids = {id(doc) for doc in representatives}
-                additional = [doc for doc in document_chunks if id(doc) not in representative_ids]
-                groups.append((representatives, additional))
-            # Allocate each document's quota across its full page range.
-            quotas = [
-                max_docs // max(1, len(groups)) + (i < max_docs % max(1, len(groups)))
-                for i in range(len(groups))
-            ]
-            for i, (representatives, additional) in enumerate(groups):
-                quota = quotas[i]
-                if quota == 0:
-                    representatives = []
-                elif len(representatives) > quota:
-                    indices = [
-                        round(j * (len(representatives) - 1) / max(1, quota - 1))
-                        for j in range(quota)
-                    ]
-                    representatives = [representatives[index] for index in indices]
-                additional_slots = max(0, quota - len(representatives))
-                if len(additional) > additional_slots > 0:
-                    if additional_slots == 1:
-                        indices = [len(additional) // 2]
-                    else:
-                        indices = [
-                            round(j * (len(additional) - 1) / (additional_slots - 1))
-                            for j in range(additional_slots)
-                        ]
-                    additional = [additional[index] for index in indices]
-                else:
-                    additional = additional[:additional_slots]
-                groups[i] = (representatives + additional, [])
+                pages = {}
+                for doc in sorted(unique, key=lambda d: d.metadata.get("content_type") != "text"):
+                    if str(doc.metadata.get("document_id")) == document_id:
+                        pages.setdefault(int(doc.metadata.get("page", 0) or 0), doc)
+                candidates = [pages[page] for page in sorted(pages)]
+                if len(candidates) > max_docs:
+                    indices = [round(i * (len(candidates) - 1) / (max_docs - 1)) for i in range(max_docs)]
+                    candidates = [candidates[i] for i in indices]
+                groups.append(candidates)
+            # Allocate each PDF's quota across its full page range.
+            for i, group in enumerate(groups):
+                quota = max_docs // max(1, len(groups)) + (i < max_docs % max(1, len(groups)))
+                if len(group) > quota and quota > 0:
+                    groups[i] = [group[round(j * (len(group)-1) / max(1, quota-1))] for j in range(quota)]
             for row in range(max_docs):
                 for group in groups:
-                    if row < len(group[0]) and len(chosen) < max_docs:
-                        chosen.append(group[0][row])
-                        chosen_ids.add(id(group[0][row]))
+                    if row < len(group) and len(chosen) < max_docs:
+                        chosen.append(group[row])
+                        chosen_ids.add(id(group[row]))
         elif cross_document:
             for document_id in selected_document_ids:
                 candidate = next((d for d in unique if str(d.metadata.get("document_id")) == document_id), None)

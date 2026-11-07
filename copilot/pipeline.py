@@ -1320,13 +1320,13 @@ class CopilotPipeline:
             from prediction.agent import PredictionAgent
         except Exception as exc:
             log.info("Copilot forecast engine unavailable (%s); trend fallback.", exc)
-            return None
+            return f"Forecast unavailable: {exc}"
         try:
             payload = PredictionAgent().forecast(
                 {"data": rows, "user_goal": question})
         except Exception as exc:
             log.info("Copilot forecast run failed (%s); trend fallback.", exc)
-            return None
+            return f"Forecast run failed: {exc}"
         if not isinstance(payload, dict) or not payload.get("valid"):
             return "Forecast returned invalid or empty result."
         points = payload.get("points") or []
@@ -1336,7 +1336,7 @@ class CopilotPipeline:
             return self._forecast_narrative(question, payload, analysis)
         except Exception as exc:
             log.info("Copilot forecast narration failed (%s); trend fallback.", exc)
-            return None
+            return f"Forecast narration failed: {exc}"
 
     def _forecast_narrative(self, question: str, payload: dict,
                             analysis: dict) -> str:
@@ -1384,9 +1384,7 @@ class CopilotPipeline:
         try:
             tables = sorted((self.mapping or {}).get("tables", {}) or {})
             if tables:
-                # Plain words, never raw identifiers ('dataset_c_messy_txns').
-                from core.analytical_result import natural_label
-                named = ", ".join(dict.fromkeys(natural_label(t) for t in tables[:3]))
+                named = ", ".join(tables[:3])
                 return (f" Try asking about {named} — for example a total, "
                         f"a breakdown, or how it changed over time.")
         except Exception:

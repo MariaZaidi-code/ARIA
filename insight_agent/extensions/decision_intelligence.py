@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 
+_ID_EXACT = {"id", "key", "code", "codeid", "row_number", "rownumber"}
 _REVENUE_WORDS = ("revenue", "sales", "amount", "turnover", "gmv", "net_sales", "total_sales")
 _PROFIT_WORDS = ("profit", "margin", "gross_profit", "net_profit")
 _DISCOUNT_WORDS = ("discount", "disc", "markdown")
@@ -39,18 +40,13 @@ _REGION_WORDS = ("region", "country", "city", "state", "territory", "market")
 
 
 def _is_id_like(name: str) -> bool:
-    """Delegate to the canonical helper (token/camelCase aware).
-
-    The previous local heuristic (`endswith("id") and len <= 18`) wrongly
-    classified business words like 'paid', 'valid' or 'void' as identifiers;
-    the canonical check keys off id/key/code tokens instead.
-    """
-    try:
-        from core.identifiers import is_id_like as _canon
-        return bool(_canon(name))
-    except Exception:
-        low = str(name or "").lower().strip()
-        return low.endswith("_id") or low.endswith("_key") or low in ("id", "key", "code", "codeid")
+    low = str(name).strip().lower()
+    return (
+        low in _ID_EXACT
+        or low.endswith("_id")
+        or low.endswith("_key")
+        or (low.endswith("id") and len(low) <= 18)
+    )
 
 
 def _human(name: str) -> str:

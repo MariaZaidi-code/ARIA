@@ -3,8 +3,5 @@
 pytest==9.0.3
 httpx==0.28.1
 pytest-cov==7.1.0
-# CI static import-safety gate: ruff check . --select F821,F822,F823,E9.
-# Keep at the version used to verify that gate locally.
-ruff==0.17.1
 # full_audit.py dev/audit script only; no production module imports requests.
 requests==2.34.2

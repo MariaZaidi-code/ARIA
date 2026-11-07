@@ -1,6 +1,5 @@
 """Small database / identifier helpers."""
 
-import ipaddress
 import re
 from urllib.parse import quote_plus
 
@@ -8,27 +7,6 @@ _URI_SCHEMES = {
     "postgresql": "postgresql",
     "mysql": "mysql+pymysql",
 }
-
-# A valid (unquoted) SQL identifier. Schema names flow into a libpq
-# ``-csearch_path=`` option string, so each segment must be strictly
-# validated — a comma/whitespace-bearing name would otherwise alter the
-# resolved search path.
-_SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def format_db_host(host):
-    """Format a database host for a SQLAlchemy URL authority.
-
-    IPv6 literals must be bracketed in URLs (for example, ``[::1]``).
-    Hostnames and IPv4 addresses are returned unchanged.
-    """
-    value = str(host or "").strip()
-    unwrapped = value[1:-1] if value.startswith("[") and value.endswith("]") else value
-    try:
-        address = ipaddress.ip_address(unwrapped)
-    except ValueError:
-        return value
-    return f"[{address}]" if address.version == 6 else str(address)
 
 
 def build_db_uri(config, db_type="postgresql"):
@@ -38,10 +16,9 @@ def build_db_uri(config, db_type="postgresql"):
     scheme is ``mysql+pymysql`` (needs pymysql installed).
     """
     scheme = _URI_SCHEMES.get(db_type, "postgresql")
-    host = format_db_host(config["host"])
     return (
         f"{scheme}://{quote_plus(config['user'])}:{quote_plus(config['password'])}"
-        f"@{host}:{config['port']}/{quote_plus(config['db'])}"
+        f"@{config['host']}:{config['port']}/{quote_plus(config['db'])}"
     )
 
 
@@ -63,10 +40,6 @@ def search_path_connect_args(db_type, schemas):
         for s in (schemas or []):
             norm = _strip_identifier_quotes(s)
             if not norm:
-                continue
-            # Reject anything that is not a bare identifier (no commas,
-            # quotes, spaces, operators) before it reaches the option string.
-            if not _SAFE_IDENT_RE.match(norm):
                 continue
             key = norm.lower()
             if key not in seen:

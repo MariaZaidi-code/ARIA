@@ -1,10 +1,9 @@
 """Encrypt/decrypt secrets at rest with Windows DPAPI.
 
-New DPAPI values use the machine scope (`enc2:<base64>`) so ARIA can move
-between its desktop and managed server identities on the same Windows
-machine. Secret-bearing files are ACL-restricted to those identities.
-Legacy `enc1:<base64>` user-scoped values remain readable by the account that
-created them and are migrated to `enc2` the next time the user saves them.
+DPAPI (CryptProtectData) binds the ciphertext to the current Windows user
+account, so a stolen `.env` file is unreadable on any other machine or user.
+Keys are stored as `enc1:<base64>` values; `decrypt_env_value()` is called
+from core.config right after load_dotenv so `os.getenv` sees the real key.
 
 Platform honesty: only Windows DPAPI encrypts. On Linux/macOS there is no
 local trust anchor, so `encrypt()` returns plaintext AND warns loudly;
@@ -20,13 +19,12 @@ import os
 import sys
 import warnings
 
-PREFIX = "enc2:"
-LEGACY_PREFIX = "enc1:"
+PREFIX = "enc1:"
 
 
 def is_encrypted(value) -> bool:
-    """Return True when the value carries a supported DPAPI envelope."""
-    return isinstance(value, str) and value.startswith((PREFIX, LEGACY_PREFIX))
+    """Return True only when the value carries the DPAPI `enc1:` envelope."""
+    return isinstance(value, str) and value.startswith(PREFIX)
 
 
 def redact(value, keep: int = 0) -> str:
@@ -42,16 +40,14 @@ def ensure_private_file(path) -> None:
     """Best-effort private perms on a secret-bearing file.
 
     POSIX: chmod 0600 (unchanged). Windows: restrict the file ACL to the
-    configured desktop account and actual process identity via icacls
-    (fail-open with warning, never crashes startup, never logs secret values).
+    current user only via icacls (fail-open with warning, never crashes
+    startup, never logs secret values).
     """
     try:
         if sys.platform != "win32":
             os.chmod(path, 0o600)
             return
-        # USERNAME can name the desktop account while a managed process runs
-        # under a separate sandbox identity. Grant both so the process can
-        # continue to read, replace, and clean up its own staged files.
+        # Windows branch: current-user-only ACL via icacls (no shell).
         try:
             import ctypes  # noqa: F401 - confirms Win32 API surface present
         except Exception:
@@ -60,28 +56,15 @@ def ensure_private_file(path) -> None:
             import logging as _logging
             import subprocess as _subprocess
 
-            _principals = []
             _username = (os.getenv("USERNAME") or "").strip()
-            if _username:
-                _principals.append(f"{_username}:F")
-            try:
-                import csv as _csv
+            if not _username:
+                try:
+                    import getpass as _getpass
 
-                _who = _subprocess.run(
-                    ["whoami", "/user", "/fo", "csv", "/nh"],
-                    shell=False,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                _rows = list(_csv.reader((_who.stdout or "").splitlines()))
-                _sid = _rows[0][1].strip() if _rows and len(_rows[0]) > 1 else ""
-                if _who.returncode == 0 and _sid.startswith("S-"):
-                    _principals.append(f"*{_sid}:F")
-            except Exception:
-                pass
-            if not _principals:
+                    _username = (_getpass.getuser() or "").strip()
+                except Exception:
+                    _username = ""
+            if not _username:
                 _logging.getLogger("uvicorn.error").warning(
                     "core.secret_box: cannot determine current user; "
                     "leaving file ACL unchanged."
@@ -94,7 +77,7 @@ def ensure_private_file(path) -> None:
                         str(path),
                         "/inheritance:r",
                         "/grant:r",
-                        *_principals,
+                        f"{_username}:F",
                     ],
                     shell=False,
                     check=False,
@@ -136,11 +119,8 @@ if sys.platform == "win32":
     def _protect(data: bytes) -> bytes:
         blob_in = _blob(data)
         blob_out = DATA_BLOB()
-        # CRYPTPROTECT_LOCAL_MACHINE allows another ARIA process identity on
-        # this machine to decrypt the value. Access to the containing session
-        # file remains restricted by ensure_private_file's Windows ACL.
         if not ctypes.windll.crypt32.CryptProtectData(
-            ctypes.byref(blob_in), "ARIA secret", None, None, None, 0x4, ctypes.byref(blob_out)
+            ctypes.byref(blob_in), "ARIA secret", None, None, None, 0, ctypes.byref(blob_out)
         ):
             raise OSError("CryptProtectData failed")
         try:
@@ -164,10 +144,9 @@ if sys.platform == "win32":
         return PREFIX + base64.b64encode(_protect(plaintext.encode("utf-8"))).decode("ascii")
 
     def decrypt(ciphertext: str) -> str:
-        if not ciphertext.startswith((PREFIX, LEGACY_PREFIX)):
+        if not ciphertext.startswith(PREFIX):
             return ciphertext
-        envelope = PREFIX if ciphertext.startswith(PREFIX) else LEGACY_PREFIX
-        raw = base64.b64decode(ciphertext[len(envelope):])
+        raw = base64.b64decode(ciphertext[len(PREFIX):])
         return _unprotect(raw).decode("utf-8")
 
 else:
@@ -186,8 +165,5 @@ else:
         return plaintext
 
     def decrypt(ciphertext: str) -> str:
-        # A Windows ciphertext is not a usable password on another OS.
-        # Plaintext migration stays compatible; encrypted values fail loudly.
-        if is_encrypted(ciphertext):
-            raise RuntimeError("Windows-encrypted secret cannot be decrypted on this platform.")
+        # Never raise on plaintext passthrough; never log the value.
         return ciphertext

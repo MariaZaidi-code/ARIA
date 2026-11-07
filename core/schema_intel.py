@@ -26,18 +26,6 @@ def _is_id_like(name: str) -> bool:
     return toks[-1] in ("id", "uuid", "guid", "key", "code")
 
 
-def _meaning_words(name: str) -> set:
-    """Name tokens plus their plain-English expansions ('amt' -> 'amount',
-    'txn_dt' -> 'transaction', 'date'), for ranking by meaning only."""
-    from schema_engine.lexical import identifier_words
-    return set(_name_tokens(name)) | set(identifier_words(name))
-
-
-# Calendar parts: grouping axes, never measures (SUM of month numbers is
-# as meaningless as SUM of years).
-_PERIOD_PART_WORDS = {"year", "month", "quarter", "week", "weekday", "day", "hour"}
-
-
 def _hint_hit(name: str, hints) -> bool:
     """Any name token equals a hint (singular/plural tolerant)."""
     for t in _name_tokens(name):
@@ -175,26 +163,19 @@ def _run_sql(conn, sql: str, limit: int = 500):
     """
     try:
         cur = conn.cursor()
-        try:
-            cur.execute(sql)
-            cols = [d[0] for d in cur.description] if cur.description else []
-            rows = cur.fetchmany(limit)
-            return cols, [dict(zip(cols, row)) for row in rows]
-        finally:
-            cur.close()
+        cur.execute(sql)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = cur.fetchmany(limit)
+        cur.close()
+        return cols, [dict(zip(cols, row)) for row in rows]
     except Exception as exc:
         import logging as _logging
         _logging.getLogger("aria.schema_intel").warning(
             "sql failed (returning empty): sql=%.200s error=%s", sql, exc)
-        for target in (conn, getattr(conn, "connection", None), getattr(conn, "raw_connection", None)):
-            if target is not None:
-                try:
-                    if callable(target):
-                        target = target()
-                    if hasattr(target, "rollback"):
-                        target.rollback()
-                except Exception:
-                    pass
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return [], []
 
 
@@ -367,8 +348,7 @@ class SchemaIntelligence:
                 and not _is_id_like(c)
                 and not _is_binary_like_name(c)
                 and not _is_binary_like_type(col_types.get(c, ""))
-                and not _is_year_like(c)
-                and not (_meaning_words(c) & _PERIOD_PART_WORDS)]
+                and not _is_year_like(c)]
 
     def find_best_measure(self, table: str):
         """Pick the most analytically useful numeric column (prefer amounts over IDs).
@@ -380,33 +360,17 @@ class SchemaIntelligence:
         if not numerics:
             return None
 
-        # Rank by meaning rather than whichever column happened to appear
-        # first in the schema. Operational measures such as quantity and
-        # unit price are useful, but should not displace a real sales/revenue
-        # total as the primary business outcome.
-        direct_outcomes = {"sales", "revenue", "profit", "income", "turnover"}
-        totals = {"amount", "total", "value", "payment", "billing", "balance"}
-        financial_components = {"price", "cost", "expense", "salary", "charge", "fee", "tax", "freight", "discount"}
-        operational = {"quantity", "qty", "count", "weight", "unit", "units"}
+        # Tier 1: amount-like names, not PK/FK
+        tier1 = [c for c in numerics
+                 if any(h in c.lower() for h in AMOUNT_HINTS)]
+        if tier1:
+            return tier1[0]
 
-        # Parts of a total (sub total, tax amount, line total, unit price)
-        # rank below the headline total they add up to ('TotalDue').
-        component_parts = {"sub", "tax", "freight", "shipping", "line", "unit",
-                           "discount", "fee"}
+        # Tier 2: non-PK/FK, non-ID columns
+        if numerics:
+            return numerics[0]
 
-        def rank(col):
-            tokens = _meaning_words(col)
-            if tokens & direct_outcomes:
-                return 4
-            if tokens & totals:
-                return 2.5 if tokens & component_parts else 3
-            if tokens & financial_components:
-                return 2
-            if tokens & operational:
-                return 1
-            return 0
-
-        return max(numerics, key=rank)
+        return None
 
     def find_all_measures(self, table: str):
         """Return all usable numeric measure columns for a table."""
@@ -436,21 +400,8 @@ class SchemaIntelligence:
                   if c not in pks and c not in fk_cols
                   and not _is_id_like(c)]
         if usable:
-            # Shorthand dates ('txn_dt') are dates too.
-            non_date = [c for c in usable if not _hint_hit(c, _DATE_NAME_HINTS)
-                        and not (_meaning_words(c) & {"date", "time", "timestamp"})]
-            pool = non_date or usable
-            # Prefer a real grouping (few distinct values) over near-unique
-            # text such as names or free text, when profiling knows it.
-            stats = (self.tables.get(table) or {}).get("null_stats") or {}
-
-            def _distinct(c):
-                try:
-                    return int((stats.get(c) or {}).get("distinct_count") or 0)
-                except (TypeError, ValueError):
-                    return 0
-            groupable = [c for c in pool if 0 < _distinct(c) <= 50]
-            return (groupable or pool)[0]
+            non_date = [c for c in usable if not _hint_hit(c, _DATE_NAME_HINTS)]
+            return (non_date or usable)[0]
         non_pk = [c for c in texts if c not in pks]
         if non_pk:
             non_date = [c for c in non_pk if not _hint_hit(c, _DATE_NAME_HINTS)]
@@ -544,7 +495,7 @@ class SchemaIntelligence:
 
         for fk_col, ref_table, ref_col in self.get_fks(to_table):
             if ref_table == from_table:
-                return [(from_table, ref_col, to_table, fk_col)]
+                return [(to_table, fk_col, from_table, ref_col)]
 
         for fk1_col, ref1_table, ref1_col in self.get_fks(from_table):
             for fk2_col, ref2_table, ref2_col in self.get_fks(ref1_table):
@@ -556,25 +507,18 @@ class SchemaIntelligence:
 
         return []
 
-    def build_join_clause(self, joins: list, dialect: str = "postgresql", base_table: str = None) -> str:
+    def build_join_clause(self, joins: list, dialect: str = "postgresql") -> str:
         """Build SQL JOIN clause from a list of join steps."""
         clauses = []
-        joined = {base_table.lower()} if base_table else set()
         for from_t, from_c, to_t, to_c in joins:
-            target_t, target_c, source_t, source_c = to_t, to_c, from_t, from_c
-            if target_t.lower() in joined and source_t.lower() not in joined:
-                target_t, target_c, source_t, source_c = from_t, from_c, to_t, to_c
-            if target_t.lower() in joined:
-                continue
             clauses.append(
-                f'JOIN {_safe_name(target_t, dialect)} ON '
-                f'{_safe_name(source_t, dialect)}.{_safe_name(source_c, dialect)} = '
-                f'{_safe_name(target_t, dialect)}.{_safe_name(target_c, dialect)}'
+                f'JOIN {_safe_name(to_t, dialect)} ON '
+                f'{_safe_name(from_t, dialect)}.{_safe_name(from_c, dialect)} = '
+                f'{_safe_name(to_t, dialect)}.{_safe_name(to_c, dialect)}'
             )
-            joined.add(target_t.lower())
         return " ".join(clauses)
 
-    def get_table_row_count(self, table: str) -> int | None:
-        """Return the recorded row_count for `table`, or None when unknown."""
+    def get_table_row_count(self, table: str) -> bool:
+        """Check if table has a row_count in metadata."""
         info = self.tables.get(table, {})
         return info.get("row_count", 0) if "row_count" in info else None

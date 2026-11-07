@@ -38,7 +38,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 from core.config import STATIC_DIR, BASE_DIR  # noqa: E402
 from core.checks import run_checks  # noqa: E402
 from llm_provider import PROVIDERS  # noqa: E402
-from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, hypothesis_investigation_routes, settings_routes, feedback_routes, autocomplete_routes, data_routes, insight_rag_routes, insights_routes, predictive_routes, prescription_routes, rl_routes, intelligence_routes, verification_routes, workspace_routes, export_routes, integrations_routes  # noqa: E402
+from api import auth_routes, connect_routes, query_routes, schema_routes, document_routes, kpi_routes, copilot_routes, hypothesis_routes, hypothesis_investigation_routes, settings_routes, feedback_routes, autocomplete_routes, data_routes, insight_rag_routes, insights_routes, predictive_routes, prescription_routes, rl_routes, intelligence_routes, verification_routes  # noqa: E402
 from core.ratelimit import limit, limit_heavy, limit_ip, limit_llm  # noqa: E402
 from fastapi import Depends as _Depends  # noqa: E402
 
@@ -47,10 +47,6 @@ from fastapi import Depends as _Depends  # noqa: E402
 async def lifespan(app: FastAPI):
     """Run startup checks; failures stay visible but never crash import."""
     import logging
-    import auth
-    # Secret resolution is lazy at import, but invalid production credentials
-    # must still fail startup before accepting requests.
-    auth._signing_secret()
     report = run_checks()
     critical = report["critical"]
     if critical:
@@ -110,45 +106,11 @@ async def lifespan(app: FastAPI):
                 "single worker. Set ARIA_REQUIRE_SHARED_STORE=1 to fail closed.",
                 _workers,
             )
-        if _workers > 1 and _redis_url:
-            _require_env = os.getenv("ARIA_REQUIRE_SHARED_STORE")
-            _require_raw = (_require_env or "").strip().lower()
-            _explicit_opt_out = _require_raw in {"0", "false", "no", "off"}
-            _require_shared = _require_raw in {"1", "true", "yes", "on"}
-            _is_prod = (os.getenv("ARIA_ENV", "") or "").strip().lower() == "production"
-            if _require_shared or (_is_prod and not _explicit_opt_out):
-                from core.config import get_redis_client as _get_session_redis
-                from core.ratelimit import (
-                    get_redis_client as _get_rate_limit_redis,
-                    store_backend as _rate_limit_backend,
-                )
-
-                if (
-                    _rate_limit_backend() != "redis"
-                    or _get_session_redis() is None
-                    or _get_rate_limit_redis() is None
-                ):
-                    raise RuntimeError(
-                        "Multi-worker production requires a reachable Redis "
-                        "store for both sessions and rate limits."
-                    )
     except RuntimeError:
         raise
-    except Exception as exc:
-        logging.getLogger("uvicorn.error").warning(
-            "ARIA worker/shared-store check skipped (%s).", type(exc).__name__,
-        )
-    logging.getLogger("uvicorn.error").info("ARIA startup checks complete.")
-    # Warm the Copilot embedder in the background (loading takes seconds),
-    # so the first Ask ARIA question is as fast as the rest. Never blocks
-    # or fails startup.
-    try:
-        import threading as _threading
-        from copilot.embeddings import create_embedder as _warm_embedder
-        _threading.Thread(target=_warm_embedder, name="aria-embedder-warmup",
-                          daemon=True).start()
     except Exception:
         pass
+    logging.getLogger("uvicorn.error").info("ARIA startup checks complete.")
     try:
         _eff_workers = _resolve_workers()
     except Exception:
@@ -157,17 +119,7 @@ async def lifespan(app: FastAPI):
         "ARIA effective workers=%d (UVICORN_WORKERS/WEB_CONCURRENCY/ARIA_WORKERS).",
         _eff_workers,
     )
-    try:
-        from services.reingest_scheduler import start as _sched_start
-        _sched_start()
-    except Exception as _e:
-        logging.getLogger("uvicorn.error").warning("reingest scheduler start failed: %s", type(_e).__name__)
     yield
-    try:
-        from services.reingest_scheduler import stop as _sched_stop
-        _sched_stop()
-    except Exception:
-        pass
 
 
 _enable_docs = os.getenv("ARIA_ENABLE_DOCS", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -213,93 +165,9 @@ async def _security_headers(request: Request, call_next):
     else:
         resp.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data: blob:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; connect-src 'self'; font-src 'self' data: https://fonts.gstatic.com",
+            "default-src 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:",
         )
     return resp
-
-
-@app.middleware("http")
-async def _request_safety(request: Request, call_next):
-    """Reject cross-origin cookie writes and unauthenticated uploads early.
-
-    This middleware runs before FastAPI parses multipart bodies, avoiding disk
-    spooling for unauthenticated upload attempts.
-    """
-    from urllib.parse import urlsplit
-
-    method = request.method.upper()
-    is_write = method in {"POST", "PUT", "PATCH", "DELETE"}
-    api_path = request.url.path.startswith("/api/")
-    cookies = request.cookies
-    cookie_token = cookies.get("aria_token") or cookies.get("__Host-aria_token")
-
-    if is_write and api_path and cookie_token:
-        supplied = request.headers.get("origin", "").strip()
-        if not supplied:
-            referer = request.headers.get("referer", "").strip()
-            supplied = f"{urlsplit(referer).scheme}://{urlsplit(referer).netloc}" if referer else ""
-        expected = f"{request.url.scheme}://{request.url.netloc}"
-        allowed = {expected, *(o.rstrip("/") for o in _cors_origins)}
-        if supplied.rstrip("/") not in allowed:
-            return JSONResponse(status_code=403, content={"ok": False, "success": False,
-                                 "code": "FORBIDDEN", "detail": "Cross-origin request rejected."})
-
-    upload_limits = {
-        "/api/connect_file": connect_routes.MAX_UPLOAD_BYTES_CSV + 2 * 1024 * 1024,
-        "/api/connect_pdf": connect_routes.MAX_UPLOAD_BYTES_PDF + 2 * 1024 * 1024,
-        "/api/insight/pdf/upload": insight_rag_routes.MAX_PDF_MB * 1024 * 1024 + 2 * 1024 * 1024,
-    }
-    cap = upload_limits.get(request.url.path)
-    if cap is not None:
-        token = request.headers.get("authorization", "")
-        if token.lower().startswith("bearer "):
-            token = token[7:].strip()
-        else:
-            token = cookie_token or ""
-        try:
-            import auth as _auth
-            authenticated = bool(token and _auth.verify_token(token))
-        except Exception:
-            authenticated = False
-        if not authenticated:
-            return JSONResponse(status_code=401, content={"ok": False, "success": False,
-                                 "code": "UNAUTHORIZED", "detail": "Authentication required."})
-        raw_length = request.headers.get("content-length")
-        try:
-            if raw_length and int(raw_length) > cap:
-                return JSONResponse(status_code=413, content={"ok": False, "success": False,
-                                     "code": "REQUEST_FAILED", "detail": "Upload exceeds the configured size limit."})
-        except ValueError:
-            return JSONResponse(status_code=400, content={"ok": False, "success": False,
-                                 "code": "REQUEST_FAILED", "detail": "Invalid Content-Length."})
-        # Content-Length may be omitted on streamed/chunked requests. Count
-        # bytes as Starlette consumes the body so parsing stops at the same cap.
-        received = 0
-        exceeded = False
-        original_receive = request._receive
-
-        async def limited_receive():
-            nonlocal received, exceeded
-            message = await original_receive()
-            if message.get("type") == "http.request":
-                received += len(message.get("body", b""))
-                if received > cap:
-                    exceeded = True
-                    return {"type": "http.disconnect"}
-            return message
-
-        request._receive = limited_receive
-        try:
-            response = await call_next(request)
-        except Exception:
-            if not exceeded:
-                raise
-            response = None
-        if exceeded or response is None:
-            return JSONResponse(status_code=413, content={"ok": False, "success": False,
-                                 "code": "REQUEST_FAILED", "detail": "Upload exceeds the configured size limit."})
-        return response
-    return await call_next(request)
 
 
 @app.middleware("http")
@@ -308,12 +176,7 @@ async def _request_id(request: Request, call_next):
     server-side against it; clients only ever see the ID."""
     import uuid as _uuid
 
-    rid = str(request.headers.get("X-Request-ID") or "").strip()
-    # Cap client-supplied IDs (log/header injection hygiene) and drop any
-    # character outside the safe token set before echoing/storing.
-    rid = "".join(c for c in rid if c.isalnum() or c in "._:-")[:128]
-    if not rid:
-        rid = _uuid.uuid4().hex[:12]
+    rid = request.headers.get("X-Request-ID") or _uuid.uuid4().hex[:12]
     request.state.request_id = rid
     resp = await call_next(request)
     resp.headers["X-Request-ID"] = rid
@@ -363,9 +226,6 @@ app.include_router(predictive_routes.router, dependencies=[_Depends(limit_llm())
 app.include_router(prescription_routes.router, dependencies=[_Depends(limit_heavy())])
 app.include_router(hypothesis_investigation_routes.router, dependencies=[_Depends(limit_heavy())])
 app.include_router(rl_routes.router, dependencies=[_Depends(limit("rl", 60))])
-app.include_router(workspace_routes.router, dependencies=[_Depends(limit("workspace", 120))])
-app.include_router(export_routes.router, dependencies=[_Depends(limit("export", 30))])
-app.include_router(integrations_routes.router, dependencies=[_Depends(limit_ip("slack_integration", 120))])
 app.include_router(intelligence_routes.router, dependencies=[_Depends(limit_heavy())])
 app.include_router(verification_routes.router, dependencies=[_Depends(limit_heavy())])
 
@@ -437,25 +297,8 @@ async def unhandled_exception(request: Request, exc: Exception):
 
 
 @app.get("/api/health", dependencies=[_Depends(limit_ip("health", 120))])
-def health(request: Request = None):
-    """Live dependency/health status for ops and the UI.
-
-    Anonymous callers get only a boolean liveness status; the detailed
-    dependency report (python/package inventory, env flags, DB details)
-    requires authentication to avoid leaking recon to unauthenticated
-    traffic.
-    """
-    detail_ok = False
-    if request is not None:
-        try:
-            from core.config import get_session_for_request
-
-            get_session_for_request(request)
-            detail_ok = True
-        except Exception:
-            detail_ok = False
-    if not detail_ok:
-        return {"ok": True, "status": "healthy"}
+def health():
+    """Live dependency/health status for ops and the UI."""
     return run_checks()
 
 

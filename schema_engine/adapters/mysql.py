@@ -29,7 +29,7 @@ class MySQLAdapter(DatabaseAdapter):
         return self.conn.cursor(pymysql.cursors.DictCursor)
 
     def _quote_ident(self, name: str) -> str:
-        return "`" + str(name).replace("`", "``") + "`"
+        return "`" + str(name).replace("`", "") + "`"
 
     def _database_name(self) -> str:
         with self._dict_cursor() as cur:

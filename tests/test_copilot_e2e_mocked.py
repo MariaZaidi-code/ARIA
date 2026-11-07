@@ -41,8 +41,7 @@ class TestCopilotE2EMocked(unittest.TestCase):
         # defaults remain Secure; see api/auth_routes._cookie_secure).
         cls._prev_cookie_secure = os.environ.get("ARIA_COOKIE_SECURE")
         os.environ["ARIA_COOKIE_SECURE"] = "0"
-        cls.client = TestClient(app_module.app, raise_server_exceptions=False,
-                                headers={"Origin": "http://127.0.0.1:8000"})
+        cls.client = TestClient(app_module.app, raise_server_exceptions=False)
 
     @classmethod
     def tearDownClass(cls):
@@ -56,9 +55,9 @@ class TestCopilotE2EMocked(unittest.TestCase):
     # -- helpers ---------------------------------------------------------
 
     def _register(self):
-        user = f"copilotmock_{int(time.time() * 1000) % 10000000}@example.test"
-        from helpers import register_verified_email
-        r = register_verified_email(self.client, user, PASSWORD)
+        user = f"copilotmock_{int(time.time() * 1000) % 10000000}"
+        r = self.client.post("/api/auth/register",
+                             json={"username": user, "password": PASSWORD})
         self.assertEqual(r.status_code, 200, r.text[:300])
         token = (self.client.cookies.get("aria_token")
                  or self.client.cookies.get("__Host-aria_token"))
@@ -78,8 +77,7 @@ class TestCopilotE2EMocked(unittest.TestCase):
         from fastapi.testclient import TestClient
         import app as app_module
 
-        anon = TestClient(app_module.app, raise_server_exceptions=False,
-                          headers={"Origin": "http://127.0.0.1:8000"})
+        anon = TestClient(app_module.app, raise_server_exceptions=False)
         r = anon.post("/api/copilot", json={"question": LEGACY_QUESTIONS[0]})
         self.assertEqual(r.status_code, 401, r.text[:200])
         r = anon.get("/api/copilot/suggestions")

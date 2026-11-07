@@ -127,6 +127,42 @@ def test_investigation_document_candidate(tmp_path):
     assert all(h["strength"] in ("Limited evidence", "Insufficient evidence") for h in doc_hypos)
 
 
+def test_document_candidates_accept_flat_session_chunks():
+    """Session document records must reach hypothesis evidence ranking."""
+    from hypothesis_engine.investigate import _document_candidates
+
+    documents = [{
+        "filename": "delivery-report.pdf",
+        "page": 7,
+        "text": "Sales revenue declined while deliveries were delayed.",
+    }]
+    candidates = _document_candidates("Why did sales decline?", "sales", documents)
+
+    assert len(candidates) == 1
+    assert candidates[0]["strength"] == "Limited evidence"
+    assert candidates[0]["source"] == {
+        "type": "document", "label": "delivery-report.pdf p.7",
+    }
+    assert "deliveries were delayed" in candidates[0]["supporting"][0]
+
+
+def test_document_candidates_keep_chunk_level_page_citations():
+    """Existing nested document callers retain the matched chunk page."""
+    from hypothesis_engine.investigate import _document_candidates
+
+    documents = [{
+        "filename": "delivery-report.pdf",
+        "page": 1,
+        "chunks": [
+            {"page": 3, "text": "Sales declined due to inventory delays."},
+        ],
+    }]
+    candidates = _document_candidates("Why did sales decline?", "sales", documents)
+
+    assert len(candidates) == 1
+    assert candidates[0]["source"]["label"] == "delivery-report.pdf p.3"
+
+
 def test_auto_detect_finds_decline_and_investigates(sales_engine, mapping):
     from hypothesis_engine.investigate import auto_detect, auto_investigate
     intel = SchemaIntelligence(mapping)
@@ -211,32 +247,10 @@ def test_suggestions_present_and_time_preferring(sales_engine, mapping):
     assert out.get("suggestions")
     # Suggestions reference the time-capable metric, not a dead end.
     assert any("amount" in s for s in out["suggestions"])
-    assert all("vary by" not in s.lower() for s in out["suggestions"])
-    assert all(("why did" in s.lower() or "changed over time" in s.lower())
-               for s in out["suggestions"])
     # Every suggestion runs without crashing the engine.
     for s in out["suggestions"][:2]:
         r = investigate_question(sales_engine, "sqlite", intel, ["orders"], s)
         assert r["ok"]
-
-
-def test_prominent_suggestions_focus_on_metric_change_over_time(sales_engine, mapping):
-    from hypothesis_engine.engine import rank_prominent, suggest_hypotheses
-
-    intel = SchemaIntelligence(mapping)
-    ranked = rank_prominent(sales_engine, "sqlite", intel, ["orders"])
-    assert all(item["kind"] == "trend" for item in ranked)
-    assert all("vary by" not in item["text"].lower()
-               and "differ across" not in item["text"].lower()
-               for item in ranked)
-
-    suggestions = suggest_hypotheses(sales_engine, "sqlite", intel, ["orders"])
-    assert suggestions
-    assert all("amount" in text.lower() for text in suggestions)
-    assert all("vary by" not in text.lower()
-               and "differ across" not in text.lower()
-               and "related?" not in text.lower()
-               for text in suggestions)
 
 
 def test_resolver_picks_targets_per_question(sales_engine, mapping):

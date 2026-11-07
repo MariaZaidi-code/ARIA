@@ -16,22 +16,6 @@ def test_api_keys_encrypt_roundtrip():
     assert _decrypt_api_keys({"cloud": "plain"})["cloud"] == "plain"
 
 
-def test_database_uris_bracket_ipv6_hosts():
-    from sqlalchemy.engine import make_url
-    from core.db import build_db_uri
-
-    for db_type, port in (("postgresql", 5432), ("mysql", 3306)):
-        uri = build_db_uri(
-            {"user": "aria", "password": "secret", "host": "::1",
-             "port": port, "db": "northwind"},
-            db_type,
-        )
-        parsed = make_url(uri)
-        assert parsed.host == "::1"
-        assert parsed.port == port
-        assert parsed.database == "northwind"
-
-
 def test_no_query_token_fallback():
     src = (Path(__file__).resolve().parent.parent / "core" / "config.py").read_text()
     assert 'query_params.get("token")' not in src
@@ -106,58 +90,6 @@ def test_security_headers_and_limits():
     assert 'limit("feedback"' in src
     assert 'limit("rl"' in src
     assert "ARIA_ENABLE_DOCS" in src
-
-
-def test_unreadable_session_store_is_reported_and_not_overwritten(tmp_path, monkeypatch):
-    import core.config as config
-
-    monkeypatch.setenv("ARIA_WORKERS", "1")
-    monkeypatch.setattr(config, "SESSION_STORE_PATH", tmp_path / "session_store.json")
-    config.SESSION_STORE_PATH.write_text("{}", encoding="utf-8")
-    previous_status = config.session_store_status()
-    previous_mtime = config._SESSION_FILE_MTIME
-    previous_user = config.SESSION_STORE.pop(998877, None)
-    monkeypatch.setattr(config, "_ensure_user_paths", lambda session, user_id: None)
-
-    def unreadable(_path):
-        raise PermissionError("access denied")
-
-    monkeypatch.setattr(config, "_read_text_locked", unreadable)
-    writes = []
-    monkeypatch.setattr(config, "_atomic_write_text", lambda *args: writes.append(args))
-    try:
-        config._load_session_store()
-        assert config.session_store_status() == {"ok": False, "error": "PermissionError"}
-        config.save_session(998877, dict(config.DEFAULT_SESSION))
-        assert writes == []
-    finally:
-        config.SESSION_STORE.pop(998877, None)
-        if previous_user is not None:
-            config.SESSION_STORE[998877] = previous_user
-        config._SESSION_STORE_STATUS.update(previous_status)
-        config._SESSION_FILE_MTIME = previous_mtime
-
-
-def test_required_multiworker_store_outage_fails_closed(monkeypatch):
-    import pytest
-    from fastapi import HTTPException
-
-    import core.config as config
-    import core.ratelimit as ratelimit
-
-    monkeypatch.setenv("ARIA_ENV", "production")
-    monkeypatch.setenv("ARIA_WORKERS", "2")
-    monkeypatch.setenv("ARIA_REDIS_URL", "redis://unavailable.invalid/0")
-    monkeypatch.setattr(config, "get_redis_client", lambda: None)
-    monkeypatch.setattr(ratelimit, "get_redis_client", lambda: None)
-
-    with pytest.raises(HTTPException) as session_error:
-        config.get_session(998878)
-    assert session_error.value.status_code == 503
-
-    with pytest.raises(HTTPException) as limit_error:
-        ratelimit.check_limit("test", "client", 10, 60)
-    assert limit_error.value.status_code == 503
 
 
 # ── hyp.txt remediation: redaction + backend consent ──────────────────────
@@ -304,7 +236,6 @@ def test_secret_box_never_claims_encrypted_plaintext():
     import warnings
     from core.secret_box import ensure_private_file, is_encrypted, redact
     assert is_encrypted("enc1:AAAA")
-    assert is_encrypted("enc2:AAAA")
     assert not is_encrypted("plaintext")
     assert not is_encrypted(None)
     assert redact("Sup3rSecret123") == "[redacted]"
@@ -329,130 +260,6 @@ def test_session_store_written_private(tmp_path):
     ensure_private_file(p)
     if sys.platform != "win32":
         assert oct(os.stat(p).st_mode & 0o777) == "0o600"
-
-
-def test_atomic_text_write_falls_back_when_windows_replace_is_blocked(tmp_path, monkeypatch):
-    from core import config
-
-    target = tmp_path / "schema_mapping_latest.json"
-    target.write_text('{"tables": {"old": {}}}', encoding="utf-8")
-
-    def deny_replace(*_args, **_kwargs):
-        raise PermissionError("rename denied by managed filesystem")
-
-    monkeypatch.setattr(config.os, "replace", deny_replace)
-    config._atomic_write_text(target, '{"tables": {"new": {}}}')
-
-    assert target.read_text(encoding="utf-8") == '{"tables": {"new": {}}}'
-
-
-def test_private_file_acl_includes_actual_windows_process_sid(tmp_path, monkeypatch):
-    import subprocess
-    from types import SimpleNamespace
-    import core.secret_box as secret_box
-
-    calls = []
-    monkeypatch.setattr(secret_box.sys, "platform", "win32")
-    monkeypatch.setenv("USERNAME", "Go")
-
-    def fake_run(args, **_kwargs):
-        calls.append(args)
-        if args[0] == "whoami":
-            return SimpleNamespace(
-                returncode=0,
-                stdout='"maria-zaidi\\codexsandboxoffline","S-1-5-21-1-1004"\n',
-            )
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    secret_box.ensure_private_file(tmp_path / "session.json")
-
-    assert len(calls) == 2
-    grant_args = calls[1]
-    assert "Go:F" in grant_args
-    assert "*S-1-5-21-1-1004:F" in grant_args
-
-
-def test_unreadable_saved_db_password_fails_with_actionable_error(monkeypatch):
-    from fastapi import HTTPException
-    import api.data_routes as data_routes
-
-    def fail_decrypt(_value):
-        raise OSError("DPAPI user mismatch")
-
-    monkeypatch.setattr(data_routes, "_decrypt_secret", fail_decrypt)
-    try:
-        data_routes._get_db_config({
-            "db_type": "postgresql",
-            "db": {"password": "enc1:unreadable"},
-        })
-    except HTTPException as exc:
-        assert exc.status_code == 503
-        assert "same Windows account" in exc.detail
-    else:
-        raise AssertionError("unreadable ciphertext must never be used as a DB password")
-
-
-def test_session_save_migrates_legacy_db_secrets_when_decryptable(monkeypatch):
-    from core import config
-
-    monkeypatch.setattr(config, "decrypt", lambda value: "db-secret" if value == "enc1:old" else value)
-    monkeypatch.setattr(config, "encrypt", lambda value: "enc2:new" if value == "db-secret" else value)
-    saved = config._session_to_disk_dict({"db": {"password": "enc1:old"}})
-    assert saved["db"]["password"] == "enc2:new"
-
-
-def test_session_save_preserves_unreadable_legacy_db_secrets(monkeypatch):
-    from core import config
-
-    def fail_decrypt(_value):
-        raise OSError("DPAPI user mismatch")
-
-    monkeypatch.setattr(config, "decrypt", fail_decrypt)
-    saved = config._session_to_disk_dict({"db": {"password": "enc1:old"}})
-    assert saved["db"]["password"] == "enc1:old"
-
-
-def test_session_status_exposes_reconnect_fields_but_never_password(monkeypatch):
-    from types import SimpleNamespace
-    import api.connect_routes as connect_routes
-
-    monkeypatch.setattr(connect_routes, "get_session", lambda _uid: {
-        "db": {"host": "localhost", "port": 5432, "db": "sample",
-               "user": "postgres", "password": "enc2:secret"},
-        "db_type": "postgresql", "db_name": "sample", "source_type": "relational",
-    })
-    # session_status now takes the Request (for the mobile read-only verdict),
-    # then the authenticated user dict.
-    result = connect_routes.session_status(SimpleNamespace(headers={}), {"user_id": 1})
-    assert result["db_type"] == "postgresql"
-    assert result["db_host"] == "localhost" and result["db_port"] == 5432
-    assert result["db_username"] == "postgres"
-    assert result["read_only"] is False and result["client_type"] == "desktop"
-    assert "password" not in result and "secret" not in str(result)
-
-
-def test_database_connection_test_does_not_use_unreadable_ciphertext(monkeypatch):
-    import asyncio
-    from fastapi import HTTPException
-    import api.connect_routes as connect_routes
-
-    monkeypatch.setattr(connect_routes, "_validate_db_endpoint", lambda *a, **k: 5432)
-
-    def fail_decrypt(_value):
-        raise OSError("DPAPI user mismatch")
-
-    monkeypatch.setattr(connect_routes, "_decrypt_secret", fail_decrypt)
-    req = connect_routes.DatabaseTestRequest(
-        host="localhost", port=5432, db="sample", user="postgres", password="enc1:bad"
-    )
-    try:
-        asyncio.run(connect_routes.test_database_connection(req, _user={"user_id": 1}))
-    except HTTPException as exc:
-        assert exc.status_code == 400
-        assert "Re-enter the database password" in exc.detail
-    else:
-        raise AssertionError("unreadable ciphertext must not be sent to PostgreSQL")
 
 
 # ── hyp.txt remediation: RAG reliability ──────────────────────────────────

@@ -12,7 +12,7 @@ confirm/disprove) + decision_handoff payload for Decision Center.
 """
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import ConfigDict, BaseModel, Field
+from pydantic import BaseModel, Field
 
 from core.config import get_session
 from core.deps import get_current_user, require_writable, require_data
@@ -22,7 +22,6 @@ router = APIRouter(tags=["hypothesis-investigation"])
 
 
 class InvestigationRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
     question: str = Field(default="", max_length=500)
     top_n: int = Field(default=4, ge=1, le=5)
 

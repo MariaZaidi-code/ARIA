@@ -50,22 +50,22 @@ def build_runtime_profile(insight_agent) -> RuntimeProfile:
         agent_class=agent_class,
         agent_version=str(version) if version is not None else None,
         llm_provider=provider,
-        rag_model=llm.models.get("rag"),
+        rag_model=RAG_LLM_MODEL,
         embedding_model=EMBEDDING_MODEL,
         vector_store="PostgreSQL + pgvector through LangChain PGVector",
         retrieval_strategy="hybrid dense + lexical retrieval with reciprocal-rank fusion and adaptive evidence selection",
         reranker=RERANKER_MODEL if RERANKER_ENABLED else None,
         table_reasoning="structured table extraction with deterministic pandas-based calculations",
         grounding_policy=(
-            "Document facts must be supported by uploaded document evidence. Missing evidence is reported as not found; "
+            "Document facts must be supported by uploaded PDF evidence. Missing evidence is reported as not found; "
             "the assistant must not fill document gaps with outside knowledge."
         ),
         assistant_scope=(
-            "Conversational interaction, questions about ARIA and its implementation, and evidence-grounded work over owned documents. "
+            "Conversational interaction, questions about ARIA and its implementation, and evidence-grounded work over owned PDFs. "
             "Unrelated general world-knowledge/current-affairs requests are outside scope."
         ),
         document_scope=(
-            "Text-based PDFs, CSV, XLSX, and DOCX with extractable text or rows. Scanned/image-only PDFs, handwriting, and image/chart understanding "
+            "Digitally generated/text PDFs and extractable tables. Scanned/image-only PDFs, handwriting, and image/chart understanding "
             "are not part of the current document pipeline."
         ),
     )

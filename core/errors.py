@@ -33,30 +33,6 @@ def sanitize_error(exc_or_msg: object, max_len: int = 300) -> str:
     return msg[:max_len] if len(msg) > max_len else msg
 
 
-_PROVIDER_LABELS = {"cloud": "Groq", "deepseek": "DeepSeek", "omniroute": "OmniRoute",
-                    "grok": "Grok", "local": "the local AI"}
-
-
-def provider_key_error(provider: str, exc: object) -> str:
-    """Plain-English reason an AI provider key could not be used.
-
-    Classifies the failure (bad key / no access / rate limit / unreachable)
-    instead of echoing the provider's raw JSON error body to the user.
-    """
-    label = _PROVIDER_LABELS.get(str(provider or "").lower(), str(provider or "the provider"))
-    text = str(exc or "").lower()
-    if re.search(r"\b401\b|invalid[ _]api[ _]key|unauthori[sz]ed|incorrect api key|authentication", text):
-        return (f"{label} did not accept this API key. Check that it was copied "
-                f"completely and is still active, then try again.")
-    if re.search(r"\b403\b|forbidden|permission|not allowed", text):
-        return f"This {label} key does not have access to the model ARIA uses."
-    if re.search(r"\b429\b|rate limit|quota|too many requests", text):
-        return f"{label} is limiting requests for this key right now. Wait a minute and try again."
-    if re.search(r"timed? ?out|timeout|connection|unreachable|name resolution|network|dns", text):
-        return f"Couldn't reach {label}. Check your internet connection and try again."
-    return f"{label} could not be used with this key. Check the key and try again."
-
-
 # Canonical ARIA API error shape (converged contract):
 #   {ok: False, success: False, code, detail, request_id}
 # Both guarded router errors ({ok:false,...}) and global FastAPI errors

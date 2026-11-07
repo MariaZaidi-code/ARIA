@@ -8,13 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 import schema_agent
-from core.config import (
-    SCHEMA_DIR,
-    _atomic_write_text,
-    _read_text_locked,
-    get_session,
-    save_session,
-)
+from core.config import SCHEMA_DIR, get_session, save_session
 from core.deps import get_current_user, require_data, require_writable
 
 router = APIRouter()
@@ -32,12 +26,6 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
     """
     session = get_session(user["user_id"])
     require_data(request)
-    # Session normalization may restore a default schema_path even for PDFs.
-    # Source identity, not presence of that path, decides whether SQL applies.
-    if session.get("source_type") == "document" or session.get("db_type") == "document":
-        return {"ok": True, "applicable": False, "source": "document",
-                "schema": {"tables": {}, "declared_relationships": [], "inferred_relationships": []},
-                "detail": "Document indexing is ready. Use Document Chat for this source."}
 
     if session["source_type"] != "relational":
         _sp = session.get("schema_path")
@@ -48,13 +36,7 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
                 detail="This source is a text document — use Document Chat "
                        "(Copilot) instead of schema analytics.",
             )
-        try:
-            mapping = json.loads(Path(str(_sp)).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise HTTPException(
-                status_code=409,
-                detail="The connected file schema is missing or unreadable. Reconnect the data file.",
-            ) from exc
+        mapping = json.loads(_sp.read_text(encoding="utf-8"))
         return {
             "ok": True,
             "provider": session["provider_name"],
@@ -118,7 +100,7 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
                     f"schema_mapping_{_safe_db(session['db_name'])}_latest.json"
                 )
                 if prev_latest.exists():
-                    previous_mapping = json.loads(_read_text_locked(prev_latest))
+                    previous_mapping = json.loads(prev_latest.read_text(encoding="utf-8"))
             except Exception:
                 previous_mapping = None
             if multi_schema:
@@ -148,9 +130,8 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
             mapping["database"] = session["db_name"]
         finally:
             conn.close()
-    except (SystemExit, schema_agent.SchemaConnectionError) as exc:
-        from core.errors import sanitize_error as _san
-        raise HTTPException(status_code=400, detail=_san(exc))
+    except SystemExit as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except HTTPException:
         raise
     except Exception as exc:
@@ -164,21 +145,10 @@ def _extract_schema_impl(request: Request, user: dict, db_type: str = "postgresq
         snapshot_id=mapping.get("snapshot_id"),
     )
     mapping["snapshot_id"] = snapshot_id
-    payload = json.dumps(mapping, indent=2)
-    try:
-        for path in (output_path, snapshot_path, latest_path):
-            _atomic_write_text(path, payload)
-    except OSError as exc:
-        from core.errors import sanitize_error as _san
-        raise HTTPException(
-            status_code=503,
-            detail=("The database was reachable, but ARIA could not save the schema. "
-                    "Check the configured ARIA_DATA_DIR is writable and retry. "
-                    f"({_san(exc)})"),
-        ) from exc
+    for path in (output_path, snapshot_path, latest_path):
+        path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
 
     session["schema_path"] = latest_path
-    session["schema_status"] = "ok" if mapping.get("tables") else "empty"
     save_session(user["user_id"], session)
 
     summary = mapping.get("summary", {})
@@ -281,12 +251,6 @@ def get_schema(request: Request, user: dict = Depends(get_current_user)):
     """Return the current schema mapping (tables, columns, relationships)."""
     session = get_session(user["user_id"])
     require_data(request)
-    # Session normalization may restore a default schema_path even for PDFs.
-    # Source identity, not presence of that path, decides whether SQL applies.
-    if session.get("source_type") == "document" or session.get("db_type") == "document":
-        return {"ok": True, "applicable": False, "source": "document",
-                "schema": {"tables": {}, "declared_relationships": [], "inferred_relationships": []},
-                "detail": "Document indexing is ready. Use Document Chat for this source."}
     path = session.get("schema_path")
     if not path:
         raise HTTPException(status_code=404, detail="No schema path configured. Connect a database first.")

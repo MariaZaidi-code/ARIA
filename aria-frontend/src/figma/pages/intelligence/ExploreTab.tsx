@@ -3,7 +3,6 @@
    /api/intelligence/explore via useExplore — this file only renders. */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { motion, AnimatePresence, MotionConfig } from "framer-motion";
 import {
   BarChart3, Compass, FlaskConical, AlertTriangle, Target, SlidersHorizontal,
@@ -27,7 +26,6 @@ import {
 } from "./cards";
 import { useExplore, RANGE_OPTIONS, type RangeKey } from "./useExplore";
 import { prescriptionApi } from "../../../services/api";
-import { useReadOnly, READ_ONLY_HINT } from "../../lib/readonly";
 import EvidenceDrawer, { type EvidenceContext } from "./EvidenceDrawer";
 import CompareView from "./CompareView";
 import { TimeRangeSelector } from "../../components/TimeRangeSelector";
@@ -106,7 +104,6 @@ function TrendChart({
 }
 
 export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreTabProps) {
-  const readOnly = useReadOnly();
   const ex = useExplore(meta);
   const {
     metrics, breakdowns, grains, comparisons, filterCols,
@@ -137,7 +134,7 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
   const [askError, setAskError] = useState("");
 
   useEffect(() => {
-    if (readOnly || result || alertsState !== "idle") return;
+    if (result || alertsState !== "idle") return;
     setAlertsState("loading");
     (async () => {
       try {
@@ -149,24 +146,21 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
         setAlertsState("ready");
       }
     })();
-  }, [result, alertsState, readOnly]);
+  }, [result, alertsState]);
 
   const askOne = useCallback(async () => {
     const q = askText.trim();
-    if (readOnly || !q) return;
+    if (!q) return;
     setAskState("loading");
     setAskError("");
     setAskAnswer(null);
     try {
-      const selectedMetric = strOf(metric || "");
-      if (!selectedMetric) {
-        setAskError("Choose a metric first so ARIA can evaluate this question against the right data.");
-        setAskState("error");
-        return;
-      }
+      /* The engine needs a metric to test — default to the first available
+         metric so a bare question still gets a real answer. */
+      const fallbackMetric = strOf(metrics[0]?.value || metrics[0]?.label);
       const [a, b] = await Promise.all([
-        (prescriptionApi as any).analyze({ question: q, metric: selectedMetric }),
-        (prescriptionApi as any).inaction({ metric: selectedMetric }),
+        (prescriptionApi as any).analyze({ question: q, ...(fallbackMetric ? { metric: fallbackMetric } : {}) }),
+        (prescriptionApi as any).inaction({ ...(fallbackMetric ? { metric: fallbackMetric } : {}) }),
       ]);
       const ad: any = (a as any)?.data ?? null;
       const bd: any = (b as any)?.data ?? null;
@@ -177,7 +171,7 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
       setAskError(e?.message || "ARIA couldn't answer that just now.");
       setAskState("error");
     }
-  }, [askText, metric, readOnly]);
+  }, [askText]);
   const csvUrlRef = useRef<string | null>(null);
 
   /* Recommended Actions — powered ONLY by the existing prescription engine
@@ -625,7 +619,7 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
                 <p className="text-[11px] text-muted-foreground mt-0.5">Select what you want to analyze. ARIA will calculate and visualize the results from your data.</p>
               </div>
               <div className="flex items-center gap-2">
-                <button onClick={saveAnalysis} disabled={!result || saving || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={`${btnGhost} disabled:opacity-50`} aria-label="Save analysis">
+                <button onClick={saveAnalysis} disabled={!result || saving} className={btnGhost} aria-label="Save analysis">
                   <Bookmark size={13} /> {saving ? "Saving…" : "Save Analysis"}
                 </button>
                 <button onClick={reset} className={btnGhost} aria-label="Reset analysis builder">
@@ -660,7 +654,7 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
               </Field>
               <div className="min-w-0">
                 <span className="hidden lg:block text-[11px] font-medium text-transparent mb-1 select-none">Run</span>
-                <button onClick={() => runAnalysis()} disabled={running || !metric || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={`${btnPrimary} w-full !h-[40px] disabled:opacity-50`} aria-label="Run analysis">
+                <button onClick={() => runAnalysis()} disabled={running || !metric} className={`${btnPrimary} w-full !h-[40px]`} aria-label="Run analysis">
                   {running ? "Running..." : "Run Analysis"} <Play size={13} />
                 </button>
               </div>
@@ -745,7 +739,7 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
               <p className="text-[12px] text-muted-foreground">Explore and analyze your business data.</p>
             </div>
             <div className="flex items-center gap-1.5">
-              <button onClick={saveAnalysis} disabled={saving || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={`${btnGhost} disabled:opacity-50`} aria-label="Save result">Save</button>
+              <button onClick={saveAnalysis} disabled={saving} className={btnGhost} aria-label="Save result">Save</button>
               <button onClick={() => onAsk(`Share this analysis: ${humanize(metric)} by ${humanize(breakdown)}`)} className={btnGhost} aria-label="Share result">Share</button>
               <button onClick={exportCsv} disabled={!rows.length} className={btnGhost} aria-label="Export breakdown as CSV" title={rows.length ? "Download the live breakdown rows as CSV" : "No rows to export"}>
                 Export
@@ -875,9 +869,8 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
                     </div>
                     <button
                       onClick={() => void fetchRecommendations(true)}
-                      disabled={rxStatus === "loading" || running || readOnly}
-                      title={readOnly ? READ_ONLY_HINT : undefined}
-                      className={`${btnGhost} disabled:opacity-50`}
+                      disabled={rxStatus === "loading" || running}
+                      className={btnGhost}
                       aria-label="Get recommendations"
                     >
                       <RefreshCw size={13} /> {rxStatus === "loading" ? "Loading…" : "Get recommendations"}
@@ -1211,6 +1204,24 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
                   </Card>
                 </div>
 
+                {/* Cost of doing nothing — engine run-rate. */}
+                {(() => {
+                  if (!inaction?.headline) return null;
+                  const burn = numOf(inaction?.monthly_burn);
+                  return (
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                      <Card className="p-4 md:p-5 lg:col-span-2">
+                        <h3 className="text-[14px] font-semibold text-foreground tracking-tight">Cost of doing nothing</h3>
+                        <p className="mt-1.5 text-[12.5px] text-secondary-foreground leading-relaxed">{strOf(inaction.headline)}</p>
+                        {burn !== null && burn > 0 && (
+                          <p className="mt-1 text-[18px] font-bold text-rose-700 dark:text-rose-400 tabular-nums">~{fmtMetric(burn, metric)}<span className="text-[12px] font-medium text-muted-foreground">/month at stake</span></p>
+                        )}
+                        {strOf(inaction?.note) && <p className="mt-1 text-[11px] text-muted-foreground">{strOf(inaction.note)}</p>}
+                      </Card>
+                    </div>
+                  );
+                })()}
+
                 <Card className="p-4 md:p-5">
                   <h3 className="text-[14px] font-semibold text-foreground tracking-tight flex items-center gap-1.5">
                     <Send size={13} className="text-blue-700 dark:text-blue-400" /> Next Steps
@@ -1284,9 +1295,8 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
                 <div className="mt-2.5 flex items-center gap-2 rounded-xl border border-border bg-secondary/60 px-3 py-2 focus-within:border-blue-400 transition-colors">
                   <Search size={14} className="text-muted-foreground flex-shrink-0" />
                   <input value={askText} onChange={(e) => setAskText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void askOne(); }} placeholder="e.g. Should I raise prices?" className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground" aria-label="Ask one business question" />
-                  <button onClick={() => void askOne()} disabled={askState === "loading" || !askText.trim() || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="inline-flex items-center justify-center h-8 px-3 rounded-lg bg-blue-700 text-white text-[12px] font-semibold hover:bg-blue-800 disabled:opacity-40 transition-colors" aria-label="Get answer"><Play size={13} /></button>
+                  <button onClick={() => void askOne()} disabled={askState === "loading" || !askText.trim()} className="inline-flex items-center justify-center h-8 px-3 rounded-lg bg-blue-700 text-white text-[12px] font-semibold hover:bg-blue-800 disabled:opacity-40 transition-colors" aria-label="Get answer"><Play size={13} /></button>
                 </div>
-                <p className="mt-1.5 text-[11px] text-muted-foreground">Evaluated against the selected metric: <span className="font-medium text-secondary-foreground">{metric ? humanize(metric) : "choose one above"}</span></p>
                 {askState === "loading" && <p className="mt-2 text-[12px] text-muted-foreground">Checking your data…</p>}
                 {askState === "error" && <p className="mt-2 text-[12px] text-rose-600 dark:text-rose-400" role="alert">{askError}</p>}
                 {askState === "ready" && askAnswer && (
@@ -1307,9 +1317,8 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
               <Card className="p-4 md:p-5">
                 <CardHead title="Alerts that matter" sub="Only when a metric really moves." />
                 <div className="mt-2 divide-y divide-border">
-                  {readOnly && <p className="text-[12px] text-muted-foreground py-2">Metric watch runs on desktop — open ARIA there to see fresh alerts.</p>}
-                  {!readOnly && alertsState === "loading" && <p className="text-[12px] text-muted-foreground py-2">Watching your metrics…</p>}
-                  {!readOnly && alertsState === "ready" && alerts.length === 0 && <p className="text-[12px] text-muted-foreground py-2">All quiet — no unusual moves lately.</p>}
+                  {alertsState === "loading" && <p className="text-[12px] text-muted-foreground py-2">Watching your metrics…</p>}
+                  {alertsState === "ready" && alerts.length === 0 && <p className="text-[12px] text-muted-foreground py-2">All quiet — no unusual moves lately.</p>}
                   {alerts.map((a: any, i: number) => (
                     <div key={i} className="py-2 flex items-start gap-2">
                       <span className={`mt-1 w-2 h-2 rounded-full flex-shrink-0 ${a?.severity === "high" ? "bg-rose-500" : "bg-amber-400"}`} />
@@ -1337,7 +1346,7 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
                       </div>
                       <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-100 dark:border-blue-500/20">{strOf(a?.type || "Explore")}</span>
                       <button onClick={() => loadSavedAnalysis(a)} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded" aria-label={`Reload analysis ${strOf(a?.title || "")}`}>View</button>
-                      {strOf(a?.id) && <button onClick={() => deleteSavedAnalysis(strOf(a.id))} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 disabled:opacity-50" aria-label={`Delete analysis ${strOf(a?.title || "")}`}>Delete</button>}
+                      {strOf(a?.id) && <button onClick={() => deleteSavedAnalysis(strOf(a.id))} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400" aria-label={`Delete analysis ${strOf(a?.title || "")}`}>Delete</button>}
                     </div>
                   ))}
                 </div>
@@ -1354,7 +1363,7 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
                         <p className="text-[11px] text-muted-foreground">{relativeOpened(strOf(a?.updated_at || a?.created_at || ""))}</p>
                       </div>
                       <button onClick={() => loadSavedAnalysis(a)} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded" aria-label={`Reload saved analysis ${strOf(a?.title || "")}`}>View</button>
-                      {strOf(a?.id) && <button onClick={() => deleteSavedAnalysis(strOf(a.id))} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 disabled:opacity-50" aria-label={`Delete saved analysis ${strOf(a?.title || "")}`}>Delete</button>}
+                      {strOf(a?.id) && <button onClick={() => deleteSavedAnalysis(strOf(a.id))} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400" aria-label={`Delete saved analysis ${strOf(a?.title || "")}`}>Delete</button>}
                     </div>
                   ))}
                 </div>
@@ -1375,62 +1384,56 @@ export default function ExploreTab({ meta, onRunQuick, onGoto, onAsk }: ExploreT
           </div>
         )}
 
-        {/* Chart fullscreen: larger view reusing the same live data.
-            AnimatePresence must live INSIDE the portal — framer-motion does
-            not mount portals that are direct children of AnimatePresence
-            (the dialog never appeared in the built app). */}
-        {typeof document !== "undefined" && createPortal(
-          <AnimatePresence>
-            {expanded && trendPoints.length > 0 && (
-              <div key="chart-fullscreen" className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label="Expanded trend chart">
+        {/* Chart fullscreen: larger view reusing the same live data. */}
+        <AnimatePresence>
+          {expanded && trendPoints.length > 0 && (
+            <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label="Expanded trend chart">
+              <motion.div
+                className="absolute inset-0 bg-slate-900/50"
+                onClick={() => setExpanded(false)}
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.2 }}
+              />
+              <div className="absolute inset-0 overflow-y-auto pointer-events-none">
                 <motion.div
-                  className="absolute inset-0 bg-slate-900/50"
-                  onClick={() => setExpanded(false)}
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.2 }}
-                />
-                <div className="absolute inset-0 overflow-y-auto pointer-events-none">
-                  <motion.div
-                    className="pointer-events-auto mx-auto mt-[5vh] mb-[5vh] w-[calc(100%-2rem)] max-w-5xl bg-card rounded-2xl shadow-2xl p-5"
-                    initial={{ opacity: 0, y: 24, scale: 0.98 }}
-                    animate={{ opacity: 1, y: 0, scale: 1 }}
-                    exit={{ opacity: 0, y: 24, scale: 0.98 }}
-                    transition={{ duration: 0.28, ease: "easeOut" }}
-                  >
-                    <div className="flex items-start justify-between gap-3 flex-wrap">
-                      <div>
-                        <h3 className="text-[15px] font-semibold text-foreground tracking-tight">{trendTitle}</h3>
-                        {trendSub && <p className="text-[11.5px] text-muted-foreground mt-0.5">{trendSub}</p>}
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        <div className="flex items-center gap-1.5 text-[11px] font-medium border border-border rounded-lg px-2 py-1" aria-label="Chart type">
-                          <BarChart3 size={12} className="text-blue-700 dark:text-blue-400" />
-                          <select value={chartMode} onChange={(e) => setChartMode(e.target.value as "bar" | "line")} className="bg-transparent outline-none cursor-pointer text-foreground" aria-label="Chart type">
-                            <option value="bar">Bar Chart</option>
-                            <option value="line">Line Chart</option>
-                          </select>
-                        </div>
-                        <button
-                          onClick={() => setExpanded(false)}
-                          className="inline-flex items-center justify-center w-8 h-8 rounded-lg hover:bg-secondary text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-                          aria-label="Close expanded chart"
-                        >
-                          <X size={16} />
-                        </button>
-                      </div>
+                  className="pointer-events-auto mx-auto mt-[5vh] mb-[5vh] w-[calc(100%-2rem)] max-w-5xl bg-card rounded-2xl shadow-2xl p-5"
+                  initial={{ opacity: 0, y: 24, scale: 0.98 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 24, scale: 0.98 }}
+                  transition={{ duration: 0.28, ease: "easeOut" }}
+                >
+                  <div className="flex items-start justify-between gap-3 flex-wrap">
+                    <div>
+                      <h3 className="text-[15px] font-semibold text-foreground tracking-tight">{trendTitle}</h3>
+                      {trendSub && <p className="text-[11.5px] text-muted-foreground mt-0.5">{trendSub}</p>}
                     </div>
-                    <div className="h-[60vh] min-h-[320px] mt-3">
-                      <TrendChart points={trendPoints} mode={chartMode} axisMetric={metric || trendTitle} tipMetric={trendTitle} />
+                    <div className="flex items-center gap-1.5">
+                      <div className="flex items-center gap-1.5 text-[11px] font-medium border border-border rounded-lg px-2 py-1" aria-label="Chart type">
+                        <BarChart3 size={12} className="text-blue-700 dark:text-blue-400" />
+                        <select value={chartMode} onChange={(e) => setChartMode(e.target.value as "bar" | "line")} className="bg-transparent outline-none cursor-pointer text-foreground" aria-label="Chart type">
+                          <option value="bar">Bar Chart</option>
+                          <option value="line">Line Chart</option>
+                        </select>
+                      </div>
+                      <button
+                        onClick={() => setExpanded(false)}
+                        className="inline-flex items-center justify-center w-8 h-8 rounded-lg hover:bg-secondary text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                        aria-label="Close expanded chart"
+                      >
+                        <X size={16} />
+                      </button>
                     </div>
-                  </motion.div>
-                </div>
+                  </div>
+                  <div className="h-[60vh] min-h-[320px] mt-3">
+                    <TrendChart points={trendPoints} mode={chartMode} axisMetric={metric || trendTitle} tipMetric={trendTitle} />
+                  </div>
+                </motion.div>
               </div>
-            )}
-          </AnimatePresence>,
-          document.body,
-        )}
+            </div>
+          )}
+        </AnimatePresence>
 
         <EvidenceDrawer
           open={evidenceOpen}

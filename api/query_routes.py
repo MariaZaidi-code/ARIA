@@ -6,11 +6,11 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import ConfigDict, BaseModel
+from pydantic import BaseModel
 
 import auth
-from core.config import get_session, save_session, resolve_provider_key, PROCESSED_DIR
-from core.deps import require_data, require_writable, get_current_user
+from core.config import get_session, save_session, resolve_provider_key
+from core.deps import require_data, require_writable
 from core.validation import validate_goal_text
 from goal_agent import GoalAgent
 from goal_agent.schema import load_user_overrides
@@ -24,7 +24,6 @@ router = APIRouter()
 
 
 class GoalRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
     goal: str
     previous_goal: str | None = None
     previous_result: dict | None = None
@@ -338,52 +337,6 @@ def _is_blocked_suggestion(text: str) -> bool:
     return any(p.search(s) for p in _BLOCKED_SUGGESTION_RES)
 
 
-_VAGUE_SUGGESTION_RE = None
-
-
-def _scrub_suggestions(items, session) -> list:
-    """User-facing suggestion prose only: raw schema identifiers are
-    replaced by their plain-English labels ('txn_dt' -> 'transaction
-    date'); items that still carry SQL/identifier plumbing ('_', '(',
-    quotes) or say nothing specific ('the most important metrics') are
-    dropped. Works for template and LLM-written suggestions alike."""
-    import re as _re
-    global _VAGUE_SUGGESTION_RE
-    if _VAGUE_SUGGESTION_RE is None:
-        _VAGUE_SUGGESTION_RE = _re.compile(
-            r"\b(most important metrics|top items|main (metric|category|numeric)|"
-            r"primary measure|categories appear)\b", _re.IGNORECASE)
-    from core.analytical_result import natural_label as _nl
-    names: set = set()
-    try:
-        _sp = Path(str((session or {}).get("schema_path", "")))
-        if _sp.exists():
-            _m = json.loads(_sp.read_text(encoding="utf-8"))
-            for _t, _info in (_m.get("tables") or {}).items():
-                names.add(str(_t).split(".")[-1])
-                _cols = _info.get("columns") or {}
-                for _c in (_cols if isinstance(_cols, dict) else
-                           [x.get("column", "") for x in _cols if isinstance(x, dict)]):
-                    names.add(str(_c))
-    except Exception:
-        names = set()
-    out = []
-    for item in items or []:
-        text_ = str(item or "").strip()
-        if not text_ or _VAGUE_SUGGESTION_RE.search(text_):
-            continue
-        for raw in sorted((n for n in names if len(n) >= 3), key=len, reverse=True):
-            label = _nl(raw)
-            if label.lower() == raw.lower():
-                continue
-            text_ = _re.sub(rf"(?<![\w]){_re.escape(raw)}s?(?![\w])", label, text_,
-                            flags=_re.IGNORECASE)
-        if _re.search(r"[_()`\"\[\]]", text_):
-            continue
-        out.append(text_)
-    return out
-
-
 @router.post("/api/suggestions")
 def get_suggestions(request: Request, payload: dict | None = None, user: dict = Depends(require_writable)):
     """LLM-driven + template-driven suggested search goals. Works with any
@@ -397,15 +350,6 @@ def get_suggestions(request: Request, payload: dict | None = None, user: dict = 
         limit = 8
     # Cap to the 4-8 window.
     limit = max(4, min(8, limit))
-    from csv_engine.analyst import is_csv_session, suggestions_csv, CsvAnalysisError
-    if is_csv_session(session):
-        try:
-            result = suggestions_csv(session, user["user_id"], limit)
-        except CsvAnalysisError as exc:
-            raise HTTPException(status_code=502, detail={"message": str(exc), "llm_trace": exc.trace}) from None
-        save_session(user["user_id"], session)
-        return result
-
     try:
         # Read the schema mapping directly (no slow agent initialization) so
         # suggestions work instantly regardless of database size.
@@ -452,10 +396,10 @@ def get_suggestions(request: Request, payload: dict | None = None, user: dict = 
                     dt = None
                 if measure:
                     _ml = _nl(measure)
-                    if _ml.strip().lower() in ("total", "sum", "count"):
+                    if _ml.strip().lower() in ("total", "sum", "count", "value", "amount"):
                         suggestions.append("What is the overall total value?")
                     else:
-                        suggestions.append((f"What is the {_ml}?" if "total" in _ml.lower().split() else f"What is the total {_ml}?"))
+                        suggestions.append(f"What is the total {_ml}?")
                 else:
                     suggestions.append("How many records are in the data?")
                 if dim:
@@ -465,13 +409,15 @@ def get_suggestions(request: Request, payload: dict | None = None, user: dict = 
                 if measure and dim:
                     suggestions.append(f"What are the top {_pl(_nl(dim))} by {_nl(measure)}?")
 
-            # Pad from the shared pool of questions this data can answer
-            # (never outlier / correlation / forecast / what-if / quality).
-            from api.autocomplete_routes import answerable_questions
-            for g in answerable_questions(session, user["user_id"]):
-                if len(suggestions) >= limit:
-                    break
-                if g not in suggestions:
+            # Pad with answerable patterns only if we need more (never
+            # outlier / correlation / forecast / what-if / data-quality).
+            generic = [
+                "How many records are in the data?",
+                "Which categories appear most frequently?",
+                "What are the top items by value?",
+            ]
+            for g in generic:
+                if len(suggestions) < limit and g not in suggestions:
                     suggestions.append(g)
 
             suggestions = suggestions[:limit]
@@ -530,49 +476,6 @@ def get_suggestions(request: Request, payload: dict | None = None, user: dict = 
     return {"ok": True, "provider": session.get("provider_name", provider), "suggestions": suggestions}
 
 
-def _csv_chat_store(session):
-    from csv_engine.chat_store import ChatStore, dataset_key
-    from csv_engine.profiling import _fingerprint
-    return ChatStore(auth.DB_PATH.with_name("csv_chats.sqlite3")), dataset_key(_fingerprint(session))
-
-
-@router.get("/api/csv/conversation")
-def restore_csv_conversation(request: Request, conversation_id: str | None = None, user: dict = Depends(get_current_user)):
-    from csv_engine.analyst import is_csv_session
-    session = get_session(user["user_id"])
-    if not is_csv_session(session) or not session.get("db_uri"):
-        return {"ok": True, "conversation": None}
-    store, dataset = _csv_chat_store(session)
-    chat = store.load(user["user_id"], dataset, conversation_id)
-    return {"ok": True, "conversation": {k: v for k, v in chat.items() if k != "history"} if chat else None}
-
-
-@router.post("/api/csv/conversation/new")
-def new_csv_conversation(request: Request, user: dict = Depends(require_writable)):
-    from csv_engine.analyst import is_csv_session
-    import uuid
-    session = get_session(user["user_id"])
-    if not is_csv_session(session) or not session.get("db_uri"):
-        return {"ok": True, "conversation_id": str(uuid.uuid4())}
-    store, dataset = _csv_chat_store(session)
-    identifier = str(uuid.uuid4())
-    store.save(user["user_id"], dataset, identifier, new=True)
-    return {"ok": True, "conversation_id": identifier}
-
-
-@router.delete("/api/csv/conversation/{conversation_id}")
-def delete_csv_conversation(conversation_id: str, user: dict = Depends(require_writable)):
-    from csv_engine.analyst import is_csv_session
-    session = get_session(user["user_id"])
-    if not is_csv_session(session) or not session.get("db_uri"):
-        raise HTTPException(status_code=400, detail="Connect the CSV first")
-    store, dataset = _csv_chat_store(session)
-    deleted = store.delete(user["user_id"], dataset, conversation_id)
-    session.get("csv_conversations", {}).pop(conversation_id, None)
-    save_session(user["user_id"], session)
-    return {"ok": True, "deleted": deleted}
-
-
 @router.post("/api/ask")
 def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writable)):
     """Run the Goal Agent: goal -> SQL -> processed_data.json.
@@ -584,88 +487,6 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     """
     session = get_session(user["user_id"])
     provider = require_data(request)
-    if session.get("source_type") == "document" or session.get("db_type") == "document":
-        from api.insight_rag_routes import _capability
-        from insight_rag.analytics_adapter import analytics_answer
-        document_id = session.get("document_id")
-        if not document_id:
-            raise HTTPException(status_code=400, detail="Select an uploaded document first.")
-        try:
-            result = _capability(user["user_id"]).chat(
-                req.goal,
-                conversation_id=req.conversation_id or session.get("document_conversation_id"),
-                document_ids=[document_id],
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:
-            log.exception("Document question failed")
-            raise HTTPException(status_code=503, detail="Document chat could not complete. Check the provider and RAG connection, then retry.") from exc
-        session["document_conversation_id"] = result.get("conversation_id")
-        save_session(user["user_id"], session)
-        return analytics_answer(result, req.goal)
-    from csv_engine.analyst import is_csv_session, ask_csv, CsvAnalysisError, conversation_turn, _fingerprint
-    if is_csv_session(session):
-        import uuid
-        import os
-        import tempfile
-        conv_id = req.conversation_id or session.get("conversation_id") or f"conv_{uuid.uuid4().hex}"
-        if not isinstance(conv_id, str) or not 1 <= len(conv_id) <= 100:
-            raise HTTPException(status_code=400, detail="Invalid conversation identifier")
-        dataset_identity = _fingerprint(session)
-        chat_store, chat_dataset = _csv_chat_store(session)
-        conversations = dict(session.get("csv_conversations", {}))
-        active = conversations.get(conv_id, {})
-        history = list(active.get("history", [])) if active.get("dataset") == dataset_identity else []
-        if not history:
-            saved_chat = chat_store.load(user["user_id"], chat_dataset, conv_id)
-            if saved_chat:
-                history = saved_chat["history"]
-        try:
-            result = ask_csv(session, user["user_id"], req.goal, history=history,
-                             request_context={"metric": req.metric, "filters": req.filters,
-                                              "time_range": req.time_range, "grouping": req.grouping,
-                                              "previous_goal": req.previous_goal})
-        except CsvAnalysisError as exc:
-            raise HTTPException(status_code=502, detail={"message": str(exc), "llm_trace": exc.trace}) from None
-        except Exception:
-            log.exception("CSV LLM analysis failed")
-            raise HTTPException(status_code=502, detail="CSV AI analysis could not complete. No fallback answer was generated.") from None
-        result["conversation_id"] = conv_id
-        result["turn_number"] = len(history) + 1
-        session["conversation_id"] = conv_id
-        if result["status"] in ("success", "partial"):
-            history.append(conversation_turn(req.goal, result))
-            session["conversation_history"] = history[-10:]
-            path = Path(session["processed_path"])
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd, temporary = tempfile.mkstemp(dir=path.parent, suffix=".json")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                    json.dump(result, stream, ensure_ascii=False, allow_nan=False)
-                os.replace(temporary, path)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-            result["history_id"] = auth.add_history(
-                user["user_id"], goal=req.goal, sql_used=result["sql_used"], row_count=result["row_count"],
-                columns=result["columns"], source_type=session.get("source_type"), db_name=session.get("db_name"),
-                dialect=session.get("dialect"), processed=result)
-            session["pending_history_id"] = result["history_id"]
-        else:
-            history.append(conversation_turn(req.goal, result))
-            session["conversation_history"] = history[-10:]
-        try:
-            chat_store.save(user["user_id"], chat_dataset, conv_id,
-                            context=conversation_turn(req.goal, result), display={"q": req.goal, "r": result})
-        except Exception:
-            log.exception("Could not persist CSV conversation")
-            result.setdefault("warnings", []).append("This answer could not be saved for chat restore.")
-        conversations.pop(conv_id, None)
-        conversations[conv_id] = {"dataset": dataset_identity, "history": history[-10:]}
-        session["csv_conversations"] = dict(list(conversations.items())[-8:])
-        save_session(user["user_id"], session)
-        return result
     # Fail fast: never query the wrong DB. A relational session without a
     # rebuilt db_uri (undecryptable/missing credentials) must reconnect.
     if session.get("source_type") == "relational" and not session.get("db_uri"):
@@ -759,20 +580,6 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
 
     _is_convo = _is_conversational_text(req.goal)
 
-    # Business glossary: rewrite recognized terms to their canonical wording
-    # before any planning happens (never for conversational turns), so every
-    # downstream stage — planner, SQL, story — speaks the business language.
-    _glossary_applied: list = []
-    try:
-        if not _is_convo:
-            from services.workspace_service import apply_glossary as _apply_glossary
-            _rw_goal, _glossary_applied = _apply_glossary(
-                user["user_id"], req.goal)
-            if _glossary_applied and _rw_goal.strip():
-                req.goal = _rw_goal
-    except Exception:
-        _glossary_applied = []
-
     # Build goal with multi-turn context (conversational turns skip history
     # so 'hi' never inherits previous tables).
     full_goal = req.goal
@@ -801,11 +608,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     if _is_convo:
         goal = str(full_goal or "").strip()
     else:
-        # Validate only what the user typed: the history prefix carries raw
-        # table/column names ('txns', 'pay_mthd') that are not the user's
-        # words and must never make a real question look like gibberish.
-        validate_goal_text(req.goal)
-        goal = str(full_goal or "").strip()
+        goal = validate_goal_text(full_goal)
     # Explicit-intent-wins (§12): a fresh COUNT/ranking-of-records question
     # must not inherit measures from previous turns ("most readings" means
     # COUNT, even after discussing averages). Only when no measure word is
@@ -865,7 +668,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         # P3 §50: sanitize internal details before shaping the user message.
         from core.errors import sanitize_error as _san_q
         _safe_exc = _san_q(exc)
-        fallback_path = session.get("processed_path", PROCESSED_DIR / "fallback_processed.json")
+        fallback_path = session.get("processed_path", Path("/tmp/fallback_processed.json"))
         if isinstance(fallback_path, str):
             fallback_path = Path(fallback_path)
         fallback_path.parent.mkdir(parents=True, exist_ok=True)
@@ -876,8 +679,8 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             "sql_used": None,
             "row_count": 0,
             "data": [],
-            "message": f"Analysis could not complete: {_safe_exc}. No result was produced. Check the source and provider settings, then retry.",
-            "preprocessing": {"notes": ["Analysis failed before a usable result was produced."]},
+            "message": f"Could not fully analyze: {_safe_exc}. The database connection and dynamic schema are working, but the analytical engine encountered an issue with this specific question. Try rephrasing or ask a simpler analytical question (e.g., counts, totals, top items, trends over time).",
+            "preprocessing": {"notes": ["Dynamic schema detected; analysis partially completed."]},
             "missing_values_handled": "preserved (NULLs kept as-is)",
             "timestamp": datetime.now().isoformat(),
             "status": "query_failed",
@@ -1060,10 +863,6 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     _shape = {"rows": len(result_data or []), "columns": list(columns or [])}
     _tables = processed.get("data_selection", {}).get("tables", []) or processed.get("join_path", [])
     _lat = round((_t0.time() - _start) * 1000)
-    # Privacy: log the SQL with string literals masked (data values belong to
-    # the user, not the ops log); structure stays readable for debugging.
-    import re as _re_log
-    _sql_masked = _re_log.sub(r"'[^']*'", "'?'", str(processed.get("sql_used") or ""))[:200]
     _qlog.info(
         "pipeline request_id=%s session_id=%s dataset_id=%s question=%r "
         "intent=%s tables=%s columns=%s sql=%.200s validation=%s "
@@ -1073,7 +872,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         req.goal[:160],
         (processed.get("goal_ir") or {}).get("intent"),
         _tables, list(columns or [])[:10],
-        _sql_masked,
+        str(processed.get("sql_used") or "")[:200],
         {"valid": analysis.get("valid"), "repaired": analysis.get("repaired")},
         "ok" if _valid else "failed", _shape,
         {"chart": (analysis.get("chart_spec") or {}).get("chart_type")},
@@ -1138,31 +937,36 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
     from core.analytical_result import natural_label as _nl
     base_suggestions = [s for s in (processed.get("suggested_questions", []) or [])
                         if s and not _is_blocked_suggestion(str(s))]
-    base_suggestions = _scrub_suggestions(base_suggestions, session)
-    # Follow-ups about the measure just answered come first. The result's
-    # own columns are SQL aliases ('total', 'value'), so the measure is
-    # read from the aggregate in the executed SQL ('SUM("amt")' ->
-    # 'amount'), then matched to the shared pool of answerable questions.
     proactive_suggestions = []
-    try:
-        import re as _re_fu
-        from api.autocomplete_routes import answerable_questions
-        _agg_cols = _re_fu.findall(
-            r'\b(?:SUM|AVG|MIN|MAX)\s*\(\s*(?:[\w"`\[\]]+\.)?["`\[]?(\w+)["`\]]?\s*\)',
-            str(processed.get("sql_used") or ""), _re_fu.IGNORECASE)
-        _focus = _nl(_agg_cols[0]) if _agg_cols else None
-        from schema_engine.lexical import expand_abbreviation as _xa
-
-        def _plain(t):
-            # 'What is the total qty?' and 'What is the total quantity?'
-            # are the same question.
-            return " ".join(_xa(w) for w in _re_fu.findall(r"[a-z0-9]+", str(t).lower()))
-        _asked = _plain(req.goal)
-        proactive_suggestions = [
-            q for q in answerable_questions(session, user["user_id"], focus=_focus)
-            if _plain(q) != _asked][:5]
-    except Exception as exc:
-        log.warning("Measure-focused follow-ups failed: %s", exc, exc_info=True)
+    if result_data and columns:
+        first_row = result_data[0] if result_data else {}
+        num_cols = []
+        cat_cols = []
+        for c in columns:
+            # Raw SQL expressions (SUM(x), COUNT(*)) and keys are data
+            # plumbing, never suggestion prose. ID-like columns (any
+            # separator: order_id, "Order ID") are never suggested as
+            # measures or breakdowns.
+            if "(" in str(c) or "*" in str(c):
+                continue
+            try:
+                from core.schema_intel import _is_id_like as _id_like
+                if _id_like(str(c)):
+                    continue
+            except Exception:
+                if str(c).lower() == "id" or str(c).lower().endswith("_id"):
+                    continue
+            v = first_row.get(c) if isinstance(first_row, dict) else None
+            if isinstance(v, (int, float)):
+                num_cols.append(c)
+            elif v:
+                cat_cols.append(c)
+        if num_cols:
+            proactive_suggestions.append(f"What is the average {_nl(num_cols[0])}?")
+            proactive_suggestions.append(f"How is {_nl(num_cols[0])} distributed?")
+        if cat_cols and num_cols:
+            proactive_suggestions.append(f"Show {_nl(num_cols[0])} by {_nl(cat_cols[0])}")
+            proactive_suggestions.append(f"Which {_nl(cat_cols[0])} has the highest {_nl(num_cols[0])}?")
     # Schema-derived fallback suggestions (spec §21): built from the actual
     # connected schema, never a static generic list.
     general_suggestions = []
@@ -1189,10 +993,10 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
                     general_suggestions.append(f"Which {_nl(_d)} has the highest {_nl(_m)}?")
                 elif _m:
                     _ml2 = _nl(_m)
-                    if _ml2.strip().lower() in ("total", "sum", "count"):
+                    if _ml2.strip().lower() in ("total", "sum", "count", "value", "amount"):
                         general_suggestions.append("What is the overall total value?")
                     else:
-                        general_suggestions.append((f"What is the {_ml2}?" if "total" in _ml2.lower().split() else f"What is the total {_ml2}?"))
+                        general_suggestions.append(f"What is the total {_ml2}?")
                 else:
                     general_suggestions.append("How many records are in the data?")
                 if _m and _dt:
@@ -1205,7 +1009,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         # No schema context at all: say so honestly instead of inventing specifics.
         general_suggestions = ["What data is currently connected?"]
     all_suggestions = list(dict.fromkeys(
-        [s for s in (proactive_suggestions + base_suggestions + general_suggestions)
+        [s for s in (base_suggestions + proactive_suggestions + general_suggestions)
          if s and not _is_blocked_suggestion(str(s))]))[:8]
 
     # ── Preference-aware follow-up ranking ──────────────────────────────
@@ -1320,8 +1124,6 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             resolve_comparison as _resolve_cmp,
             map_visualization as _map_viz,
             compute_possible_drivers as _drivers,
-            compute_change_drivers as _change_drivers,
-            build_change_hypothesis as _build_change_hyp,
             build_followups as _followups,
             decide_status as _decide,
             graceful_message as _grace_msg,
@@ -1352,105 +1154,23 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             (processed.get("data_selection", {}) or {}).get("tables", []) or [])
         _main_table = _tables_used[0] if _tables_used else None
         # Possible drivers from REAL aggregates (best-effort, never fatal).
-        # Why/change questions get a period-over-period decomposition first —
-        # a structural "share of the total" view cannot explain a *change*.
         _drivers_list: list = []
-        _change_ctx: dict | None = None
-        _is_why = (_primary in ("explanation", "root_cause", "hypothesis")
-                   or any(_c in ("explanation", "root_cause")
-                          for _c in (_capabilities or [])))
-        if (_is_why and result_data and len(result_data) >= 2
-                and len(columns) >= 2 and processed.get("sql_used")):
-            try:
+        try:
+            if _main_table and _metric_col and result_data:
                 from sqlalchemy import create_engine as _mk
                 _eng = _mk(session["db_uri"])
                 try:
-                    _ir_dims: list = []
-                    try:
-                        from core.schema_intel import _is_id_like as _env_id_like2
-                        for _d in ((processed.get("goal_ir") or {})
-                                   .get("dimensions") or []):
-                            try:
-                                if isinstance(_d, dict):
-                                    _dt = str(_d.get("resolved_table") or "")
-                                    _dc = str(_d.get("resolved_column") or "")
-                                else:
-                                    _dt, _dc = "", str(_d or "")
-                            except Exception:
-                                continue
-                            _dcl = _dc.lower()
-                            if (not _dc or _env_id_like2(_dc)
-                                    or "date" in _dcl or "time" in _dcl
-                                    or _dc == _metric_col):
-                                continue
-                            _pair = (_dt, _dc)
-                            if _pair not in _ir_dims:
-                                _ir_dims.append(_pair)
-                    except Exception:
-                        _ir_dims = []
-                    if _ir_dims:
-                        _tcol0 = columns[0]
-                        _mcol0 = (_metric_col if _metric_col in columns
-                                  else columns[-1])
-                        _series = []
-                        for _r in result_data or []:
-                            try:
-                                _vv = _r.get(_mcol0)
-                                if _vv is None or str(_vv).strip() == "":
-                                    continue
-                                _series.append(
-                                    (str(_r.get(_tcol0)), float(_vv)))
-                            except (TypeError, ValueError):
-                                continue
-                        _chg = _change_drivers(
-                            _eng, session.get("dialect", "postgresql"),
-                            str(processed.get("sql_used") or ""),
-                            _series, dims=_ir_dims,
-                            measure_alias=str(_mcol0),
-                            time_alias=str(_tcol0),
-                            question=req.goal,
-                            metric_label=_metric_label)
-                        if isinstance(_chg, dict):
-                            _change_ctx = _chg.get("change")
-                            if _chg.get("drivers"):
-                                _drivers_list = _chg["drivers"]
-                            if _change_ctx:
-                                _cmp = dict(_cmp or {})
-                                _cmp["current"] = {
-                                    "label": _change_ctx.get("current")}
-                                _cmp["previous"] = {
-                                    "label": _change_ctx.get("previous")}
-                                _cmp["description"] = (
-                                    f"Compared {_change_ctx.get('current')} vs "
-                                    f"{_change_ctx.get('previous')} "
-                                    f"(period-over-period on "
-                                    f"{_cmp.get('granularity', 'month')} "
-                                    f"granularity).")
+                    _drivers_list = _drivers(
+                        _eng, session.get("dialect", "postgresql"),
+                        _main_table, _metric_col, _dims,
+                        period_label=_cmp.get("granularity", ""))
                 finally:
                     try:
                         _eng.dispose()
                     except Exception:
                         pass
-            except Exception:
-                _drivers_list = []
-                _change_ctx = None
-        if not _drivers_list:
-            try:
-                if _main_table and _metric_col and result_data:
-                    from sqlalchemy import create_engine as _mk
-                    _eng = _mk(session["db_uri"])
-                    try:
-                        _drivers_list = _drivers(
-                            _eng, session.get("dialect", "postgresql"),
-                            _main_table, _metric_col, _dims,
-                            period_label=_cmp.get("granularity", ""))
-                    finally:
-                        try:
-                            _eng.dispose()
-                        except Exception:
-                            pass
-            except Exception:
-                _drivers_list = []
+        except Exception:
+            _drivers_list = []
         _viz_type = _map_viz(_primary, chart_spec)
         _evidence = [{
             "tables": _tables_used,
@@ -1485,31 +1205,20 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         if _primary in ("explanation", "root_cause", "hypothesis",
                         "change_detection", "anomaly") or _drivers_list:
             try:
-                if _change_ctx:
-                    _hypothesis = _build_change_hyp(
-                        _change_ctx, _drivers_list,
-                        metric_label=_metric_label,
-                        metric_col=_metric_col,
-                        observation_count=len(result_data or []),
-                        dimensions=_dims,
-                    )
-                else:
-                    from goal_agent.analytics_intent import (
-                        build_hypothesis as _build_hyp,
-                    )
+                from goal_agent.analytics_intent import build_hypothesis as _build_hyp
+                _top_period = ""
+                try:
+                    _top_period = str((_drivers_list[0] or {}).get("period") or "")
+                except Exception:
                     _top_period = ""
-                    try:
-                        _top_period = str((_drivers_list[0] or {}).get("period") or "")
-                    except Exception:
-                        _top_period = ""
-                    _hypothesis = _build_hyp(
-                        _drivers_list,
-                        metric_label=_metric_label,
-                        metric_col=_metric_col,
-                        period_label=_top_period or _cmp.get("granularity", ""),
-                        observation_count=len(result_data or []),
-                        dimensions=_dims,
-                    )
+                _hypothesis = _build_hyp(
+                    _drivers_list,
+                    metric_label=_metric_label,
+                    metric_col=_metric_col,
+                    period_label=_top_period or _cmp.get("granularity", ""),
+                    observation_count=len(result_data or []),
+                    dimensions=_dims,
+                )
             except Exception:
                 if _drivers_list:
                     _top = _drivers_list[0]
@@ -1584,43 +1293,6 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
                 _rstatus = "partial"
             else:
                 _rstatus = "backend-failure" if _rstatus == "success" else _rstatus
-        # Auto "why" annotation for trend views: a one-line, grounded note of
-        # the decomposed period-over-period change (feature: annotations on
-        # trend charts). Rendered as a caption under the chart in the UI.
-        try:
-            if _change_ctx and (result_data or []):
-                _an_dir = str(_change_ctx.get("direction") or "")
-                _an_word = "fall" if _an_dir == "drop" else "rise"
-                _an_cur = str(_change_ctx.get("current") or "").strip()
-                _an_prev = str(_change_ctx.get("previous") or "").strip()
-                _an_pct = _change_ctx.get("change_pct")
-                _an_text = (_an_cur or "Latest period") + (
-                    " fell" if _an_dir == "drop" else " rose")
-                if isinstance(_an_pct, (int, float)):
-                    _an_text += f" {abs(round(float(_an_pct), 1))}%"
-                if _an_prev:
-                    _an_text += f" vs {_an_prev}"
-                _an_top = _drivers_list[0] if _drivers_list else None
-                if isinstance(_an_top, dict):
-                    _an_label = str(_an_top.get("label")
-                                    or _an_top.get("driver")
-                                    or _an_top.get("dimension") or "").strip()
-                    _an_cp = _an_top.get("contribution_pct")
-                    if _an_label:
-                        _an_text += f" — mostly {_an_label}"
-                        if isinstance(_an_cp, (int, float)):
-                            _an_text += (f" ({abs(round(float(_an_cp), 1))}%"
-                                         f" of the {_an_word})")
-                chart_spec = dict(chart_spec or {})
-                chart_spec["annotation"] = {
-                    "text": _an_text[:300],
-                    "direction": _an_dir,
-                    "current": _an_cur,
-                    "previous": _an_prev,
-                    "pct": _an_pct,
-                }
-        except Exception:
-            pass
         _analytics_envelope = {
             "interpreted_intent": {"primary": _primary,
                                    "capabilities": _capabilities,
@@ -1653,7 +1325,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             "interpreted_intent": {"primary": "descriptive_summary",
                                    "capabilities": ["descriptive_summary"],
                                    "confidence": "low"},
-            "metric": None, "metric_column": None, "dimensions": [], "filters": req.filters or [],
+            "metric": None, "dimensions": [], "filters": req.filters or [],
             "time_range": req.time_range or {},
             "comparison_period": {"granularity": "month",
                                   "description": "Comparison unavailable."},
@@ -1662,9 +1334,9 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             "confidence": "low", "limitations": [_san2(_env_exc)],
             "possible_drivers": [], "hypothesis": None, "recommendations": [],
             "follow_up_questions": list(all_suggestions or [])[:8],
-            "result_status": "partial" if result_data else "backend-failure",
-            "result_message": ("Extended analytics metadata was unavailable. Review the partial results."
-                               if result_data else "Analysis did not produce a usable result. Please retry."),
+            "result_status": "partial",
+            "result_message": ("Partial result: extended analytics metadata "
+                               "was unavailable. Core findings above are intact."),
         }
     # ── Business 360 (non-technical 360° view: what + why + what-to-do) ──
     # Best-effort, never fatal. Powers the AI Analytics inline card.
@@ -1700,12 +1372,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
             question=req.goal,
             result_data=result_data,
             columns=columns,
-            metric_label=(
-                (_metric_label if "_metric_label" in dir() and _metric_label
-                 and _metric_label not in ("value", "Value") else None)
-                or (processed.get("kpi_alignment", {}) or {}).get("kpis", [{}])[0].get("resolved_column", "").split(".")[-1]
-                or (_analytics_envelope.get("metric") if "_analytics_envelope" in dir() else None)
-                or _metric_col if "_metric_col" in dir() else None),
+            metric_label=_analytics_envelope.get("metric") if "_analytics_envelope" in dir() else None,
             metric_col=_metric_col if "_metric_col" in dir() else None,
             dims=_dims if "_dims" in dir() else [],
             drivers=_drivers_list if "_drivers_list" in dir() else [],
@@ -1745,7 +1412,6 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
         "why": why_block,
         "story": story_text,
         "chart_spec": chart_spec,
-        "glossary_applied": _glossary_applied,
         "display": display,
         "consistency": consistency,
         "analysis": analysis.get("analysis"),

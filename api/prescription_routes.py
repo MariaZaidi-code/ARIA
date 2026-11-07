@@ -12,8 +12,8 @@ import logging
 import time
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import ConfigDict, BaseModel
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel
 
 from core.config import get_session, save_session
 from core.deps import get_current_user, require_writable
@@ -86,13 +86,11 @@ def _strip_prescription_response(out):
 
 
 class SegmentRef(BaseModel):
-    model_config = ConfigDict(extra="allow")
     field: str | None = None
     value: str | int | float | None = None
 
 
 class AnalyzeContext(BaseModel):
-    model_config = ConfigDict(extra="allow")
     origin: str | None = None
     insight_id: str | None = None
     metric: str | None = None
@@ -102,7 +100,6 @@ class AnalyzeContext(BaseModel):
 
 
 class AnalyzeRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
     context: AnalyzeContext | None = None
     metric: str | None = None
     driver: str | None = None
@@ -113,28 +110,24 @@ class AnalyzeRequest(BaseModel):
 
 
 class ScenarioChange(BaseModel):
-    model_config = ConfigDict(extra="allow")
     field: str
     operation: str
     value: float
 
 
 class ScenarioFilter(BaseModel):
-    model_config = ConfigDict(extra="allow")
     field: str
     operator: str = "equals"
     value: str | int | float
 
 
 class ScenarioJoin(BaseModel):
-    model_config = ConfigDict(extra="allow")
     table: str
     self_col: str
     other_col: str
 
 
 class ScenarioRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
     table: str
     metric: str
     driver: str
@@ -144,7 +137,6 @@ class ScenarioRequest(BaseModel):
 
 
 class SaveRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
     prescription: dict = {}
     question: str | None = None
 
@@ -292,25 +284,22 @@ def prescription_context(user: dict = Depends(get_current_user)):
 def _enrich_context(engine, dialect, intel, tables, session):
     """Opportunities, per-table limitations, and latest saved evidence (§1).
 
-    Opportunity candidates are schema-discovered only (metric × drivers
-    within the same table), then ranked by what the data actually shows on a
-    bounded sample: measures that move beat constants, and tables with
-    dimensions make better segmentation stories. Foreign-key relationships
-    never auto-generate drivers (hyp §4) and derived fields never
-    auto-generate drivers (hyp §5) — actionability for those is established
-    separately inside the prescription engine behind statistical evidence
-    gates. Actionable reasons name row counts and missing pieces.
+    Opportunity candidates are schema-discovered only (no data scanned):
+    metric × controllable-ish drivers within the same table. Foreign-key
+    relationships never auto-generate drivers (hyp §4) and derived fields
+    never auto-generate drivers (hyp §5) — actionability for those is
+    established separately inside the prescription engine behind statistical
+    evidence gates. Actionable reasons name row counts and missing pieces.
     """
     from prescription_engine.engine import _usable_measures, classify_driver
     from prescription_engine.engine import (classify_semantic_role as _role,
                                             NON_LEVER_ROLES as _NON_LEVER,
-                                            NON_OUTCOME_ROLES as _NON_OUTCOME,
-                                            _HIGHER_BETTER_HINTS)
-    from core.schema_intel import _safe_name
+                                            NON_OUTCOME_ROLES as _NON_OUTCOME)
     from sqlalchemy import text as _t
     opportunities, limitations = [], []
 
     def _count(table):
+        from core.schema_intel import _safe_name
         try:
             with engine.connect() as conn:
                 return int(conn.execute(
@@ -318,31 +307,10 @@ def _enrich_context(engine, dialect, intel, tables, session):
         except Exception:
             return -1
 
-    def _variation(table, col, sample=10000):
-        """(distinct, sampled) over a bounded sample; (-1, -1) on failure.
-
-        Only asks "does this column move at all" — never an exact
-        statistic — so the LIMIT sample keeps the probe cheap on big
-        tables. A count of 1 means constant: nothing to vary or act on.
-        """
-        try:
-            with engine.connect() as conn:
-                row = conn.execute(_t(
-                    f"SELECT COUNT(*) AS n, "
-                    f"COUNT(DISTINCT {_safe_name(col, dialect)}) AS d "
-                    f"FROM (SELECT {_safe_name(col, dialect)} "
-                    f"FROM {_safe_name(table, dialect)} LIMIT {int(sample)}) AS s"
-                )).first()
-            if row is None:
-                return -1, -1
-            return int(row[1] or 0), int(row[0] or 0)
-        except Exception:
-            return -1, -1
-
     # Rank-first scan: tiny lookup tables must not eat the 3-table modeling
     # budget (e.g. northwind's categories/demographics hid orders entirely).
-    # Up to 12 tables are cheaply COUNTed; the most promising get the full
-    # opportunity treatment.
+    # Up to 12 tables are cheaply COUNTed; the 3 most promising (most rows,
+    # most measures) get the full opportunity treatment.
     ranked = []
     for t in tables[:12]:
         measures = _usable_measures(intel, t)
@@ -356,63 +324,12 @@ def _enrich_context(engine, dialect, intel, tables, session):
         ranked.append((n, t, measures))
     # Uncountable tables (-1) sort last; then most rows, then most measures.
     ranked.sort(key=lambda x: (x[0] < 0, -(x[0] if x[0] >= 0 else 0), -len(x[2])))
-
-    # Variation + segmentation probe on the shortlist: a table whose numbers
-    # actually move, and that offers dimensions to segment by, makes a far
-    # better opportunity than a big table full of constants. (Row counts and
-    # measure counts stay as tiebreakers.)
-    scored = []
-    for n, t, measures in ranked[:6]:
-        vary: dict = {}
-        for m in measures[:8]:
-            d, _s = _variation(t, m)
-            vary[m] = d
-        n_var = sum(1 for d in vary.values() if d >= 2)
-        try:
-            seg = len(intel.find_all_dimensions(t)) + len(intel.get_datetime_cols(t))
-        except Exception:
-            seg = 0
-        scored.append((n_var, seg, n, t, measures, vary))
-    scored.sort(key=lambda x: (x[2] < 0, -x[0], -x[1],
-                               -(x[2] if x[2] >= 0 else 0), -len(x[4])))
-
-    for _nv, _seg, _n, t, measures, vary in scored[:3]:
-        # Metric preference: recognized business OUTCOMES first (revenue,
-        # signups, conversions ...), then other business measures; levers
-        # (price/spend/discount) stay pickable as drivers below.
-        def _role_rank(c):
-            low = str(c or "").lower()
-            try:
-                outcome = 0 if any(h in low for h in _HIGHER_BETTER_HINTS) else 1
-            except Exception:
-                outcome = 1
-            try:
-                business = 0 if _role(c, "numeric") == "BUSINESS_MEASURE" else 1
-            except Exception:
-                business = 1
-            return (outcome, business)
-        ordered = sorted(measures, key=_role_rank)
-        # A pair and its mirror (a→b and b→a) are the same relationship —
-        # emit it once, in the direction the ranking reached first. Only
-        # suppress the mirror when the first direction actually became an
-        # opportunity (a role-refused direction never blocks its mirror).
-        seen_pairs: set = set()
-        for m in ordered[:2]:
-            if vary.get(m, -1) == 1:
-                limitations.append(f"{t}.{m}: holds a single value — nothing to vary or act on.")
-                continue
+    for _n, t, measures in ranked[:3]:
+        for m in measures[:2]:
             cands = []
             for c in measures:
-                if c == m or vary.get(c, -1) == 1:
-                    continue
-                _lvl, _rsn = classify_driver(c, "numeric")
-                # Outcomes (revenue/signups/visits ...) and segmentation
-                # fields are never auto-levers: driving a metric with a
-                # downstream outcome inverts causality. Only adjustable
-                # levels become candidate drivers.
-                if _lvl in ("not_controllable", "segmentation"):
-                    continue
-                cands.append((c, None, "same table", _lvl))
+                if c != m:
+                    cands.append((c, None, "same table"))
             # hyp §4: FK relationships are join metadata, never auto-drivers —
             # no cross-table candidates are seeded here. An explicit driver
             # request over a declared join is still supported inside the
@@ -423,12 +340,7 @@ def _enrich_context(engine, dialect, intel, tables, session):
             if not cands:
                 limitations.append(f"{t}.{m}: no other numbers reachable to test as drivers.")
                 continue
-            _pref = {"controllable": 0, "potentially_controllable": 1}
-            cands.sort(key=lambda x: _pref.get(x[3], 2))
-            for c, ot, how, _lvl in cands[:3]:
-                pair_key = tuple(sorted((str(m).lower(), str(c).lower())))
-                if pair_key in seen_pairs:
-                    continue
+            for c, ot, how in cands[:3]:
                 # hyp.txt §§4/10-11: technical/system measurements stay
                 # analytic — they never become auto-opportunities, however
                 # "measurable" they look. Generalized role check, never
@@ -447,7 +359,6 @@ def _enrich_context(engine, dialect, intel, tables, session):
                     limitations.append(f"{t}.{_bad}: a {_kind} — analytic signal only, not an actionable opportunity.")
                     continue
                 level, _ = classify_driver(c, "numeric")
-                seen_pairs.add(pair_key)
                 opportunities.append({"table": t, "metric": m, "driver": c,
                                       "driver_table": ot or t, "control": level,
                                       "note": how})
@@ -760,61 +671,16 @@ def _sanitize_saved_text(value, max_len=500):
     return s
 
 
-# Only engine card/display fields may be saved. IDs and timestamps are
-# server-owned; nested internal instructions/SQL/debug keys are discarded.
-_RX_SAVED_FIELDS = frozenset({
-    "title", "summary", "action", "confidence", "confidence_label", "risk",
-    "display", "why_summary", "details", "impact_note", "limitations",
-    "assumptions", "evidence_pass", "driver", "metric", "table", "rank",
-    "score", "impact", "evidence", "scenario_options", "success_metric",
-    "review_cadence", "review_trigger", "action_type", "control_level",
-    "problem_text", "why_text", "action_text", "outcome_text", "owner",
-    "priority", "due", "review_outcome", "review_note", "review_at",
-})
-
-
-def _sanitize_saved_prescription(payload):
-    import math
-    def clean(value, depth=0):
-        if depth > 8:
-            raise HTTPException(status_code=422, detail="Prescription is too deeply nested.")
-        if isinstance(value, str):
-            return _sanitize_saved_text(value, 4000)
-        if value is None or isinstance(value, (bool, int)):
-            return value
-        if isinstance(value, float):
-            return value if math.isfinite(value) else None
-        if isinstance(value, list):
-            return [clean(v, depth + 1) for v in value[:100]]
-        if isinstance(value, dict):
-            return {str(k): clean(v, depth + 1) for k, v in list(value.items())[:100]
-                    if str(k).lower() not in _RX_INTERNAL_KEYS | _TOP_INTERNAL_KEYS
-                    and not any(x in str(k).lower() for x in ("sql", "password", "token", "api_key", "instruction", "prompt"))}
-        raise HTTPException(status_code=422, detail="Unsupported prescription value.")
-    import json
-    try:
-        size = len(json.dumps(payload, default=str).encode("utf-8"))
-    except (ValueError, RecursionError):
-        raise HTTPException(status_code=422, detail="Invalid prescription payload.")
-    if size > 65536:
-        raise HTTPException(status_code=413, detail="Prescription exceeds the 64 KB limit.")
-    return clean({k: v for k, v in payload.items() if k in _RX_SAVED_FIELDS})
-
-
 @router.post("/api/prescriptions/save")
 def prescription_save(req: SaveRequest, request: Request,
                       user: dict = Depends(require_writable)):
     """Persist the structured prescription — never prose alone (§28)."""
     session = get_session(user["user_id"])
     saved = session.get("saved_prescriptions", [])
-    # Server-controlled identity always wins: client echoes of internal
-    # fields are dropped by the sanitizer and ids/timestamps are minted here.
-    from uuid import uuid4
-    from datetime import timezone
-    entry = {**_sanitize_saved_prescription(req.prescription or {}),
-             "id": f"rxsv_{uuid4().hex}",
-             "created_at": datetime.now(timezone.utc).isoformat(),
-             "question": _sanitize_saved_text(req.question, 500) or None}
+    entry = {"id": f"rxsv_{int(time.time() * 1000)}",
+             "created_at": datetime.now().isoformat(),
+             "question": _sanitize_saved_text(req.question, 500) or None,
+             **(req.prescription or {})}
     saved = [entry] + saved[:49]
     session["saved_prescriptions"] = saved
     save_session(user["user_id"], session)
@@ -822,7 +688,7 @@ def prescription_save(req: SaveRequest, request: Request,
 
 
 @router.get("/api/prescriptions/saved")
-def prescription_saved(user: dict = Depends(get_current_user)):
+def prescription_saved(user: dict = Depends(require_writable)):
     session = get_session(user["user_id"])
     return {"ok": True, "success": True,
             "saved": session.get("saved_prescriptions", [])}
@@ -838,7 +704,6 @@ def prescription_unsave(sid: str, user: dict = Depends(require_writable)):
 
 
 class SavedUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
     owner: str | None = None
     priority: str | None = None
     due: str | None = None
@@ -887,7 +752,6 @@ def prescription_saved_update(sid: str, req: SavedUpdateRequest,
 
 
 class InactionRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
     metric: str | None = None
     table: str | None = None
 

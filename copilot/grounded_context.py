@@ -178,31 +178,25 @@ def _sample_values(db_uri: str | None, dialect: str, table: str,
         quote = "`" if dialect == "mysql" else '"'
         _cargs = {} if "sqlite" in str(db_uri) else {"connect_timeout": 5}
         try:
-            # Schema-qualified keys quote per segment ("sales"."employee");
-            # embedded quote chars are doubled, never stripped.
+            # Schema-qualified keys quote per segment ("sales"."employee").
             _tsegs = [s for s in str(table or "").split(".") if s]
-            _qtable = (".".join(f"{quote}{s.replace(quote, quote + quote)}{quote}"
-                                for s in _tsegs)
-                       if len(_tsegs) > 1
-                       else f"{quote}{str(table).replace(quote, quote + quote)}{quote}")
+            _qtable = (".".join(f"{quote}{s}{quote}" for s in _tsegs)
+                       if len(_tsegs) > 1 else f"{quote}{table}{quote}")
         except Exception:
-            _qtable = f"{quote}{str(table).replace(quote, quote + quote)}{quote}"
+            _qtable = f"{quote}{table}{quote}"
         engine = create_engine(db_uri, pool_pre_ping=True,
                                connect_args=_cargs)
         try:
             with engine.connect() as conn:
                 for col in columns[:MAX_SAMPLE_COLUMNS_PER_TABLE]:
                     try:
-                        sql = (f"SELECT DISTINCT "
-                               f"{quote}{str(col).replace(quote, quote + quote)}{quote} "
-                               f"FROM {_qtable} LIMIT {MAX_SAMPLE_VALUES}")
+                        sql = (f"SELECT DISTINCT {quote}{col}{quote} FROM "
+                               f"{_qtable} LIMIT {MAX_SAMPLE_VALUES}")
                         rows = conn.execute(_text(sql)).fetchmany(MAX_SAMPLE_VALUES)
                         vals = [str(r[0])[:24] for r in rows if r[0] is not None]
                         if vals:
                             out[col] = vals
-                    except Exception as exc:
-                        log.debug("Grounded sample column skipped (%s.%s): %s",
-                                  table, col, exc)
+                    except Exception:
                         continue
         finally:
             engine.dispose()
@@ -213,16 +207,15 @@ def _sample_values(db_uri: str | None, dialect: str, table: str,
 
 def _quote(name: str, dialect: str) -> str:
     # Schema-qualified keys quote per segment ("sales"."employee").
-    # Embedded quote chars are doubled, never stripped, so the rendered
-    # identifier always references the name that was asked for.
-    q = "`" if dialect == "mysql" else '"'
     try:
         segs = [s for s in str(name or "").split(".") if s]
         if len(segs) > 1:
-            return ".".join(f"{q}{s.replace(q, q + q)}{q}" for s in segs)
+            q = "`" if dialect == "mysql" else '"'
+            return ".".join(f"{q}{s}{q}" for s in segs)
     except Exception:
         pass
-    return f"{q}{str(name).replace(q, q + q)}{q}"
+    q = "`" if dialect == "mysql" else '"'
+    return f"{q}{name}{q}"
 
 
 def rerank_schema_tables(question: str, tables: list[str],

@@ -20,7 +20,8 @@ log = logging.getLogger(__name__)
 MIN_OBS = 10
 
 _STRENGTH_ORDER = {"Strong evidence": 0, "Moderate evidence": 1,
-                   "Limited evidence": 2, "Insufficient evidence": 3}
+                   "Limited evidence": 2, "Insufficient evidence": 3,
+                   "Contradictory evidence": 4}
 
 
 def _biz(v) -> str:
@@ -55,6 +56,59 @@ def _strength_for(share: float, n: int) -> str:
     if share > 0:
         return "Limited evidence"
     return "Insufficient evidence"
+
+
+def _assess_candidates(candidates: list[dict], observation: dict | None) -> None:
+    """Add measured grades and bounded rival explanations in place.
+
+    Existing `contradictory` may contain unmeasured limitations (notably
+    document mentions without a demonstrated link). Only explicit measured
+    counterevidence changes the grade.
+    """
+    from .evidence_ladder import normalize
+
+    note = str((observation or {}).get("text") or "").strip()
+    for candidate in candidates:
+        raw = candidate.get("strength", "Insufficient evidence")
+        supports = 1 if candidate.get("supporting") and raw != "Insufficient evidence" else 0
+        against = list(candidate.get("measured_contradictions") or [])
+        grade = normalize(raw, supports, len(against))
+        candidate["strength"] = grade
+        candidate["evidence_grade"] = grade
+        candidate["evidence_reason"] = (
+            "Measured observations point the other way."
+            if grade == "Contradictory evidence" else
+            "Measured observations disagree; the assessment was downgraded."
+            if against else
+            "Evidence is descriptive; a causal explanation is not established."
+            if supports else
+            "Not enough measured support is available to assess this explanation."
+        )
+        candidate["settled_data_notes"] = [note] if note else []
+        if against:
+            candidate["contradictory"] = list(dict.fromkeys(
+                [*candidate.get("contradictory", []), *against]))
+
+    for candidate in candidates:
+        others = [
+            other for other in candidates
+            if other is not candidate and other.get("title") != candidate.get("title")
+        ]
+        candidate["rival_explanations"] = [
+            {"title": other["title"], "evidence_grade": other["evidence_grade"],
+             "status": "Other measured pattern; may coexist, not a proven cause"}
+            for other in others[:2]
+        ]
+        if others:
+            candidate["rivals"] = [
+                f"{other['title']} (alternative pattern; causation unproven)"
+                for other in others[:2]
+            ]
+        else:
+            candidate["rivals"] = [
+                "A shift in group mix could also explain the pattern; test it with a breakdown.",
+                "A timing effect could explain it; compare additional time periods.",
+            ]
 
 
 def _doc_score(question: str, text: str) -> int:
@@ -178,6 +232,8 @@ def _investigate(engine, dialect, intel, tables, question, documents, llm,
             "chart": None,
         })
 
+    # Grade measured support before ranking; rivals refer to real candidates.
+    _assess_candidates(candidates, obs)
     # Rank: strongest evidence first, cap at 4.
     candidates.sort(key=lambda c: (_STRENGTH_ORDER.get(c["strength"], 3), c["title"]))
     candidates = candidates[:4]
@@ -410,6 +466,7 @@ def _investigate_count(engine, dialect, intel, table, question):
                       "limitations": ["Pace change is measured; the reason is not yet identified."],
                       "needed_data": ["segment history to see whose activity changed"],
                       "chart": None}]
+        _assess_candidates(cands, obs)
         return {"ok": True,
                 "insufficient": all(c["strength"] == "Insufficient evidence" for c in cands),
                 "observation": obs, "hypotheses": cands,
@@ -645,6 +702,11 @@ def _volume_split(engine, dialect, table, metric, obs):
     if direction == "down" and vol > -5:
         return [{
             "title": "Volume held steady — pricing or mix likely",
+            "measured_contradictions": (
+                ["The measured transaction count and average value both increased, "
+                 "so these measurements do not support a volume or value decline."]
+                if vol >= 0 and aov >= 0 else []
+            ),
             "strength": "Limited evidence",
             "explanation": (f"Transaction volume barely moved ({vol:+.0f}%), so the "
                             f"decline more likely reflects lower values per transaction "
@@ -759,18 +821,27 @@ def _document_candidates(question, metric, documents):
     """Document passages as Limited-evidence candidates (never higher)."""
     scored = []
     for doc in documents or []:
-        for ch in (doc.get("chunks") or [])[:20]:
+        if not isinstance(doc, dict):
+            continue
+        # Session storage supplies one flat {text, page} record per chunk,
+        # while callers may supply a document containing a chunks list.
+        chunks = doc.get("chunks")
+        if not chunks and doc.get("text"):
+            chunks = [doc]
+        for ch in (chunks or [])[:20]:
             text = ch.get("text", "") if isinstance(ch, dict) else str(ch)
+            if not text.strip():
+                continue
             s = _doc_score(question + " " + str(metric), text)
             if s > 0:
-                scored.append((s, doc, text))
+                page = ch.get("page", doc.get("page")) if isinstance(ch, dict) else doc.get("page")
+                scored.append((s, doc, text, page))
     if not scored:
         return []
     scored.sort(key=lambda t: t[0], reverse=True)
-    s, doc, text = scored[0]
+    s, doc, text, page = scored[0]
     snippet = " ".join(text.split())[:350]
     fname = doc.get("filename", "document")
-    page = doc.get("page")
     label = f"{fname}" + (f" p.{page}" if page is not None else "")
     return [{
         "title": "External factor mentioned in documents",
@@ -791,10 +862,17 @@ def _document_candidates(question, metric, documents):
 def _validated_suggestions(intel, table, metric, time_col):
     """Next questions guaranteed structurally investigable.
 
-    Built only from resolved schema roles (real metric/time fields), never
-    from the user's phrasing. Change investigations require a time axis.
+    Built only from resolved schema roles (real table/metric/dims), never
+    from the user's phrasing — so every suggestion can actually run.
+    Prefers metrics that have a time field, so suggestions lead somewhere.
     """
     out = []
+
+    def _dims(t):
+        try:
+            return [d for d in (intel.find_all_dimensions(t) or [])][:2]
+        except Exception:
+            return []
 
     def _time(t):
         try:
@@ -822,15 +900,18 @@ def _validated_suggestions(intel, table, metric, time_col):
     for t in ordered:
         m = _first_table_metric(intel, t)
         if m:
-            dt = _time(t)
-            if dt:
-                timed.append((t, m, dt))
+            timed.append((t, m, _time(t)))
         if len([x for x in timed if x[2] is not None]) >= 3 and len(timed) >= 6:
             break
-    timed.sort(key=lambda x: x[0] != table)
-    for _, m, _ in timed[:2]:
+    timed.sort(key=lambda x: (x[2] is None, x[0] != table))
+    for t, m, dt in timed[:2]:
         out.append(f"Why did {_plain(m)} change?")
-        out.append(f"How has {_plain(m)} changed over time?")
+        for d in _dims(t):
+            out.append(f"How does {_plain(m)} vary by {_plain(d)}?")
+            break
+        if dt:
+            out.append(f"How has {_plain(m)} changed over time?")
+            break
     seen, clean = set(), []
     for s in out:
         if s not in seen:

@@ -1,16 +1,13 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { RefreshCw, Sparkles, Target, TrendingUp, TrendingDown, Crosshair, Lightbulb, Check, Shield } from "lucide-react";
-import { ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
+import { ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Brush } from "recharts";
 import { useTheme } from "../App";
 import Evidence from "../components/Evidence";
 import { ChartFrame, useSeriesToggle, ToggleLegend } from "../components/charts";
-import { ChartBrush } from "../components/ChartBrush";
 import { CATEGORY_COLORS } from "../lib/charts";
 import AIProcessingIndicator from "../components/AIProcessingIndicator";
 import { loadAnalysisContext, readHashParams, saveAnalysisContext } from "../lib/analysisContext";
-import { humanizeLabel } from "../lib/labels";
 import { apiFetch, normalizeApiError, prescriptionApi } from "../../services/api";
-import { localStore, sessionStore } from "../../utils/storage.js";
 
 interface PredictiveProps {
   insightResult?: any;
@@ -28,25 +25,6 @@ const FORECAST_C = CATEGORY_COLORS[0];
 const BASELINE_C = CATEGORY_COLORS[4];
 
 const plainName = (c: string) => (c || "").split(" (")[0].trim();
-
-/* Plain-English names for forecast methods and statuses (no math jargon on
-   screen). Unknown values fall back to readable words. */
-const METHOD_WORDS: Record<string, string> = {
-  naive: "Repeat the latest value",
-  seasonal_naive: "Repeat last season's pattern",
-  drift: "Continue the average recent change",
-  linear_trend: "Straight-line trend",
-  moving_average: "Recent average",
-  sarima: "Seasonal pattern model",
-  theta: "Smoothed trend",
-};
-const plainMethod = (m: string | null) =>
-  !m ? "—" : METHOD_WORDS[String(m).toLowerCase()] || humanizeLabel(String(m));
-const RELIABILITY_WORDS: Record<string, string> = {
-  high: "High", limited: "Limited", insufficient_data: "Not enough history", not_available: "Not available",
-};
-const plainReliability = (r: string | null) =>
-  !r ? "—" : RELIABILITY_WORDS[String(r).toLowerCase()] || humanizeLabel(String(r));
 
 const fmtNum = (v: any) => {
   if (v === null || v === undefined || isNaN(Number(v))) return "—";
@@ -217,17 +195,17 @@ function normalizeLinkFilters(f: any): { column: string; value: string }[] {
 
 function readForecastLinkContext(): ForecastLinkContext | null {
   try {
-    const ls = localStore.getItem("aria_forecast_context");
+    const ls = localStorage.getItem("aria_forecast_context");
     if (ls) {
-      localStore.removeItem("aria_forecast_context");
+      localStorage.removeItem("aria_forecast_context");
       const c = JSON.parse(ls);
       if (c && typeof c === "object") return c;
     }
   } catch { /* best-effort */ }
   try {
-    const ss = sessionStore.getItem("aria_forecast_prefill");
+    const ss = sessionStorage.getItem("aria_forecast_prefill");
     if (ss) {
-      sessionStore.removeItem("aria_forecast_prefill");
+      sessionStorage.removeItem("aria_forecast_prefill");
       const h = JSON.parse(ss);
       if (h && typeof h === "object") {
         return {
@@ -334,7 +312,6 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   // Single auto-fetch guard: one ref gates both auto-run effects so StrictMode
   // double-invoke and competing effects never fire two initial requests.
   const autoFetchRef = useRef<string>("");
-  const useAutomaticTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /* So-consider actions: top prescriptions for the forecast target, fetched
      once per forecast from the existing engine. Honest omission on refusal. */
   const [rxItems, setRxItems] = useState<any[]>([]);
@@ -459,7 +436,6 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     try {
       const data: any = await apiFetch("/predictive/scenario", {
         method: "POST",
-        timeoutMs: 300000,
         body: JSON.stringify({
           column: plainName(selectedTarget) || undefined,
           pct_change: Number(scenarioPct) || 0,
@@ -519,7 +495,6 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       const data: any = await apiFetch("/predictive/forecast", {
         method: "POST",
         signal: ctrl.signal,
-        timeoutMs: 300000,
         body: JSON.stringify({
           question: buildQuestion(t, td, useFlt),
           column: t,
@@ -660,13 +635,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
       if (empty && !hasInsightPredictions) {
         const key = `ctx:${table.table}|${metric}|${timeDim}|${hz}`;
         if (autoFetchRef.current !== key) {
-          // Mark the key only when the timer actually fires. If this effect
-          // re-runs first, its cleanup clears the timer and a later run can
-          // still schedule the fetch (otherwise the page deadlocks empty).
-          const timer = setTimeout(() => {
-            autoFetchRef.current = key;
-            fetchForecast(metric, timeDim, hz, flt);
-          }, 300);
+          autoFetchRef.current = key;
+          const timer = setTimeout(() => fetchForecast(metric, timeDim, hz, flt), 300);
           return () => clearTimeout(timer);
         }
       }
@@ -687,10 +657,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     if (!hasInsightPredictions && empty) {
       const key = `auto:${selectedTable}|${selectedTarget}|${selectedTime}`;
       if (autoFetchRef.current === key) return;
-      const timer = setTimeout(() => {
-        autoFetchRef.current = key;
-        fetchForecast();
-      }, 500);
+      autoFetchRef.current = key;
+      const timer = setTimeout(() => fetchForecast(), 500);
       return () => clearTimeout(timer);
     }
   }, [connectionStatus, elig, selectedTarget, hasInsightPredictions, fetchForecast, pendingCtx, ctxApplied]);
@@ -708,8 +676,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
     setForecastVerdict(null);
     autoFetchRef.current = "";
     setError("");
-    if (useAutomaticTimerRef.current) clearTimeout(useAutomaticTimerRef.current);
-    useAutomaticTimerRef.current = setTimeout(() => fetchForecast(rec.measure, rec.time_dim, horizon, []), 50);
+    setTimeout(() => fetchForecast(rec.measure, rec.time_dim, horizon, []), 50);
   };
 
   const predictions = forecast || insightPredictions;
@@ -733,9 +700,6 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   const targetName = plainName(
     selection?.measure || (predictions as any)?.target || predictions?.column || selectedTarget);
   const timeName = plainName(selection?.time_dim || selectedTime);
-  // Display-only label ("total_amount" -> "Total amount"); the raw name
-  // stays in API payloads, saved context and the CSV export.
-  const targetLabel = targetName ? humanizeLabel(targetName) : "";
   // Backend accuracy lives in two shapes: accuracy_pct (number) or
   // accuracy: { pct, summary }. Support both verbatim.
   const accuracy: number | null = (() => {
@@ -939,10 +903,10 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   // scenario values, never static copy (see buildForecastStory).
   const forecastStory: { story: string; signal: string } = useMemo(() => {
     return buildForecastStory({
-      hasPredictions, scenarios, targetName: targetLabel,
+      hasPredictions, scenarios, targetName,
       horizonPeriods: fwdVals.length, accuracy, momDelta,
     });
-  }, [hasPredictions, scenarios, targetLabel, fwdVals.length, accuracy, momDelta]);
+  }, [hasPredictions, scenarios, targetName, fwdVals.length, accuracy, momDelta]);
 
   // Preliminary comes from the backend total: the backend marks fewer than
   // 50 observations preliminary, mirrored here via forecast_stage + n_obs.
@@ -979,16 +943,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
   const whyItems: { title: string; body: string; source: string }[] = useMemo(() => {
     if (!hasPredictions) return [];
     const items: { title: string; body: string; source: string }[] = [];
-    // The backend statement is technical ("Selected seasonal_naive based on
-    // best holdout"); say the same thing in plain words.
-    if (selectionStatement) items.push({
-      title: "How the method was chosen",
-      body: /insufficient history/i.test(selectionStatement)
-        ? "There isn't enough history yet to test methods on past periods, so treat this as an early estimate."
-        : "ARIA tested several methods on earlier periods and kept the one that predicted the later periods most closely.",
-      source: "selection_statement",
-    });
-    if (modelName && modelName !== "none") items.push({ title: "Approach", body: `Projected with "${plainMethod(modelName)}", the method that held up best against past results.`, source: "model" });
+    if (selectionStatement) items.push({ title: "Model selection", body: selectionStatement, source: "selection_statement" });
+    if (modelName && modelName !== "none") items.push({ title: "Approach", body: `Projected with ${modelName}, the approach that held up best against past actuals.`, source: "model" });
     for (const d of backendDrivers) {
       const name = String(d?.name || "").trim();
       if (!name) continue;
@@ -1265,7 +1221,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 className="w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:border-primary outline-none cursor-pointer"
               >
                 {tables.map((t) => (
-                  <option key={t.table} value={t.table}>{humanizeLabel(t.table)} ({t.row_count ?? "?"} rows)</option>
+                  <option key={t.table} value={t.table}>{t.table} ({t.row_count ?? "?"} rows)</option>
                 ))}
               </select>
             </div>
@@ -1281,7 +1237,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               >
                 {activeMeasures.length === 0 && <option value="">No measures in this dataset</option>}
                 {activeMeasures.map((m: string) => (
-                  <option key={m} value={m}>{humanizeLabel(m)}</option>
+                  <option key={m} value={m}>{m}</option>
                 ))}
               </select>
             </div>
@@ -1294,7 +1250,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               >
                 {activeTimes.length === 0 && <option value="">Auto-detect…</option>}
                 {activeTimes.map((d: any) => (
-                  <option key={d.column} value={d.column}>{humanizeLabel(d.column)}{d.kind === "text" ? " (text)" : ""} · {d.distinct ?? "?"} points</option>
+                  <option key={d.column} value={d.column}>{d.column}{d.kind === "text" ? " (text)" : ""} · {d.distinct ?? "?"} points</option>
                 ))}
               </select>
               {selectedTime && (
@@ -1381,7 +1337,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                     aria-label="Filter column"
                   >
                     {schemaCols.map((c: any) => (
-                      <option key={c.name} value={c.name}>{humanizeLabel(c.name)}</option>
+                      <option key={c.name} value={c.name}>{c.name}</option>
                     ))}
                   </select>
                   <input
@@ -1394,7 +1350,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                   />
                   <datalist id="predictive-filter-values">
                     {filters.map((f) => (
-                      <option key={`sug-${f.column}-${f.value}`} value={f.value}>{humanizeLabel(f.column)}</option>
+                      <option key={`sug-${f.column}-${f.value}`} value={f.value}>{f.column}</option>
                     ))}
                   </datalist>
                   <button
@@ -1418,7 +1374,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
             <div className="flex flex-wrap gap-2">
               {filters.map((f) => (
                 <span key={f.column} className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full bg-secondary text-foreground">
-                  {humanizeLabel(f.column)} = {f.value}
+                  {f.column} = {f.value}
                   <button
                     onClick={() => setFilters((prev) => prev.filter((x) => x.column !== f.column))}
                     className="text-muted-foreground hover:text-foreground"
@@ -1438,7 +1394,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
             >
               {loading ? "Working…" : hasPredictions ? "Update" : "Build forecast"}
             </button>
-            {timeName && <p className="text-[11px] text-muted-foreground">Time base: {humanizeLabel(timeName)} · detected from your data, changeable above.</p>}
+            {timeName && <p className="text-[11px] text-muted-foreground">Time base: {timeName} · detected from your data, changeable above.</p>}
           </div>
           {horizonWarning && <p className="text-[11px] text-warning mt-1">{horizonWarning}</p>}
         </div>
@@ -1491,7 +1447,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
           <div className="lg:col-span-2 space-y-4">
             <div className={`bg-card border border-border rounded-xl p-5 forecast-reveal ${loading ? "opacity-70" : ""}`} key={`fc-${revealKey}`}>
               <ChartFrame
-                title={`${humanizeLabel(plainName(selectedTarget)) || "Metric"} forecast`}
+                title={`${plainName(selectedTarget) || "Metric"} forecast`}
                 explanation={`Solid line: what actually happened${frequency ? ` (${frequency})` : ""}. Line ahead: what ARIA expects next. Shaded band: likely range. Hover any point for detail, click a point to inspect it, drag the range bar to zoom. Click legend items to toggle series.`}
                 empty={chartRows.length === 0}
                 emptyText="Chart couldn't be drawn from this result — the numbers above still apply."
@@ -1582,8 +1538,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                       <Line type="monotone" dataKey="act" stroke="#8B5CF6" strokeWidth={2} strokeDasharray="2 3" dot={false} connectNulls name="If we act (estimate)" isAnimationActive={true} animationBegin={200} animationDuration={900} />
                     )}
                     {chartRows.length > 5 && (
-                      <ChartBrush
-                        dataKey="short"
+                      <Brush
+                        dataKey="short" height={24} stroke="var(--primary)" travellerWidth={10}
                         startIndex={win ? Math.max(0, win.s) : undefined}
                         endIndex={win ? Math.min(chartRows.length - 1, win.e) : undefined}
                         onChange={(r: any) => {
@@ -1707,7 +1663,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
             {/* What-if estimate: wired to the real scenario endpoint. */}
             <div className="bg-card border border-border rounded-xl p-4 space-y-2">
               <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">What-if estimate</p>
-              <p className="text-xs text-muted-foreground leading-relaxed">See what a change to {targetLabel || "this number"} could look like. Arithmetic estimate from your history, not a forecast.</p>
+              <p className="text-xs text-muted-foreground leading-relaxed">See what a change to {targetName || "this number"} could look like. Arithmetic estimate from your history, not a forecast.</p>
               <div className="flex items-center gap-2 flex-wrap">
                 <label className="text-xs text-muted-foreground" htmlFor="predictive-scenario-pct">Change (%)</label>
                 <input
@@ -1733,7 +1689,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                   <div className="flex justify-between"><span className="text-muted-foreground">Starting level</span><span className="font-bold text-foreground">{fmtNum(scenario.baseline)}</span></div>
                   <div className="flex justify-between"><span className="text-muted-foreground">With change</span><span className="font-bold text-foreground">{fmtNum(scenario.scenario_value)} ({Number(scenario.pct_change) >= 0 ? "+" : ""}{scenario.pct_change}%)</span></div>
                   <div className="flex justify-between"><span className="text-muted-foreground">Difference</span><span className="font-bold text-foreground">{fmtNum(scenario.delta)}</span></div>
-                  <p className="text-[11px] text-muted-foreground">Based on the last {scenario.periods_used ?? 3} periods of {scenario.column ? humanizeLabel(scenario.column) : targetLabel}.</p>
+                  <p className="text-[11px] text-muted-foreground">Based on the last {scenario.periods_used ?? 3} periods of {scenario.column || targetName}.</p>
                   {Array.isArray(scenario.assumptions) && scenario.assumptions.length > 0 && (
                     <ul className="space-y-0.5 pt-1">
                       {scenario.assumptions.map((a: string, i: number) => (
@@ -1820,7 +1776,7 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 <span className="text-muted-foreground text-xs">{confidenceOpen ? "▾" : "▸"}</span>
               </button>
               <p className="text-sm text-foreground leading-relaxed">
-                {targetLabel ? <><strong>{targetLabel}</strong> is </> : "Your number is "}
+                {targetName ? <><strong>{targetName}</strong> is </> : "Your number is "}
                 {pctChange !== null && pctChange > 1 && <>heading up about <strong>+{pctChange.toFixed(1)}%</strong></>}
                 {pctChange !== null && pctChange < -1 && <>heading down about <strong>{pctChange.toFixed(1)}%</strong></>}
                 {(pctChange === null || Math.abs(pctChange) <= 1) && <>holding roughly steady</>}
@@ -1828,19 +1784,17 @@ export default function Predictive({ insightResult = null, goalResult = null, co
               </p>
               {confidenceOpen && (
                 <div className="pt-1 space-y-1.5 text-xs border-t border-border mt-2">
-                  {/* Plain English only: same figures, no statistics jargon. */}
-                  <div className="flex justify-between pt-2"><span className="text-muted-foreground">Past periods used</span><span className="font-bold text-foreground">{historyCount}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Reliability</span><span className="font-bold text-foreground">{plainReliability(backendReliability)}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Quality checks passed</span><span className="font-bold text-foreground">{backendValid === null ? "—" : backendValid ? "Yes" : "No"}</span></div>
-                  {forecastStage && forecastStage !== "none" && (
-                    <div className="flex justify-between"><span className="text-muted-foreground">Status</span><span className="font-bold text-foreground">{forecastStage === "preliminary" ? "Early estimate" : humanizeLabel(forecastStage)}</span></div>
-                  )}
-                  <div className="flex justify-between"><span className="text-muted-foreground">Accuracy on past periods</span><span className="font-bold text-foreground">{accuracy !== null ? `${accuracy.toFixed(1)}%` : "—"}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Typical miss</span><span className="font-bold text-foreground">{contractMetrics?.mae !== null && contractMetrics?.mae !== undefined ? fmtNum(contractMetrics.mae) : "—"}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Average miss</span><span className="font-bold text-foreground">{contractMetrics?.mape !== null && contractMetrics?.mape !== undefined ? `${contractMetrics.mape}%` : "—"}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Past periods tested</span><span className="font-bold text-foreground">{coverage && coverage.evaluated !== null ? `${coverage.evaluated} of ${coverage.origins ?? "?"}${coverage.zeroSkipped ? ` (${coverage.zeroSkipped} with no activity skipped)` : ""}` : "—"}</span></div>
-                  <div className="flex justify-between gap-3"><span className="text-muted-foreground">Method</span><span className="font-bold text-foreground text-right">{plainMethod(modelName)}</span></div>
-                  <div className="flex justify-between"><span className="text-muted-foreground">Forecast length</span><span className="font-bold text-foreground">{fwdVals.length} {fwdVals.length === 1 ? "period" : "periods"}</span></div>
+                  <div className="flex justify-between pt-2"><span className="text-muted-foreground">Historical observations</span><span className="font-bold text-foreground">{historyCount}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Backend reliability</span><span className="font-bold text-foreground">{backendReliability ?? "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Backend valid</span><span className="font-bold text-foreground">{backendValid === null ? "—" : String(backendValid)}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Stage</span><span className="font-bold text-foreground">{forecastStage ?? "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Backtest accuracy</span><span className="font-bold text-foreground">{accuracy !== null ? `${accuracy.toFixed(1)}%` : "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">MAE</span><span className="font-bold text-foreground">{contractMetrics?.mae ?? "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">RMSE</span><span className="font-bold text-foreground">{contractMetrics?.rmse ?? "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">MAPE</span><span className="font-bold text-foreground">{contractMetrics?.mape !== null && contractMetrics?.mape !== undefined ? `${contractMetrics.mape}%` : "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Walk-forward coverage</span><span className="font-bold text-foreground">{coverage && coverage.evaluated !== null ? `${coverage.evaluated}/${coverage.origins ?? "?"} evaluated${coverage.zeroSkipped ? ` (${coverage.zeroSkipped} zero-demand skipped)` : ""}` : "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Model</span><span className="font-bold text-foreground">{modelName || "—"}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Horizon</span><span className="font-bold text-foreground">{fwdVals.length} {fwdVals.length === 1 ? "period" : "periods"}</span></div>
                 </div>
               )}
             </div>
@@ -1919,13 +1873,13 @@ export default function Predictive({ insightResult = null, goalResult = null, co
                 metrics live only under Technical details — never in the main view. */}
             <Evidence
               sections={[
-                { title: "Data analyzed", body: `${targetLabel || "The selected number"} over the last ${historyCount > 0 ? `${historyCount} periods` : "available history"}${frequency ? ` (${frequency}).` : "."}` },
+                { title: "Data analyzed", body: `${targetName || "The selected number"} over the last ${historyCount > 0 ? `${historyCount} periods` : "available history"}${frequency ? ` (${frequency}).` : "."}` },
                 { title: "Key observation", body: pctChange !== null && Math.abs(pctChange) > 1 ? `Recent momentum points ${pctChange > 0 ? "up" : "down"} about ${Math.abs(Math.round(pctChange))}%.` : "Recent values sit close to their average — no strong direction." },
                 { title: "Analysis method", body: "ARIA compared several projection approaches and kept the one that held up best against past actuals before showing any projection." },
                 { title: "Confidence", body: accuracy !== null ? `${accuracy >= 70 ? "Reliable" : "Weak"} in backtesting (${Math.round(accuracy)}% accuracy). Uncertainty grows further out — treat distant points as directional.` : "Backtesting could not score this series — treat the projection as directional." },
                 { title: "Assumptions", body: "Past patterns continue; no shocks, price changes, or seasonality shifts are modeled. A forecast is an estimate, not a promise." },
               ]}
-              technical={`How ARIA calculated this: ARIA tried several methods on your past data and chose "${plainMethod(modelName) === "—" ? "the best of several methods" : plainMethod(modelName)}", the one that predicted past periods most closely.${contractMetrics && (contractMetrics.mae != null || contractMetrics.mape != null) ? ` On those past periods it was off by${contractMetrics.mape != null ? ` about ${contractMetrics.mape}% on average` : ""}${contractMetrics.mape != null && contractMetrics.mae != null ? "," : ""}${contractMetrics.mae != null ? ` a typical miss of ${fmtNum(contractMetrics.mae)}` : ""}.` : ""}${intervalMethod === "summed_bounds_approx" ? " The likely range is approximate because periods were regrouped." : ""}${uncertaintyNote ? ` ${uncertaintyNote}.` : ""}`}
+              technical={`How ARIA calculated this: ${modelName ? `selected approach ${modelName}` : "best of several candidate approaches"}${selectionStatement ? ` — ${selectionStatement}` : ""}${contractMetrics && (contractMetrics.mae !== null || contractMetrics.mape !== null) ? ` Holdout error: ${contractMetrics.mape !== null ? `MAPE ${contractMetrics.mape}%` : ""}${contractMetrics.mape !== null && contractMetrics.rmse !== null ? ", " : ""}${contractMetrics.rmse !== null ? `RMSE ${contractMetrics.rmse}` : ""}${contractMetrics.mae !== null ? `, MAE ${contractMetrics.mae}` : ""}.` : ""}${intervalMethod === "summed_bounds_approx" ? " Approximate range from regrouping." : ""}${uncertaintyNote ? ` ${uncertaintyNote}.` : ""} For analyst review.`}
             />
           </div>
         </div>
@@ -1966,8 +1920,8 @@ export default function Predictive({ insightResult = null, goalResult = null, co
             )}
             <p className="text-[11px] text-muted-foreground pt-1">
               {pointSel.forecast !== null && pointSel.forecast !== undefined
-                ? `Forecast${modelName ? ` · ${modelName}` : ""} · ${targetLabel}`
-                : `Historical actual · ${targetLabel}`}
+                ? `Forecast${modelName ? ` · ${modelName}` : ""} · ${targetName}`
+                : `Historical actual · ${targetName}`}
             </p>
           </div>
         </div>

@@ -340,26 +340,27 @@ class GroundingMixin:
         info = self.tables[table_name]
         pk = set(info.get("primary_key", []) or [])
         fk_cols = {fk.get("column") for fk in info.get("foreign_keys", [])}
-        measures = []
+        fallback = None
         for col in info["columns"]:
             low = col.lower()
-            if col in pk or col in fk_cols or low == "id" or low.endswith("_id") or low.endswith("id"):
+            if col in pk or col in fk_cols or low == "id" \
+                    or low.endswith("_id") or low.endswith("id"):
                 continue
-            if self._classify_column(table_name, col) == "numeric" \
-                    and not self._is_dimension_like(table_name, col):
-                measures.append(col)
-        if measures:
-            # Best guess by meaning, not schema order: a money total
-            # ('amt', 'total_due') before a per-line price before a quantity,
-            # matching how the dashboard picks its headline measure. Ties
-            # keep schema order.
-            def _tier(c):
-                try:
-                    return self._measure_name_tier(c, True)
-                except Exception:
-                    return 2
-            ranked = [c for c in measures if _tier(c) < 10] or measures
-            return min(ranked, key=lambda c: (_tier(c), measures.index(c)))
+            if self._classify_column(table_name, col) == "numeric":
+                if self._is_dimension_like(table_name, col):
+                    if fallback is None:
+                        fallback = col
+                    continue
+                return col
+        if fallback is not None:
+            return fallback
+        for col in info["columns"]:
+            low = col.lower()
+            if col in pk or col in fk_cols or low == "id" \
+                    or low.endswith("_id") or low.endswith("id"):
+                continue
+            if self._classify_column(table_name, col) == "numeric":
+                return col
         return None
 
     # ---- _first_date_column (_first_date_column) ----
@@ -537,10 +538,6 @@ class GroundingMixin:
         look for a fact table with BOTH a quantity and a unit-price column and
         synthesize quantity * unit_price.  Also includes discount when present.
         Generic, schema-driven, no DB names."""
-        # Quantity times selling price estimates revenue, never profit/margin.
-        # Do not replace a matched profit column with a revenue expression.
-        if not set(concept_tokens or ()) & {"revenue", "sales"}:
-            return None
         for table in relevant:
             info = self.tables.get(table, {})
             cols = list(info.get("columns", {}))
@@ -784,15 +781,8 @@ class GroundingMixin:
                 s = s[1:-1].strip()
             s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
             s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)
-            if not s:
-                return set()
-            words = {w for w in re.split(r"[^a-z0-9]+", s.lower()) if w}
-            # Shorthand folds to its meaning too ('amt' -> 'amount'), so an
-            # abbreviated money column ranks like its spelled-out form.
-            from schema_engine.lexical import expand_abbreviation
-            words |= {expand_abbreviation(w) for w in words
-                      if " " not in expand_abbreviation(w)}
-            return words | {s.lower()}
+            return {w for w in re.split(r"[^a-z0-9]+", s.lower()) if w} | \
+                {s.lower()} if s else set()
         except Exception:
             low = str(value or "").lower()
             return {low} if low else set()
@@ -949,87 +939,52 @@ class GroundingMixin:
             try:
                 quote = (lambda n: self._quote(n, getattr(self, "dialect", "postgresql")))
             except Exception:
-                # Fallback quoter must still escape embedded quotes — a raw
-                # f'"{n}"' breaks on identifiers with quotes inside.
-                quote = lambda n: '"' + str(n).replace('"', '""') + '"'  # noqa: E731
+                quote = lambda n: f'"{n}"'  # noqa: E731
             try:
                 from core.db import base_table as _bt
             except Exception:
                 _bt = lambda n: str(n or "").split(".")[-1]  # noqa: E731
-            # One sampled connection for all probes: a new engine borrow
-            # (plus its statement_timeout) per candidate × column pooled
-            # several pooled connections per goal; hold one instead.
-            _probe_conn = None
-            try:
-                _probe_conn = self.engine.connect()
-            except Exception:
-                _probe_conn = None
-            try:
-                for cand in cands:
-                    if len(found) >= 2:
-                        break
-                    for (t, c) in cols:
-                        try:
-                            # Bare segment: the engine search_path resolves
-                            # schema-qualified keys (sales.employee -> employee).
-                            sql = (f"SELECT DISTINCT {quote(c)} FROM {quote(_bt(t))} "
-                                   f"LIMIT 50")
-                            if _probe_conn is not None:
-                                conn = _probe_conn
-                            else:
-                                conn = self.engine.connect()
-                            try:
-                                # Same dialect-conditional statement timeout the
-                                # main execution path sets: sampling probes must
-                                # never hang a request (bounded read-only SQL).
+            for cand in cands:
+                if len(found) >= 2:
+                    break
+                for (t, c) in cols:
+                    try:
+                        # Bare segment: the engine search_path resolves
+                        # schema-qualified keys (sales.employee -> employee).
+                        sql = (f"SELECT DISTINCT {quote(c)} FROM {quote(_bt(t))} "
+                               f"LIMIT 50")
+                        with self.engine.connect() as conn:
+                            rows = conn.execute(_text(sql)).fetchall()
+                    except Exception:
+                        continue
+                    hit = False
+                    hit_val = None
+                    try:
+                        for r in rows or []:
+                            if str(r[0]).strip().lower() == str(cand).strip().lower():
+                                hit = True
                                 try:
-                                    _dl = getattr(self, "dialect", "")
-                                    if _dl == "postgresql":
-                                        conn.execute(_text("SET statement_timeout = '5000'"))
-                                    elif _dl == "mysql":
-                                        conn.execute(_text("SET SESSION max_execution_time = 5000"))
+                                    hit_val = str(r[0]).strip()
                                 except Exception:
-                                    pass
-                                rows = conn.execute(_text(sql)).fetchall()
-                            finally:
-                                if conn is not _probe_conn:
-                                    conn.close()
-                        except Exception:
-                            continue
-                        hit = False
-                        hit_val = None
-                        try:
-                            for r in rows or []:
-                                if str(r[0]).strip().lower() == str(cand).strip().lower():
-                                    hit = True
-                                    try:
-                                        hit_val = str(r[0]).strip()
-                                    except Exception:
-                                        hit_val = str(cand).strip()
-                                    break
-                        except Exception:
-                            continue
-                        if hit:
-                            # Preserve the database's own casing ('Electronics',
-                            # not the goal's 'electronics'): equality is
-                            # case-sensitive on SQLite/Postgres, so storing the
-                            # goal casing would filter to zero rows.
-                            _val = hit_val if hit_val else str(cand).strip()
-                            found.append({
-                                "column": f"{t}.{c}",
-                                "operator": "=",
-                                "value": _val,
-                                "confidence": 0.85,
-                                "reason": (f"value '{_val}' found in {t}.{c} "
-                                           "(sampled distinct values)"),
-                            })
-                            break
-            finally:
-                try:
-                    if _probe_conn is not None:
-                        _probe_conn.close()
-                except Exception:
-                    pass
+                                    hit_val = str(cand).strip()
+                                break
+                    except Exception:
+                        continue
+                    if hit:
+                        # Preserve the database's own casing ('Electronics',
+                        # not the goal's 'electronics'): equality is
+                        # case-sensitive on SQLite/Postgres, so storing the
+                        # goal casing would filter to zero rows.
+                        _val = hit_val if hit_val else str(cand).strip()
+                        found.append({
+                            "column": f"{t}.{c}",
+                            "operator": "=",
+                            "value": _val,
+                            "confidence": 0.85,
+                            "reason": (f"value '{_val}' found in {t}.{c} "
+                                       "(sampled distinct values)"),
+                        })
+                        break
         except Exception:
             return found
         return found
@@ -1041,24 +996,14 @@ class GroundingMixin:
             try:
                 quote = (lambda n: self._quote(n, getattr(self, "dialect", "postgresql")))
             except Exception:
-                # Fallback quoter escapes embedded quotes (see _probe_value_filters).
-                quote = lambda n: '"' + str(n).replace('"', '""') + '"'  # noqa: E731
+                quote = lambda n: f'"{n}"'  # noqa: E731
             try:
                 from core.db import base_table as _bt2
             except Exception:
                 _bt2 = lambda n: str(n or "").split(".")[-1]  # noqa: E731
-            qualified = ".".join(quote(part) for part in str(table).split("."))
-            sql = (f"SELECT DISTINCT {quote(col)} FROM {qualified} "
+            sql = (f"SELECT DISTINCT {quote(col)} FROM {quote(_bt2(table))} "
                    f"LIMIT {int(cap)}")
             with self.engine.connect() as conn:
-                try:
-                    _dl = getattr(self, "dialect", "")
-                    if _dl == "postgresql":
-                        conn.execute(_text("SET statement_timeout = '5000'"))
-                    elif _dl == "mysql":
-                        conn.execute(_text("SET SESSION max_execution_time = 5000"))
-                except Exception:
-                    pass
                 rows = conn.execute(_text(sql)).fetchall()
             return len(rows or [])
         except Exception:
@@ -1087,76 +1032,6 @@ class GroundingMixin:
             return False
 
 # ---- _resolve_semantics (_resolve_semantics) ----
-
-    def _avoid_fan_out(self, ir):
-        """Never add a parent-level measure across its child rows.
-
-        Grouping an order-level SUM ('total due') by something reached only
-        through the order's lines (product category) repeats each order once
-        per line and inflates every group. When that shape appears, switch
-        to the child table's own money measure ('line total'), which is the
-        correct grain; the answer then names that measure. Generic: uses
-        only declared/inferred foreign keys and measure-name tiers.
-        """
-        def _bare(t):
-            return str(t or "").split(".")[-1].strip('"`[]').lower()
-
-        by_bare = {_bare(t): t for t in self.tables}
-
-        def _parents(t):
-            out = set()
-            for fk in (self.tables.get(t, {}) or {}).get("foreign_keys", []) or []:
-                ref = by_bare.get(_bare(fk.get("referenced_table")))
-                if ref and ref != t:
-                    out.add(ref)
-            return out
-
-        def _ancestors(t):
-            seen, stack = set(), [t]
-            while stack:
-                for p in _parents(stack.pop()):
-                    if p not in seen:
-                        seen.add(p)
-                        stack.append(p)
-            return seen
-
-        dim_tables = {d.get("resolved_table") for d in ir.get("dimensions", []) or []
-                      if d.get("resolved_table")}
-        for m in ir.get("metrics", []) or []:
-            mt, col = m.get("resolved_table"), m.get("resolved_column")
-            if not mt or not col or str(m.get("aggregation") or "SUM").upper() not in ("SUM", "AVG"):
-                continue
-            mt_up = _ancestors(mt)
-            children = [t for t in self.tables if mt in _parents(t)]
-            risky = [c for c in children
-                     if any(dt != mt and dt not in mt_up and (dt == c or dt in _ancestors(c))
-                            for dt in dim_tables)]
-            if not risky:
-                continue
-            child = risky[0]
-            candidates = []
-            for c in (self.tables.get(child, {}) or {}).get("columns", {}) or {}:
-                try:
-                    if not self._is_safe_numeric_measure(child, c):
-                        continue
-                    tier = self._measure_name_tier(c, True)
-                except Exception:
-                    continue
-                if tier <= 1:
-                    candidates.append((tier, c))
-            if not candidates:
-                m["fan_out_risk"] = True
-                continue
-            new_col = min(candidates)[1]
-            m.update({
-                "resolved_table": child,
-                "resolved_column": new_col,
-                "resolved_expression": f"{child}.{new_col}",
-                "substituted_from": f"{mt}.{col}",
-                "reason": (f"{col} is recorded once per {_bare(mt)} row; grouping "
-                           f"through {_bare(child)} would count it once per line, "
-                           f"so the line-level {new_col} is used"),
-            })
 
     def _resolve_semantics(self, goal, ir, join_path):
         """Bind the Goal IR concepts to real schema columns/tables (spec §3).
@@ -1474,9 +1349,8 @@ class GroundingMixin:
                 return (_direct, _named, _isolated, 0 if _geo else 1, _card_v,
                         -_conf, str(_t or ""), str(_c or ""))
             try:
-                # Keep date dims required by trends outside the categorical cap;
-                # cap them separately so multi-table schemas do not explode
-                # dimensions across all tables.
+                # Keep date dims required by trends outside the cap;
+                # cap only the categorical breakdown candidates.
                 _date_ds = []
                 _cat_ds = []
                 for _d in dims:
@@ -1489,13 +1363,6 @@ class GroundingMixin:
                         _date_ds.append(_d)
                     else:
                         _cat_ds.append(_d)
-                def _date_rank(d):
-                    _t = d.get("resolved_table")
-                    _in_rel = 0 if _t in relevant else 1
-                    return (_in_rel, _rank_key(d))
-                _date_ds = sorted(_date_ds, key=_date_rank)
-                _date_cap = min(_cap_n, 2)
-                _date_ds = _date_ds[:_date_cap]
                 _cat_ds = sorted(_cat_ds, key=_rank_key)[:_cap_n]
                 dims = _date_ds + _cat_ds
             except Exception:
@@ -1512,43 +1379,6 @@ class GroundingMixin:
         for metric in ir["metrics"]:
             concept = metric["concept"].lower()
             if metric.get("aggregation") == "COUNT" or concept == "row count":
-                # An INFERRED count (no explicit "how many"/"count" wording)
-                # whose question lexically names a real measure column
-                # ("how much did we spend", "total signups") tracks that
-                # column instead of counting rows. Fully schema-driven.
-                if metric.get("inferred"):
-                    _lex = None
-                    try:
-                        _q = set(self._normalize_tokens(goal_l))
-                    except Exception:
-                        _q = set()
-                    for m in measures:
-                        try:
-                            _snake = re.sub(
-                                r"([a-z0-9])([A-Z])", r"\1_\2",
-                                str(m["column"] or "")).lower()
-                            cts = {p for p in re.split(r"[^a-z0-9]+", _snake) if p}
-                        except Exception:
-                            cts = set()
-                        if not cts or not _q:
-                            continue
-                        miss = {t for t in cts if t not in _q
-                                and not (t.endswith("s") and t[:-1] in _q)}
-                        if not miss:
-                            _lex = m
-                            break
-                    if _lex is not None:
-                        metric["resolved_table"] = _lex["table"]
-                        metric["resolved_column"] = _lex["column"]
-                        metric["resolved_expression"] = (
-                            f"{_lex['table']}.{_lex['column']}")
-                        metric["aggregation"] = "SUM"
-                        metric["confidence"] = 0.8
-                        metric["reason"] = (
-                            "question names the measure column "
-                            f"{_lex['table']}.{_lex['column']}; aggregating "
-                            "it instead of counting rows")
-                        continue
                 # A vague trend goal ("analyze trend over time") names no
                 # measure: tracking the table's real measure over time is the
                 # useful default, not a row count. Only inferred (guessed)
@@ -1675,43 +1505,11 @@ class GroundingMixin:
                 if best_key is None or key > best_key:
                     best_key = key
                     best = m
-            # Lexical name hit (generic, no DB names): a measure column
-            # literally named in the question ("total spend" -> spend,
-            # "signups" -> signups) outranks concept-token scoring and is
-            # never traded for the computed qty*price fallback.
-            best_direct = False
-            try:
-                _q = set(self._normalize_tokens(goal_l))
-            except Exception:
-                _q = set()
-            _direct = None
-            for m in _pool:
-                try:
-                    _snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2",
-                                    str(m["column"] or "")).lower()
-                    cts = {p for p in re.split(r"[^a-z0-9]+", _snake) if p}
-                except Exception:
-                    cts = set()
-                if not cts or not _q:
-                    continue
-                miss = {t for t in cts if t not in _q
-                        and not (t.endswith("s") and t[:-1] in _q)}
-                if not miss:
-                    try:
-                        _line = 1 if self._is_line_grain_table(m.get("table")) else 0
-                    except Exception:
-                        _line = 0
-                    key = (len(cts), -_line, str(m.get("table") or ""))
-                    if _direct is None or key > _direct[0]:
-                        _direct = (key, m)
-            if _direct is not None:
-                best = _direct[1]
-                best_direct = True
             # Goal-name override: if the user explicitly names a column
             # (e.g. "average rating" -> "rating"), prefer it over the
             # concept-token match which may pick the wrong column. Never
             # overrides a revenue-like goal with a cost/fuel/id/count column.
-            if not monetary_bias and not best_direct:
+            if not monetary_bias:
                 try:
                     goal_words = {w for w in self._normalize_tokens(goal_l) if len(w) >= 3}
                 except Exception:
@@ -1722,24 +1520,6 @@ class GroundingMixin:
                     if col_lower in goal_words or col_base in goal_words:
                         best = m
                         break
-            # Exact-phrase override (any bias): a question that spells out a
-            # multi-word measure ("line total", "sub total", "total due",
-            # "tax amount") means that column, never a different total that
-            # merely shares the word "total". The longest phrase wins.
-            try:
-                from schema_engine.lexical import identifier_words as _iw
-                _goal_phrase = " " + " ".join(
-                    re.findall(r"[a-z0-9]+", goal_l.lower())) + " "
-                _named = []
-                for m in _pool:
-                    _words = _iw(m["column"])
-                    if len(_words) >= 2 and f" {' '.join(_words)} " in _goal_phrase:
-                        _named.append((len(_words), m))
-                if _named:
-                    best = max(_named, key=lambda x: x[0])[1]
-                    metric["explicit_column"] = True
-            except Exception:
-                pass
             # If nothing matched (best is None) the computed-measure path
             # below synthesizes a quantity*unit_price expression.
             # Also prefer the computed expression when monetary_bias is on
@@ -1756,9 +1536,7 @@ class GroundingMixin:
                 # A header-level monetary total (tier 0) always wins over the
                 # line-grain synthesis: header totals are already the
                 # qty*price rollup and re-multiplying lines double-counts.
-                if computed and best_tier >= 1 and monetary_bias \
-                        and not best_direct \
-                        and not metric.get("explicit_column"):
+                if computed and best_tier >= 1 and monetary_bias:
                     metric["resolved_table"] = computed["table"]
                     metric["resolved_column"] = None
                     metric["resolved_expression"] = computed["expression"]
@@ -1790,7 +1568,7 @@ class GroundingMixin:
                             list(relevant) + _all_tables, tokens)
                     except Exception:
                         computed = None
-                if not computed and monetary_bias and concept != "profit kpi":
+                if not computed and monetary_bias:
                     # Money-preferred fallback across the whole schema:
                     # first safe total/amount/sales-like column, never
                     # cost/fuel/id/counts. Generic, no DB names.
@@ -1929,11 +1707,6 @@ class GroundingMixin:
                 for f in ir["filters"]:
                     if f["column"] is None:
                         f["column"] = f"{date_col[0]}.{date_col[1]}"
-
-        try:
-            self._avoid_fan_out(ir)
-        except Exception as exc:
-            logger.debug("fan-out check skipped: %s", exc)
 
         resolved_any = any(m.get("resolved_table") for m in ir["metrics"]) or bool(ir["dimensions"])
         ir["confidence"] = 0.85 if resolved_any else 0.5

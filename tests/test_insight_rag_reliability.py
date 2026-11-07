@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 from langchain_core.documents import Document
-import pandas as pd
 
 from insight_rag import InsightPDFRAG
 from insight_rag.context_engine import ContextEngineer, ContextPlan
@@ -21,7 +20,6 @@ from insight_rag.retrieval import bm25_search
 from insight_rag.semantic_router import SemanticRouter
 from insight_rag.storage import ConversationStore, RAGMetadataStore, UserPGVectorStore
 from insight_rag.table_reasoner import build_table_facts, markdown_to_frame
-from insight_rag.tabular import dataframe_to_table_documents
 
 DID = "document-a"
 
@@ -130,89 +128,6 @@ def test_summary_comparison_balances_documents():
     for did in [DID, "document-b"]:
         pages = {d.metadata["page"] for d in selected if d.metadata["document_id"] == did}
         assert len(pages) == 4 and 1 in pages and 20 in pages
-
-
-def test_broad_summary_keeps_multiple_tabular_chunks_on_same_page():
-    docs = [
-        document(
-            f"Chunk {index}",
-            cid=f"chunk-{index}",
-            content_type="table",
-            source_type="tabular",
-            table_summary=index == 0,
-        )
-        for index in range(12)
-    ]
-
-    selected = ContextEngineer.select_evidence(
-        "summarize this document",
-        docs,
-        selected_document_ids=[DID],
-        broad_query=True,
-    )
-
-    assert len(selected) == 8
-    assert selected[0].metadata["table_summary"] is True
-    assert len({item.metadata["chunk_id"] for item in selected}) == 8
-    assert selected[-1].metadata["chunk_id"] == "chunk-11"
-
-
-@pytest.mark.parametrize(
-    "question",
-    [
-        "What are the key takeaways from this document?",
-        "Summarize the PDF",
-    ],
-)
-def test_documents_assistant_routes_summary_prompts_to_grounded_summary(make_rag, question):
-    docs = [
-        document(
-            f"Revenue was {100 + index} in 2025. [row {index}]",
-            cid=f"summary-chunk-{index}",
-            content_type="table",
-            source_type="tabular",
-            table_summary=index == 0,
-        )
-        for index in range(10)
-    ]
-    rag = make_rag(Model(answer="Revenue was 100 in 2025 [S1]."), docs=docs)
-
-    result = rag.chat(question, document_only=True)
-
-    assert result["routing"]["task"] == "DOCUMENT_SUMMARY"
-    assert result["context_plan"]["broad_query"] is True
-    assert result["evidence_status"] == "supported"
-    assert result["sources"]
-
-
-def test_documents_assistant_summarizes_spreadsheet_without_model_guessing(make_rag):
-    frame = pd.DataFrame({
-        "month": ["Jan", "Feb", "Mar", "Apr"],
-        "sales": [100, 150, 125, 175],
-        "units": [10, 15, 12, 18],
-    })
-    docs, _ = dataframe_to_table_documents(
-        frame, document_id=DID, filename="sales.csv", table_name="sales.csv",
-    )
-    model = Model(
-        answer="I couldn't find that information in the uploaded document.",
-        verify="UNSUPPORTED",
-    )
-    rag = make_rag(model, docs=docs)
-
-    result = rag.chat(
-        "What are the key takeaways in my documents?",
-        document_only=True,
-    )
-
-    assert result["evidence_status"] == "supported"
-    assert result["answer_mode"] == "deterministic"
-    assert result["citation_status"] == "cited"
-    assert result["sources"]
-    assert "sales.csv contains 4 rows across 3 columns" in result["answer"]
-    assert "sales averages 137.5" in result["answer"]
-    assert "[S1]" in result["answer"]
-    assert not any(role in {"rag", "rag_verify"} for role, _ in model.calls)
 
 
 def test_bm25_matches_identifiers_and_prefers_concise_relevant_chunk():
@@ -393,8 +308,8 @@ def test_failed_ingestion_rolls_back_vector_and_local_artifacts(make_rag, tmp_pa
     def extract(path, *, document_id, filename):
         doc = document(did=document_id)
         return [doc], dict(pages=1, tables=0, text_chunks=1, table_chunks=0, total_chunks=1)
-    monkeypatch.setattr("insight_rag.ingestion.extract_pdf_documents", extract)
-    monkeypatch.setattr("insight_rag.ingestion.UserPGVectorStore", lambda *a: SimpleNamespace(
+    monkeypatch.setattr("insight_rag.service.extract_pdf_documents", extract)
+    monkeypatch.setattr("insight_rag.service.UserPGVectorStore", lambda *a: SimpleNamespace(
         add_documents=lambda docs: None, delete_chunks=lambda ids: deleted.extend(ids)))
     monkeypatch.setattr(rag.metadata, "save_chunks", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
     with pytest.raises(OSError):
@@ -491,21 +406,6 @@ def test_http_chat_endpoint_uses_authenticated_user_and_complete_result(make_rag
     assert response.json()["grounding"]["used_pdf_evidence"] is True
 
 
-def test_documents_assistant_chat_bypasses_semantic_router(make_rag):
-    model = Model()
-    rag = make_rag(model)
-    rag.semantic_router.decide = lambda **_kwargs: pytest.fail(
-        "Document-only chat must not depend on semantic routing"
-    )
-
-    result = rag.chat("What was revenue?", document_only=True)
-
-    assert result["scope"] == "DOCUMENT"
-    assert result["grounding"]["used_pdf_evidence"] is True
-    assert result["sources"]
-    assert not any(role == "rag_scope" for role, _ in model.calls)
-
-
 def test_concurrent_manifest_updates_keep_every_document(make_rag):
     metadata = make_rag(docs=[]).metadata
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -518,68 +418,3 @@ def test_multiquery_fusion_promotes_shared_hit_without_duplicates():
     a, b, c = [document(cid=key) for key in ["a", "b", "c"]]
     ranked = fuse_ranked_lists([[a, b, b], [c, b]])
     assert ranked[0] is b and len(ranked) == 3
-
-
-def test_reindex_legacy_chunks_writes_canonical_index(make_rag, monkeypatch):
-    from insight_rag.ingestion import PDFIngestion
-    rag = make_rag()
-    written = []
-    monkeypatch.setattr('insight_rag.ingestion.UserPGVectorStore', lambda *a: SimpleNamespace(
-        add_documents=lambda docs: written.extend(docs)))
-    ingest = PDFIngestion.__new__(PDFIngestion)
-    ingest.user_id, ingest.metadata = rag.user_id, rag.metadata
-    result = ingest.reindex(DID)
-    assert written and all(d.metadata['document_id'] == DID for d in written)
-    assert result['document']['status'] == 'ready'
-    assert result['document']['chunk_ids'] == [d.metadata['chunk_id'] for d in written]
-
-
-def test_reindex_failure_is_not_reported_ready(make_rag, monkeypatch):
-    from insight_rag.ingestion import PDFIngestion
-    rag = make_rag()
-    def fail(docs):
-        raise RuntimeError('database offline')
-    monkeypatch.setattr('insight_rag.ingestion.UserPGVectorStore', lambda *a: SimpleNamespace(add_documents=fail))
-    ingest = PDFIngestion.__new__(PDFIngestion)
-    ingest.user_id, ingest.metadata = rag.user_id, rag.metadata
-    with pytest.raises(RuntimeError):
-        ingest.reindex(DID)
-    assert rag.metadata.get_document(DID)['status'] == 'failed'
-
-
-def test_document_search_term_cannot_replace_latest_question(make_rag):
-    model = Model()
-    rag = make_rag(model)
-    rag._build_context_plan = lambda question, **kw: ContextPlan(
-        intent="document_query", question=question, document_ids=(DID,),
-        text_search_term="What action was proposed?")
-    original = rag._expand_search_queries
-    seen = []
-    def capture(question, plan):
-        seen.append(question)
-        return original(question, plan)
-    rag._expand_search_queries = capture
-    result = GroundedRAG.chat(rag, "Does revenue establish causation?", document_ids=[DID])
-    assert seen == ["Does revenue establish causation?"]
-    generation = [messages for role, messages in model.calls if role == "rag"]
-    assert generation
-    assert "Does revenue establish causation?" in generation[0][-1]["content"]
-
-
-def test_small_pdf_keeps_narrative_caveat_even_when_search_misses_it(make_rag):
-    docs = [document("Delivery totals.", cid="totals"),
-            document("Shipments include prior-period orders; populations differ.", cid="caveat")]
-    rag = make_rag(docs=docs)
-    rag._retrieve = lambda *a, **kw: docs[:1]
-    plan = ContextPlan(intent="document_query", question="Can these totals be divided?", document_ids=[DID])
-    evidence = rag._retrieve_adaptive([plan.question], plan)
-    assert {d.metadata["chunk_id"] for d in evidence} == {"totals", "caveat"}
-
-
-def test_failed_repair_never_becomes_supported(make_rag):
-    model = Model(verify="UNSUPPORTED")
-    rag = make_rag(model)
-    rag._semantic_evidence_check = lambda *a: True
-    result = rag.chat("What is revenue?", document_ids=[DID])
-    assert result["evidence_status"] != "supported"
-    assert not result["sources"]

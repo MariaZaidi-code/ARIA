@@ -15,26 +15,25 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_IDENT_RE = None
 
-def _quote_ident(name: str, dialect: str = "postgresql") -> str:
+
+def _quote_ident(name: str) -> str:
     """Quote an SQL identifier safely. Raises ValueError on invalid names.
 
-    Dialect-aware: MySQL uses backticks, PostgreSQL/SQLite double quotes.
-    Schema-qualified keys (sales.employee) are quoted per segment; embedded
-    quote characters are escaped by doubling.
+    Schema-qualified keys (sales.employee) are quoted per segment
+    ("sales"."employee"); embedded double quotes are escaped by doubling.
     Prevents identifier injection vs the previous raw f-string
     interpolation.
     """
     import re as _re
     if not isinstance(name, str) or not name or len(name) > 256:
         raise ValueError("Invalid identifier.")
-    _d = str(dialect or "").lower()
-    _q = "`" if _d == "mysql" else '"'
     parts = []
     for seg in str(name).split("."):
         if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_ ]*", seg or ""):
             raise ValueError(f"Unsafe identifier: {name!r}")
-        parts.append(_q + seg.replace(_q, _q + _q) + _q)
+        parts.append('"' + seg.replace('"', '""') + '"')
     if not parts:
         raise ValueError("Invalid identifier.")
     return ".".join(parts)
@@ -84,7 +83,6 @@ def validate_pk_quality(
     conn,
     tables: dict[str, Any],
     max_sample: int = 10000,
-    dialect: str = "postgresql",
 ) -> list[dict[str, Any]]:
     """Check PK columns for duplicates and NULLs.
 
@@ -97,12 +95,12 @@ def validate_pk_quality(
         if not pk_cols:
             continue
         try:
-            _t = _quote_ident(tname, dialect)
+            _t = _quote_ident(tname)
         except ValueError:
             continue
         for pk_col in pk_cols:
             try:
-                _c = _quote_ident(pk_col, dialect)
+                _c = _quote_ident(pk_col)
             except ValueError:
                 continue
             # NOTE: pk_cols comes from the declared/inferred primary_key list,
@@ -142,14 +140,11 @@ def validate_fk_quality(
     conn,
     tables: dict[str, Any],
     max_sample: int = 10000,
-    dialect: str = "postgresql",
 ) -> list[dict[str, Any]]:
     """Check FK columns for orphan values and NULLs.
 
     Only runs on tables with declared/inferred FK relationships.
-    Orphan detection joins the SAME bounded sample used for the total
-    count (LEFT JOIN over the first `max_sample` non-null FKs), so the
-    reported counts are always comparable and never a full-table scan.
+    Uses LEFT JOIN for orphan detection (efficient with indexes).
     """
     findings = []
     for tname, tinfo in tables.items():
@@ -162,26 +157,29 @@ def validate_fk_quality(
             if ref_table not in tables:
                 continue
             try:
-                _t = _quote_ident(tname, dialect)
-                _fc = _quote_ident(fk_col, dialect)
-                _rt = _quote_ident(ref_table, dialect)
-                _rc = _quote_ident(ref_col, dialect)
+                _t = _quote_ident(tname)
+                _fc = _quote_ident(fk_col)
+                _rt = _quote_ident(ref_table)
+                _rc = _quote_ident(ref_col)
             except ValueError:
                 continue
 
             try:
                 sample = _bound_sample(max_sample)
-                # Orphan count over a bounded sample of non-null FKs
-                # (never a full-table scan; the same bound the null check
-                # and PK checks use).
                 cur = conn.execute(
                     f'SELECT COUNT(*) FROM ('
-                    f'SELECT {_fc} AS fk_val FROM {_t} '
+                    f'SELECT {_fc} FROM {_t} '
                     f'WHERE {_fc} IS NOT NULL '
                     f'LIMIT {sample}'
-                    f') s '
-                    f'LEFT JOIN {_rt} r ON s.fk_val = r.{_rc} '
-                    f'WHERE r.{_rc} IS NULL'
+                    f') sub'
+                )
+                total_fks = cur.fetchone()[0]
+
+                cur = conn.execute(
+                    f'SELECT COUNT(*) FROM {_t} t '
+                    f'LEFT JOIN {_rt} r ON t.{_fc} = r.{_rc} '
+                    f'WHERE t.{_fc} IS NOT NULL AND r.{_rc} IS NULL '
+                    f'LIMIT 100'
                 )
                 orphan_count = cur.fetchone()[0]
 
@@ -221,7 +219,6 @@ def validate_fk_quality(
 def run_all_validations(
     conn,
     tables: dict[str, Any],
-    dialect: str = "postgresql",
 ) -> dict[str, Any]:
     """Run all PK/FK data quality checks and return a summary.
 
@@ -235,8 +232,8 @@ def run_all_validations(
         }
     """
     schema_warnings = validate_schema_references(tables)
-    pk_findings = validate_pk_quality(conn, tables, dialect=dialect)
-    fk_findings = validate_fk_quality(conn, tables, dialect=dialect)
+    pk_findings = validate_pk_quality(conn, tables)
+    fk_findings = validate_fk_quality(conn, tables)
     total = len(schema_warnings) + len(pk_findings) + len(fk_findings)
     return {
         "schema_warnings": schema_warnings,

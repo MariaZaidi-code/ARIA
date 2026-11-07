@@ -7,41 +7,6 @@ evidence layers already support. Real-database regression coverage lives in
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
-
-
-def register_verified_email(client, email: str, password: str = "Secret123!"):
-    """Register and verify an email with a mocked mail transport for API tests."""
-    sent = {}
-    with (
-        patch(
-            "auth.send_email_verification",
-            side_effect=lambda recipient, token: sent.update(
-                recipient=recipient, token=token
-            ),
-        ),
-        patch("api.auth_routes._check_login_rate_limit"),
-    ):
-        response = client.post(
-            "/api/auth/register",
-            json={"email": email, "password": password},
-        )
-        if response.status_code == 200 and sent.get("token"):
-            verified = client.post(
-                "/api/auth/verify-email", json={"token": sent["token"]}
-            )
-            if verified.status_code != 200:
-                raise AssertionError(
-                    f"Email verification failed: {verified.status_code} {verified.text[:200]}"
-                )
-            login = client.post(
-                "/api/auth/login", json={"email": email, "password": password}
-            )
-            if login.status_code != 200:
-                raise AssertionError(
-                    f"Verified email login failed: {login.status_code} {login.text[:200]}"
-                )
-    return response
 
 
 def fake_profiler(src=None, rows=100, hit=None, exact_hit=None,

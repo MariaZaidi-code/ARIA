@@ -88,7 +88,7 @@ class ConstantsMixin:
         "shipper": {"shipping", "carrier", "courier", "delivery", "freight", "logistics"},
         "brand": {"make", "manufacturer", "vendor", "label", "supplier"},
         "category": {"group", "department", "segment", "class", "type", "division"},
-        "quantity": {"qty", "units", "volume"},
+        "quantity": {"qty", "units", "volume", "amount"},
         "price": {"cost", "amount", "value", "rate", "fee"},
         "revenue": {"sales", "income", "turnover", "gross", "earnings"},
         "status": {"state", "stage", "condition", "phase", "position"},

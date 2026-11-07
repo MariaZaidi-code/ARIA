@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import hashlib
 import json
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +63,6 @@ class EmbeddingGenerator:
         self.cloud_api_key = cloud_api_key
         self.model = None
         self.embedding_dim = 384  # Default for MiniLM
-        self._embedding_backend = "sentence-transformers"
         self._cache = {}
         self._cache_dir = Path(cache_dir) if cache_dir else None
         
@@ -82,27 +80,22 @@ class EmbeddingGenerator:
             logger.warning("Cloud embeddings not yet implemented, using local model")
             self.use_cloud = False
         
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            raise RuntimeError(
+                "sentence-transformers not installed. "
+                "Run: pip install sentence-transformers"
+            )
+        
         # Resolve model name
         model_path = self.LOCAL_MODELS.get(self.model_name, self.model_name)
-        try:
-            if not SENTENCE_TRANSFORMERS_AVAILABLE:
-                raise RuntimeError("sentence-transformers is not installed")
-            logger.info("Loading embedding model: %s", model_path)
-            self.model = SentenceTransformer(model_path)
-            test_emb = self.model.encode(["test"])
-            self.embedding_dim = len(test_emb[0])
-            logger.info("Embedding dimension: %s", self.embedding_dim)
-        except Exception as exc:
-            # Keep PDF ingestion and search usable in offline/local installs.
-            # Feature hashing is lexical, so it is less semantic than MiniLM
-            # but needs no model download or remote service.
-            logger.warning(
-                "Embedding model %s unavailable (%s); using local hashing embeddings.",
-                model_path,
-                type(exc).__name__,
-            )
-            self.model = _HashingEmbeddingModel(self.embedding_dim)
-            self._embedding_backend = "local-hashing-v1"
+        
+        logger.info(f"Loading embedding model: {model_path}")
+        self.model = SentenceTransformer(model_path)
+        
+        # Get embedding dimension
+        test_emb = self.model.encode(["test"])
+        self.embedding_dim = len(test_emb[0])
+        logger.info(f"Embedding dimension: {self.embedding_dim}")
     
     def generate(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings for a list of texts."""
@@ -155,8 +148,8 @@ class EmbeddingGenerator:
     
     def _get_cache_key(self, text: str) -> str:
         """Generate cache key for text."""
-        # Include the effective backend so cached vectors never mix models.
-        content = f"{self.model_name}:{self._embedding_backend}:{text}"
+        # Include model name in key
+        content = f"{self.model_name}:{text}"
         return hashlib.sha256(content.encode()).hexdigest()[:32]
     
     def _save_to_disk(self, key: str, embedding: List[float]) -> None:
@@ -210,28 +203,3 @@ def create_embedding_generator(
 ) -> EmbeddingGenerator:
     """Factory function to create embedding generator."""
     return EmbeddingGenerator(model_name=model, cache_dir=cache_dir)
-
-
-class _HashingEmbeddingModel:
-    """Small deterministic lexical encoder used when a local model is absent."""
-
-    def __init__(self, dimension: int):
-        self.dimension = int(dimension)
-
-    def encode(self, texts: List[str], show_progress_bar: bool = False):
-        import numpy as np
-
-        vectors = np.zeros((len(texts), self.dimension), dtype=np.float32)
-        for row, text in enumerate(texts):
-            tokens = re.findall(r"[\w]+", str(text or "").casefold(), flags=re.UNICODE)
-            features = list(tokens)
-            features.extend(f"{left}_{right}" for left, right in zip(tokens, tokens[1:]))
-            for feature in features:
-                digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
-                index = int.from_bytes(digest[:4], "big") % self.dimension
-                sign = 1.0 if digest[4] & 1 else -1.0
-                vectors[row, index] += sign
-            norm = float(np.linalg.norm(vectors[row]))
-            if norm:
-                vectors[row] /= norm
-        return vectors

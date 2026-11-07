@@ -34,8 +34,8 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
     @staticmethod
     def _source_summary(sources: list[dict]) -> str:
         if not sources:
-            return "My previous answer did not use document evidence, so there are no citations to show."
-        lines = ["I used these documents for my previous answer:"]
+            return "My previous answer did not use PDF evidence, so there are no PDF citations to show."
+        lines = ["I used these PDF sources for my previous answer:"]
         seen = set()
         for source in sources:
             key = (
@@ -47,7 +47,7 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
             if key in seen:
                 continue
             seen.add(key)
-            detail = f"- {source.get('filename') or 'Document'}, page {source.get('page')}"
+            detail = f"- {source.get('filename') or 'PDF'}, page {source.get('page')}"
             if source.get("content_type") == "table" and source.get("table_index"):
                 detail += f", table {source.get('table_index')}"
             if source.get("source_id"):
@@ -247,7 +247,7 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
             instruction = (transform_instruction or question).strip()
             try:
                 answer = self._transform_previous_answer(instruction, previous)
-                model = self.llm.models.get("rag")
+                model = RAG_LLM_MODEL
             except Exception:
                 failed = True
                 previous_sources, previous_doc_ids = [], []
@@ -255,7 +255,7 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
                     "I'm having trouble safely reshaping the previous answer right now. "
                     "The original grounded answer is still available just above."
                 )
-                model = self.llm.models.get("rag")
+                model = RAG_LLM_MODEL
         else:
             answer = "Could you clarify what you want me to do with my previous answer?"
             model = None

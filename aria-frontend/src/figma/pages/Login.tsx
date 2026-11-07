@@ -1,11 +1,5 @@
-import { useEffect, useState } from "react";
-import { Eye, EyeOff } from "lucide-react";
-import {
-  authenticateLocalUser,
-  registerLocalUser,
-  resendVerificationEmail,
-  verifyEmailAddress,
-} from "../../utils/authStorage";
+import { useState } from "react";
+import { authenticateLocalUser, registerLocalUser } from "../../utils/authStorage";
 import AriaLogo from "../components/AriaLogo";
 
 interface LoginProps {
@@ -17,46 +11,21 @@ export default function Login({ onLogin }: LoginProps) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
-  const [passwordVisible, setPasswordVisible] = useState(false);
-  const [confirmPasswordVisible, setConfirmPasswordVisible] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const [verificationEmail, setVerificationEmail] = useState("");
-
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const token = params.get("verify_email");
-    if (!token) return;
-    window.history.replaceState(null, "", `${window.location.pathname}${window.location.hash}`);
-    setLoading(true);
-    void verifyEmailAddress(token)
-      .then((result) => {
-        setMode("login");
-        setNotice(result.message || "Email verified. You can now sign in.");
-      })
-      .catch((err: unknown) => {
-        setError(err instanceof Error ? err.message : "Email verification failed.");
-      })
-      .finally(() => setLoading(false));
-  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
 
-    const identity = email.trim();
-    setNotice("");
-    if (identity === "" || password.trim() === "") {
+    if (email.trim() === "" || password.trim() === "") {
       setError("Please enter your email and password.");
       return;
     }
-    const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(identity);
-    if (!isEmail) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
       setError("Please enter a valid email address.");
       return;
     }
-    setVerificationEmail("");
 
     setLoading(true);
     try {
@@ -77,39 +46,22 @@ export default function Login({ onLogin }: LoginProps) {
           setLoading(false);
           return;
         }
-        setMode("login");
-        if (reg.verificationRequired) {
-          setVerificationEmail(email.trim());
-          setNotice(reg.message || "Check your email for a verification link before signing in.");
-        } else {
-          setVerificationEmail("");
-          setNotice(reg.message || "Account created. You can now sign in.");
-        }
+        // Registration establishes the cookie session: auto-login.
+        onLogin();
         return;
       }
 
       const result = await authenticateLocalUser(email, password);
       if (!result.success) {
         setError(result.message || "Unable to sign in.");
-        if (result.needsVerification) setVerificationEmail(email.trim());
+        if (result.code === "USER_NOT_FOUND") {
+          setMode("register");
+        }
         return;
       }
       onLogin();
     } catch (err) {
       setError("ARIA could not sign you in. Please try again.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const resendVerification = async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const result = await resendVerificationEmail(verificationEmail);
-      setNotice(result.message || "If verification is needed, a new link has been sent.");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not resend the verification email.");
     } finally {
       setLoading(false);
     }
@@ -214,29 +166,14 @@ export default function Login({ onLogin }: LoginProps) {
             {error && (
               <p className="login-error" role="alert">{error}</p>
             )}
-            {notice && (
-              <p className="login-success" role="status">{notice}</p>
-            )}
-            {verificationEmail && mode === "login" && (
-              <button
-                type="button"
-                className="login-forgot"
-                onClick={() => void resendVerification()}
-                disabled={loading}
-              >
-                Resend verification email
-              </button>
-            )}
 
             <div className="login-form-group">
-              <label htmlFor="login-email">
-                Email Address
-              </label>
+              <label htmlFor="login-email">Email Address</label>
               <input
                 id="login-email"
                 type="email"
                 value={email}
-                onChange={(e) => { setEmail(e.target.value); setError(""); setNotice(""); }}
+                onChange={(e) => { setEmail(e.target.value); setError(""); }}
                 placeholder="you@company.com"
                 autoComplete="email"
                 aria-invalid={error ? "true" : undefined}
@@ -246,63 +183,32 @@ export default function Login({ onLogin }: LoginProps) {
             <div className="login-form-group">
               <div className="login-label-row">
                 <label htmlFor="login-password">Password</label>
+                {mode === "login" && (
+                  <button type="button" className="login-forgot" onClick={() => setError("Password reset is not available in this build. Contact your workspace admin.")}>Forgot password?</button>
+                )}
               </div>
-              <div className="login-password-field">
-                <input
-                  id="login-password"
-                  type={passwordVisible ? "text" : "password"}
-                  value={password}
-                  onChange={(e) => { setPassword(e.target.value); setError(""); }}
-                  placeholder="Enter your password"
-                  autoComplete={mode === "login" ? "current-password" : "new-password"}
-                  aria-invalid={error ? "true" : undefined}
-                />
-                <button
-                  type="button"
-                  className="login-password-toggle"
-                  aria-label={passwordVisible ? "Hide password" : "Show password"}
-                  aria-pressed={passwordVisible}
-                  onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      setPasswordVisible((visible) => !visible);
-                    }}
-                >
-                  {passwordVisible
-                    ? <EyeOff size={18} aria-hidden="true" />
-                    : <Eye size={18} aria-hidden="true" />}
-                </button>
-              </div>
+              <input
+                id="login-password"
+                type="password"
+                value={password}
+                onChange={(e) => { setPassword(e.target.value); setError(""); }}
+                placeholder="Enter your password"
+                autoComplete={mode === "login" ? "current-password" : "new-password"}
+                aria-invalid={error ? "true" : undefined}
+              />
             </div>
 
             {mode === "register" && (
               <div className="login-form-group">
                 <label htmlFor="login-confirm">Confirm Password</label>
-                <div className="login-password-field">
-                  <input
-                    id="login-confirm"
-                    type={confirmPasswordVisible ? "text" : "password"}
-                    value={confirmPassword}
-                    onChange={(e) => setConfirmPassword(e.target.value)}
-                    placeholder="Confirm your password"
-                    autoComplete="new-password"
-                  />
-                  <button
-                    type="button"
-                    className="login-password-toggle"
-                    aria-label={confirmPasswordVisible ? "Hide confirm password" : "Show confirm password"}
-                    aria-pressed={confirmPasswordVisible}
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      setConfirmPasswordVisible((visible) => !visible);
-                    }}
-                  >
-                    {confirmPasswordVisible
-                      ? <EyeOff size={18} aria-hidden="true" />
-                      : <Eye size={18} aria-hidden="true" />}
-                  </button>
-                </div>
+                <input
+                  id="login-confirm"
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="Confirm your password"
+                  autoComplete="new-password"
+                />
               </div>
             )}
 
@@ -330,12 +236,7 @@ export default function Login({ onLogin }: LoginProps) {
             <button
               type="button"
               className="register-login-link"
-              onClick={() => {
-                setMode(mode === "login" ? "register" : "login");
-                setError("");
-                setNotice("");
-                setVerificationEmail("");
-              }}
+              onClick={() => { setMode(mode === "login" ? "register" : "login"); setError(""); }}
             >
               {mode === "login" ? "Create Account" : "Sign In"}
             </button>

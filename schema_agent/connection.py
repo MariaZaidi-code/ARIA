@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import traceback
 from datetime import datetime, timezone
@@ -86,15 +87,6 @@ def _apply_session_timeout(conn, db_type="postgresql"):
 
 # ---- get_connection (77-137) ----
 
-class SchemaConnectionError(RuntimeError):
-    """Raised when a schema connection cannot be established.
-
-    Library code must never call sys.exit(): in a server process that would
-    kill the worker. Callers (API routes) catch this and translate it into
-    a 400 with the same message the CLI used to print.
-    """
-
-
 def get_connection(args):
     """Build a database connection (PostgreSQL or MySQL) from CLI args / env vars.
 
@@ -122,21 +114,21 @@ def get_connection(args):
                [("database", dbname), ("user", user), ("password", password)]
                if not val]
     if missing:
-        raise SchemaConnectionError(
+        sys.exit(
             f"ERROR: missing required connection info: {', '.join(missing)}.\n"
             f"Set them via .env or pass --db --user --password on the command line."
         )
 
     if db_type == "mysql":
         if not MYSQL_AVAILABLE:
-            raise SchemaConnectionError("ERROR: pymysql is not installed. Run: pip install pymysql")
+            sys.exit("ERROR: pymysql is not installed. Run: pip install pymysql")
         try:
             conn = pymysql.connect(
                 host=host, port=int(port), user=user, password=password,
                 database=dbname, charset="utf8mb4", connect_timeout=10,
             )
         except pymysql.MySQLError as e:
-            raise SchemaConnectionError(
+            sys.exit(
                 f"ERROR: could not connect to MySQL at {host}:{port}/{dbname}: {e}\n"
                 "Check: is the MySQL server running on that host/port? Are the "
                 "database name, user, and password correct, and does the server "
@@ -155,7 +147,7 @@ def get_connection(args):
         # which would silently fail every later query on the same connection.
         conn.autocommit = True
     except psycopg2.OperationalError as e:
-        raise SchemaConnectionError(
+        sys.exit(
             f"ERROR: could not connect to PostgreSQL at {host}:{port}/{dbname}: {e}\n"
             "Check: is the PostgreSQL service running on that host/port? Are the "
             "database name, user, and password correct? Does pg_hba.conf allow "

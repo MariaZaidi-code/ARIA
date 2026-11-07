@@ -141,8 +141,8 @@ class ValueProfiler:
 
     def quote(self, name: str) -> str:
         if self.db_type == "mysql":
-            return "`" + str(name).replace("`", "``") + "`"
-        return '"' + str(name).replace('"', '""') + '"'
+            return "`" + str(name).replace("`", "") + "`"
+        return '"' + str(name).replace('"', "") + '"'
 
     def rel_table(self, table):
         """SQL-safe qualified table reference (schema-qualified where needed)."""

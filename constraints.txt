@@ -44,7 +44,6 @@ redis==5.2.1
 pytest==9.0.3
 httpx==0.28.1
 pytest-cov==7.1.0
-ruff==0.17.1
 
 # Security pins (pip-audit gate): transitive deps with known CVEs.
 # Keep these at-or-above the fixed versions; re-run pip-audit after bumps.

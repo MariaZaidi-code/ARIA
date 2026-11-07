@@ -40,13 +40,8 @@ log = logging.getLogger("aria.insight.advanced")
 
 
 def _is_id_like(name: str) -> bool:
-    """Delegate to the canonical helper (token/camelCase aware, single source)."""
-    try:
-        from core.identifiers import is_id_like as _canon
-        return bool(_canon(name))
-    except Exception:
-        low = str(name).lower().strip()
-        return low in {"id", "key", "code", "codeid"} or low.endswith("_id") or low.endswith("_key")
+    low = str(name).lower().strip()
+    return low in {"id", "key", "code", "codeid"} or low.endswith("_id") or low.endswith("_key")
 
 
 def _human(name: str) -> str:

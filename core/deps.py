@@ -8,7 +8,6 @@ import auth
 from core.config import get_session
 
 
-
 def get_current_user(request: Request, authorization: str | None = Header(default=None)) -> dict:
     """Resolve the Bearer token into a {user_id, username} dict or 401.
 
@@ -20,27 +19,18 @@ def get_current_user(request: Request, authorization: str | None = Header(defaul
     back to a default/anonymous session.
     """
     token = None
-    user = None
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
-        if token and token.lower() not in ("null", "undefined", '""', "''", "none"):
-            user = auth.verify_token(token)
-        else:
-            token = None
+    if not token or token.lower() in ("null", "undefined", '""', "''", "none"):
+        token = None
     if not token:
-        # Try both cookie names and select the first valid session. A browser
-        # can retain an expired __Host cookie alongside a newer local-dev
-        # aria_token; choosing by name alone lets the stale cookie mask the
-        # valid one on every protected request.
+        # Prefer __Host- prefixed cookie; fall back to legacy plain name.
         for _name in ("__Host-aria_token", "aria_token"):
-            _candidate = (request.cookies.get(_name) or "").strip()
-            if not _candidate or _candidate.lower() in ("null", "undefined", '""', "''", "none"):
-                continue
-            _user = auth.verify_token(_candidate)
-            if _user:
-                token = _candidate
-                user = _user
+            _tok = request.cookies.get(_name)
+            if _tok and _tok.strip() and _tok.strip().lower() not in ("null", "undefined", '""', "''", "none"):
+                token = _tok.strip()
                 break
+    user = auth.verify_token(token) if token else None
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated. Provide a valid Bearer token.")
     return user
@@ -126,13 +116,6 @@ def require_writable(request: Request, user: dict = Depends(get_current_user)) -
     return user
 
 
-def require_admin(user: dict = Depends(get_current_user)) -> dict:
-    """Allow only usernames explicitly configured as administrators."""
-    if not auth.is_admin_email(str(user.get("email") or user.get("username") or "")):
-        raise HTTPException(status_code=403, detail="Administrator access required.")
-    return user
-
-
 def ensure_decision_owner(session_user_id, decision: dict | None) -> dict:
     """Ownership gate for Decision Center records (hyp.txt #84-85).
 
@@ -150,9 +133,7 @@ def ensure_decision_owner(session_user_id, decision: dict | None) -> dict:
             if int(owner) != int(session_user_id):
                 raise HTTPException(status_code=404, detail="That decision was not found.")
         except (TypeError, ValueError):
-            # Fail closed: an unresolvable owner id must not hand a foreign
-            # record to the caller.
-            raise HTTPException(status_code=404, detail="That decision was not found.")
+            pass
     if decision.get("quarantined"):
         raise HTTPException(
             status_code=410,

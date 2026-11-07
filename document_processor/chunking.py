@@ -56,6 +56,8 @@ class DocumentChunker:
         chunks = []
         current_chunk_elements = []
         current_tokens = 0
+        current_page = sorted_elements[0].page_number if sorted_elements else 1
+        current_section = None
         
         for element in sorted_elements:
             element_tokens = self._estimate_tokens(element.content)
@@ -79,12 +81,14 @@ class DocumentChunker:
             
             current_chunk_elements.append(element)
             current_tokens += element_tokens
+            current_page = element.page_number
+            if element.section:
+                current_section = element.section
         
         # Don't forget the last chunk
         if current_chunk_elements:
             chunk = self._create_chunk(current_chunk_elements, document_id, len(chunks))
-            if chunk is not None:
-                chunks.append(chunk)
+            chunks.append(chunk)
         
         # Filter out too-small chunks (merge with neighbors if possible)
         chunks = self._filter_small_chunks(chunks)
@@ -153,8 +157,8 @@ class DocumentChunker:
         elements: List[DocumentElement], 
         document_id: str, 
         chunk_index: int
-    ) -> Optional[DocumentChunk]:
-        """Create a DocumentChunk from elements (None when empty)."""
+    ) -> DocumentChunk:
+        """Create a DocumentChunk from elements."""
         if not elements:
             return None
         

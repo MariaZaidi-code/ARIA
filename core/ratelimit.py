@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 import time
 from collections import defaultdict
 
@@ -26,7 +25,6 @@ from fastapi import Depends, HTTPException, Request
 from core.deps import get_current_user
 
 _hits: dict[tuple[str, str], list[float]] = defaultdict(list)
-_HITS_LOCK = threading.Lock()
 _warned_multi_worker = False
 _last_cleanup: float = 0.0
 _redis_client = None
@@ -118,21 +116,6 @@ def worker_count() -> int:
     return 1
 
 
-def shared_store_required() -> bool:
-    """Explicit opt-in, or production with multiple workers, requires Redis."""
-    raw = (os.getenv("ARIA_REQUIRE_SHARED_STORE") or "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return worker_count() > 1 and (os.getenv("ARIA_ENV") or "").strip().lower() == "production"
-
-
-def _shared_store_required() -> bool:
-    """Back-compat alias for the deployment policy."""
-    return shared_store_required()
-
-
 def _check_shared_store() -> None:
     """Fail closed for multi-worker runs without a shared store.
 
@@ -147,10 +130,11 @@ def _check_shared_store() -> None:
     limits. Single-worker default is unchanged (never raises).
     """
     global _warned_multi_worker
+    if store_backend() != "memory":
+        return
     if worker_count() <= 1:
         return
-    required = _shared_store_required()
-    if store_backend() == "redis" and get_redis_client() is not None:
+    if os.getenv("ARIA_REDIS_URL", "").strip():
         return
     if not _warned_multi_worker:
         _warned_multi_worker = True
@@ -160,11 +144,16 @@ def _check_shared_store() -> None:
             "per-process; use a shared store in production.",
             worker_count(),
         )
-    if required:
+    _require_env = os.getenv("ARIA_REQUIRE_SHARED_STORE")
+    _require_raw = (_require_env or "").strip().lower()
+    _explicit_opt_out = _require_raw in {"0", "false", "no", "off"}
+    _require_shared = _require_raw in {"1", "true", "yes", "on"}
+    _is_prod = (os.getenv("ARIA_ENV", "") or "").strip().lower() == "production"
+    if _require_shared or (_is_prod and not _explicit_opt_out):
         raise HTTPException(
             status_code=503,
             detail="Multi-worker deployment requires a shared rate-limit store. "
-                    "Configure a reachable ARIA_REDIS_URL or run a single worker.",
+                    "Set ARIA_REDIS_URL or run a single worker.",
         )
 
 
@@ -202,11 +191,6 @@ def _redis_check_limit(bucket: str, key: str, max_calls: int, window_s: int) -> 
     try:
         client = get_redis_client()
         if client is None:
-            if _shared_store_required() or redis_url():
-                raise HTTPException(
-                    status_code=503,
-                    detail="Shared rate-limit store is unavailable. Retry shortly.",
-                )
             return False
         import time as _time
         import uuid as _uuid
@@ -222,12 +206,7 @@ def _redis_check_limit(bucket: str, key: str, max_calls: int, window_s: int) -> 
             pipe.expire(rkey, int(window_s))
             res = pipe.execute()
             count = int(res[2]) if len(res) >= 3 else 0
-        except Exception as exc:
-            if _shared_store_required() or redis_url():
-                raise HTTPException(
-                    status_code=503,
-                    detail="Shared rate-limit store is unavailable. Retry shortly.",
-                ) from exc
+        except Exception:
             return False
         if count > max_calls:
             raise HTTPException(
@@ -237,12 +216,7 @@ def _redis_check_limit(bucket: str, key: str, max_calls: int, window_s: int) -> 
         return True
     except HTTPException:
         raise
-    except Exception as exc:
-        if _shared_store_required():
-            raise HTTPException(
-                status_code=503,
-                detail="Shared rate-limit store is unavailable. Retry shortly.",
-            ) from exc
+    except Exception:
         return False
 
 
@@ -259,35 +233,24 @@ def check_limit(bucket: str, key: str, max_calls: int, window_s: int) -> None:
         raise
     except Exception:
         pass
-    if _shared_store_required() or redis_url():
-        # A configured shared store is authoritative: never silently fall
-        # back to per-process limits when it is unreachable.
-        raise HTTPException(
-            status_code=503,
-            detail="Shared rate-limit store is unavailable. Try again shortly.",
-        )
     now = time.monotonic()
     k = (bucket, key)
-    # Mutate atomically: the FastAPI threadpool runs requests concurrently,
-    # so a read-filter-append here can lose hits and overshoot the budget.
-    with _HITS_LOCK:
-        hits = [t for t in _hits[k] if now - t < window_s]
-        if len(hits) >= max_calls:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many requests. Slow down and try again shortly.",
-            )
-        hits.append(now)
-        _hits[k] = hits
-        # Bound memory: drop buckets idle past 2x the longest window and cap
-        # total keys. Only run cleanup periodically (every ~60 s) to avoid
-        # an O(n) scan on every request.
-        global _last_cleanup
-        if len(_hits) > 5000 and (now - _last_cleanup) > 60:
-            _last_cleanup = now
-            stale = [kk for kk, vv in _hits.items() if not vv or now - vv[-1] > window_s * 2]
-            for kk in stale[:1000]:
-                _hits.pop(kk, None)
+    hits = [t for t in _hits[k] if now - t < window_s]
+    if len(hits) >= max_calls:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Slow down and try again shortly.",
+        )
+    hits.append(now)
+    _hits[k] = hits
+    # Bound memory: drop buckets idle past 2x the longest window and cap total keys.
+    # Only run cleanup periodically (every ~60 s) to avoid O(n) scan on every request.
+    global _last_cleanup
+    if len(_hits) > 5000 and (now - _last_cleanup) > 60:
+        _last_cleanup = now
+        stale = [kk for kk, vv in _hits.items() if not vv or now - vv[-1] > window_s * 2]
+        for kk in stale[:1000]:
+            _hits.pop(kk, None)
 
 
 def limit(bucket: str, max_calls: int, window_s: int = 60):

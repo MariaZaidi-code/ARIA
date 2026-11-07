@@ -7,7 +7,6 @@ scope, request limits, privacy-safe observability and final response persistence
 
 from __future__ import annotations
 
-import re
 import time
 import uuid
 from contextvars import ContextVar
@@ -28,14 +27,6 @@ from .runtime_profile import build_runtime_profile
 from .semantic_router import RouteDecision, SemanticRouter
 
 _ACTIVE_ROUTE = ContextVar("aria_active_route", default=None)
-_DOCUMENT_SUMMARY_REQUEST = re.compile(
-    r"\b(?:summari[sz](?:e|ing|ed)?|summary|overview|key\s+takeaways|main\s+points|highlights|tl\s*;\s*dr)\b",
-    re.IGNORECASE,
-)
-
-
-def _is_document_summary_request(question: str) -> bool:
-    return bool(_DOCUMENT_SUMMARY_REQUEST.search(question or ""))
 
 
 class InsightPDFRAG(FinalInsightPDFRAG):
@@ -71,14 +62,14 @@ class InsightPDFRAG(FinalInsightPDFRAG):
     def _out_of_scope_answer() -> str:
         return (
             "I'm focused on ARIA itself and your uploaded documents, so I don't answer unrelated general-knowledge or current-affairs questions. "
-            "You can ask about ARIA, the Insight Agent/RAG system, or something that should be answered from your documents."
+            "You can ask about ARIA, the Insight Agent/RAG system, or something that should be answered from your PDFs."
         )
 
     @staticmethod
     def _document_inventory_context(documents: list[dict]) -> str:
         """Authoritative upload metadata safe to expose in non-document turns."""
         if not documents:
-            return "No documents are currently uploaded/indexed for this user."
+            return "No PDFs are currently uploaded/indexed for this user."
         lines = [f"Uploaded/indexed sources: {len(documents)}"]
         for index, document in enumerate(documents[:20], start=1):
             quality = (document.get("ingestion_quality") or {}).get("grade")
@@ -92,7 +83,7 @@ class InsightPDFRAG(FinalInsightPDFRAG):
                 )
             else:
                 lines.append(
-                    f"{index}. {document.get('filename') or 'Untitled document'} "
+                    f"{index}. {document.get('filename') or 'Untitled PDF'} "
                     f"({int(document.get('pages', 0) or 0)} pages, "
                     f"{int(document.get('tables', 0) or 0)} tables, "
                     f"{int(document.get('total_chunks', 0) or 0)} chunks{quality_note})"
@@ -151,16 +142,16 @@ class InsightPDFRAG(FinalInsightPDFRAG):
                 "content": (
                     "You are ARIA's bounded Insight Agent in a normal conversational turn. "
                     "Respond naturally to social interaction, acknowledgements, greetings, thanks or conversational clarification. "
-                    "Do not provide world-knowledge facts, current affairs, trivia, medical/legal/financial advice, or claims about document contents. "
-                    "The supplied document inventory is authoritative metadata: you may accurately acknowledge whether documents are uploaded/indexed and may name/count them, but do not claim to have read or searched their contents in this conversational route. "
-                    "Never say that no document is uploaded when the inventory shows one or more documents. If the user's conversational wording appears to refer to an uploaded document, acknowledge the available metadata and invite a concrete document question rather than inventing content. "
+                    "Do not provide world-knowledge facts, current affairs, trivia, medical/legal/financial advice, or claims about PDF contents. "
+                    "The supplied PDF inventory is authoritative metadata: you may accurately acknowledge whether PDFs are uploaded/indexed and may name/count them, but do not claim to have read or searched their contents in this conversational route. "
+                    "Never say that no PDF is uploaded when the inventory shows one or more PDFs. If the user's conversational wording appears to refer to an uploaded PDF, acknowledge the available PDF metadata and invite a concrete document question rather than inventing content. "
                     "Keep the response brief and friendly, and keep ARIA's scope clear when useful."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Authoritative document inventory:\n{inventory}\n\n"
+                    f"Authoritative PDF inventory:\n{inventory}\n\n"
                     f"Recent conversation:\n{conversation}\n\n"
                     f"Latest message:\n{question}"
                 ),
@@ -178,9 +169,9 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         except Exception:
             if documents:
                 count = len(documents)
-                noun = "document" if count == 1 else "documents"
+                noun = "PDF" if count == 1 else "PDFs"
                 return f"I'm here and ready. You currently have {count} uploaded {noun}; ask me what you'd like to find or summarize."
-            return "I'm here and ready. You can ask about ARIA or upload a document and ask me about it."
+            return "I'm here and ready. You can ask about ARIA or upload a PDF and ask me about it."
 
     @staticmethod
     def _decorate_result(result: dict, decision: RouteDecision, request_id: str) -> dict:
@@ -199,7 +190,6 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         *,
         conversation_id: str | None = None,
         document_ids: list[str] | None = None,
-        document_only: bool = False,
     ) -> dict:
         question = (question or "").strip()
         if len(question) < 2:
@@ -251,38 +241,13 @@ class InsightPDFRAG(FinalInsightPDFRAG):
                 return result
         except Exception:
             pass
-        if document_only:
-            is_summary = _is_document_summary_request(question)
-            selected_ids = {
-                str(document_id)
-                for document_id in (document_ids or [])
-            }
-            eligible_ids = [
-                str(document.get("document_id"))
-                for document in documents
-                if document.get("document_id")
-                and (not selected_ids or str(document.get("document_id")) in selected_ids)
-            ]
-            decision = RouteDecision(
-                scope="DOCUMENT",
-                task="DOCUMENT_SUMMARY" if is_summary else "DOCUMENT_QA",
-                confidence=1.0,
-                document_ids=tuple(eligible_ids),
-                broad_query=is_summary,
-                requires_retrieval=True,
-                classifier_used=False,
-                reason="Documents assistant requested a grounded summary from owned documents"
-                if is_summary
-                else "Documents assistant requested a grounded answer from owned documents",
+        with stage("semantic_router"):
+            decision = self.semantic_router.decide(
+                question,
+                history=history,
+                documents=documents,
+                selected_document_ids=document_ids,
             )
-        else:
-            with stage("semantic_router"):
-                decision = self.semantic_router.decide(
-                    question,
-                    history=history,
-                    documents=documents,
-                    selected_document_ids=document_ids,
-                )
         record("route_scope", decision.scope)
         record("route_task", decision.task)
         record("router_confidence", round(float(decision.confidence or 0.0), 4))
@@ -308,7 +273,7 @@ class InsightPDFRAG(FinalInsightPDFRAG):
             if prior_ids - permitted:
                 result = self._base_result(
                     conversation_id=conversation_id, question=question,
-                    answer="The previous answer used a document that is no longer available or selected. Please select the relevant document and ask the question again.",
+                    answer="The previous answer used a PDF that is no longer available or selected. Please select the relevant PDF and ask the question again.",
                     intent="clarification", evidence_status="scope_changed",
                 )
                 return self._decorate_result(result, decision, request_id)
@@ -325,14 +290,14 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         if decision.scope == "SYSTEM":
             answer = self._system_context_answer(question, history)
             intent = "system"
-            model = self.llm.models.get("rag")
+            model = RAG_LLM_MODEL
         elif decision.scope == "CONVERSATION":
             answer = self._conversation_answer(question, history, documents)
             intent = "smalltalk"
-            model = self.llm.models.get("rag")
+            model = RAG_LLM_MODEL
         elif decision.scope == "CLARIFICATION":
             answer = decision.clarification_question or (
-                "Could you clarify whether you're asking about ARIA itself or information from an uploaded document?"
+                "Could you clarify whether you're asking about ARIA itself or information from an uploaded PDF?"
             )
             intent = "clarification"
             model = None
@@ -370,12 +335,8 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         return self._decorate_result(result, decision, request_id)
 
     def chat(self, question: str, *, conversation_id: str | None = None,
-             document_ids: list[str] | None = None, document_only: bool = False) -> dict:
+             document_ids: list[str] | None = None) -> dict:
         """Serialize one conversation, enforce scope limits, and persist one visible response."""
-        if not getattr(self, "_hosted", False):
-            raise RuntimeError(
-                "Document Q&A requires a hosted LLM (configure DEEPSEEK_API_KEY)."
-            )
         conversation_id = conversation_id or uuid.uuid4().hex
         if len(conversation_id) > 128:
             raise ValueError("Conversation id is too long.")
@@ -384,7 +345,7 @@ class InsightPDFRAG(FinalInsightPDFRAG):
             document_ids = list(dict.fromkeys(str(value) for value in document_ids if str(value)))
             if len(document_ids) > MAX_SELECTED_DOCUMENTS:
                 raise ValueError(
-                    f"Select at most {MAX_SELECTED_DOCUMENTS} documents for one request. Narrow the selection and try again."
+                    f"Select at most {MAX_SELECTED_DOCUMENTS} PDFs for one request. Narrow the selection and try again."
                 )
 
         started = time.perf_counter()
@@ -398,14 +359,11 @@ class InsightPDFRAG(FinalInsightPDFRAG):
                 if document_ids:
                     owned = {str(doc.get("document_id")) for doc in self.metadata.list_documents()}
                     if any(str(did) not in owned for did in document_ids):
-                        raise ValueError("One or more selected documents are unavailable. Refresh the document list.")
+                        raise ValueError("One or more selected PDFs are unavailable. Refresh the document list.")
 
                 with stage("orchestration"):
                     raw_result = self._chat(
-                        question,
-                        conversation_id=conversation_id,
-                        document_ids=document_ids,
-                        document_only=document_only,
+                        question, conversation_id=conversation_id, document_ids=document_ids,
                     )
                 with stage("finalize_response"):
                     result = self.finalize_result(raw_result)
@@ -413,7 +371,7 @@ class InsightPDFRAG(FinalInsightPDFRAG):
                 owned_now = {str(doc.get("document_id")) for doc in self.metadata.list_documents()}
                 if any(str(source.get("document_id")) not in owned_now for source in result.get("sources", [])):
                     result.update(
-                        answer="A source document was removed during this request. Please ask again using the available documents.",
+                        answer="A source PDF was removed during this request. Please ask again using the available PDFs.",
                         sources=[], evidence_status="scope_changed",
                     )
                     with stage("finalize_scope_change"):

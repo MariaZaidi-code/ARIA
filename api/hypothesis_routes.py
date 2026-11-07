@@ -3,7 +3,7 @@
 import re
 import math
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import ConfigDict, BaseModel
+from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from urllib.parse import quote_plus
 import numpy as np
@@ -21,7 +21,7 @@ def _safe_detail(prefix: str, exc: Exception, limit: int = 200) -> str:
     try:
         return f"{prefix}: {str(_sanitize_error(exc))[:limit]}"
     except Exception:
-        return f"{prefix}."
+        return f"{prefix}." if prefix.endswith(".") else f"{prefix}."
 
 
 # Bounded sample for correlation tests (spec §3, deterministic precedent):
@@ -40,13 +40,11 @@ def _quote_identifier(name, dialect="postgresql"):
 
 
 class HypothesisRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
     hypothesis: str
     dataset: str = "Connected dataset"
 
 
 class InvestigateRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
     question: str
 
 
@@ -183,7 +181,6 @@ def auto_hypotheses(request: Request, user: dict = Depends(get_current_user)):
 
 
 class AnalyzeRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
     question: str
     table: str | None = None
     metric: str | None = None
@@ -191,7 +188,6 @@ class AnalyzeRequest(BaseModel):
 
 
 class ParseRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
     question: str
     metric: str | None = None
     driver: str | None = None
@@ -218,8 +214,6 @@ def _engine_for_session(session):
             password = _decrypt_secret(password)
         except Exception:
             pass
-    from core.db import format_db_host
-    host = format_db_host(host)
     if driver == "mysql":
         engine_url = f"mysql+pymysql://{quote_plus(str(user_name))}:{quote_plus(str(password))}@{host}:{port}/{db}"
     else:
@@ -428,8 +422,6 @@ def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depend
                 password = _decrypt_secret(password)
             except Exception:
                 pass
-        from core.db import format_db_host
-        host = format_db_host(host)
         if driver == "mysql":
             engine_url = f"mysql+pymysql://{quote_plus(str(user_name))}:{quote_plus(str(password))}@{host}:{port}/{db}"
         else:
@@ -448,7 +440,7 @@ def run_hypothesis(req: HypothesisRequest, request: Request, user: dict = Depend
                 pass
 
     except Exception as e:
-        return {"ok": False, "detail": _safe_detail("Hypothesis test failed", e)}
+        return {"ok": False, "detail": f"Hypothesis test failed: {str(e)}"}
 
 
 def _run_test(engine, dialect, req, schema=None):
@@ -515,15 +507,6 @@ def _run_test(engine, dialect, req, schema=None):
                 except Exception:
                     continue
             comparisons.sort(key=lambda c: abs(c["r"]), reverse=True)
-            primary = next(
-                (c for c in comparisons
-                 if (c["x"], c["y"], c["table"]) == best_pair),
-                None,
-            )
-            if primary is not None:
-                comparisons = [primary] + [
-                    c for c in comparisons if c is not primary
-                ]
 
             return {
                 "ok": True,
@@ -535,10 +518,7 @@ def _run_test(engine, dialect, req, schema=None):
                     "Link found": ("Strong link" if abs(stats['r']) > 0.7
                                    else "Moderate link" if abs(stats['r']) > 0.4
                                    else "Weak or no link"),
-                    "Direction": (
-                        ("Move together" if stats["r"] > 0 else "Move apart")
-                        if supported else "No clear direction"
-                    ),
+                    "Direction": ("Move together" if stats['r'] > 0 else "Move apart"),
                     "Confidence": _confidence_word(stats['p_value']),
                 },
                 "data_quality": {
@@ -554,7 +534,7 @@ def _run_test(engine, dialect, req, schema=None):
                 "y_label": y_col,
             }
     except Exception as e:
-        return {"ok": False, "detail": _safe_detail("Hypothesis test failed", e)}
+        return {"ok": False, "detail": f"Hypothesis test failed: {str(e)}"}
 
 
 def _get_tables(conn, dialect, schema=None):

@@ -1,5 +1,5 @@
 """Full audit: connect Amazon Sales, test every page endpoint."""
-import requests, json, os, sys
+import requests, json, time, sys
 
 BASE = "http://127.0.0.1:8000"
 AMAZON = r"C:\Users\Go\Desktop\ARIA\data\kaggle_retail_sales\karkavelrajaj__amazon-sales-dataset\amazon.csv"
@@ -8,15 +8,10 @@ AMAZON = r"C:\Users\Go\Desktop\ARIA\data\kaggle_retail_sales\karkavelrajaj__amaz
 def main():
     sys.stdout.reconfigure(encoding='utf-8')
 
-    # Use a pre-provisioned verified account; registration no longer creates
-    # a session until the email owner completes verification.
-    email = (os.getenv("ARIA_E2E_EMAIL") or "").strip()
-    password = os.getenv("ARIA_E2E_PASSWORD") or ""
-    if not email or not password:
-        raise RuntimeError("Set ARIA_E2E_EMAIL and ARIA_E2E_PASSWORD to a verified test account.")
+    # Register + connect (token is now an HttpOnly cookie, not in JSON body)
     s = requests.Session()
-    r = s.post(f"{BASE}/api/auth/login", json={"email": email, "password": password})
-    assert r.status_code == 200, f"Login failed: {r.status_code} {r.text[:200]}"
+    r = s.post(f"{BASE}/api/auth/register", json={"username": f"audit_{int(time.time())}", "password": "Test1234!"})
+    assert r.status_code == 200, f"Register failed: {r.status_code} {r.text[:200]}"
     TOKEN = s.cookies.get("aria_token") or s.cookies.get("__Host-aria_token") or ""
     assert TOKEN, f"Auth cookie missing: {r.json()} cookies={dict(s.cookies)}"
     H = {"Authorization": f"Bearer {TOKEN}"}

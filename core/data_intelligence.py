@@ -96,19 +96,6 @@ def is_id_like_name(column_name: str) -> bool:
     return toks[-1] in ("id", "uuid", "guid", "key", "code")
 
 
-def is_date_name(column_name: str) -> bool:
-    """Name says "this is a date": 'order_date', 'CreatedAt', and data
-    shorthand such as 'txn_dt' / 'created_ts' (expanded through the shared
-    abbreviation dictionary, so 'dt' reads as 'date')."""
-    if hint_hit(column_name, _DATE_NAME_HINTS):
-        return True
-    try:
-        from schema_engine.lexical import identifier_words
-        return bool({"date", "timestamp", "time"} & set(identifier_words(column_name)))
-    except Exception:
-        return False
-
-
 def hint_hit(column_name: str, hints) -> bool:
     """True when any token of the name equals a hint (singular/plural).
 
@@ -243,13 +230,13 @@ def classify_column(column_name: str, data_type: Any = "") -> str:
     if any(tok in dtype for tok in _TEXT_TOKENS) or not dtype:
         if is_id_like_name(name):
             return "identifier"
-        if is_date_name(name):
+        if hint_hit(name, _DATE_NAME_HINTS):
             return "datetime"
         return "categorical"
     # Unknown vendor type: fall back to the name.
     if is_id_like_name(name):
         return "identifier"
-    if is_date_name(name):
+    if hint_hit(name, _DATE_NAME_HINTS):
         return "datetime"
     return "categorical"
 
@@ -528,10 +515,20 @@ def build_data_intelligence(mapping: Dict[str, Any]) -> Dict[str, Any]:
 
     duplicates = None
     quality = mapping.get("quality") or {}
+    for t in tables:
+        info = tables[t] or {}
+        csv_q = ((info.get("csv_profile") or {}).get("quality")
+                 or (mapping.get("semi_structured_sources") or {}))
+        _ = csv_q  # reserved: CSV dup counts surface via csv_profile when present
     if isinstance(quality.get("duplicate_rows"), int):
         duplicates = quality["duplicate_rows"]
 
     cardinality: Dict[str, Any] = {}
+    for t, p in profiles.items():
+        info = tables[t] or {}
+        for col in p["dimensions"]:
+            stats = (info.get("null_stats") or {}).get(col) or {}
+            _ = stats  # distinct counts surface here when profilers provide them
 
     table_count = len(tables)
     if total_rows == 0 and not usable:
