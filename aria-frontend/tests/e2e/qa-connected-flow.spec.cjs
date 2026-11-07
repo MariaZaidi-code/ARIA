@@ -1,10 +1,10 @@
-// QA: real connected-source flow. Registers, selects Cloud AI, connects a real
-// CSV through the API, then drives every AI page and captures runtime errors.
+// QA: real connected-source flow. Signs in with Local AI, connects a real
+// small CSV through the API, then checks pages and handles unavailable inference.
 const { test, expect } = require("@playwright/test");
 const { seedAuth } = require("./auth-helper");
 
 const BASE = process.env.ARIA_BASE || "http://localhost:8000";
-const CSV_FIXTURE = ["order_id,product_category,sales,quantity", "1,Home,120,2", "2,Electronics,280,1", "3,Home,75,1", "4,Grocery,42,5"].join("\\n") + "\\n";
+const CSV_FIXTURE = ["order_id,product_category,sales,quantity", "1,Home,120,2", "2,Electronics,280,1", "3,Home,75,1", "4,Grocery,42,5"].join("\n") + "\n";
 
 const BENIGN = [/favicon/i, /React DevTools/i];
 
