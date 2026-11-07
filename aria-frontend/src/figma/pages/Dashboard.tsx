@@ -2039,7 +2039,7 @@ export default function Dashboard({ setPage, onAsk, user, connectionStatus = "no
           <p className="mt-3">{config.dataset_understanding?.description}</p>
           {(config.dataset_understanding?.assumptions || []).map((text: string, i: number) => <p key={i} className="mt-1">Assumption: {text}</p>)}
           <p className="text-xs text-muted-foreground mt-2">Profile scope: {config.dataset_profile.profile?.scope}. SQL analysis uses the connected dataset.</p>
-          {(config.quality?.issues || []).map((text: string, i: number) => <p key={i} className="mt-1 text-muted-foreground">{text}</p>)}
+          {(config.quality?.issues || []).map((issue: any, i: number) => <p key={i} className="mt-1 text-muted-foreground">{issue?.message || issue?.check || String(issue)}</p>)}
           <p className="mt-2 text-xs text-muted-foreground">Metric meaning is AI-interpreted and has not been independently verified.</p>
           <p className="mt-2 text-xs">{config.llm_trace?.cached ? "Cached analysis" : "Fresh analysis"} · {config.llm_trace?.provider}</p>
         </details>}
