@@ -22,7 +22,8 @@ export const API_BASE = (import.meta?.env?.VITE_API_BASE || "/api").replace(/\/$
 
 // Versioned storage (aria.v1.*) with legacy-key fallback. Static import is
 // cycle-safe: storage.js is dependency-free.
-import { storage as versionedStorage } from "../utils/storage.js";
+import { storage as versionedStorage, localStore, sessionStore } from "../utils/storage.js";
+import { humanizeLabel } from "../figma/lib/labels";
 
 const storageHelperGet = (key, fallback) => {
   try {
@@ -38,6 +39,7 @@ export const handleUnauthorized = () => {
   try {
     localStorage.removeItem("aria_auth_token"); // legacy JWT, cookie auth now
     localStorage.removeItem("aria_auth_user");
+    localStorage.removeItem("aria.v1.auth.user");
   } catch { /* ignore */ }
   try {
     window.dispatchEvent(new Event("aria:unauthorized"));
@@ -70,10 +72,14 @@ const resolvePath = (path) => {
 
 // Unified client timeout: 60s floor / 120s ceiling (heavy LLM + forecast
 // calls need headroom; chatty reads stay snappy). Single knob for the
-// whole frontend — services/api.js and figma/lib/decisionCenterApi.ts
-// share it via apiFetch (VITE_API_TIMEOUT_MS overrides, then clamped).
+// whole frontend — every caller shares it via apiFetch
+// (VITE_API_TIMEOUT_MS overrides, then clamped).
 const RAW_TIMEOUT_MS = Number(import.meta?.env?.VITE_API_TIMEOUT_MS || 90000);
 const REQUEST_TIMEOUT_MS = Math.max(60000, Math.min(120000, RAW_TIMEOUT_MS));
+// One budget for every AI-answered question (Analytics, Copilot, Ask ARIA
+// bot): the same backend pipeline must never time out on one page while
+// it is still allowed to finish on another. Cold local models are slow.
+export const AI_ANSWER_TIMEOUT_MS = 300000;
 export const API_TIMEOUT_MS = REQUEST_TIMEOUT_MS;
 
 // =========================================================
@@ -104,9 +110,19 @@ const getLLMMode = () => {
 // login/register. No Authorization header is sent (omitted entirely —
 // never `Bearer null`/empty); every request uses credentials:include so
 // the cookie travels automatically. On 401 the session is cleared and the
-// app is asked to return to login.
+// app is asked to return to login. Advisory probes may suppress that global
+// side effect while still receiving the normal rejected-response error.
 const request = async (path, options = {}) => {
-  const { signal: externalSignal, timeoutMs, ...rest } = options || {};
+  const {
+    signal: externalSignal,
+    timeoutMs,
+    suppressUnauthorized = false,
+    // responseType "text" returns the raw body (e.g. printable report HTML)
+    // while keeping every hardened behaviour: timeout, abort, request id,
+    // 401 handling and normalized errors.
+    responseType = "json",
+    ...rest
+  } = options || {};
   // Per-request timeout override (clamped 1s–10min): cold local LLM calls
   // can take minutes on first load; the 90s default would abort them.
   const limitMs = Math.max(
@@ -187,18 +203,26 @@ const request = async (path, options = {}) => {
     externalSignal?.removeEventListener?.("abort", onExternalAbort);
   } catch { /* ignore */ }
 
-  let data;
-
+  let raw;
   try {
-    data = await response.json();
+    raw = await response.text();
+  } catch {
+    raw = "";
+  }
+  if (responseType === "text" && response.ok) return raw;
+
+  let data;
+  try {
+    data = raw ? JSON.parse(raw) : {};
   } catch {
     data = {};
   }
 
   if (!response.ok) {
     // Never turn failures into empty dashboards: surface a real Error.
-    // 401 clears the cookie session and routes back to login.
-    if (response.status === 401) {
+    // 401 clears the cookie session and routes back to login by default;
+    // advisory probes opt out so stale background checks cannot unmount UI.
+    if (response.status === 401 && !suppressUnauthorized) {
       handleUnauthorized();
     }
     const norm = normalizeApiError(data, response.status, response.headers);
@@ -207,6 +231,12 @@ const request = async (path, options = {}) => {
     error.status = response.status;
     error.code = norm.code;
     error.requestId = norm.requestId || requestId;
+    // Mobile read-only refusals (core.deps.require_writable) are an expected
+    // outcome on phones, not a fault: flag them so UI can show a calm hint
+    // instead of a red error when a stale affordance fires a write.
+    if (response.status === 403 && /read-only on mobile/i.test(norm.message || "")) {
+      error.readOnly = true;
+    }
     throw error;
   }
 
@@ -269,19 +299,12 @@ export const normalizeApiError = (data, status = 0, headers = null) => {
 // empty arrays, errors, and partial results all render as "—" or a useful
 // empty state, never undefined/null/NaN/blank/raw exceptions.
 
-export const safeList = (v) => (Array.isArray(v) ? v : []);
-
 export const safeText = (v, fallback = "—") => {
   if (v === null || v === undefined) return fallback;
   const s = String(v).trim();
   return s === "" || s.toLowerCase() === "undefined" || s.toLowerCase() === "null" || s.toLowerCase() === "nan"
     ? fallback
     : String(v);
-};
-
-export const safeNumberText = (v, fallback = "—") => {
-  const n = toNumber(v);
-  return n === null || Number.isNaN(n) ? fallback : formatValue(n);
 };
 
 const toNumber = (value) => {
@@ -315,12 +338,7 @@ const formatValue = (value) => {
   }).format(parsed);
 };
 
-const humanize = (key) => {
-  return String(key || "")
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
-};
+const humanize = (key) => humanizeLabel(key, { titleCase: true });
 
 const isIdLike = (key) => {
   // Whole-token / suffix match mirroring the backend (semantic +
@@ -522,7 +540,7 @@ export const connectFile = async (file, provider = "local") => {
 // PDF DOCUMENT CONNECTION
 // =========================================================
 
-export const connectPdf = async (file, provider = "local") => {
+export const connectPdf = async (file, provider) => {
   if (!file) {
     return { success: false, message: "No file selected." };
   }
@@ -531,7 +549,7 @@ export const connectPdf = async (file, provider = "local") => {
   formData.append("file", file);
   try {
     const data = await request("/connect_pdf", { method: "POST", body: formData });
-    return { success: true, message: "PDF uploaded and processing started.", data };
+    return { success: true, message: "PDF indexed and ready.", data };
   } catch (error) {
     return { success: false, message: error?.message || "PDF upload failed." };
   }
@@ -546,9 +564,64 @@ export const listDocuments = async () => {
   return { success: true, data: data?.documents || data?.data || [] };
 };
 
+export const getDocumentOverview = async () => {
+  const data = await request("/documents/overview/stats");
+  return { success: true, data: data?.overview || {} };
+};
+
+export const uploadDocument = async (file) => {
+  if (!file) return { success: false, message: "No file selected." };
+  const formData = new FormData();
+  formData.append("file", file);
+  try {
+    const data = await request("/insight/pdf/upload", { method: "POST", body: formData });
+    return { success: true, message: "Document uploaded and indexed.", data };
+  } catch (error) {
+    return { success: false, message: error?.message || "Document upload failed." };
+  }
+};
+
+/** @param {string} question @param {string[] | null} [documentIds] @param {string | null} [conversationId] */
+export const askDocuments = async (question, documentIds = null, conversationId = null) => {
+  const response = await request("/insight/pdf/chat", {
+    method: "POST",
+    body: JSON.stringify({
+      question,
+      document_ids: documentIds,
+      conversation_id: conversationId,
+      document_only: true,
+    }),
+  });
+  const sources = Array.isArray(response?.sources) ? response.sources : [];
+  return {
+    success: true,
+    data: {
+      ...response,
+      answer_mode: response?.answer_mode || "ai",
+      passages: sources.map((source) => ({
+        ...source,
+        page_number: source.page,
+        content: source.snippet,
+      })),
+      citations: sources.map((source, index) => ({
+        index: source.source_id || index + 1,
+        document_id: source.document_id,
+        filename: source.filename,
+        page_number: source.page,
+        chunk_id: source.chunk_id,
+      })),
+    },
+  };
+};
+
 export const getDocument = async (documentId) => {
   const data = await request(`/documents/${documentId}`);
   return { success: true, data: data?.document };
+};
+
+export const getDocumentDashboard = async (documentId) => {
+  const data = await request(`/documents/${documentId}/dashboard`, { method: "POST" });
+  return { success: true, data: data || {} };
 };
 
 export const searchDocuments = async (query, documentIds = null, k = 10) => {
@@ -574,8 +647,9 @@ export const deleteDocument = async (documentId) => {
   return { success: true, data };
 };
 
-export const retryDocument = async (documentId) => {
-  const data = await request(`/documents/${documentId}/retry`, {
+export const retryDocument = async (documentId, options = {}) => {
+  const suffix = options?.rechunk ? "?rechunk=true" : "";
+  const data = await request(`/documents/${documentId}/retry${suffix}`, {
     method: "POST",
   });
   return { success: true, data: data?.document };
@@ -591,6 +665,9 @@ export const fetchSchema = async () => {
   // reload unchanged datasets on every call.
   try {
     const cached = await request("/schema");
+    if (cached?.applicable === false && cached?.source === "document") {
+      return { success: true, data: cached.schema || { tables: {} }, applicable: false, source: "document" };
+    }
     const tables = cached?.schema?.tables || cached?.tables || {};
     if (cached?.schema && Object.keys(tables).length > 0) {
       return { success: true, data: cached?.schema || cached || {}, cached: true };
@@ -689,6 +766,13 @@ const deriveGoalType = (data) => {
 // GOAL AGENT
 // =========================================================
 
+/**
+ * @param {string} question
+ * @param {unknown} llmMode
+ * @param {Record<string, any>} sourceContext
+ * @param {{conversationId?: string, previousGoal?: string, previousResult?: any} | null} multiTurnContext
+ * @param {Record<string, any>} options
+ */
 export const analyzeQuestion = async (question, llmMode, sourceContext = {}, multiTurnContext = null, options = {}) => {
   void llmMode;
 
@@ -715,9 +799,9 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
   // dimension), so "this period / previous period" resolves dynamically.
   try {
     let shared = {};
-    try { shared = JSON.parse(sessionStorage.getItem("aria_shared_context") || "{}") || {}; } catch { shared = {}; }
+    try { shared = JSON.parse(sessionStore.getItem("aria_shared_context") || "{}") || {}; } catch { shared = {}; }
     if (!shared || typeof shared !== "object" || Object.keys(shared).length === 0) {
-      try { shared = JSON.parse(localStorage.getItem("aria_analysis_context") || "{}") || {}; } catch { shared = {}; }
+      try { shared = JSON.parse(localStore.getItem("aria_analysis_context") || "{}") || {}; } catch { shared = {}; }
     }
     // Dataset guard: cross-module context describes a specific dataset. When
     // the caller names its dataset explicitly and the stored context names
@@ -730,7 +814,7 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
     const sharedDs = shared && typeof shared === "object"
       ? normDs(shared.dataset || shared.table || (shared.source && shared.source.tables && shared.source.tables[0]))
       : "";
-    if (shared && typeof shared === "object" && (!explicitDs || !sharedDs || sharedDs === explicitDs)) {
+    if (options.useSharedContext !== false && shared && typeof shared === "object" && (!explicitDs || !sharedDs || sharedDs === explicitDs)) {
       if (!body.metric && shared.metric) body.metric = shared.metric;
       if (!body.grouping && (shared.dimensions || shared.dimension)) {
         body.grouping = shared.dimensions || shared.dimension;
@@ -748,6 +832,7 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
   } catch { /* best-effort */ }
 
   const data = await request("/ask", {
+    timeoutMs: 120000,
     method: "POST",
     body: JSON.stringify(body),
     ...(options.signal ? { signal: options.signal } : {}),
@@ -758,7 +843,9 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
   // Conversational turns (greetings/thanks/bye/help/empty) are NOT errors:
   // they carry a warm message + starter suggestions with empty data and
   // must flow to the UI like clarification (never throw).
-  const failed =
+  const preservedCsv = status === "partial" && data?.analysis_source === "csv_llm"
+    && data?.execution?.success === true && data?.narrative_status === "unavailable";
+  const failed = !preservedCsv &&
     status !== "success" && status !== "clarification" && status !== "conversation";
 
   if (failed) {
@@ -774,6 +861,15 @@ export const analyzeQuestion = async (question, llmMode, sourceContext = {}, mul
       : [];
 
   const goalData = {
+    narrative_status: data?.narrative_status || null,
+    resolved_question: data?.resolved_question || null,
+    context_resolution: data?.context_resolution || null,
+    analysis_results: Array.isArray(data?.analysis_results) ? data.analysis_results : [],
+    analysis_plan: data?.analysis_plan || null,
+    dataset_profile: data?.dataset_profile || null,
+    dataset_understanding: data?.dataset_understanding || null,
+    llm_trace: data?.llm_trace || null,
+    verdict: data?.verdict || null,
     interpretedGoal:
       data?.question ||
       data?.user_goal ||
@@ -1168,10 +1264,14 @@ export const intelligenceApi = {
   // POST /api/intelligence/explore { metric, breakdown, secondary_breakdown,
   //   time_grain, comparison, date_range, filters } -> { trend, observation,
   //   breakdown_rows, ... } — all numbers computed server-side.
-  runExplore: async (payload = {}) => {
+  // opts: { signal, timeoutMs } forwarded to the request layer so callers
+  // (focus-insight race guard) can abort in-flight explores on unmount.
+  runExplore: async (payload = {}, opts = {}) => {
     const data = await request("/intelligence/explore", {
       method: "POST",
       body: JSON.stringify(payload || {}),
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+      ...(opts?.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}),
     });
     return { success: true, data: data?.data || data || {} };
   },
@@ -1189,11 +1289,25 @@ export const intelligenceApi = {
       total: intelTotal(data, list),
       page: data?.page ?? params.page ?? null,
       pageSize: data?.page_size ?? params.page_size ?? null,
+      // Plain-worded reason when a searched measure has no date column
+      // (backend hint) — surfaced in the empty state instead of a blank.
+      hint: typeof data?.hint === "string" ? data.hint : "",
     };
   },
 
   getHypothesis: async (id) => {
     const data = await request(`/intelligence/hypotheses/${encodeURIComponent(id)}`);
+    return { success: true, data: data?.data || data || {} };
+  },
+
+  // Run the evidence-grounded investigation pipeline for a user question.
+  // Results are returned directly and are not silently saved as hypotheses.
+  investigateHypotheses: async (question, opts = {}) => {
+    const data = await request("/hypotheses/investigation", {
+      method: "POST",
+      body: JSON.stringify({ question: String(question || "").trim(), top_n: 4 }),
+      ...(opts?.signal ? { signal: opts.signal } : {}),
+    });
     return { success: true, data: data?.data || data || {} };
   },
 
@@ -1353,25 +1467,15 @@ export const intelligenceApi = {
   },
 
   // GET /api/intelligence/reports/:id/html -> styled printable HTML string
-  // (Reporting Agent). Uses raw fetch (not the JSON request helper) so the
-  // HTML body is preserved; throws a normalized Error on failure.
+  // (Reporting Agent). Goes through the hardened client in text mode, so it
+  // gets the same timeout, abort, request id and 401/error handling as
+  // every other call; throws a normalized Error on failure.
   getReportHtml: async (id) => {
-    const res = await fetch(
-      `${API_BASE}/intelligence/reports/${encodeURIComponent(id)}/html`,
-      { credentials: "include" },
+    const html = await request(
+      `/intelligence/reports/${encodeURIComponent(id)}/html`,
+      { responseType: "text" },
     );
-    if (res.status === 401) handleUnauthorized();
-    if (!res.ok) {
-      let data = {};
-      try { data = await res.json(); } catch { /* HTML/empty error body */ }
-      const norm = normalizeApiError(data, res.status, res.headers);
-      const error = new Error(norm.message);
-      error.status = res.status;
-      error.code = norm.code;
-      error.requestId = norm.requestId;
-      throw error;
-    }
-    return { success: true, data: await res.text() };
+    return { success: true, data: html };
   },
 
   // POST /api/intelligence/reports/:id/rerun -> same definition, fresh numbers.
@@ -1589,8 +1693,9 @@ export const prescriptionApi = {
 // DAY 8 - FEEDBACK AGENT
 // =========================================================
 //
-// The backend has no feedback endpoint yet; feedback is recorded
-// in the local history session so it is not lost.
+// General feedback posts to the legacy /api/feedback endpoint. RL-grade
+// feedback (the random popup's star rating, used as a reward signal for
+// future ranking) goes to /api/rl/feedback — see submitRlFeedback below.
 // =========================================================
 
 export const submitFeedback = async (feedbackData = {}) => {
@@ -1607,4 +1712,324 @@ export const submitFeedback = async (feedbackData = {}) => {
     console.warn("Feedback submit failed (non-blocking):", error?.message);
     return { success: false, message: error?.message || "Feedback could not be sent." };
   }
+};
+
+// =========================================================
+// RL FEEDBACK (random popup + observability) — /api/rl/*
+// =========================================================
+//
+// The popup sends 1-5 stars + an optional comment; the backend maps the
+// rating to a reward in [-1, +1] and appends a
+// (state, action, outcome, reward) event (core/rl.py). Submission is
+// non-blocking: a failure must never interrupt the page.
+
+/**
+ * @param {{ rating: number, comment?: string, page?: string, context?: Record<string, any> }} [payload]
+ * @returns {Promise<{ success: boolean, data?: any, message?: string }>}
+ */
+export const submitRlFeedback = async ({ rating, comment = "", page = "", context = {} } = {}) => {
+  try {
+    const data = await request("/rl/feedback", {
+      method: "POST",
+      body: JSON.stringify({ rating, comment, page, context }),
+    });
+    return { success: true, data };
+  } catch (error) {
+    console.warn("RL feedback submit failed (non-blocking):", error?.message);
+    return { success: false, message: error?.message || "Feedback could not be sent." };
+  }
+};
+
+// =========================================================
+// WORKSPACE API — /api/workspace/* (monitors, targets, glossary,
+// inbox, webhooks, integrations) + /api/export/story
+// =========================================================
+//
+// Per-user storage lives server-side (data/users/user_<id>/workspace/).
+// Monitors re-run their stored read-only SQL on a cadence; triggers land in
+// the in-app inbox and optionally fan out to Slack/Teams webhooks. The UI
+// only renders these payloads — no metric math lives here. Writes fail on
+// read-only (mobile) sessions via the backend's require_writable guard.
+
+const wsList = (data) => (Array.isArray(data?.items) ? data.items : (Array.isArray(data?.data) ? data.data : []));
+
+export const workspaceApi = {
+  // ---- Monitors (natural-language alerts) ----
+  listMonitors: async () => {
+    const data = await request("/workspace/monitors");
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  previewMonitor: async (text) => {
+    const data = await request("/workspace/monitors/preview", {
+      method: "POST",
+      body: JSON.stringify({ text: String(text || "") }),
+    });
+    return { success: true, data };
+  },
+
+  createMonitor: async (payload = {}) => {
+    const data = await request("/workspace/monitors", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data?.item || data?.data || {} };
+  },
+
+  patchMonitor: async (id, patch = {}) => {
+    const data = await request(`/workspace/monitors/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch || {}),
+    });
+    return { success: true, data: data?.item || data?.data || {} };
+  },
+
+  deleteMonitor: async (id) => {
+    const data = await request(`/workspace/monitors/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    return { success: true, data };
+  },
+
+  checkMonitor: async (id) => {
+    const data = await request(`/workspace/monitors/${encodeURIComponent(id)}/check`, {
+      method: "POST",
+    });
+    return { success: true, data };
+  },
+
+  // ---- KPI targets ----
+  getTargets: async () => {
+    const data = await request("/workspace/targets");
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  putTargets: async (targets = []) => {
+    const data = await request("/workspace/targets", {
+      method: "PUT",
+      body: JSON.stringify({ targets: Array.isArray(targets) ? targets : [] }),
+    });
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  // ---- Business glossary ----
+  getGlossary: async () => {
+    const data = await request("/workspace/glossary");
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  putGlossary: async (entries = []) => {
+    const data = await request("/workspace/glossary", {
+      method: "PUT",
+      body: JSON.stringify({ entries: Array.isArray(entries) ? entries : [] }),
+    });
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  // ---- Notification inbox ----
+  listNotifications: async (unreadOnly = false) => {
+    const data = await request(`/workspace/notifications${unreadOnly ? "?unread_only=true" : ""}`);
+    return { success: true, data: wsList(data), unread: data?.unread ?? 0 };
+  },
+
+  markNotificationsRead: async ({ ids = [], all = false } = {}) => {
+    const data = await request("/workspace/notifications/read", {
+      method: "POST",
+      body: JSON.stringify({ ids, all }),
+    });
+    return { success: true, unread: data?.unread ?? 0, changed: data?.changed ?? 0 };
+  },
+
+  clearNotifications: async () => {
+    const data = await request("/workspace/notifications", { method: "DELETE" });
+    return { success: true, data };
+  },
+
+  // ---- Outbound webhooks (Slack / Teams / generic) ----
+  listWebhooks: async () => {
+    const data = await request("/workspace/webhooks");
+    return { success: true, data: wsList(data), total: data?.total ?? 0 };
+  },
+
+  createWebhook: async (payload = {}) => {
+    const data = await request("/workspace/webhooks", {
+      method: "POST",
+      body: JSON.stringify(payload || {}),
+    });
+    return { success: true, data: data?.item || data?.data || {} };
+  },
+
+  deleteWebhook: async (id) => {
+    const data = await request(`/workspace/webhooks/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    return { success: true, data };
+  },
+
+  testWebhook: async (id) => {
+    const data = await request(`/workspace/webhooks/${encodeURIComponent(id)}/test`, {
+      method: "POST",
+    });
+    return { success: data?.ok !== false, data };
+  },
+
+  // ---- Integrations (Slack slash command) ----
+  getIntegrations: async () => {
+    const data = await request("/workspace/integrations");
+    return { success: true, data: data?.data || {} };
+  },
+
+  regenerateSlackToken: async () => {
+    const data = await request("/workspace/integrations", {
+      method: "POST",
+      body: JSON.stringify({ regenerate_slack_token: true }),
+    });
+    return { success: true, data: data?.data || {} };
+  },
+
+  clearSlackToken: async () => {
+    const data = await request("/workspace/integrations", {
+      method: "POST",
+      body: JSON.stringify({ clear_slack_token: true }),
+    });
+    return { success: true, data: data?.data || {} };
+  },
+};
+
+// Downloads a story export (pptx | xlsx | html) using the exact in-app
+// envelope (question/answer/story/why/drivers rows sql as_of). Raw fetch so
+// the binary body is preserved; triggers the browser download.
+export const downloadStoryExport = async (envelope = {}, format = "pptx") => {
+  const res = await fetch(resolvePath("/export/story"), {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Request-ID": newRequestId(),
+    },
+    body: JSON.stringify({ ...(envelope || {}), format }),
+  });
+  if (res.status === 401) handleUnauthorized();
+  if (!res.ok) {
+    let data = {};
+    try { data = await res.json(); } catch { /* empty error body */ }
+    const norm = normalizeApiError(data, res.status, res.headers);
+    const error = new Error(norm.message);
+    error.status = res.status;
+    error.code = norm.code;
+    error.requestId = norm.requestId || "";
+    throw error;
+  }
+  const blob = await res.blob();
+  let filename = `aria-story.${format}`;
+  try {
+    const cd = res.headers.get("content-disposition") || "";
+    const m = cd.match(/filename="?([^";]+)"?/i);
+    if (m && m[1]) filename = m[1];
+  } catch { /* keep default */ }
+  try {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+      try { a.remove(); } catch { /* ignore */ }
+    }, 0);
+  } catch {
+    throw new Error("The export was generated but the download could not start.");
+  }
+  return { success: true, filename };
+};
+
+export const listDocumentConversations = async (limit = 30) => {
+  const data = await request(`/insight/pdf/conversations?limit=${encodeURIComponent(limit)}`);
+  return { success: true, data: data?.conversations || [] };
+};
+
+export const getDocumentConversation = async (conversationId) => {
+  const data = await request(`/insight/pdf/conversations/${encodeURIComponent(conversationId)}`);
+  return { success: true, data: data?.conversation || null };
+};
+
+export const deleteDocumentConversation = async (conversationId) => {
+  const data = await request(`/insight/pdf/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "DELETE",
+  });
+  return { success: true, data };
+};
+
+/** Map backend PDF-RAG sources to the passage/citation shape the UI renders. */
+export const documentSourcesView = (sources) => {
+  const list = Array.isArray(sources) ? sources : [];
+  return {
+    passages: list.map((source) => ({
+      ...source,
+      page_number: source.page,
+      content: source.excerpt || source.snippet,
+    })),
+    citations: list.map((source, index) => ({
+      index: source.source_id || index + 1,
+      document_id: source.document_id,
+      filename: source.filename,
+      page_number: source.page,
+      chunk_id: source.chunk_id,
+      location_label: source.location_label || (source.page ? `p. ${source.page}` : ""),
+    })),
+  };
+};
+
+export const uploadDocumentsBatch = (files, options = {}) => new Promise((resolve, reject) => {
+  const { onUploadProgress, signal } = options || {};
+  const formData = new FormData();
+  for (const file of files || []) formData.append("files", file);
+  const xhr = new XMLHttpRequest();
+  const requestId = newRequestId();
+  xhr.open("POST", resolvePath("/insight/pdf/upload-batch"));
+  xhr.withCredentials = true;
+  xhr.setRequestHeader("X-Request-ID", requestId);
+  xhr.timeout = AI_ANSWER_TIMEOUT_MS;
+  xhr.upload.onprogress = (event) => {
+    if (event.lengthComputable && onUploadProgress) onUploadProgress(event.loaded / event.total);
+  };
+  const fail = (message, status = 0, code = "NETWORK_ERROR") => {
+    const error = new Error(message);
+    error.status = status;
+    error.code = code;
+    error.requestId = requestId;
+    reject(error);
+  };
+  xhr.onerror = () => fail("Network error: backend unreachable.");
+  xhr.ontimeout = () => fail("The upload timed out. Try fewer or smaller files.", 0, "TIMEOUT");
+  xhr.onabort = () => {
+    const aborted = new Error("The operation was aborted.");
+    aborted.name = "AbortError";
+    reject(aborted);
+  };
+  xhr.onload = () => {
+    let data;
+    try { data = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch { data = {}; }
+    if (xhr.status >= 200 && xhr.status < 300) {
+      resolve({ success: true, data });
+      return;
+    }
+    if (xhr.status === 401) handleUnauthorized();
+    const norm = normalizeApiError(data, xhr.status, null);
+    fail(norm.message, xhr.status, norm.code);
+  };
+  if (signal) {
+    if (signal.aborted) { xhr.abort(); return; }
+    signal.addEventListener("abort", () => xhr.abort(), { once: true });
+  }
+  xhr.send(formData);
+});
+
+/** Per-file progress for a batch (served under /documents so polling never
+ *  spends the AI chat rate budget). @param {string | null} [batchId] */
+export const listUploadJobs = async (batchId = null, options = {}) => {
+  const query = batchId ? `?batch_id=${encodeURIComponent(batchId)}` : "";
+  const data = await request(`/documents/upload-jobs${query}`, options);
+  return { success: true, data: data?.jobs || [] };
 };

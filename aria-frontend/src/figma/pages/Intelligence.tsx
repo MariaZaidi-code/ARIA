@@ -593,7 +593,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                         <span className="font-semibold text-secondary-foreground">Measured so far: </span>
                         {asList(h?.settled_data_notes).map((s: any) => strOf(s)).join(" ")}
                       </p>
-                    )
+                    )}
                     <p className="mt-2 text-[12px] font-semibold text-foreground">Other possibilities to test</p>
                     <ul className="mt-1 space-y-1">
                       {allRivals.map((r, i) => (
