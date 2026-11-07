@@ -1,19 +1,16 @@
 import { useState, useEffect } from "react";
-import { User, Palette, Brain, Database, Bell, Shield, Monitor, ChevronRight, Boxes } from "lucide-react";
+import { User, Palette, Brain, Database, Bell, Shield, Monitor, ChevronRight } from "lucide-react";
 import { useTheme } from "../App";
 import { apiFetch } from "../../services/api";
 import { KEYS, storage } from "../../utils/storage";
-import WorkspacePanels from "../components/WorkspacePanels";
-import { datasetLabel } from "../lib/labels";
 
-type Tab = "profile" | "appearance" | "ai" | "datasources" | "workspace" | "notifications" | "privacy" | "application";
+type Tab = "profile" | "appearance" | "ai" | "datasources" | "notifications" | "privacy" | "application";
 
 const tabs: { id: Tab; label: string; icon: React.ElementType }[] = [
   { id: "profile", label: "Profile", icon: User },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "ai", label: "AI Configuration", icon: Brain },
   { id: "datasources", label: "Data Sources", icon: Database },
-  { id: "workspace", label: "Workspace", icon: Boxes },
   { id: "notifications", label: "Notifications", icon: Bell },
   { id: "privacy", label: "Privacy", icon: Shield },
   { id: "application", label: "Application", icon: Monitor },
@@ -23,7 +20,7 @@ interface SettingsProps {
   selectedLLM?: string;
   onChangeLLM?: () => void;
   onProviderSwitched?: (provider: string) => void;
-  user?: { email?: string; username?: string; is_admin?: boolean } | null;
+  user?: { email?: string; username?: string } | null;
   connectionStatus?: string;
   dbName?: string;
   selectedSourceType?: string;
@@ -34,15 +31,12 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
   const [tab, setTab] = useState<Tab>("profile");
   const [displayName, setDisplayName] = useState(user?.username || "User");
   const [email, setEmail] = useState(user?.email || "");
-  const role = user?.is_admin ? "Administrator" : "User";
+  const [role, setRole] = useState("Business Analyst");
   const [providers, setProviders] = useState<any[]>([]);
   const [apiKey, setApiKey] = useState("");
   const [selectedProvider, setSelectedProvider] = useState("cloud");
   const [saving, setSaving] = useState(false);
-  const [saveMsg, setSaveMsgText] = useState("");
-  /* Errors must never look like success: tone drives red vs green. */
-  const [saveTone, setSaveTone] = useState<"ok" | "error">("ok");
-  const setSaveMsg = (text: string, tone: "ok" | "error" = "ok") => { setSaveMsgText(text); setSaveTone(tone); };
+  const [saveMsg, setSaveMsg] = useState("");
   const [notifAnalysis, setNotifAnalysis] = useState(true);
   const [notifInsights, setNotifInsights] = useState(true);
   const [notifSystem, setNotifSystem] = useState(false);
@@ -53,8 +47,8 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
 
   const pickAvatar = (file: File | undefined) => {
     if (!file) return;
-    if (!file.type.startsWith("image/")) { setSaveMsg("Please choose an image file", "error"); return; }
-    if (file.size > 2 * 1024 * 1024) { setSaveMsg("Image must be under 2MB", "error"); return; }
+    if (!file.type.startsWith("image/")) { setSaveMsg("Please choose an image file"); return; }
+    if (file.size > 2 * 1024 * 1024) { setSaveMsg("Image must be under 2MB"); return; }
     const reader = new FileReader();
     reader.onload = () => {
       const url = String(reader.result || "");
@@ -88,24 +82,17 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
       onProviderSwitched?.(data.provider || selectedProvider);
       setSaveMsg(data.message || "Provider saved"); setApiKey(""); fetchProviders();
       setTimeout(() => setSaveMsg(""), 3000);
-    } catch (e: any) { setSaveMsg(e?.status === 401 ? "Session expired. Please sign in again." : (e?.message || "Couldn't save the provider. Please try again."), "error"); } finally { setSaving(false); }
+    } catch (e: any) { setSaveMsg(e?.status === 401 ? "Session expired. Please sign in again." : (e?.message || "Failed")); } finally { setSaving(false); }
   };
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Page header: every content page renders its own heading inside
-          main (banner h1 is chrome); Settings must not be the exception. */}
-      <div className="px-6 pt-5 pb-4 border-b border-border flex-shrink-0">
-        <h2 className="text-xl font-bold text-foreground tracking-tight">Settings</h2>
-        <p className="text-xs text-muted-foreground mt-0.5">Manage your account, AI providers, data sources, and application preferences.</p>
-      </div>
-      <div className="flex flex-1 min-h-0">
+    <div className="flex h-full">
       {/* Sub-sidebar */}
       <div className="w-48 border-r border-border bg-card/80 backdrop-blur-sm flex-shrink-0">
         <div className="py-3">
           {tabs.map((t) => (
-            <button key={t.id} onClick={() => setTab(t.id)} aria-current={tab === t.id ? "page" : undefined}
-              className={`w-full flex items-center gap-2.5 px-4 py-2 text-[13px] transition-all duration-150 ${tab === t.id ? "bg-primary/10 text-primary font-semibold border-r-2 border-primary" : "text-secondary-foreground hover:text-foreground hover:bg-secondary/60"}`}>
+            <button key={t.id} onClick={() => setTab(t.id)}
+              className={`nav-item w-full flex items-center gap-2.5 px-4 py-2 text-[13px] transition-all duration-150 ${tab === t.id ? "bg-primary/8 text-primary font-medium border-r-2 border-primary active" : "text-muted-foreground hover:text-foreground hover:bg-secondary/60"}`}>
               <t.icon size={14} />
               <span>{t.label}</span>
               {tab === t.id && <ChevronRight size={12} className="ml-auto" />}
@@ -117,13 +104,8 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
       {/* Content */}
       <div className="flex-1 overflow-auto p-6 max-w-2xl">
         {saveMsg && (
-          <div role={saveTone === "error" ? "alert" : "status"}
-            className={`mb-4 text-sm rounded-lg px-3 py-2 border ${saveTone === "error"
-              ? "text-negative bg-negative/10 border-negative/20"
-              : "text-positive bg-positive/10 border-positive/20"}`}>{saveMsg}</div>
+          <div className="mb-4 text-sm text-positive bg-positive/10 border border-positive/20 rounded-lg px-3 py-2">{saveMsg}</div>
         )}
-
-        {tab === "workspace" && <WorkspacePanels />}
 
         {tab === "profile" && (
           <div className="space-y-6">
@@ -158,8 +140,8 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
               </div>
               <div>
                 <label className="text-xs font-medium text-muted-foreground">Role</label>
-                <input value={role} readOnly
-                  className="mt-1 w-full cursor-not-allowed bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-muted-foreground outline-none" />
+                <input value={role} onChange={(e) => setRole(e.target.value)}
+                  className="mt-1 w-full bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none focus:border-primary focus:shadow-[0_0_0_3px_rgba(99,102,241,0.08)] transition-all duration-150" />
               </div>
             </div>
             <button onClick={async () => {
@@ -172,7 +154,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
                   setSaveMsg("Profile saved");
                   setTimeout(() => setSaveMsg(""), 3000);
                 } catch {
-                  setSaveMsg("Couldn't save your profile. Please try again.", "error");
+                  setSaveMsg("Failed to save");
                   setTimeout(() => setSaveMsg(""), 3000);
                 } finally {
                   setSaving(false);
@@ -215,7 +197,6 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
                 <select value={selectedProvider} onChange={(e) => setSelectedProvider(e.target.value)}
                   className="bg-secondary border border-border rounded-lg px-3 py-2 text-sm text-foreground outline-none w-40">
                   <option value="cloud">Cloud (Groq)</option>
-                  <option value="grok">Grok (xAI)</option>
                   <option value="deepseek">DeepSeek</option>
                   <option value="omniroute">Universal (OmniRoute)</option>
                   <option value="local">Local (Ollama)</option>
@@ -245,7 +226,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
               <div className="pt-3 border-t border-border">
                 <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-2">Current AI Mode</p>
                 <div className="flex items-center justify-between py-2 px-3 bg-primary/5 border border-primary/20 rounded-lg">
-                  <span className="text-sm font-medium text-primary capitalize">{selectedLLM === "local" ? "Local LLM (Ollama)" : selectedLLM === "cloud" ? "Cloud LLM (Groq)" : selectedLLM === "grok" ? "Grok (xAI)" : selectedLLM === "deepseek" ? "DeepSeek" : selectedLLM === "omniroute" ? "Universal (OmniRoute)" : selectedLLM}</span>
+                  <span className="text-sm font-medium text-primary capitalize">{selectedLLM === "local" ? "Local LLM (Ollama)" : selectedLLM === "cloud" ? "Cloud LLM (Groq)" : selectedLLM === "deepseek" ? "DeepSeek" : selectedLLM === "omniroute" ? "Universal (OmniRoute)" : selectedLLM}</span>
                   {onChangeLLM && (
                     <button onClick={onChangeLLM} className="text-[11px] text-primary hover:underline">Change</button>
                   )}
@@ -270,7 +251,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
                 <div className="space-y-2 text-sm">
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Database</span>
-                    <span className="text-foreground font-medium">{datasetLabel(dbName)}</span>
+                    <span className="text-foreground font-medium">{dbName}</span>
                   </div>
                   {selectedSourceType && (
                     <div className="flex justify-between">
@@ -321,7 +302,7 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
             </div>
             <div className="py-3 border-t border-border">
               <p className="text-sm text-foreground">API Key Security</p>
-              <p className="text-xs text-muted-foreground mt-1">ARIA checks your API key, stores it encrypted, and uses it only with the cloud AI service you chose.</p>
+              <p className="text-xs text-muted-foreground mt-1">All API keys are stored encrypted. Keys are never sent to our servers.</p>
             </div>
           </div>
         )}
@@ -338,7 +319,6 @@ export default function Settings({ selectedLLM, onChangeLLM, onProviderSwitched,
             </div>
           </div>
         )}
-        </div>
       </div>
     </div>
   );

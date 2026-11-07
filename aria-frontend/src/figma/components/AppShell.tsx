@@ -4,13 +4,9 @@ import type { Page } from "../App";
 import {
   LayoutDashboard, Sparkles, Lightbulb, TrendingUp,
   Database, Bot, Clock, Settings, FileText,
-  Sun, Moon, Menu, Compass, ShieldCheck,
-  Search, LogOut, ChevronDown, Bell, CheckCheck, Trash2, Eye,
+  Sun, Moon, Menu, Compass,
+  Search, LogOut, ChevronDown,
 } from "lucide-react";
-import { workspaceApi } from "../../services/api";
-import { useReadOnly, READ_ONLY_HINT } from "../lib/readonly";
-import { localStore } from "../../utils/storage.js";
-import { datasetLabel } from "../lib/labels";
 
 // The standalone Hypothesis page was removed: hypothesis is an investigation
 // capability surfacing as Possible drivers inside AI Analytics / Insights /
@@ -45,7 +41,6 @@ const navGroups: { label: string; items: { id: Page; label: string; icon: React.
 
 const pageTitles: Record<Page, string> = {
   dashboard: "Dashboard",
-  admin: "Admin Dashboard",
   analytics: "AI Analytics",
   insights: "Insights",
   intelligence: "Intelligence",
@@ -60,120 +55,37 @@ const pageTitles: Record<Page, string> = {
 interface Props {
   children: React.ReactNode;
   user?: { email?: string } | null;
-  isAdmin?: boolean;
   selectedLLM?: string;
   dbName?: string;
   onChangeLLM?: () => void;
   onSignOut?: () => void;
 }
 
-export default function AppShell({ children, user, isAdmin = false, selectedLLM, dbName, onChangeLLM, onSignOut }: Props) {
+export default function AppShell({ children, user, selectedLLM, dbName, onChangeLLM, onSignOut }: Props) {
   const { isDark, toggleTheme, page, setPage } = useTheme();
-  const readOnly = useReadOnly();
   const [collapsed, setCollapsed] = useState(() => {
     try {
-      return localStore.getItem("aria_sidebar_collapsed") === "1";
+      return localStorage.getItem("aria_sidebar_collapsed") === "1";
     } catch {
       return false;
     }
   });
-  // Small screens: sidebar becomes an overlay drawer instead of collapsing.
-  const [isSmall, setIsSmall] = useState(() => typeof window !== "undefined" && window.innerWidth < 768);
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
-
-  useEffect(() => {
-    const onResize = () => setIsSmall(window.innerWidth < 768);
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
-
-  // Leaving small screens must not leave a stale drawer open.
-  useEffect(() => {
-    if (!isSmall && mobileNavOpen) setMobileNavOpen(false);
-  }, [isSmall, mobileNavOpen]);
   const [profileOpen, setProfileOpen] = useState(false);
-  const [notifOpen, setNotifOpen] = useState(false);
-  const [notifs, setNotifs] = useState<any[]>([]);
 
   useEffect(() => {
     try {
-      localStore.setItem("aria_sidebar_collapsed", collapsed ? "1" : "0");
+      localStorage.setItem("aria_sidebar_collapsed", collapsed ? "1" : "0");
     } catch { /* private mode: session-only */ }
   }, [collapsed]);
 
-  /* Workspace notifications (monitor alerts etc.) — best-effort poll. */
-  useEffect(() => {
-    let dead = false;
-    const tick = async () => {
-      if (document.hidden) return;
-      try {
-        const r = await workspaceApi.listNotifications();
-        if (!dead) setNotifs(Array.isArray(r?.data) ? r.data : []);
-      } catch { /* the bell must never break the shell */ }
-    };
-    tick();
-    const id = window.setInterval(tick, 60_000);
-    return () => { dead = true; window.clearInterval(id); };
-  }, []);
-
-  const unread = notifs.reduce((n, x) => n + (x?.read ? 0 : 1), 0);
-  // On small screens the drawer always shows labels, regardless of the
-  // desktop collapse preference.
-  const showLabels = isSmall || !collapsed;
-  const visibleNavGroups = isAdmin
-    ? [...navGroups, {
-        label: "Administration",
-        items: [{ id: "admin" as Page, label: "Admin Dashboard", icon: ShieldCheck }],
-      }]
-    : navGroups;
-
-  const relTime = (iso: string) => {
-    const t = Date.parse(iso);
-    if (!Number.isFinite(t)) return "";
-    const s = Math.max(0, (Date.now() - t) / 1000);
-    if (s < 60) return "just now";
-    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-    if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-    return `${Math.floor(s / 86400)}d ago`;
-  };
-
-  const markAllRead = async () => {
-    try {
-      await workspaceApi.markNotificationsRead();
-      setNotifs((ns) => ns.map((n) => ({ ...n, read: true })));
-    } catch { /* noop */ }
-  };
-
-  const clearAllNotifs = async () => {
-    try {
-      await workspaceApi.clearNotifications();
-      setNotifs([]);
-    } catch { /* noop */ }
-  };
-
   return (
     <div className="flex h-screen bg-background font-sans text-foreground overflow-hidden">
-      {/* Backdrop for the mobile nav drawer */}
-      {isSmall && mobileNavOpen && (
-        <div
-          className="fixed inset-0 z-40 bg-black/40 backdrop-blur-[1px]"
-          onClick={() => setMobileNavOpen(false)}
-          aria-hidden
-        />
-      )}
       {/* Sidebar */}
       <aside
-        className={`flex flex-col flex-shrink-0 border-r border-border/70 transition-all duration-300 ease-out h-full ${
-          isSmall
-            ? `fixed inset-y-0 left-0 z-50 shadow-2xl ${mobileNavOpen ? "translate-x-0" : "-translate-x-full"}`
-            : ""
-        }`}
+        className="flex flex-col flex-shrink-0 border-r border-border/70 transition-all duration-300 ease-out h-full"
         style={{
-          width: showLabels ? 232 : 68,
-          // Solid card behind the drawer so mobile overlay never shows
-          // page content through (the old gradient used invalid syntax
-          // and was being dropped by the browser).
-          background: "var(--card)",
+          width: collapsed ? 68 : 232,
+          background: "linear-gradient(180deg, var(--card) 0%, var(--card) 70%, var(--secondary)/40 100%)",
         }}
       >
         {/* Logo */}
@@ -184,7 +96,7 @@ export default function AppShell({ children, user, isAdmin = false, selectedLLM,
           >
             <Sparkles size={15} className="text-white" />
           </div>
-          {showLabels && (
+          {!collapsed && (
             <div className="flex flex-col leading-none">
               <span className="font-bold text-[15px] text-foreground tracking-tight">ARIA</span>
               <span className="text-[9px] font-semibold text-primary/80 tracking-[0.18em] uppercase">Analytics</span>
@@ -194,9 +106,9 @@ export default function AppShell({ children, user, isAdmin = false, selectedLLM,
 
         {/* Nav */}
         <nav className="flex-1 py-2 px-2.5 overflow-y-auto premium-scroll space-y-4">
-          {visibleNavGroups.map((group) => (
+          {navGroups.map((group) => (
             <div key={group.label}>
-              {showLabels && (
+              {!collapsed && (
                 <p className="px-3 mb-1 text-[10px] font-bold text-muted-foreground/70 uppercase tracking-[0.14em]">
                   {group.label}
                 </p>
@@ -207,22 +119,22 @@ export default function AppShell({ children, user, isAdmin = false, selectedLLM,
                   return (
                     <button
                       key={id}
-                      onClick={() => { setPage(id); setMobileNavOpen(false); }}
-                      title={showLabels ? undefined : label}
+                      onClick={() => setPage(id)}
+                      title={collapsed ? label : undefined}
                       aria-current={active ? "page" : undefined}
                       aria-label={label}
                       className={`relative w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-[13px] transition-all duration-200 ${
                         active
                           ? "bg-primary/10 text-primary font-semibold shadow-[inset_0_0_0_1px_rgba(79,70,229,0.15)]"
                           : "text-muted-foreground hover:text-foreground hover:bg-secondary/80"
-                      } ${showLabels ? "" : "justify-center px-0"}`}
+                      } ${collapsed ? "justify-center px-0" : ""}`}
                     >
-                      {active && showLabels && (
+                      {active && !collapsed && (
                         <span className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-5 rounded-r-full" style={{ background: "var(--gradient-primary)" }} />
                       )}
                       <Icon size={16} className="flex-shrink-0" strokeWidth={active ? 2.25 : 2} />
-                      {showLabels && <span className="truncate">{label}</span>}
-                      {active && showLabels && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-primary" />}
+                      {!collapsed && <span className="truncate">{label}</span>}
+                      {active && !collapsed && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-primary" />}
                     </button>
                   );
                 })}
@@ -233,14 +145,14 @@ export default function AppShell({ children, user, isAdmin = false, selectedLLM,
 
         {/* User */}
         <div className="p-2.5 flex-shrink-0">
-          <div className={`flex items-center gap-2.5 rounded-xl bg-secondary/60 border border-border/60 px-2.5 py-2 overflow-hidden ${showLabels ? "" : "justify-center px-0"}`}>
+          <div className={`flex items-center gap-2.5 rounded-xl bg-secondary/60 border border-border/60 px-2.5 py-2 overflow-hidden ${collapsed ? "justify-center px-0" : ""}`}>
             <div
               className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white shadow-sm"
               style={{ background: "var(--gradient-primary)" }}
             >
               {user?.email?.[0]?.toUpperCase() || "A"}
             </div>
-            {showLabels && (
+            {!collapsed && (
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-semibold text-foreground truncate">{user?.email?.split("@")[0] || "User"}</p>
                 <p className="text-[11px] text-muted-foreground truncate">{user?.email || "user@email.com"}</p>
@@ -259,13 +171,9 @@ export default function AppShell({ children, user, isAdmin = false, selectedLLM,
           style={{ boxShadow: "0 1px 0 0 rgba(0,0,0,0.02), 0 1px 8px -4px rgba(0,0,0,0.04)" }}
         >
           <button
-            onClick={() => (isSmall ? setMobileNavOpen((o) => !o) : setCollapsed((c) => !c))}
-            aria-label={
-              isSmall
-                ? mobileNavOpen ? "Close navigation" : "Open navigation"
-                : collapsed ? "Expand sidebar" : "Collapse sidebar"
-            }
-            title={isSmall ? "Menu" : collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            onClick={() => setCollapsed((c) => !c)}
+            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
             className="p-1.5 -ml-1 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-all"
           >
             <Menu size={15} />
@@ -274,25 +182,15 @@ export default function AppShell({ children, user, isAdmin = false, selectedLLM,
             <h1 className="text-[15px] font-semibold text-foreground tracking-tight flex items-center gap-2">{pageTitles[page]}{dbName ? (
               <button
                 onClick={() => setPage("data")}
-                title={`Analyzing: ${datasetLabel(dbName)} — click to switch dataset`}
-                aria-label={`Analyzing ${datasetLabel(dbName)}. Switch dataset`}
+                title={`Analyzing: ${dbName} — click to switch dataset`}
+                aria-label={`Analyzing ${dbName}. Switch dataset`}
                 className="inline-flex items-center gap-1 text-[11px] text-muted-foreground font-normal bg-secondary/70 border border-border/60 rounded-full px-2.5 py-0.5 hover:text-foreground hover:border-primary/50 transition-colors"
               >
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
-                {datasetLabel(dbName)}
+                {dbName}
               </button>
             ) : null}</h1>
           </div>
-
-          {readOnly && (
-            <span
-              title={READ_ONLY_HINT}
-              aria-label={READ_ONLY_HINT}
-              className="inline-flex items-center gap-1 flex-shrink-0 text-[11px] font-medium text-amber-700 dark:text-amber-400 bg-amber-500/10 border border-amber-500/25 rounded-full px-2.5 py-0.5"
-            >
-              <Eye size={11} /> Read-only
-            </span>
-          )}
 
           <div className="flex-1" />
 
@@ -317,67 +215,6 @@ export default function AppShell({ children, user, isAdmin = false, selectedLLM,
             {isDark ? <Sun size={14} /> : <Moon size={14} />}
           </button>
 
-          {/* Notifications bell (monitor alerts from the workspace) */}
-          <div className="relative">
-            <button
-              onClick={() => { setProfileOpen(false); setNotifOpen((o) => !o); }}
-              aria-label={unread > 0 ? `Notifications, ${unread} unread` : "Notifications"}
-              className="relative p-1.5 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-all"
-              title="Notifications"
-            >
-              <Bell size={14} />
-              {unread > 0 && (
-                <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-0.5 rounded-full bg-primary text-white text-[9px] font-bold flex items-center justify-center">
-                  {unread > 9 ? "9+" : unread}
-                </span>
-              )}
-            </button>
-            {notifOpen && (
-              <div
-                className="absolute right-0 top-9 w-80 bg-card border border-border rounded-xl z-50 animate-scale-in overflow-hidden"
-                style={{ boxShadow: "var(--shadow-xl)" }}
-              >
-                <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-                  <p className="text-[12.5px] font-semibold text-foreground">Notifications</p>
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={markAllRead}
-                      disabled={!unread}
-                      className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground disabled:opacity-40"
-                      title="Mark all read" aria-label="Mark all notifications read">
-                      <CheckCheck size={13} />
-                    </button>
-                    <button
-                      onClick={clearAllNotifs}
-                      disabled={notifs.length === 0}
-                      className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-negative disabled:opacity-40"
-                      title="Clear all" aria-label="Clear all notifications">
-                      <Trash2 size={13} />
-                    </button>
-                  </div>
-                </div>
-                <div className="max-h-80 overflow-y-auto premium-scroll">
-                  {notifs.length === 0 ? (
-                    <p className="px-3 py-6 text-center text-[12px] text-muted-foreground">
-                      Nothing yet. Monitors you create will alert you here.
-                    </p>
-                  ) : (
-                    notifs.map((n) => (
-                      <div key={String(n?.id || "")} className={`px-3 py-2.5 border-b border-border/60 last:border-0 ${n?.read ? "" : "bg-primary/5"}`}>
-                        <div className="flex items-center gap-2 min-w-0">
-                          {!n?.read && <span className="w-1.5 h-1.5 rounded-full bg-primary flex-shrink-0" aria-hidden />}
-                          <p className="text-[12px] font-semibold text-foreground truncate flex-1">{String(n?.title || "Update")}</p>
-                          <span className="text-[10px] text-muted-foreground flex-shrink-0">{relTime(String(n?.at || ""))}</span>
-                        </div>
-                        <p className="mt-0.5 text-[11.5px] text-muted-foreground leading-relaxed">{String(n?.message || "")}</p>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-
           {/* Settings shortcut (was a dead Notifications bell with a dot) */}
           <button
             onClick={() => setPage("settings")}
@@ -391,7 +228,7 @@ export default function AppShell({ children, user, isAdmin = false, selectedLLM,
           {/* Profile */}
           <div className="relative">
             <button
-              onClick={() => { setNotifOpen(false); setProfileOpen((o) => !o); }}
+              onClick={() => setProfileOpen((o) => !o)}
               className="flex items-center gap-1.5 p-1 rounded-lg hover:bg-secondary transition-all"
             >
               <div
@@ -429,12 +266,6 @@ export default function AppShell({ children, user, isAdmin = false, selectedLLM,
             )}
           </div>
         </header>
-
-        {readOnly && (
-          <div className="px-4 py-1.5 text-[11.5px] bg-amber-500/10 text-amber-800 dark:text-amber-300 border-b border-amber-500/20 flex-shrink-0">
-            Mobile read-only view — connect sources and run analyses on desktop.
-          </div>
-        )}
 
         {/* Content */}
         <main className="flex-1 overflow-auto page-bg">

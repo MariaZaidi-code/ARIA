@@ -1,10 +1,10 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { motion, MotionConfig } from "framer-motion";
+import { motion, AnimatePresence, MotionConfig } from "framer-motion";
 import {
   BarChart3, Lightbulb, Target, SlidersHorizontal, FileText, Play, RotateCcw,
   ChevronRight, ArrowLeft, RefreshCw, Database, Sparkles,
   Plus, Printer, Download, Share2,
-  CalendarDays, Save, Eye, Check, Search, TrendingUp, TrendingDown, Minus,
+  CalendarDays, Save, Eye, Check,
 } from "lucide-react";
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
@@ -13,7 +13,6 @@ import {
 import { useTheme } from "../App";
 import { fmtBiz, fmtPctBiz } from "../lib/format";
 import { asList, strOf, numOf, humanize, fmtMetric, businessError, getNoSchemaInfo } from "../lib/intelHelpers";
-import { useReadOnly, READ_ONLY_HINT } from "../lib/readonly";
 import {
   Card, CardHead, NoDatasetPanel, ErrorPanel, EmptyState, LoadingPanel,
   SkeletonBlock, Field, selectCls, inputCls, btnPrimary, btnGhost,
@@ -21,7 +20,6 @@ import {
 import ExploreTab from "./intelligence/ExploreTab";
 import PrescriptionsFeed from "./intelligence/PrescriptionsFeed";
 import { intelligenceApi, normalizeApiError, apiFetch } from "../../services/api";
-import { localStore, sessionStore } from "../../utils/storage.js";
 
 /* =====================================================================
    ARIA Intelligence — Explore / Hypotheses / Goals / What-If / Reports.
@@ -90,7 +88,7 @@ type ReportDraftItem = { id: string; title: string };
 
 function loadReportDraft(): ReportDraftItem[] {
   try {
-    const raw = localStore.getItem(REPORT_DRAFT_KEY);
+    const raw = localStorage.getItem(REPORT_DRAFT_KEY);
     const v = JSON.parse(raw || "[]");
     if (!Array.isArray(v)) return [];
     return v
@@ -103,7 +101,7 @@ function loadReportDraft(): ReportDraftItem[] {
 
 function saveReportDraft(items: ReportDraftItem[]): void {
   try {
-    localStore.setItem(REPORT_DRAFT_KEY, JSON.stringify(items || []));
+    localStorage.setItem(REPORT_DRAFT_KEY, JSON.stringify(items || []));
   } catch { /* best-effort */ }
 }
 
@@ -128,14 +126,14 @@ function clearReportDraft(): void {
 
 function pushToast(msg: string): void {
   try {
-    sessionStore.setItem(INTEL_TOAST_KEY, msg);
+    sessionStorage.setItem(INTEL_TOAST_KEY, msg);
   } catch { /* best-effort */ }
 }
 
 function popToast(): string | null {
   try {
-    const v = sessionStore.getItem(INTEL_TOAST_KEY);
-    if (v) sessionStore.removeItem(INTEL_TOAST_KEY);
+    const v = sessionStorage.getItem(INTEL_TOAST_KEY);
+    if (v) sessionStorage.removeItem(INTEL_TOAST_KEY);
     return v || null;
   } catch {
     return null;
@@ -144,9 +142,9 @@ function popToast(): string | null {
 
 function readGoalPrefill(): any | null {
   try {
-    const raw = sessionStore.getItem(GOAL_PREFILL_KEY);
+    const raw = sessionStorage.getItem(GOAL_PREFILL_KEY);
     if (!raw) return null;
-    sessionStore.removeItem(GOAL_PREFILL_KEY);
+    sessionStorage.removeItem(GOAL_PREFILL_KEY);
     return JSON.parse(raw);
   } catch {
     return null;
@@ -186,7 +184,6 @@ function duePlus90(): string {
    ===================================================================== */
 
 function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: (t: IntelTab, extra?: Record<string, string>) => void }) {
-  const readOnly = useReadOnly();
   const [items, setItems] = useState<any[]>([]);
   const [total, setTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
@@ -194,10 +191,6 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
   const [errorId, setErrorId] = useState("");
   const [search, setSearch] = useState("");
   const [debounced, setDebounced] = useState("");
-  const [question, setQuestion] = useState("");
-  const [analysisResult, setAnalysisResult] = useState<any>(null);
-  const [analysisLoading, setAnalysisLoading] = useState(false);
-  const [analysisError, setAnalysisError] = useState("");
   const [sort, setSort] = useState("recent");
   const [page, setPage] = useState(1);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -209,7 +202,6 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
   const [trackMsg, setTrackMsg] = useState("");
   const [trackingId, setTrackingId] = useState<string | null>(null);
   const [draftMsg, setDraftMsg] = useState("");
-  const [listHint, setListHint] = useState("");
 
   useEffect(() => {
     const t = setTimeout(() => { setDebounced(search.trim()); setPage(1); }, 350);
@@ -219,9 +211,9 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
   /* One-tap why from Dashboard KPI cards: prefilled metric search. */
   useEffect(() => {
     try {
-      const raw = sessionStore.getItem("aria_hypothesis_prefill");
+      const raw = sessionStorage.getItem("aria_hypothesis_prefill");
       if (!raw) return;
-      sessionStore.removeItem("aria_hypothesis_prefill");
+      sessionStorage.removeItem("aria_hypothesis_prefill");
       const m = String(JSON.parse(raw)?.metric || "").trim();
       if (m) setSearch(m);
     } catch { /* best-effort */ }
@@ -235,45 +227,21 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
       const r = await intelligenceApi.listHypotheses({ search: debounced || undefined, sort, page, page_size: PAGE_SIZE });
       setItems(asList(r.data));
       setTotal(typeof r.total === "number" ? r.total : null);
-      setListHint(strOf((r as any)?.hint));
     } catch (e: any) {
       const norm = normalizeApiError({ message: e?.message }, e?.status || 0, null);
       setError(norm.message);
       setErrorId(norm.requestId);
       setItems([]);
-      setListHint("");
     } finally {
       setLoading(false);
     }
   }, [debounced, sort, page]);
   useEffect(() => { fetchList(); }, [fetchList]);
 
-  const runInvestigation = async (questionOverride?: string) => {
-    const q = (questionOverride ?? question).trim();
-    if (!q || analysisLoading) return;
-    if (readOnly) { setAnalysisError(READ_ONLY_HINT); return; }
-    setAnalysisLoading(true);
-    setAnalysisError("");
-    setAnalysisResult(null);
-    try {
-      const response = await intelligenceApi.investigateHypotheses(q);
-      const result: any = response?.data || {};
-      if (result.ok === false) {
-        setAnalysisError(strOf(result.detail) || "ARIA could not analyze this question.");
-      } else {
-        setAnalysisResult(result);
-      }
-    } catch (e: any) {
-      setAnalysisError(businessError(e?.message) || "ARIA could not analyze this question.");
-    } finally {
-      setAnalysisLoading(false);
-    }
-  };
-
   /* Severity ranking (client-side, dynamic): |change%| x evidence weight.
      Reason chip explains each rank in plain words. */
   const strengthOf = (h: any): number => {
-    const s = strOf(h?.evidence_strength || h?.strength || "").toLowerCase();
+    const s = strOf(h?.evidence_grade || h?.evidence_strength || h?.strength || "").toLowerCase();
     if (/strong/.test(s)) return 3;
     if (/moderate|medium/.test(s)) return 2;
     if (s) return 1;
@@ -287,7 +255,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
   };
   const severityReason = (h: any): string => {
     const c = changeOf(h);
-    const s = strOf(h?.evidence_strength || h?.strength || "").toLowerCase();
+    const s = strOf(h?.evidence_grade || h?.evidence_strength || h?.strength || "").toLowerCase();
     const move = c === null ? "" : `${Math.abs(c)}% move`;
     const sign = /strong/.test(s) ? "strong signs" : /moderate|medium/.test(s) ? "moderate signs" : s ? "early signs" : "unrated signs";
     return [move, sign].filter(Boolean).join(" · ");
@@ -322,7 +290,6 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
      direction is known, due +90d). Unknown target -> prefill the Goals
      form and let the user fill the blank, then navigate there. */
   const trackAsGoal = async (h: any) => {
-    if (readOnly) { pushToast(READ_ONLY_HINT); return; }
     const id = strOf(h?.id);
     setTrackMsg("");
     setDraftMsg("");
@@ -346,7 +313,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
         onGoto("goals");
       } else {
         try {
-          sessionStore.setItem(GOAL_PREFILL_KEY, JSON.stringify({
+          sessionStorage.setItem(GOAL_PREFILL_KEY, JSON.stringify({
             name, ...(metric ? { metric } : {}), due: duePlus90(),
           }));
         } catch { /* best-effort */ }
@@ -387,14 +354,14 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
     const breakdown = hypBreakdownOf(h);
     try {
       if (metric || breakdown) {
-        sessionStore.setItem("aria_explore_prefill", JSON.stringify({
+        sessionStorage.setItem("aria_explore_prefill", JSON.stringify({
           ...(metric ? { metric } : {}),
           ...(breakdown ? { breakdown } : {}),
         }));
       }
     } catch { /* best-effort */ }
     try {
-      localStore.setItem("aria_dashboard_drill", JSON.stringify({
+      localStorage.setItem("aria_dashboard_drill", JSON.stringify({
         at: Date.now(), kind: "hypothesis",
         ...(metric ? { metric } : {}),
         ...(breakdown ? { dimension: breakdown, breakdown } : {}),
@@ -408,10 +375,13 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
   const gradeOf = (h: any, factors: any[], evidenceCount: number): { label: string; reason: string; tone: string } => {
     const g = strOf(h?.evidence_grade || "").toLowerCase();
     const reason = strOf(h?.evidence_reason || "");
+    if (/contradictory/.test(g)) return { label: "Contradictory evidence", reason: reason || "Measured results point against this explanation.", tone: "bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/25" };
+    if (/insufficient/.test(g)) return { label: "Insufficient evidence", reason: reason || "Not enough measured data to assess this yet.", tone: "bg-secondary text-secondary-foreground border-border" };
+    if (/limited/.test(g)) return { label: "Limited evidence", reason: reason || "A measured pattern exists, but the cause is unknown.", tone: "bg-secondary text-secondary-foreground border-border" };
     if (/strong/.test(g)) return { label: "Strong evidence", reason: reason || "Strong — the pattern is backed by comparatively strong supporting signs.", tone: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25" };
     if (/mixed|moderate|medium/.test(g)) return { label: "Mixed evidence", reason: reason || "Mixed — there are supporting signs, but also reasons to keep checking.", tone: "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" };
     if (/weak/.test(g)) return { label: "Weak evidence", reason: reason || "Weak — only early signs so far, treat this as a question to explore.", tone: "bg-secondary text-secondary-foreground border-border" };
-    const s = strOf(h?.evidence_strength || h?.strength || "").toLowerCase();
+    const s = strOf(h?.evidence_grade || h?.evidence_strength || h?.strength || "").toLowerCase();
     if (/strong/.test(s)) return { label: "Strong evidence", reason: "Strong — the supporting signs behind this pattern look comparatively strong.", tone: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25" };
     if (/moderate|medium/.test(s)) return { label: "Mixed evidence", reason: "Mixed — some supporting signs, but the picture is not yet firm.", tone: "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" };
     if (/weak|limited|early/.test(s)) return { label: "Weak evidence", reason: "Weak — only early signs so far, treat this as a question to explore.", tone: "bg-secondary text-secondary-foreground border-border" };
@@ -452,7 +422,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
               const headerQ = strOf(h?.question || "").startsWith("Why might")
                 ? strOf(h.question)
                 : `Why might ${metricLabel} have ${direction}?`;
-              // Observational patterns do not establish causation.
+              // Verdict-first headline: lead with the most likely cause.
               const rankScore = (f: any): number => {
                 const s = strOf(f?.evidence_strength || f?.strength || "").toLowerCase();
                 const w = /strong/.test(s) ? 3 : /moderate|medium/.test(s) ? 2 : 1;
@@ -462,13 +432,13 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
               const ranked = [...factors].sort((a, b) => rankScore(b) - rankScore(a));
               const top = ranked[0];
               const topName = top ? strOf(top?.factor || top?.name) : "";
-              const verdictWord = "STRONGEST RELATED PATTERN";
+              const verdictWord = "Pattern to investigate";
               return (
                 <>
                   {topName ? (
                     <>
                       <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">{verdictWord.toUpperCase()}</p>
-                      <h3 className="text-[17px] font-semibold text-foreground tracking-tight">{topName} is associated with the observed change in {metricLabel}</h3>
+                      <h3 className="text-[17px] font-semibold text-foreground tracking-tight">{topName}: a possible factor associated with {metricLabel} {direction}</h3>
                       <p className="text-[12px] text-muted-foreground mt-0.5">{headerQ}</p>
                     </>
                   ) : (
@@ -483,8 +453,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
             <div className="flex items-center gap-2 flex-wrap" aria-label="Hypothesis actions">
               <button
                 onClick={() => trackAsGoal(detail)}
-                disabled={trackingId !== null || readOnly}
-                title={readOnly ? READ_ONLY_HINT : undefined}
+                disabled={trackingId !== null}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50"
                 aria-label="Track this hypothesis as a goal">
                 <Target size={13} /> {trackingId ? "Creating goal…" : "Track as goal"}
@@ -559,7 +528,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
             {(detailTab === "results") && (
               <>
               {(() => {
-                const mLabel = strOf(ctx?.metric || h?.metric_label || h?.metric) || "this measure";
+                const mLabel = strOf(ctx?.metric || h?.metric_label || h?.metric || "the metric").toLowerCase();
                 const pct = numOf(pattern?.change_pct);
                 const dir = strOf(pattern?.direction || "");
                 const dirWord = dir || (pct !== null ? (pct < 0 ? "dropped" : pct > 0 ? "grew" : "changed") : "changed");
@@ -568,7 +537,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                 const per = strOf(ctx?.period || ctx?.time_period || h?.period || "");
                 const seg = strOf(ctx?.breakdown || ctx?.dimension || h?.dimension || "");
                 const verdict = strOf(h?.verdict || h?.status || "").toLowerCase();
-                const confWord = /support/i.test(verdict) ? "The signs point clearly" : /inconclus|needs|more data/i.test(verdict) ? "The signs are still early" : /not support|refut/i.test(verdict) ? "The data does not back this explanation" : "This is an early read";
+                const confWord = /support/i.test(verdict) ? "The signs point clearly" : /inconclus|needs|more data/i.test(verdict) ? "The signs are still early" : /not support|refut/i.test(verdict) ? "The data does not back this explanation" : "Looking at the numbers";
                 const topFactor = factors.length ? strOf(factors[0]?.factor || factors[0]?.name || "") : "";
                 const s1 = `We checked ${mLabel}${per && per !== "All data" ? ` for ${per}` : ""}, and it ${dirWord}${pct !== null ? ` by ${Math.abs(pct)}%` : ""}${before && after ? ` (from ${before} to ${after})` : ""}.`;
                 const s2 = topFactor ? ` The strongest related pattern sits with ${topFactor.toLowerCase()}${seg ? ` within ${seg.toLowerCase()}` : ""} — related, not proven cause.` : ` No single related factor stands out yet.`;
@@ -588,7 +557,20 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                   .map((r: any) => strOf(typeof r === "string" ? r : r?.text))
                   .filter(Boolean)
                   .slice(0, 2);
-                const settle = strOf(h?.data_needed || h?.settle || "") || "Checking a different period, or breaking the change down by segment, would show whether this pattern holds.";
+                const fallbackRivals: string[] = [];
+                if (!rivals.length && factors.length > 1) {
+                  const r1 = factors[1];
+                  const r1Name = strOf(r1?.factor || r1?.name);
+                  if (r1Name) fallbackRivals.push(`Another factor worth checking is ${r1Name}; its causal role has not been established.`);
+                }
+                if (!rivals.length && !fallbackRivals.length && factors.length <= 1) {
+                  fallbackRivals.push("One rival explanation is that the pattern is spread across many small contributors, so no single one drives it.");
+                }
+                if (rivals.length + fallbackRivals.length < 2) {
+                  fallbackRivals.push("A further rival is a timing or mix effect not visible in this cut — nothing here rules it out.");
+                }
+                const allRivals = [...rivals, ...fallbackRivals].slice(0, 2);
+                const settle = strOf(h?.data_needed || h?.settle || "") || "Comparing another period, or breaking the numbers down over time, would settle whether this pattern holds.";
                 return (
                   <Card className="p-4 md:p-5">
                     <div className="flex items-center gap-2 flex-wrap">
@@ -596,12 +578,28 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                       <span className={`text-[10.5px] font-semibold px-2 py-0.5 rounded-full border ${grade.tone}`} title={grade.reason}>{grade.label}</span>
                     </div>
                     <p className="mt-1.5 text-[12px] text-secondary-foreground leading-relaxed">{grade.reason}</p>
-                    <p className="mt-2 text-[12px] font-semibold text-foreground">Other possibilities checked</p>
-                    {rivals.length ? <ul className="mt-1 space-y-1">
-                      {rivals.map((r, i) => (
+                    {asList(h?.measured_contradictions).length > 0 && (
+                      <div className="mt-2" role="note" aria-label="Contradicting measured evidence">
+                        <p className="text-[12px] font-semibold text-foreground">Evidence pointing the other way</p>
+                        <ul className="mt-1 space-y-1">
+                          {asList(h?.measured_contradictions).map((s: any, i: number) => (
+                            <li key={i} className="text-[12px] text-secondary-foreground">• {strOf(s)}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {asList(h?.settled_data_notes).length > 0 && (
+                      <p className="mt-2 text-[12px] text-muted-foreground">
+                        <span className="font-semibold text-secondary-foreground">Measured so far: </span>
+                        {asList(h?.settled_data_notes).map((s: any) => strOf(s)).join(" ")}
+                      </p>
+                    )
+                    <p className="mt-2 text-[12px] font-semibold text-foreground">Other possibilities to test</p>
+                    <ul className="mt-1 space-y-1">
+                      {allRivals.map((r, i) => (
                         <li key={i} className="text-[12px] text-secondary-foreground leading-relaxed">· {r}</li>
                       ))}
-                    </ul> : <p className="mt-1 text-[12px] text-muted-foreground">ARIA didn't find a competing explanation in the columns it could check.</p>}
+                    </ul>
                     <p className="mt-2 text-[12px] text-muted-foreground leading-relaxed">
                       <span className="font-semibold text-secondary-foreground">What would settle it: </span>{settle}
                     </p>
@@ -613,7 +611,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                   </Card>
                 );
               })()}
-              <div className="grid grid-cols-1 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <Card className="p-4 md:p-5">
                   <div className="flex items-center justify-between gap-2">
                     <h4 className="text-[13px] font-semibold text-foreground">Observed Pattern</h4>
@@ -639,22 +637,39 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                         </div>
                       )}
                       {(() => {
+                        const pts = asList(pattern?.series || pattern?.points).map((v: any, i: number) => ({ i, label: strOf(v?.label || v?.period || `P${i + 1}`), v: numOf(typeof v === "number" ? v : v?.value ?? v?.v) ?? 0 }));
                         const bd = numOf(pattern?.before ?? pattern?.before_value);
                         const ad = numOf(pattern?.after ?? pattern?.after_value);
-                        const max = Math.max(bd ?? 0, ad ?? 0, 1);
-                        if (bd === null || ad === null) return null;
-                        return (
-                          <div className="mt-3 space-y-2">
-                            <div>
-                              <div className="flex justify-between text-[11px] mb-1"><span className="text-muted-foreground">Before</span><span className="font-semibold tabular-nums">{strOf(pattern?.before_display || "—")}</span></div>
-                              <div className="h-2 rounded-full bg-secondary overflow-hidden"><div className="h-full bg-slate-300 dark:bg-slate-500 rounded-full" style={{ width: `${(bd / max) * 100}%` }} /></div>
+                        const showBars = bd !== null && ad !== null;
+                        return (<>
+                          {showBars && (
+                            <div className="h-32 mt-2" role="img" aria-label={`Before ${strOf(pattern?.before_display)} versus after ${strOf(pattern?.after_display)}`}>
+                              <ResponsiveContainer width="100%" height="100%">
+                                <BarChart data={[{ label: "Before", value: bd as number }, { label: "After", value: ad as number }]} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                                  <XAxis dataKey="label" tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} />
+                                  <YAxis tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => fmtMetric(v, strOf(ctx?.metric || h?.metric || ""))} />
+                                  <Tooltip formatter={(v: any) => [fmtMetric(numOf(v) ?? 0, strOf(ctx?.metric || h?.metric || "")), "Value"]} cursor={{ fill: "var(--secondary)" }} contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8, fontSize: 12 }} />
+                                  <Bar dataKey="value" radius={[6, 6, 0, 0]} isAnimationActive animationDuration={600}>
+                                    <Cell fill="#B9D0E8" /><Cell fill="#2F6FAD" />
+                                  </Bar>
+                                </BarChart>
+                              </ResponsiveContainer>
                             </div>
-                            <div>
-                              <div className="flex justify-between text-[11px] mb-1"><span className="text-muted-foreground">After</span><span className="font-semibold tabular-nums">{strOf(pattern?.after_display || "—")}</span></div>
-                              <div className="h-2 rounded-full bg-secondary overflow-hidden"><div className="h-full bg-blue-600 rounded-full" style={{ width: `${(ad / max) * 100}%` }} /></div>
+                          )}
+                          {pts.length > 1 && (
+                            <div className="h-28 mt-2" role="img" aria-label="Pattern over time">
+                              <ResponsiveContainer width="100%" height="100%">
+                                <LineChart data={pts} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                                  <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} minTickGap={20} />
+                                  <YAxis tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={48} tickFormatter={(v: number) => fmtMetric(v, strOf(ctx?.metric || h?.metric || ""))} />
+                                  <Tooltip formatter={(v: any) => [fmtMetric(numOf(v) ?? 0, strOf(ctx?.metric || h?.metric || "")), "Value"]} labelFormatter={(l) => `Point ${l}`} />
+                                  <Line type="monotone" dataKey="v" stroke="#4F46E5" strokeWidth={2} dot={false} isAnimationActive animationDuration={600} />
+                                </LineChart>
+                              </ResponsiveContainer>
                             </div>
-                          </div>
-                        );
+                          )}
+                        </>);
                       })()}
                       {strOf(pattern?.detail || pattern?.description) && <p className="text-[12px] text-secondary-foreground mt-2 leading-relaxed">{strOf(pattern.detail || pattern.description)}</p>}
                     </div>
@@ -770,10 +785,10 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                                 <button
                                   onClick={() => {
                                     try {
-                                      sessionStore.setItem("aria_explore_prefill", JSON.stringify({ metric: strOf(h?.metric || ctx?.metric || ""), breakdown: strOf(h?.dimension || ctx?.breakdown || "") }));
+                                      sessionStorage.setItem("aria_explore_prefill", JSON.stringify({ metric: strOf(h?.metric || ctx?.metric || ""), breakdown: strOf(h?.dimension || ctx?.breakdown || "") }));
                                     } catch { /* best-effort */ }
                                     try {
-                                      localStore.setItem("aria_dashboard_drill", JSON.stringify({
+                                      localStorage.setItem("aria_dashboard_drill", JSON.stringify({
                                         at: Date.now(), kind: "hypothesis-factor",
                                         metric: strOf(h?.metric || ctx?.metric || ""),
                                         dimension: strOf(h?.dimension || ctx?.breakdown || ""),
@@ -788,7 +803,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                                 <button
                                   onClick={() => {
                                     try {
-                                      sessionStore.setItem("aria_whatif_prefill", JSON.stringify({ variable: strOf(h?.metric || ctx?.metric || "") }));
+                                      sessionStorage.setItem("aria_whatif_prefill", JSON.stringify({ variable: strOf(h?.metric || ctx?.metric || "") }));
                                     } catch { /* best-effort */ }
                                     onGoto("whatif");
                                   }}
@@ -804,7 +819,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
                     <p className="mt-2 text-[11px] text-muted-foreground">These factors are associated with the observed pattern. They do not necessarily establish causation.</p>
                   </div>
                 ) : (
-                  <p className="text-[12px] text-muted-foreground mt-2">Nothing else cleared the evidence bar as a related factor yet. Weak or purely structural links are not shown.</p>
+                  <p className="text-[12px] text-muted-foreground mt-2">No independently supported associated factors were found — weak or structural-only links are never promoted into factors.</p>
                 )}
               </Card>
             )}
@@ -868,160 +883,24 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
 
   return (
     <div className="space-y-4">
-      <div className="text-[11px] text-muted-foreground flex items-center gap-1"><span>Intelligence</span><ChevronRight size={11} /><span className="text-secondary-foreground font-medium">Hypotheses</span></div>
-      <div className="flex items-start justify-between gap-3 flex-wrap">
-        <div>
-          <h2 className="text-[22px] font-bold tracking-tight text-foreground">Hypotheses</h2>
-          <p className="mt-1 text-[12px] text-muted-foreground">Explore patterns in your data. Association is not proof of cause.</p>
-        </div>
-        <label className="text-[11px] text-muted-foreground flex items-center gap-1.5">
-          Sort
-          <select value={sort} onChange={(e) => { setSort(e.target.value); setPage(1); }} className={`${selectCls} !w-auto`} aria-label="Sort hypotheses">
-            <option value="recent">Most recent</option>
-            <option value="strongest">Strongest evidence</option>
-            <option value="severity">Highest impact</option>
-            <option value="az">Title A–Z</option>
-          </select>
-        </label>
-      </div>
-      <Card className="p-4 md:p-5 border-blue-200/60 dark:border-blue-500/25 bg-gradient-to-br from-blue-50/40 dark:from-blue-500/5 to-card">
-        <div className="flex items-start justify-between gap-3 flex-wrap">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-100 dark:bg-blue-500/15 text-blue-700 dark:text-blue-400 shrink-0"><Sparkles size={15} /></span>
-            <div>
-            <h3 className="text-[14px] font-semibold text-foreground">Investigate a question</h3>
-            <p className="mt-1 text-[11px] text-muted-foreground">ARIA will resolve a metric from your connected data and show measured patterns with their limitations.</p>
-            </div>
+      <Card className="p-4 md:p-5">
+        <div className="flex items-center gap-2 flex-wrap">
+          <div className="flex-1 min-w-44">
+            <label htmlFor="hyp-search" className="sr-only">Search hypotheses</label>
+            <input id="hyp-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search hypotheses…" className={inputCls} aria-label="Search hypotheses" />
           </div>
-          <span className="text-[10px] font-semibold text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 border border-blue-100 dark:border-blue-500/20 rounded-full px-2.5 py-1">Evidence-led · no cause claims</span>
+          <label className="text-[11px] text-muted-foreground flex items-center gap-1.5">
+            Sort
+            <select value={sort} onChange={(e) => { setSort(e.target.value); setPage(1); }} className={`${selectCls} !w-auto`} aria-label="Sort hypotheses">
+              <option value="recent">Most recent</option>
+              <option value="strongest">Strongest evidence</option>
+              <option value="severity">Highest impact</option>
+              <option value="az">Title A–Z</option>
+            </select>
+          </label>
+          <button onClick={fetchList} className={btnGhost} aria-label="Refresh hypotheses"><RefreshCw size={13} /> Refresh</button>
         </div>
-        <form className="mt-3 flex items-center gap-2 flex-wrap" onSubmit={(e) => { e.preventDefault(); void runInvestigation(); }}>
-          <label htmlFor="hyp-question" className="sr-only">Question to investigate</label>
-          <input id="hyp-question" value={question} maxLength={500} onChange={(e) => setQuestion(e.target.value)} placeholder="e.g. Why did net revenue change this quarter?" className={`${inputCls} flex-1 min-w-48 !h-11`} />
-          <button type="submit" disabled={analysisLoading || !question.trim() || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={btnPrimary} aria-label="Analyze question">
-            {analysisLoading ? <RefreshCw size={13} className="animate-spin" /> : <Sparkles size={13} />}
-            {analysisLoading ? "Analyzing…" : "Analyze"}
-          </button>
-        </form>
-        {readOnly && (
-          <p className="mt-2 text-[11.5px] text-amber-700 dark:text-amber-400">Running questions is disabled in the mobile read-only view — open ARIA on desktop to investigate.</p>
-        )}
-        {analysisError && <p className="mt-2 text-[12px] text-rose-600 dark:text-rose-400" role="alert">{analysisError}</p>}
       </Card>
-
-      {analysisResult && (() => {
-        const observation = analysisResult.observation || {};
-        const candidates = asList(analysisResult.hypotheses);
-        const suggestions = asList(analysisResult.suggestions).map((s: any) => strOf(typeof s === "string" ? s : s?.question || s?.text)).filter(Boolean).slice(0, 4);
-        const points = asList(observation?.chart?.points).map((p: any, i: number) => ({
-          label: strOf(p?.label || p?.period || `Point ${i + 1}`),
-          value: numOf(p?.actual ?? p?.value ?? p?.v),
-        })).filter((p: any) => p.value !== null);
-        const change = numOf(observation?.change_pct);
-        return (
-          <section className="space-y-3" aria-label="Investigation results">
-            <Card className="p-4 md:p-5 border-blue-100 dark:border-blue-500/20">
-              <div className="flex items-start justify-between gap-3 flex-wrap">
-                <div>
-                  <p className="text-[10px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">OBSERVED PATTERN</p>
-                  <h3 className="mt-1 text-[16px] font-semibold text-foreground">{strOf(observation?.metric || "Investigation summary")}</h3>
-                  <p className="mt-1 text-[12px] text-secondary-foreground">{strOf(observation?.text || analysisResult?.detail || "The analysis did not return a measurable summary.")}</p>
-                </div>
-                {change !== null && <span className={`rounded-full border px-3 py-1 text-[12px] font-bold tabular-nums ${change < 0 ? "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-500/25 dark:bg-rose-500/10 dark:text-rose-400" : "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-500/25 dark:bg-emerald-500/10 dark:text-emerald-400"}`}>{change > 0 ? "↑" : change < 0 ? "↓" : ""} {Math.abs(change).toFixed(1)}%</span>}
-              </div>
-              {points.length > 1 && (
-                <div className="mt-3 h-48" role="img" aria-label={`${strOf(observation?.metric || "Metric")} trend over time`}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={points} margin={{ top: 8, right: 12, bottom: 0, left: 4 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
-                      <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} minTickGap={24} />
-                      <YAxis tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={56} tickFormatter={(v: number) => fmtMetric(v, strOf(observation?.metric || ""))} />
-                      <Tooltip formatter={(v: any) => [fmtMetric(numOf(v) ?? 0, strOf(observation?.metric || "")), strOf(observation?.metric || "Value")]} contentStyle={{ background: "var(--card)", border: "1px solid var(--border)", borderRadius: 8, fontSize: 12 }} />
-                      <Line type="monotone" dataKey="value" stroke="#3769e8" strokeWidth={2.5} dot={{ r: 2.5 }} activeDot={{ r: 4 }} isAnimationActive animationDuration={450} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
-              <div className="mt-3 flex items-center gap-2 flex-wrap text-[11px] text-muted-foreground">
-                {observation?.n != null && <span className="rounded-full bg-secondary px-2.5 py-1">{Number(observation.n).toLocaleString()} observations</span>}
-                {observation?.time_col && <span className="rounded-full bg-secondary px-2.5 py-1">Time field: {strOf(observation.time_col)}</span>}
-                {strOf(observation?.table) && <span className="rounded-full bg-secondary px-2.5 py-1">Source: {strOf(observation.table)}</span>}
-              </div>
-            </Card>
-
-            {candidates.length ? (
-              <div className="space-y-3">
-                <h4 className="text-[13px] font-semibold text-foreground">Related patterns · {candidates.length}</h4>
-                {candidates.map((candidate: any, index: number) => {
-                  const supporting = asList(candidate?.supporting).map((value: unknown) => strOf(value)).filter(Boolean);
-                  const contradictory = asList(candidate?.contradictory).map((value: unknown) => strOf(value)).filter(Boolean);
-                  const limitations = asList(candidate?.limitations).map((value: unknown) => strOf(value)).filter(Boolean);
-                  const needed = asList(candidate?.needed_data).map((value: unknown) => strOf(value)).filter(Boolean);
-                  const strength = strOf(candidate?.strength || candidate?.evidence_strength || "Evidence level unavailable");
-                  const candidateForActions = {
-                    ...candidate,
-                    title: strOf(candidate?.title || `Pattern ${index + 1}`),
-                    metric: strOf(observation?.metric || ""),
-                    context: { metric: strOf(observation?.metric || ""), breakdown: strOf(candidate?.dimension || "") },
-                  };
-                  const strengthTone = /strong/i.test(strength)
-                    ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/25 dark:bg-emerald-500/10 dark:text-emerald-400"
-                    : /moderate|limited/i.test(strength)
-                      ? "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-500/25 dark:bg-amber-500/10 dark:text-amber-400"
-                      : /contradict/i.test(strength)
-                        ? "border-rose-200 bg-rose-50 text-rose-800 dark:border-rose-500/25 dark:bg-rose-500/10 dark:text-rose-400"
-                        : "border-border bg-secondary text-secondary-foreground";
-                  return (
-                    <Card key={strOf(candidate?.id || candidate?.title) || index} className="p-4 md:p-5">
-                      <div className="flex items-start justify-between gap-3 flex-wrap">
-                        <div className="min-w-0">
-                          <h4 className="text-[14px] font-semibold text-foreground">{strOf(candidate?.title || `Pattern ${index + 1}`)}</h4>
-                          <p className="mt-1 text-[12px] text-secondary-foreground leading-relaxed">{strOf(candidate?.explanation || "No explanation was returned for this pattern.")}</p>
-                        </div>
-                        <span className={`shrink-0 rounded-full border px-2.5 py-1 text-[10px] font-semibold ${strengthTone}`}>{humanize(strength)}</span>
-                      </div>
-                      <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
-                        <div className="rounded-xl bg-secondary/60 px-3 py-2.5">
-                          <p className="text-[10px] font-bold tracking-wide text-muted-foreground">SUPPORTING EVIDENCE</p>
-                          {supporting.length ? <ul className="mt-1.5 space-y-1">{supporting.slice(0, 4).map((item: string, i: number) => <li key={i} className="text-[11px] text-secondary-foreground">• {item}</li>)}</ul> : <p className="mt-1.5 text-[11px] text-muted-foreground">No supporting points were returned.</p>}
-                        </div>
-                        <div className="rounded-xl bg-secondary/60 px-3 py-2.5">
-                          <p className="text-[10px] font-bold tracking-wide text-muted-foreground">LIMITS & CONTRARY SIGNS</p>
-                          {contradictory.length || limitations.length ? <ul className="mt-1.5 space-y-1">{[...contradictory, ...limitations].slice(0, 4).map((item: string, i: number) => <li key={i} className="text-[11px] text-secondary-foreground">• {item}</li>)}</ul> : <p className="mt-1.5 text-[11px] text-muted-foreground">No limitations were returned; this does not establish cause.</p>}
-                        </div>
-                      </div>
-                      {needed.length > 0 && <p className="mt-2 text-[11px] text-muted-foreground"><span className="font-semibold text-secondary-foreground">To check next: </span>{needed.slice(0, 2).join(" · ")}</p>}
-                      <div className="mt-3 flex items-center gap-2 flex-wrap">
-                        <button onClick={() => void trackAsGoal(candidateForActions)} disabled={trackingId !== null || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-[11px] font-semibold text-secondary-foreground hover:bg-secondary disabled:opacity-50"><Target size={12} /> {trackingId ? "Creating goal…" : "Track as goal"}</button>
-                        <button onClick={() => addHypToDraft(candidateForActions)} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-[11px] font-semibold text-secondary-foreground hover:bg-secondary"><FileText size={12} /> Add to report</button>
-                        <button onClick={() => testThis(candidateForActions)} className="inline-flex items-center gap-1.5 rounded-lg bg-blue-700 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-blue-800"><Play size={12} /> Continue in Explore</button>
-                        <button onClick={() => onAsk(`${question.trim()} — ${strOf(candidate?.title)}`)} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-[11px] font-semibold text-secondary-foreground hover:bg-secondary"><Sparkles size={12} /> Discuss in Copilot</button>
-                      </div>
-                    </Card>
-                  );
-                })}
-              </div>
-            ) : (
-              <Card className="p-4 border-amber-200/70 dark:border-amber-500/20">
-                <p className="text-[13px] font-semibold text-foreground">No explanation cleared the evidence bar</p>
-                <p className="mt-1 text-[12px] text-secondary-foreground">{strOf(analysisResult?.detail || "ARIA could not identify a testable pattern from the available data.")}</p>
-                {asList(analysisResult?.needed_data).length > 0 && <p className="mt-2 text-[11px] text-muted-foreground">Needed: {asList(analysisResult.needed_data).map((value: unknown) => strOf(value)).join(" · ")}</p>}
-              </Card>
-            )}
-            {suggestions.length > 0 && (
-              <Card className="p-4">
-                <h4 className="text-[12px] font-semibold text-foreground">Useful follow-up questions</h4>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {suggestions.map((suggestion: string, i: number) => (
-                    <button key={`${suggestion}-${i}`} onClick={() => { setQuestion(suggestion); void runInvestigation(suggestion); }} disabled={analysisLoading || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="rounded-full border border-border bg-card px-3 py-1.5 text-left text-[11px] text-secondary-foreground hover:border-blue-300 hover:text-blue-700 disabled:opacity-50 dark:hover:border-blue-500/30 dark:hover:text-blue-400">{suggestion}</button>
-                  ))}
-                </div>
-              </Card>
-            )}
-            {(trackMsg || draftMsg) && <p className={`text-[12px] ${trackMsg ? "text-rose-600 dark:text-rose-400" : "text-emerald-700 dark:text-emerald-400"}`} role={trackMsg ? "alert" : "status"}>{trackMsg || draftMsg}</p>}
-          </section>
-        );
-      })()}
 
       {loading && <LoadingPanel label="Loading hypotheses…" />}
       {!loading && error && <ErrorPanel message={error} requestId={errorId} onRetry={fetchList} />}
@@ -1029,7 +908,7 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
         <EmptyState
           icon={Lightbulb}
           title="No hypotheses found yet."
-          body={listHint || "ARIA promotes a hypothesis only when the observed pattern has enough supporting evidence. Try a broader search, or run an analysis in Explore first."}
+          body="ARIA promotes a hypothesis only when the observed pattern has enough supporting evidence. Try a broader search, or run an analysis in Explore first."
           action={<button onClick={() => { setSearch(""); setPage(1); fetchList(); }} className="text-xs font-semibold text-blue-700 dark:text-blue-400 hover:underline">Clear search</button>}
         />
       )}
@@ -1040,81 +919,27 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
               {trackMsg || draftMsg}
             </p>
           )}
-          <div className="grid grid-cols-1 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {orderedItems.map((h: any) => (
-              <Card key={strOf(h?.id || h?.title)} className="p-4 md:p-5 hover:border-blue-200 dark:hover:border-blue-500/25 hover:shadow-sm transition-all">
-                <div className="flex items-start gap-3">
-                  <span className="mt-0.5 inline-flex h-8 w-8 items-center justify-center rounded-xl bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400"><Lightbulb size={15} /></span>
-                  <div className="min-w-0 flex-1">
-                    <button
-                      type="button"
-                      onClick={() => openDetail(strOf(h?.id))}
-                      disabled={!h?.id}
-                      title="Open full details"
-                      aria-label={`View hypothesis ${strOf(h?.title || "")}`}
-                      className="text-left text-[14px] font-semibold text-foreground leading-snug cursor-pointer rounded-sm hover:text-blue-700 dark:hover:text-blue-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 disabled:opacity-40"
-                    >
-                      {strOf(h?.title || h?.question || "Hypothesis")}
-                    </button>
-                    <p className="text-[12px] text-muted-foreground mt-1 line-clamp-2 leading-relaxed">{strOf(h?.summary || h?.observed_pattern?.headline || h?.description || "")}</p>
-                  </div>
-                  {(() => {
-                    const s = strOf(h?.evidence_strength || h?.strength);
-                    if (!s) return null;
-                    // "Not tested evidence" is neither English nor useful —
-                    // untested candidates get a neutral, honest chip.
-                    if (/not tested|untested|not measured/i.test(s)) {
-                      return (
-                        <span className="shrink-0 text-[10.5px] font-semibold px-2.5 py-1 rounded-full bg-secondary text-secondary-foreground border border-border">Not measured yet</span>
-                      );
-                    }
-                    return (
-                      <span className="shrink-0 text-[10.5px] font-semibold px-2.5 py-1 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-100 dark:border-blue-500/20">{humanize(s)} evidence</span>
-                    );
-                  })()}
-                </div>
-                <div className="mt-3 flex items-center gap-2 flex-wrap pl-11">
+              <Card key={strOf(h?.id || h?.title)} className="p-4 hover:border-blue-200 dark:hover:border-blue-500/25 hover:shadow-md transition-all">
+                <p className="text-[13px] font-semibold text-foreground leading-snug">{strOf(h?.title || h?.question || "Hypothesis")}</p>
+                <p className="text-[12px] text-muted-foreground mt-1 line-clamp-2 leading-relaxed">{strOf(h?.summary || h?.observed_pattern?.headline || h?.description || "")}</p>
+                <div className="mt-2 flex items-center gap-2 flex-wrap">
+                  {strOf(h?.evidence_grade || h?.evidence_strength || h?.strength) && (
+                    <span className="text-[10.5px] font-semibold px-2 py-0.5 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-100 dark:border-blue-500/20">{humanize(strOf(h?.evidence_grade || h?.evidence_strength || h?.strength || ""))}</span>
+                  )}
                   {strOf(h?.status) && <span className="text-[10.5px] text-muted-foreground">{humanize(strOf(h.status))}</span>}
-                  {(() => {
-                    const ts = h?.trend_summary && typeof h.trend_summary === "object" ? h.trend_summary : null;
-                    if (ts) {
-                      const d = strOf(ts.direction);
-                      const pc = numOf(ts.change_pct);
-                      const Icon = d === "increased" ? TrendingUp : d === "declined" ? TrendingDown : Minus;
-                      const tone = d === "increased"
-                        ? "text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-500/10 border-emerald-200 dark:border-emerald-500/25"
-                        : d === "declined"
-                          ? "text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-500/10 border-rose-200 dark:border-rose-500/25"
-                          : "text-secondary-foreground bg-secondary border-border";
-                      return (
-                        <span
-                          title={`Measured ${strOf(ts.first_label)} → ${strOf(ts.last_label)} (${strOf(ts.first_display)} → ${strOf(ts.last_display)}) — earliest vs latest period.`}
-                          className={`inline-flex items-center gap-1 text-[10.5px] font-semibold px-2 py-0.5 rounded-full border ${tone}`}>
-                          <Icon size={11} />
-                          {pc !== null && Math.abs(pc) >= 0.05 ? `${Math.abs(pc).toFixed(1)}% ${d}` : "held steady"}
-                          {(strOf(ts.first_label) || strOf(ts.last_label)) && (
-                            <span className="font-normal opacity-80">{strOf(ts.first_label)} → {strOf(ts.last_label)}</span>
-                          )}
-                        </span>
-                      );
-                    }
-                    if (strOf(h?.trend_limitation)) {
-                      return <span className="text-[10.5px] text-muted-foreground" title={strOf(h.trend_limitation)}>{strOf(h.trend_limitation)}</span>;
-                    }
-                    return null;
-                  })()}
                   {sort === "severity" && severityOf(h) > 0 && (
                     <span className="text-[10.5px] font-medium px-2 py-0.5 rounded-full bg-violet-50 dark:bg-violet-500/10 text-violet-700 dark:text-violet-400 border border-violet-200 dark:border-violet-500/25" title="Ranked by size of move times evidence strength">{severityReason(h)}</span>
                   )}
                   <button onClick={() => openDetail(strOf(h?.id))} disabled={!h?.id} className="ml-auto inline-flex items-center gap-1 text-[12px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`View hypothesis ${strOf(h?.title || "")}`}>
-                    <Eye size={12} /> View evidence
+                    <Eye size={12} /> View
                   </button>
                 </div>
                 <div className="mt-2 pt-2 border-t border-border flex items-center gap-3 flex-wrap">
                   <button
                     onClick={() => trackAsGoal(h)}
-                    disabled={trackingId !== null || readOnly}
-                    title={readOnly ? READ_ONLY_HINT : undefined}
+                    disabled={trackingId !== null}
                     className="inline-flex items-center gap-1 text-[11.5px] font-semibold text-violet-700 dark:text-violet-400 hover:underline disabled:opacity-40"
                     aria-label={`Track hypothesis as goal: ${strOf(h?.title || "")}`}>
                     <Target size={12} /> {trackingId === strOf(h?.id) ? "Creating…" : "Track as goal"}
@@ -1155,7 +980,6 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
 type GoalFilter = "active" | "completed" | "paused" | "all";
 
 function GoalsTab({ meta }: { meta: any }) {
-  const readOnly = useReadOnly();
   const [filter, setFilter] = useState<GoalFilter>("active");
   const [goals, setGoals] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1213,7 +1037,6 @@ function GoalsTab({ meta }: { meta: any }) {
   }, []);
 
   const createGoal = async () => {
-    if (readOnly) { setFormError(READ_ONLY_HINT); return; }
     setFormError("");
     if (!fTitle.trim() || !fTarget.trim()) { setFormError("Give the goal a title and a target value."); return; }
     setFormBusy(true);
@@ -1245,7 +1068,7 @@ function GoalsTab({ meta }: { meta: any }) {
   };
 
   const deleteGoal = async (id: string) => {
-    if (!id || readOnly) return;
+    if (!id) return;
     setActingId(id);
     try {
       await intelligenceApi.deleteGoal(id);
@@ -1258,7 +1081,6 @@ function GoalsTab({ meta }: { meta: any }) {
   };
 
   const setStatus = async (id: string, status: string) => {
-    if (readOnly) return;
     setActingId(id);
     try {
       await intelligenceApi.updateGoal(id, { status });
@@ -1273,7 +1095,7 @@ function GoalsTab({ meta }: { meta: any }) {
   /* Goal auto-progress: recompute current from live data server-side.
      Honest failure surfaces the backend message; the goal stays unchanged. */
   const refreshOne = async (id: string) => {
-    if (!id || readOnly) return;
+    if (!id) return;
     setRefreshingId(id);
     setRefreshMsg("");
     try {
@@ -1287,7 +1109,7 @@ function GoalsTab({ meta }: { meta: any }) {
   };
 
   const refreshAll = async () => {
-    if (readOnly || !goals.length || refreshingAll) return;
+    if (!goals.length || refreshingAll) return;
     setRefreshingAll(true);
     setRefreshMsg("");
     let failed = 0;
@@ -1347,13 +1169,12 @@ function GoalsTab({ meta }: { meta: any }) {
         <div className="flex items-center gap-1.5">
           <button
             onClick={refreshAll}
-            disabled={refreshingAll || goals.length === 0 || readOnly}
-            title={readOnly ? READ_ONLY_HINT : undefined}
+            disabled={refreshingAll || goals.length === 0}
             className={btnGhost}
             aria-label="Refresh all goals from live data">
             <RefreshCw size={13} className={refreshingAll ? "animate-spin" : ""} /> {refreshingAll ? "Refreshing…" : "Refresh all"}
           </button>
-          <button onClick={() => setShowForm((v) => !v)} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={btnPrimary} aria-label="Create goal">
+          <button onClick={() => setShowForm((v) => !v)} className={btnPrimary} aria-label="Create goal">
             <Plus size={13} /> Create Goal
           </button>
         </div>
@@ -1391,7 +1212,7 @@ function GoalsTab({ meta }: { meta: any }) {
           </div>
           {formError && <p className="mt-2 text-[12px] text-rose-600 dark:text-rose-400" role="alert">{formError}</p>}
           <div className="mt-3 flex items-center gap-2">
-            <button onClick={createGoal} disabled={formBusy || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={btnPrimary} aria-label="Save goal">
+            <button onClick={createGoal} disabled={formBusy} className={btnPrimary} aria-label="Save goal">
               {formBusy ? "Saving…" : "Save Goal"}
             </button>
             <button onClick={() => { setShowForm(false); setFormError(""); }} className={btnGhost}>Cancel</button>
@@ -1462,19 +1283,19 @@ function GoalsTab({ meta }: { meta: any }) {
                     {status && <span className={`text-[10.5px] font-semibold px-2 py-0.5 rounded-full border ${statusTone(status)}`}>{status}</span>}
                     {filter !== "completed" && (
                       <div className="flex items-center gap-1.5 flex-wrap justify-end">
-                        <button onClick={() => id && refreshOne(id)} disabled={!id || refreshingId === id || readOnly} className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Refresh goal from live data: ${strOf(g?.title)}`}>
+                        <button onClick={() => id && refreshOne(id)} disabled={!id || refreshingId === id} className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Refresh goal from live data: ${strOf(g?.title)}`}>
                           <RefreshCw size={11} className={refreshingId === id ? "animate-spin" : ""} /> {refreshingId === id ? "…" : "Refresh"}
                         </button>
                         {filter !== "paused" && (
-                          <button onClick={() => id && setStatus(id, "paused")} disabled={!id || actingId === id || readOnly} className="text-[11px] font-medium text-muted-foreground hover:text-foreground disabled:opacity-40" aria-label={`Pause goal ${strOf(g?.title)}`}>Pause</button>
+                          <button onClick={() => id && setStatus(id, "paused")} disabled={!id || actingId === id} className="text-[11px] font-medium text-muted-foreground hover:text-foreground disabled:opacity-40" aria-label={`Pause goal ${strOf(g?.title)}`}>Pause</button>
                         )}
                         {(filter === "paused") && (
-                          <button onClick={() => id && setStatus(id, "active")} disabled={!id || actingId === id || readOnly} className="text-[11px] font-medium text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Resume goal ${strOf(g?.title)}`}>Resume</button>
+                          <button onClick={() => id && setStatus(id, "active")} disabled={!id || actingId === id} className="text-[11px] font-medium text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Resume goal ${strOf(g?.title)}`}>Resume</button>
                         )}
-                        <button onClick={() => id && setStatus(id, "completed")} disabled={!id || actingId === id || readOnly} className="text-[11px] font-medium text-emerald-700 dark:text-emerald-400 hover:underline disabled:opacity-40" aria-label={`Complete goal ${strOf(g?.title)}`}>
+                        <button onClick={() => id && setStatus(id, "completed")} disabled={!id || actingId === id} className="text-[11px] font-medium text-emerald-700 dark:text-emerald-400 hover:underline disabled:opacity-40" aria-label={`Complete goal ${strOf(g?.title)}`}>
                           {actingId === id ? "…" : "Complete"}
                         </button>
-                        <button onClick={() => id && deleteGoal(id)} disabled={!id || actingId === id || readOnly} className="text-[11px] font-medium text-rose-600 dark:text-rose-400 hover:underline disabled:opacity-40" aria-label={`Delete goal ${strOf(g?.title)}`}>Delete</button>
+                        <button onClick={() => id && deleteGoal(id)} disabled={!id || actingId === id} className="text-[11px] font-medium text-rose-600 dark:text-rose-400 hover:underline disabled:opacity-40" aria-label={`Delete goal ${strOf(g?.title)}`}>Delete</button>
                       </div>
                     )}
                   </div>
@@ -1501,7 +1322,6 @@ function GoalsTab({ meta }: { meta: any }) {
    ===================================================================== */
 
 function WhatIfTab() {
-  const readOnly = useReadOnly();
   const [meta, setMeta] = useState<any>(null);
   const [metaLoading, setMetaLoading] = useState(true);
   const [metaError, setMetaError] = useState("");
@@ -1560,12 +1380,12 @@ function WhatIfTab() {
 
   useEffect(() => {
     try {
-      const raw = sessionStore.getItem("aria_whatif_prefill");
+      const raw = sessionStorage.getItem("aria_whatif_prefill");
       if (raw && variables.length) {
         const p = JSON.parse(raw);
         const v = strOf(p?.variable);
         if (v && variables.some((x) => x.toLowerCase() === v.toLowerCase())) setVariable(v);
-        sessionStore.removeItem("aria_whatif_prefill");
+        sessionStorage.removeItem("aria_whatif_prefill");
       }
     } catch { /* ignore */ }
   }, [variables]);
@@ -1650,7 +1470,6 @@ function WhatIfTab() {
     if (applyTo && !applyOptions.includes(applyTo)) setApplyTo("All data");
   }, [applyOptions, applyTo]);
   const saveCurrentScenario = async () => {
-    if (readOnly) { setSaveMsg(READ_ONLY_HINT); return; }
     if (!result || !variable) return;
     setSaveMsg("");
     try {
@@ -1671,7 +1490,7 @@ function WhatIfTab() {
   };
 
   const deleteSavedScenario = async (id: string) => {
-    if (!id || readOnly) return;
+    if (!id) return;
     try {
       await intelligenceApi.deleteScenario(id);
       loadSaved();
@@ -1682,7 +1501,6 @@ function WhatIfTab() {
   };
 
   const runScenario = async () => {
-    if (readOnly) { setError(READ_ONLY_HINT); return; }
     setRunning(true);
     setError("");
     setErrorId("");
@@ -1751,7 +1569,7 @@ function WhatIfTab() {
           <p className="text-[12px] text-muted-foreground">Explore how changes in key factors may impact your business.</p>
         </div>
         <div className="flex items-center gap-1.5">
-          <button onClick={saveCurrentScenario} disabled={!result || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={btnGhost} aria-label="Save scenario">Save Scenario</button>
+          <button onClick={saveCurrentScenario} disabled={!result} className={btnGhost} aria-label="Save scenario">Save Scenario</button>
           <button onClick={resetScenario} className={btnGhost} aria-label="Reset scenario"><RotateCcw size={13} /> Reset</button>
         </div>
       </div>
@@ -1823,7 +1641,7 @@ function WhatIfTab() {
                 <p className="text-[11px] text-muted-foreground mt-1">Segments from your live data — breakdown of {humanize(variable)} by {humanize(segDim)}.</p>
               )}
             </fieldset>
-            <button onClick={runScenario} disabled={running || !variable || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={`${btnPrimary} w-full`} aria-label="Run scenario">
+            <button onClick={runScenario} disabled={running || !variable} className={`${btnPrimary} w-full`} aria-label="Run scenario">
               {running ? "Running…" : "Run Scenario"} <Play size={13} />
             </button>
           </div>
@@ -1923,7 +1741,6 @@ function WhatIfTab() {
 const FALLBACK_SECTIONS = ["Executive Summary", "Key Metrics", "Analysis & Charts", "Insights", "Hypotheses", "Forecast", "Goals", "What-If Scenarios", "Recommendations"];
 
 function ReportsTab({ meta }: { meta: any }) {
-  const readOnly = useReadOnly();
   const [templates, setTemplates] = useState<any[]>([]);
   const [tplLoading, setTplLoading] = useState(true);
   const [tplError, setTplError] = useState("");
@@ -2037,7 +1854,7 @@ function ReportsTab({ meta }: { meta: any }) {
   useEffect(() => { loadDigests(); }, [loadDigests]);
 
   const createDigest = async () => {
-    if (readOnly || digBusy) return;
+    if (digBusy) return;
     setDigBusy(true);
     setDigError("");
     setActMsg("");
@@ -2063,7 +1880,7 @@ function ReportsTab({ meta }: { meta: any }) {
 
   const toggleDigest = async (d: any) => {
     const id = strOf(d?.id);
-    if (readOnly || !id || digBusyId) return;
+    if (!id || digBusyId) return;
     setDigBusyId(id);
     try {
       await apiFetch(`/intelligence/digests/${encodeURIComponent(id)}`, {
@@ -2080,7 +1897,7 @@ function ReportsTab({ meta }: { meta: any }) {
 
   const runDigestNow = async (d: any) => {
     const id = strOf(d?.id);
-    if (readOnly || !id || digBusyId) return;
+    if (!id || digBusyId) return;
     setDigBusyId(id);
     setActMsg("");
     try {
@@ -2098,7 +1915,7 @@ function ReportsTab({ meta }: { meta: any }) {
 
   const deleteDigest = async (d: any) => {
     const id = strOf(d?.id);
-    if (readOnly || !id || digBusyId) return;
+    if (!id || digBusyId) return;
     setDigBusyId(id);
     try {
       await apiFetch(`/intelligence/digests/${encodeURIComponent(id)}`, { method: "DELETE" });
@@ -2125,7 +1942,7 @@ function ReportsTab({ meta }: { meta: any }) {
   };
 
   const deleteReport = async (id: string) => {
-    if (readOnly || !id) return;
+    if (!id) return;
     try {
       await intelligenceApi.deleteReport(id);
       loadReports();
@@ -2164,7 +1981,7 @@ function ReportsTab({ meta }: { meta: any }) {
 
   /* Re-run: same definition, fresh numbers (new history entry, per user). */
   const rerunOne = async (id: string) => {
-    if (readOnly || !id || repBusyId) return;
+    if (!id || repBusyId) return;
     setRepBusyId(id);
     setActMsg("");
     try {
@@ -2237,7 +2054,6 @@ function ReportsTab({ meta }: { meta: any }) {
   };
 
   const generatePdf = async () => {
-    if (readOnly) return;
     setGenBusy(true);
     setGenError("");
     setGenOk("");
@@ -2265,7 +2081,6 @@ function ReportsTab({ meta }: { meta: any }) {
   };
 
   const reportAction = async (kind: "template" | "schedule" | "share" | "ppt") => {
-    if (readOnly) return;
     setActMsg("");
     try {
       if (kind === "template") {
@@ -2302,7 +2117,7 @@ function ReportsTab({ meta }: { meta: any }) {
         </div>
         <div className="flex items-center gap-1.5">
           <button onClick={scrollPreview} className={btnGhost} aria-label="Preview report"><Eye size={13} /> Preview</button>
-          <button onClick={generatePdf} disabled={genBusy || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={`${btnPrimary} disabled:opacity-50`} aria-label="Generate PDF top"><Printer size={13} /> {genBusy ? "Generating..." : "Generate PDF"}</button>
+          <button onClick={generatePdf} disabled={genBusy} className={btnPrimary} aria-label="Generate PDF top"><Printer size={13} /> {genBusy ? "Generating..." : "Generate PDF"}</button>
         </div>
       </div>
       {!hasDatasetRep && !tplLoading && <NoDatasetPanel hint={noSchemaRep.isNoSchema ? noSchemaRep.hint : undefined} />}
@@ -2450,7 +2265,7 @@ function ReportsTab({ meta }: { meta: any }) {
           </div>
           {genError && <p className="mt-2 text-[12px] text-rose-600 dark:text-rose-400" role="alert">{genError}</p>}
           {genOk && <p className="mt-2 text-[12px] text-emerald-700 dark:text-emerald-400" role="status">{genOk}</p>}
-          <button onClick={generatePdf} disabled={genBusy || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={`${btnPrimary} w-full mt-3 disabled:opacity-50`} aria-label="Generate PDF">
+          <button onClick={generatePdf} disabled={genBusy} className={`${btnPrimary} w-full mt-3`} aria-label="Generate PDF">
             <Printer size={13} /> {genBusy ? "Generating…" : "Generate PDF"}
           </button>
           <button onClick={downloadHtml} className={`${btnGhost} w-full mt-2 justify-center`} aria-label="Download printable HTML">
@@ -2498,7 +2313,7 @@ function ReportsTab({ meta }: { meta: any }) {
                 { k: "share" as const, label: "Share Report", Icon: Share2 },
                 { k: "ppt" as const, label: "Export to PowerPoint", Icon: Download },
               ].map(({ k, label, Icon }) => (
-                <button key={k} onClick={() => reportAction(k)} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="w-full flex items-center gap-2 text-left text-[12.5px] font-medium text-foreground hover:text-blue-700 dark:hover:text-blue-400 rounded-lg px-2 py-1.5 hover:bg-blue-50/60 dark:hover:bg-blue-500/10 transition-colors disabled:opacity-50" aria-label={label}>
+                <button key={k} onClick={() => reportAction(k)} className="w-full flex items-center gap-2 text-left text-[12.5px] font-medium text-foreground hover:text-blue-700 dark:hover:text-blue-400 rounded-lg px-2 py-1.5 hover:bg-blue-50/60 dark:hover:bg-blue-500/10 transition-colors" aria-label={label}>
                   <Icon size={13} className="text-muted-foreground" />{label}
                 </button>
               ))}
@@ -2518,7 +2333,7 @@ function ReportsTab({ meta }: { meta: any }) {
             <option value="daily">Daily</option>
             <option value="weekly">Weekly</option>
           </select>
-          <button onClick={createDigest} disabled={digBusy || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={`${btnPrimary} disabled:opacity-50`} aria-label="Schedule digest">
+          <button onClick={createDigest} disabled={digBusy} className={btnPrimary} aria-label="Schedule digest">
             <CalendarDays size={13} /> {digBusy ? "Scheduling…" : "Schedule digest"}
           </button>
         </div>
@@ -2543,11 +2358,11 @@ function ReportsTab({ meta }: { meta: any }) {
                   {strOf(d?.last_error) && <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1 truncate" title={strOf(d.last_error)}>{strOf(d.last_error)}</p>}
                 </div>
                 <div className="flex flex-col items-end gap-1 flex-shrink-0">
-                  <button onClick={() => runDigestNow(d)} disabled={digBusyId === did || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Run digest now ${strOf(d?.name || "")}`}>{digBusyId === did ? "Running…" : "Run now"}</button>
-                  <button onClick={() => toggleDigest(d)} disabled={digBusyId === did || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={d?.enabled ? `Pause digest ${strOf(d?.name || "")}` : `Enable digest ${strOf(d?.name || "")}`}>{d?.enabled ? "Pause" : "Enable"}</button>
+                  <button onClick={() => runDigestNow(d)} disabled={digBusyId === did} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Run digest now ${strOf(d?.name || "")}`}>{digBusyId === did ? "Running…" : "Run now"}</button>
+                  <button onClick={() => toggleDigest(d)} disabled={digBusyId === did} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={d?.enabled ? `Pause digest ${strOf(d?.name || "")}` : `Enable digest ${strOf(d?.name || "")}`}>{d?.enabled ? "Pause" : "Enable"}</button>
                   {lastReportId && <button onClick={() => viewDigestHtml(lastReportId)} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline" aria-label={`View last digest report ${strOf(d?.name || "")}`}>View</button>}
                   {lastReportId && <button onClick={() => downloadServerHtml(lastReportId, strOf(d?.name || "digest"))} disabled={repBusyId === lastReportId} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Download last digest report ${strOf(d?.name || "")}`}>Download</button>}
-                  <button onClick={() => deleteDigest(d)} disabled={digBusyId === did || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 disabled:opacity-40" aria-label={`Delete digest ${strOf(d?.name || "")}`}>Delete</button>
+                  <button onClick={() => deleteDigest(d)} disabled={digBusyId === did} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 disabled:opacity-40" aria-label={`Delete digest ${strOf(d?.name || "")}`}>Delete</button>
                 </div>
               </div>
             );
@@ -2568,8 +2383,8 @@ function ReportsTab({ meta }: { meta: any }) {
               </div>
               <button onClick={() => viewReport(strOf(r?.id))} disabled={!r?.id} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`View report ${strOf(r?.name || "")}`}>View</button>
               {strOf(r?.id) && <button onClick={() => downloadServerHtml(strOf(r.id), strOf(r?.name || "aria-report"))} disabled={repBusyId === strOf(r.id)} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Download report HTML ${strOf(r?.name || "")}`}>{repBusyId === strOf(r.id) ? "Working…" : "Download"}</button>}
-              {strOf(r?.id) && <button onClick={() => rerunOne(strOf(r.id))} disabled={repBusyId === strOf(r.id) || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Re-run report ${strOf(r?.name || "")}`}>Re-run</button>}
-              {strOf(r?.id) && <button onClick={() => deleteReport(strOf(r.id))} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 disabled:opacity-50" aria-label={`Delete report ${strOf(r?.name || "")}`}>Delete</button>}
+              {strOf(r?.id) && <button onClick={() => rerunOne(strOf(r.id))} disabled={repBusyId === strOf(r.id)} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Re-run report ${strOf(r?.name || "")}`}>Re-run</button>}
+              {strOf(r?.id) && <button onClick={() => deleteReport(strOf(r.id))} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400" aria-label={`Delete report ${strOf(r?.name || "")}`}>Delete</button>}
             </div>
           ))}
         </div>
@@ -2645,7 +2460,7 @@ export default function Intelligence({
     const question = (q || "").trim();
     if (onAskCopilot) { onAskCopilot(question); return; }
     try {
-      sessionStore.setItem("aria_copilot_context", JSON.stringify({ origin: "intelligence", question }));
+      sessionStorage.setItem("aria_copilot_context", JSON.stringify({ origin: "intelligence", question }));
     } catch { /* best-effort */ }
     if (setPage) setPage("copilot");
   };
@@ -2742,13 +2557,12 @@ export default function Intelligence({
 
         <div id={`intel-panel-${tab}`} role="tabpanel" aria-labelledby={`intel-tab-${tab}`} className="mt-4">
           <MotionConfig reducedMotion="user">
-            {/* Enter-only fade, no exit/"wait": with mode="wait" a quick
-                tab change could leave the old panel stuck on screen while
-                the new tab was already highlighted. */}
+            <AnimatePresence mode="wait" initial={false}>
               <motion.div
                 key={tab}
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -6 }}
                 transition={{ duration: 0.22, ease: "easeOut" }}
               >
                 {tab === "explore" && <ExploreTab meta={meta || {}} onRunQuick={quickPrefill} onGoto={goto} onAsk={ask} />}
@@ -2758,6 +2572,7 @@ export default function Intelligence({
                 {tab === "whatif" && <WhatIfTab />}
                 {tab === "reports" && <ReportsTab meta={meta || {}} />}
               </motion.div>
+            </AnimatePresence>
           </MotionConfig>
         </div>
       </div>

@@ -10,9 +10,7 @@ import {
 import {
   Card, EmptyState, LoadingPanel, ErrorPanel, btnGhost, btnPrimary,
 } from "./cards";
-import { useReadOnly, READ_ONLY_HINT } from "../../lib/readonly";
 import RxCaseDrawer, { type RxCaseInput } from "./RxCaseDrawer";
-import { KEYS, storage } from "../../../utils/storage";
 
 /* =====================================================================
    Prescriptions auto feed — "What needs attention".
@@ -123,16 +121,6 @@ function compactNum(v: number): string {
   return strOf(Math.round(v * 10) / 10);
 }
 
-/* "album: no measurable numeric columns to improve." -> "Album — no
-   measurable numeric columns to improve." Raw table names are never
-   dumped at the reader. */
-function friendlyLimitation(text: string): string {
-  const s = strOf(text);
-  const m = /^([A-Za-z0-9_ .]+?):\s+(.+)$/.exec(s);
-  if (!m) return s;
-  return `${humanize(m[1].trim())} — ${m[2].trim()}`;
-}
-
 /* Mini baseline-vs-scenario bars: plain words, backend numbers only. */
 function MiniBars({ baseline, scenario, metricLabel }: { baseline: number | null; scenario: number | null; metricLabel: string }) {
   if (baseline === null || scenario === null) return null;
@@ -158,15 +146,10 @@ function MiniBars({ baseline, scenario, metricLabel }: { baseline: number | null
 }
 
 export default function PrescriptionsFeed() {
-  const readOnly = useReadOnly();
-  // Per-user feed cache: account A's cards never paint for account B.
-  // Computed once per mount from the persisted auth user.
-  const cacheKey = useMemo(() => storage.scoped(CACHE_KEY, storage.get(KEYS.authUser, null)), []);
   const [ctxLoading, setCtxLoading] = useState(true);
   const [ctxError, setCtxError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [cards, setCards] = useState<FeedCard[]>([]);
-  const [opportunityCount, setOpportunityCount] = useState(0);
   const [cacheAt, setCacheAt] = useState<number | null>(null);
   const [watchedMetrics, setWatchedMetrics] = useState<string[]>([]);
   const [watchedGroups, setWatchedGroups] = useState<string[]>([]);
@@ -228,7 +211,6 @@ export default function PrescriptionsFeed() {
   }, []);
 
   const recheckOne = useCallback(async (item: any) => {
-    if (readOnly) return;
     const id = strOf(item?.id);
     const metric = strOf(item?.metric);
     if (!id || !metric) return;
@@ -253,12 +235,12 @@ export default function PrescriptionsFeed() {
     } catch {
       setRecheck((p) => ({ ...p, [id]: { state: "error", at: Date.now(), fresh: "" } }));
     }
-  }, [readOnly]);
+  }, []);
 
   /* Auto re-measure: past-due tracked items without a review outcome are
      re-run through the existing analyze endpoint in the background. */
   useEffect(() => {
-    if (readOnly || savedLoading || !saved.length) return;
+    if (savedLoading || !saved.length) return;
     for (const s of saved.slice(0, 6)) {
       const id = strOf(s?.id);
       const outcome = strOf(s?.review_outcome).toLowerCase();
@@ -267,7 +249,7 @@ export default function PrescriptionsFeed() {
       autoRechecked.current.add(id);
       void recheckOne(s);
     }
-  }, [saved, savedLoading, recheckOne, readOnly]);
+  }, [saved, savedLoading, recheckOne]);
 
   const buildFeed = useCallback(async (opts?: { background?: boolean }) => {
     const background = !!opts?.background;
@@ -282,7 +264,6 @@ export default function PrescriptionsFeed() {
       const d: any = (ctx as any)?.data ?? {};
       if (d?.ok === false || d?.code === "NO_CONNECTION") {
         setNoSource(true);
-        setOpportunityCount(0);
         if (!background) setCards([]);
         setWatchedMetrics([]);
         setWatchedGroups([]);
@@ -291,7 +272,6 @@ export default function PrescriptionsFeed() {
       }
       setNoSource(false);
       const opps = asList(d?.opportunities).slice(0, MAX_CARDS);
-      setOpportunityCount(opps.length);
       const mets: string[] = asList(d?.metrics)
         .map((m: any) => strOf(typeof m === "string" ? m : m?.name || m?.label || m?.column))
         .filter(Boolean).slice(0, 6);
@@ -302,14 +282,8 @@ export default function PrescriptionsFeed() {
       setWatchedGroups(dims);
       setLimitations(
         asList(d?.table_limitations ?? d?.limitations)
-          .map((x: any) => strOf(typeof x === "string" ? x : x?.text)).filter(Boolean).slice(0, 8),
+          .map((x: any) => strOf(typeof x === "string" ? x : x?.text)).filter(Boolean).slice(0, 4),
       );
-
-      if (readOnly) {
-        // Mobile read-only: the engine (POST analyze) is refused server-side.
-        // Keep any previously cached cards for viewing; never re-run checks.
-        return;
-      }
 
       const next: FeedCard[] = await Promise.all(opps.map(async (o: any, i: number) => {
         const metric = strOf(o?.metric);
@@ -364,7 +338,7 @@ export default function PrescriptionsFeed() {
       const at = Date.now();
       setCacheAt(at);
       try {
-        localStorage.setItem(cacheKey, JSON.stringify({ at, cards: next }));
+        localStorage.setItem(CACHE_KEY, JSON.stringify({ at, cards: next }));
       } catch { /* best-effort */ }
     } catch (e: any) {
       if (!background && !cards.length) {
@@ -375,13 +349,13 @@ export default function PrescriptionsFeed() {
       setRefreshing(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [readOnly]);
+  }, []);
 
   /* Zero-click start: cached cards paint instantly, then the background
      run refreshes from live context + engine. */
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(cacheKey);
+      const raw = localStorage.getItem(CACHE_KEY);
       if (raw) {
         const c = JSON.parse(raw);
         if (Array.isArray(c?.cards) && c.cards.length && Date.now() - Number(c.at || 0) < CACHE_TTL_MS) {
@@ -393,7 +367,7 @@ export default function PrescriptionsFeed() {
     void buildFeed({ background: false });
     void loadSaved();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [readOnly]);
+  }, []);
 
   const refreshAll = useCallback(() => {
     autoRechecked.current = new Set();
@@ -407,7 +381,6 @@ export default function PrescriptionsFeed() {
 
   const saveAction = useCallback(async (card: FeedCard, prescription: any, idx: number) => {
     const actionKey = `${card.key}:${idx}`;
-    if (readOnly) { setSaveFlash((p) => ({ ...p, [actionKey]: READ_ONLY_HINT })); return; }
     if (busySave) return;
     setBusySave(actionKey);
     setSaveFlash((p) => ({ ...p, [actionKey]: "" }));
@@ -433,10 +406,10 @@ export default function PrescriptionsFeed() {
       setBusySave(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busySave, drafts, loadSaved, readOnly]);
+  }, [busySave, drafts, loadSaved]);
 
   const patchSaved = useCallback(async (id: string, patch: Record<string, string>) => {
-    if (!id || patchBusy || readOnly) return;
+    if (!id || patchBusy) return;
     setPatchBusy(id);
     try {
       await prescriptionApi.updateSaved(id, patch);
@@ -446,17 +419,17 @@ export default function PrescriptionsFeed() {
     } finally {
       setPatchBusy(null);
     }
-  }, [patchBusy, loadSaved, readOnly]);
+  }, [patchBusy, loadSaved]);
 
   const unsave = useCallback(async (id: string) => {
-    if (!id || readOnly) return;
+    if (!id) return;
     try {
       await prescriptionApi.unsave(id);
       await loadSaved();
     } catch (e: any) {
       setSaveFlash((p) => ({ ...p, [`saved:${id}`]: businessError(e?.message) || "ARIA couldn't remove this item." }));
     }
-  }, [loadSaved, readOnly]);
+  }, [loadSaved]);
 
   /* Deep-link target: a feed card or a tracked item. */
   const selectedInput: RxCaseInput | null = useMemo(() => {
@@ -489,9 +462,6 @@ export default function PrescriptionsFeed() {
   }, [selectedId, cards, saved, recheck]);
 
   const readyCards = cards.filter((c) => c.status === "ready" && c.options.length);
-  const refusedCards = cards.filter((c) => c.status === "refused");
-  const errorCards = cards.filter((c) => c.status === "error");
-  const isChecking = ctxLoading || refreshing;
   const showInitialLoading = ctxLoading && !cards.length;
 
   return (
@@ -505,56 +475,36 @@ export default function PrescriptionsFeed() {
             <Sparkles size={15} className="text-blue-700 dark:text-blue-400" /> What needs attention
           </h3>
           <p className="text-[12px] text-muted-foreground">
-            Actions are ranked by evidence and impact, with uncertainty shown clearly
-            {cacheAt ? ` · last check ${timeAgo(cacheAt)}` : ""}
-            {readOnly ? " · fresh checks run on desktop." : " · checks again on your next visit."}
+            Checked automatically from your live data
+            {cacheAt ? ` · last check ${timeAgo(cacheAt)}` : ""} · checks again on your next visit.
           </p>
         </div>
-        <button onClick={refreshAll} disabled={refreshing || ctxLoading || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={btnGhost} aria-label="Check again now">
+        <button onClick={refreshAll} disabled={refreshing || ctxLoading} className={btnGhost} aria-label="Check again now">
           <RefreshCw size={13} className={refreshing ? "animate-spin" : ""} /> {refreshing ? "Checking…" : "Check again"}
         </button>
       </div>
-
-      {!noSource && !ctxError && (
-        <Card className="p-3 md:px-4 md:py-3 bg-secondary/40 border-border/80">
-          <div className="flex items-center gap-3 flex-wrap">
-            <span className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400"><RefreshCw size={14} className={refreshing || ctxLoading ? "animate-spin" : ""} /></span>
-            <div className="min-w-0 flex-1">
-              <p className="text-[12px] font-semibold text-foreground">{isChecking ? "Checking opportunities…" : `Last checked ${cacheAt ? timeAgo(cacheAt) : "just now"}`}</p>
-              <p className="text-[11px] text-muted-foreground">
-                {isChecking && opportunityCount === 0
-                  ? "Finding opportunities…"
-                  : `${opportunityCount} opportunit${opportunityCount === 1 ? "y" : "ies"} in this scan${isChecking ? " · recommendations being checked" : readOnly ? "" : ` · ${readyCards.length} recommendation${readyCards.length === 1 ? "" : "s"} ready · ${refusedCards.length} need${refusedCards.length === 1 ? "s" : ""} more evidence${errorCards.length ? ` · ${errorCards.length} couldn’t be checked` : ""}`}`}
-              </p>
-            </div>
-            {cards.length > 0 && <span className="hidden sm:inline-flex text-[10px] font-semibold text-muted-foreground bg-card border border-border rounded-full px-2.5 py-1">Evidence checked</span>}
-          </div>
-        </Card>
-      )}
 
       {showInitialLoading && <LoadingPanel label="Checking what needs attention…" />}
       {!showInitialLoading && ctxError && !cards.length && (
         <ErrorPanel message={ctxError} onRetry={() => void buildFeed()} />
       )}
-      {!showInitialLoading && !ctxError && (noSource || (!readyCards.length && !refusedCards.length && !errorCards.length && !refreshing)) && (
+      {!showInitialLoading && !ctxError && (noSource || (!readyCards.length && !refreshing)) && (
         <EmptyState
           icon={Sparkles}
-          title={noSource ? "No data source connected yet." : readOnly ? "Fresh checks run on desktop." : "Nothing needs attention right now."}
+          title={noSource ? "No data source connected yet." : "Nothing needs attention right now."}
           body={
             noSource
               ? "Connect your data and ARIA will watch it for slowdowns and drops worth acting on."
-              : readOnly
-                ? "You're viewing saved results on mobile. Open ARIA on desktop to scan for new actions — anything tracked stays available below."
-                : `ARIA is watching ${watchedMetrics.length ? watchedMetrics.map((m) => humanize(m)).join(", ") : "your measures"}${watchedGroups.length ? ` across ${watchedGroups.map((g) => humanize(g)).join(", ")}` : ""}. It checks again on your next visit — or press Check again any time.`
+              : `ARIA is watching ${watchedMetrics.length ? watchedMetrics.map((m) => humanize(m)).join(", ") : "your measures"}${watchedGroups.length ? ` across ${watchedGroups.map((g) => humanize(g)).join(", ")}` : ""}. It checks again on your next visit — or press Check again any time.`
           }
-          action={!noSource && !readOnly ? (
+          action={!noSource ? (
             <button onClick={refreshAll} className="text-xs font-semibold text-blue-700 dark:text-blue-400 hover:underline">Check again now</button>
           ) : undefined}
         />
       )}
 
       {readyCards.length > 0 && (
-        <div className="grid grid-cols-1 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
           {readyCards.map((card, ci) => {
             const primary = card.options[0];
             const disp = primary?.display && typeof primary.display === "object" ? primary.display : {};
@@ -571,7 +521,7 @@ export default function PrescriptionsFeed() {
                 <div id={`rx-card-${card.key}`}>
                   <div className="flex items-center gap-2">
                     <span className="text-[10.5px] font-bold text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 border border-blue-100 dark:border-blue-500/20 rounded-full px-2 py-0.5">
-                      #{ci + 1} priority
+                      #{ci + 1} to look at
                     </span>
                     {(() => {
                       const v: any = (card as any)?.verdict;
@@ -599,15 +549,7 @@ export default function PrescriptionsFeed() {
                       ))}
                     </span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => openCase(card.key)}
-                    title="Open full details"
-                    aria-label={`Open details: ${headline.slice(0, 60)}`}
-                    className="mt-2 block w-full text-left text-[13.5px] font-semibold text-foreground leading-snug cursor-pointer rounded-sm hover:text-blue-700 dark:hover:text-blue-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40"
-                  >
-                    {headline}
-                  </button>
+                  <p className="mt-2 text-[13.5px] font-semibold text-foreground leading-snug">{headline}</p>
                   <p className="mt-1 text-[11px] text-muted-foreground">
                     {humanize(card.metric)}{card.driver ? ` · lever: ${humanize(card.driver)}` : ""}
                   </p>
@@ -653,8 +595,7 @@ export default function PrescriptionsFeed() {
                           </label>
                           <button
                             onClick={() => void saveAction(card, p, idx)}
-                            disabled={savingThis || readOnly}
-                            title={readOnly ? READ_ONLY_HINT : undefined}
+                            disabled={savingThis}
                             className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11.5px] font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-50"
                             aria-label={`Track action: ${strOf(pd.action_text).slice(0, 60)}`}
                           >
@@ -679,70 +620,6 @@ export default function PrescriptionsFeed() {
             );
           })}
         </div>
-      )}
-
-      {refusedCards.length > 0 && readyCards.length === 0 && (
-        <Card className="p-4 border-border/80" aria-label="Nothing actionable yet">
-          <div className="flex items-start gap-2.5">
-            <span className="mt-0.5 inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-secondary text-secondary-foreground"><Check size={14} /></span>
-            <div className="min-w-0 flex-1">
-              <p className="text-[13px] font-semibold text-foreground">
-                Nothing actionable yet — {refusedCards.length === 1 ? "this opening was checked" : `all ${refusedCards.length} openings were checked`}.
-              </p>
-              <p className="mt-1 text-[12px] text-secondary-foreground leading-relaxed">
-                A clean scan with no recommendation is an honest result, not a failure — ARIA only suggests a specific action when the evidence supports one.
-              </p>
-              <ul className="mt-2.5 space-y-1.5">
-                {refusedCards.map((card) => (
-                  <li key={card.key} className="text-[11.5px] text-muted-foreground leading-relaxed">
-                    <span className="font-medium text-secondary-foreground">{humanize(card.metric)}{card.driver ? ` × ${humanize(card.driver)}` : ""}</span>
-                    {" — "}{card.refusalHeadline || "the evidence did not support a specific action."}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </div>
-        </Card>
-      )}
-
-      {refusedCards.length > 0 && readyCards.length > 0 && (
-        <section aria-label="Opportunities that need more evidence" className="space-y-2">
-          <h4 className="text-[12px] font-semibold text-foreground">Checked, but not ready to recommend</h4>
-          <p className="text-[11px] text-muted-foreground">These opportunities were counted in the scan, but the available evidence did not support a specific action.</p>
-          <div className="grid grid-cols-1 gap-3">
-            {refusedCards.map((card) => (
-              <Card key={card.key} className="p-3 border-amber-200/70 dark:border-amber-500/20">
-                <p className="text-[12px] font-semibold text-foreground">{humanize(card.metric)}{card.driver ? ` · ${humanize(card.driver)}` : ""}</p>
-                <p className="mt-1 text-[11px] text-secondary-foreground leading-relaxed">{card.refusalHeadline || "No action cleared the evidence check."}</p>
-                {card.refusalAlternatives.length > 0 && (
-                  <ul className="mt-2 space-y-1 list-disc pl-4">
-                    {card.refusalAlternatives.map((item, i) => <li key={i} className="text-[11px] text-muted-foreground">{strOf(item)}</li>)}
-                  </ul>
-                )}
-              </Card>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {errorCards.length > 0 && (
-        <section aria-label="Opportunities that could not be checked" className="space-y-2">
-          <div className="flex items-center justify-between gap-3 flex-wrap">
-            <div>
-              <h4 className="text-[12px] font-semibold text-foreground">Some opportunities could not be checked</h4>
-              <p className="text-[11px] text-muted-foreground">These checks failed, so ARIA has not counted them as recommendations or evidence refusals.</p>
-            </div>
-            <button onClick={refreshAll} disabled={refreshing} className="text-[11px] font-semibold text-blue-700 hover:underline disabled:opacity-50 dark:text-blue-400">Retry checks</button>
-          </div>
-          <div className="space-y-2">
-            {errorCards.map((card) => (
-              <Card key={card.key} className="p-3 border-rose-200/70 dark:border-rose-500/20">
-                <p className="text-[12px] font-semibold text-foreground">{humanize(card.metric)}{card.driver ? ` · ${humanize(card.driver)}` : ""}</p>
-                <p className="mt-1 text-[11px] text-rose-700 dark:text-rose-400">{card.error || "ARIA couldn't check this opportunity."}</p>
-              </Card>
-            ))}
-          </div>
-        </section>
       )}
 
       {/* Tracked actions — saved items with auto re-measure + outcome badges */}
@@ -782,15 +659,7 @@ export default function PrescriptionsFeed() {
               return (
                 <div key={id || title} id={`rx-card-${id}`} className="rounded-xl border border-border/80 p-3">
                   <div className="flex items-start gap-2 flex-wrap">
-                    <button
-                      type="button"
-                      onClick={() => openCase(id)}
-                      title="Open full details"
-                      aria-label={`Open tracked case ${title.slice(0, 40)}`}
-                      className="text-left flex-1 min-w-40 text-[12.5px] font-semibold text-foreground leading-snug hover:text-blue-700 dark:hover:text-blue-400 hover:underline"
-                    >
-                      {title}
-                    </button>
+                    <p className="text-[12.5px] font-semibold text-foreground leading-snug flex-1 min-w-40">{title}</p>
                     {badge}
                   </div>
                   <p className="mt-1 text-[11px] text-muted-foreground flex items-center gap-2 flex-wrap">
@@ -805,30 +674,25 @@ export default function PrescriptionsFeed() {
                     <span className="text-slate-200 dark:text-muted-foreground">|</span>
                     <button
                       onClick={() => void patchSaved(id, { review_outcome: "achieved" })}
-                      disabled={patchBusy === id || readOnly}
-                      title={readOnly ? READ_ONLY_HINT : undefined}
+                      disabled={patchBusy === id}
                       className="text-[11.5px] font-medium text-emerald-700 dark:text-emerald-400 hover:underline disabled:opacity-40"
                       aria-label={`Mark achieved: ${title.slice(0, 40)}`}
                     >Mark achieved</button>
                     <button
                       onClick={() => void patchSaved(id, { review_outcome: "missed" })}
-                      disabled={patchBusy === id || readOnly}
-                      title={readOnly ? READ_ONLY_HINT : undefined}
+                      disabled={patchBusy === id}
                       className="text-[11.5px] font-medium text-rose-600 dark:text-rose-400 hover:underline disabled:opacity-40"
                       aria-label={`Mark missed: ${title.slice(0, 40)}`}
                     >Mark missed</button>
                     <button
                       onClick={() => void recheckOne(s)}
-                      disabled={rc?.state === "checking" || readOnly}
-                      title={readOnly ? READ_ONLY_HINT : undefined}
+                      disabled={rc?.state === "checking"}
                       className="inline-flex items-center gap-1 text-[11.5px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40"
                       aria-label={`Re-check now: ${title.slice(0, 40)}`}
                     ><RefreshCw size={11} /> Re-check</button>
                     <button
                       onClick={() => void unsave(id)}
-                      disabled={readOnly}
-                      title={readOnly ? READ_ONLY_HINT : undefined}
-                      className="text-[11.5px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 hover:underline disabled:opacity-40"
+                      className="text-[11.5px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 hover:underline"
                       aria-label={`Stop tracking: ${title.slice(0, 40)}`}
                     >Stop tracking</button>
                   </div>
@@ -843,14 +707,9 @@ export default function PrescriptionsFeed() {
       </Card>
 
       {limitations.length > 0 && (
-        <details className="text-[11px] text-muted-foreground">
-          <summary className="cursor-pointer select-none font-medium text-secondary-foreground hover:text-foreground">
-            Coverage notes ({limitations.length})
-          </summary>
-          <ul className="mt-1.5 space-y-1 list-disc pl-4 leading-relaxed">
-            {limitations.map((l, i) => <li key={i}>{friendlyLimitation(l)}</li>)}
-          </ul>
-        </details>
+        <p className="text-[11px] text-muted-foreground leading-relaxed">
+          Coverage notes: {limitations.join(" · ")}
+        </p>
       )}
 
       <RxCaseDrawer
@@ -869,7 +728,6 @@ export default function PrescriptionsFeed() {
           if (s) void recheckOne(s);
         }}
         rechecking={selectedId ? recheck[selectedId]?.state === "checking" : false}
-        readOnly={readOnly}
       />
     </div>
   );

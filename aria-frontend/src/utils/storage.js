@@ -26,9 +26,6 @@ export const KEYS = {
   history: `${NS}history.sessions`,
   dashboardDrill: `${NS}dashboard.drill`,
   sidebarCollapsed: `${NS}ui.sidebar_collapsed`,
-  // RL feedback popup: timestamp of the last interaction, stored with a TTL
-  // so the popup's shared cooldown expires without any bookkeeping.
-  feedbackPopup: `${NS}ui.feedback_popup`,
 };
 
 // Legacy (unversioned) keys still honored as read-fallbacks.
@@ -36,6 +33,7 @@ const LEGACY_FALLBACK = {
   [KEYS.theme]: ["aria_theme"],
   [KEYS.llmMode]: ["aria_llm_mode"],
   [KEYS.avatar]: ["aria_avatar"],
+  [KEYS.authUser]: ["aria_auth_user"],
   [KEYS.forecastContext]: ["aria_forecast_context"],
   [KEYS.analysisContext]: ["aria_analysis_context"],
   [KEYS.history]: ["aria_analysis_history"],
@@ -202,7 +200,7 @@ export const storage = {
    * @returns {string}
    */
   scoped(base, user) {
-    const id = user?.user_id || user?.username || user?.email || "anon";
+    const id = user?.username || user?.email || "anon";
     return `${base}.${id}`;
   },
 };
@@ -213,101 +211,3 @@ export const getStored = (key, fallback) => storage.get(key, fallback);
 export const setStored = (key, value, opts) => storage.set(key, value, opts);
 /** @param {string} key */
 export const removeStored = (key) => storage.remove(key);
-
-// ---------------------------------------------------------------------------
-// Drop-in Web Storage replacements (localStore / sessionStore).
-//
-// Same getItem / setItem / removeItem shape as localStorage/sessionStorage,
-// so a page and the page that reads its handoff switch together with no
-// behaviour change, but every value now lives under the versioned
-// `aria.v1.raw.*` namespace inside the `{ v, exp }` envelope. Legacy
-// unversioned keys are read once, moved forward, and deleted. Values stay
-// strings (callers keep their own JSON.stringify / JSON.parse). Falls back
-// to memory when the browser blocks storage (private mode, quota).
-// ---------------------------------------------------------------------------
-
-function makeRawStore(getArea) {
-  const mem = new Map();
-  const area = () => {
-    try {
-      return getArea() || null;
-    } catch {
-      return null;
-    }
-  };
-  const nsKey = (key) => {
-    const k = String(key);
-    return k.startsWith(NS) ? k : `${NS}raw.${k}`;
-  };
-  const unwrap = (stored) => {
-    try {
-      const p = JSON.parse(stored);
-      if (p && typeof p === "object" && !Array.isArray(p) && p.__aria_v1 === 1 && "v" in p) {
-        if (p.exp && Date.now() > p.exp) return { expired: true, value: null };
-        return { expired: false, value: typeof p.v === "string" ? p.v : JSON.stringify(p.v) };
-      }
-    } catch {
-      /* not an envelope */
-    }
-    return { expired: false, value: stored };
-  };
-  const store = {
-    getItem(key) {
-      const a = area();
-      const nk = nsKey(key);
-      try {
-        const stored = (a ? a.getItem(nk) : null) ?? mem.get(nk) ?? null;
-        if (stored !== null && stored !== undefined) {
-          const { expired, value } = unwrap(stored);
-          if (expired) {
-            store.removeItem(key);
-            return null;
-          }
-          return value;
-        }
-        if (a && nk !== String(key)) {
-          const legacy = a.getItem(String(key));
-          if (legacy !== null) {
-            store.setItem(key, legacy);
-            a.removeItem(String(key));
-            return legacy;
-          }
-        }
-      } catch {
-        /* storage blocked */
-      }
-      return null;
-    },
-    setItem(key, value) {
-      const nk = nsKey(key);
-      const envelope = JSON.stringify({ __aria_v1: 1, exp: 0, v: String(value) });
-      const a = area();
-      if (!a) {
-        mem.set(nk, envelope);
-        return;
-      }
-      try {
-        a.setItem(nk, envelope);
-      } catch {
-        // Quota or blocked storage: keep the value for this page session.
-        mem.set(nk, envelope);
-      }
-    },
-    removeItem(key) {
-      const a = area();
-      mem.delete(nsKey(key));
-      try {
-        a?.removeItem(nsKey(key));
-        a?.removeItem(String(key));
-      } catch {
-        /* storage blocked */
-      }
-    },
-  };
-  return store;
-}
-
-export const localStore = makeRawStore(() => (canUseStorage() ? localStorage : null));
-export const sessionStore = makeRawStore(() =>
-  typeof sessionStorage !== "undefined" ? sessionStorage : null,
-);
