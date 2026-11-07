@@ -465,7 +465,9 @@ def providers():
     """Return provider metadata (labels + privacy context) for the UI."""
     return {
         "providers": {
-            name: {"label": meta["label"], "privacy": meta["privacy"], "models": meta["models"]}
+            name: {"label": meta.get("label", name),
+                   "privacy": meta.get("privacy") or "Review the provider\u0027s privacy terms before sending data.",
+                   "models": meta.get("models") or {}}
             for name, meta in PROVIDERS.items()
         }
     }
