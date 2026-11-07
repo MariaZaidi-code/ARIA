@@ -454,7 +454,7 @@ export default function Data({
                 <Field label="Database Name" id="db-name" value={lDbName} onChange={setLDbName} placeholder="my_database" disabled={connecting} />
                 <Field label="Username" id="db-user" value={lUser} onChange={setLUser} placeholder={sourceType === "mysql" ? "root" : "postgres"} disabled={connecting} />
               </div>
-               <Field label="Password" id="db-pass" type={showPassword ? "text" : "password"} value={lPass} onChange={setLPass} placeholder="Enter password" disabled={connecting}>
+              <Field label="Password" id="db-pass" type="password-show" value={lPass} onChange={setLPass} placeholder="Enter password" disabled={connecting}>
                 <button type="button" onClick={() => setShowPassword((s) => !s)}
                   className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground text-[10px]">
                   {showPassword ? "Hide" : "Show"}
