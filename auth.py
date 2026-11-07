@@ -46,7 +46,7 @@ def _token_ttl_days() -> int:
 TOKEN_TTL_DAYS = _token_ttl_days()
 PBKDF2_ITERATIONS = 120_000
 
-_USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]+")
+_USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]+")
 
 
 def _is_production() -> bool:

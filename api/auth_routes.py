@@ -143,8 +143,13 @@ def _check_login_rate_limit(request: Request) -> None:
 
 
 class AuthRequest(BaseModel):
-    username: str
+    username: str | None = None
+    email: str | None = None
     password: str
+
+    @property
+    def resolved_username(self) -> str:
+        return (self.username or self.email or "").strip()
 
 
 @router.post("/api/auth/register")
@@ -152,11 +157,11 @@ def register(auth_req: AuthRequest, request: Request):
     """Create a user account and return a JWT (generic error avoids enumeration)."""
     _check_login_rate_limit(request)
     try:
-        user_id = auth.register(auth_req.username, auth_req.password)
+        user_id = auth.register(auth_req.resolved_username, auth_req.password)
     except ValueError:
         # Generic message: don't reveal whether the username is taken.
         raise HTTPException(status_code=400, detail="Could not create account. Try a different username.")
-    username = auth_req.username.strip()
+    username = auth_req.resolved_username
     return _auth_response(auth.issue_token(user_id, username), username)
 
 
@@ -164,10 +169,10 @@ def register(auth_req: AuthRequest, request: Request):
 def login(auth_req: AuthRequest, request: Request):
     """Exchange username/password for a JWT."""
     _check_login_rate_limit(request)
-    user_id = auth.authenticate(auth_req.username, auth_req.password)
+    user_id = auth.authenticate(auth_req.resolved_username, auth_req.password)
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid username or password.")
-    username = auth_req.username.strip()
+    username = auth_req.resolved_username
     return _auth_response(auth.issue_token(user_id, username), username)
 
 
