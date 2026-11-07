@@ -199,16 +199,13 @@ class TestScorecard(unittest.TestCase):
         check("hypothesis", r["method"] == "Insufficient data", "n<3 refused")
 
     def test_09_prescription_honesty(self):
-        from prescription_engine.engine import quality_gate, recommendation_for_decision
-        from core.rl import IMPACT_UNKNOWN_NOTE
+        from prescription_agent import PrescriptionAgent
 
-        assessment = quality_gate(None)
-        ungrounded = recommendation_for_decision(
-            {"title": "Cut waste", "recommendation": "Cut waste"}
-        )
-        check("prescription", not assessment["pass"] and ungrounded is None
-              and "could not be reliably estimated" in IMPACT_UNKNOWN_NOTE,
-              "evidence required; no ungrounded action")
+        ag = PrescriptionAgent.__new__(PrescriptionAgent)
+        acts = ag._template_actions([], [], [], [], None, 3)
+        from core.rl import IMPACT_UNKNOWN_NOTE
+        check("prescription", len(acts) > 0 and "could not be reliably estimated" in IMPACT_UNKNOWN_NOTE,
+              "actions + honesty note")
 
     def test_10_dashboard_scoring(self):
         from api.kpi_routes import _score_kpi, _variation

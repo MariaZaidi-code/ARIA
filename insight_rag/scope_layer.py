@@ -380,12 +380,6 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         if len(conversation_id) > 128:
             raise ValueError("Conversation id is too long.")
 
-        # Session scope contract: a non-empty list selects documents and is
-        # saved on the conversation; ``[]`` explicitly means "all documents";
-        # ``None`` reuses the conversation's saved selection (or all documents).
-        explicit_scope = document_ids is not None
-        if document_ids is not None and not document_ids:
-            document_ids = None
         if document_ids:
             document_ids = list(dict.fromkeys(str(value) for value in document_ids if str(value)))
             if len(document_ids) > MAX_SELECTED_DOCUMENTS:
@@ -401,17 +395,6 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         budget_token = begin_rag_llm_budget(RAG_MAX_LLM_CALLS_PER_QUERY)
         try:
             with self.conversations.turn_lock(conversation_id):
-                scope_source = "request" if document_ids else "all"
-                if not explicit_scope and self.conversations.exists(conversation_id):
-                    saved = self.conversations.load(conversation_id).get("scope_document_ids") or []
-                    if saved:
-                        owned = {str(doc.get("document_id")) for doc in self.metadata.list_documents()}
-                        document_ids = [str(did) for did in saved if str(did) in owned]
-                        if not document_ids:
-                            raise ValueError(
-                                "The documents in this chat were removed. Start a new chat or choose documents."
-                            )
-                        scope_source = "conversation"
                 if document_ids:
                     owned = {str(doc.get("document_id")) for doc in self.metadata.list_documents()}
                     if any(str(did) not in owned for did in document_ids):
@@ -443,11 +426,6 @@ class InsightPDFRAG(FinalInsightPDFRAG):
                         document_ids=result.get("document_ids", []),
                         search_query=result.get("search_query"), routing=result.get("routing"),
                     )
-                    if explicit_scope:
-                        self.conversations.update_meta(
-                            conversation_id, set_scope=True, scope_document_ids=document_ids)
-                result["scope_document_ids"] = list(document_ids) if document_ids else None
-                result["scope_source"] = scope_source
 
                 result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
                 trace = dict(TRACE.get() or {})

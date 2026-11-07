@@ -1,11 +1,7 @@
 """Persistent PDF metadata, conversation history, and LangChain PGVector access.
 
-Document metadata lives in PostgreSQL (``metadata_db``, same database as the
-vectors) whenever ``ARIA_RAG_DATABASE_URL`` is set, otherwise in a per-user
-``manifest.json``; ``ARIA_RAG_METADATA_BACKEND`` overrides the choice.
-
-Consistency contract: the vector index (PGVector), the metadata rows and the
-filesystem (chunk JSON + PDF bytes) are separate stores with no distributed
+Consistency contract: the vector index (PGVector) and the filesystem
+(manifest + chunk JSON + PDF bytes) are two stores with no distributed
 transaction. Callers (see ``InsightPDFRAG._ingest_pdf``) own the
 write-then-commit order and must roll both back together on any failure,
 failing loudly (raise, never report partial as healthy). Helpers here never
@@ -26,7 +22,6 @@ from pathlib import Path
 from langchain_core.documents import Document
 from filelock import FileLock
 
-from . import config as _config
 from .config import (
     RAG_COLLECTION_PREFIX,
     RAG_DATABASE_URL,
@@ -75,81 +70,44 @@ def _atomic_write(path: Path, payload) -> None:
             temp.unlink(missing_ok=True)
 
 
-def metadata_backend_name() -> str:
-    """Resolved metadata backend: ``"postgres"`` or ``"file"``."""
-    choice = _config.RAG_METADATA_BACKEND
-    if choice in ("file", "postgres"):
-        return choice
-    return "postgres" if _config.RAG_DATABASE_URL else "file"
-
-
-def _postgres_metadata(key: str):
-    from .metadata_db import PostgresDocumentMetadata
-
-    if not _config.RAG_DATABASE_URL:
-        raise RuntimeError("ARIA_RAG_METADATA_BACKEND=postgres requires ARIA_RAG_DATABASE_URL.")
-    return PostgresDocumentMetadata(key, _config.RAG_DATABASE_URL)
-
-
 class RAGMetadataStore:
     def __init__(self, user_id: str | int):
         self.user_id = str(user_id)
         self.root = user_dir(user_id)
         self.manifest_path = self.root / "manifest.json"
-        self.backend = metadata_backend_name()
-        self._db = None
-        if self.backend == "postgres":
-            self._db = _postgres_metadata(user_key(user_id))
-            self._db.import_manifest(self.manifest_path, _read_json)
 
     def mutation_lock(self):
         return FileLock(str(self.root / "mutation.lock"), timeout=30)
 
     def load_manifest(self) -> dict:
-        if self._db is not None:
-            return {"documents": {doc["document_id"]: doc for doc in self._db.list()}}
         with _LOCK:
             return _read_json(self.manifest_path, {"documents": {}})
 
     def save_manifest(self, manifest: dict) -> None:
-        if self._db is not None:
-            self._db.replace_all(list((manifest.get("documents") or {}).values()))
-            return
         with _LOCK:
             _atomic_write(self.manifest_path, manifest)
 
     def list_documents(self) -> list[dict]:
-        if self._db is not None:
-            return self._db.list()
         docs = list(self.load_manifest().get("documents", {}).values())
         docs.sort(key=lambda item: item.get("created_at", ""), reverse=True)
         return docs
 
     def get_document(self, document_id: str) -> dict | None:
-        if self._db is not None:
-            return self._db.get(document_id)
         return self.load_manifest().get("documents", {}).get(document_id)
 
     def find_by_sha256(self, digest: str) -> dict | None:
-        if self._db is not None:
-            return self._db.find_by_sha256(digest)
         for doc in self.list_documents():
             if doc.get("sha256") == digest:
                 return doc
         return None
 
     def put_document(self, metadata: dict) -> None:
-        if self._db is not None:
-            self._db.put(metadata)
-            return
         with FileLock(str(self.manifest_path) + ".lock", timeout=30):
             manifest = self.load_manifest()
             manifest.setdefault("documents", {})[metadata["document_id"]] = metadata
             self.save_manifest(manifest)
 
     def remove_document(self, document_id: str) -> dict | None:
-        if self._db is not None:
-            return self._db.remove(document_id)
         with FileLock(str(self.manifest_path) + ".lock", timeout=30):
             manifest = self.load_manifest()
             removed = manifest.setdefault("documents", {}).pop(document_id, None)
@@ -182,62 +140,6 @@ class RAGMetadataStore:
     def document_file_path(self, document_id: str) -> Path:
         ConversationStore._safe_id(document_id)
         return self.root / "documents" / f"{document_id}.pdf"
-
-
-def _legacy_manifests():
-    """Yield (owner_dir, manifest) for every user with a manifest.json (file backend)."""
-    base = _config.RAG_USERS_DIR
-    if not base.exists():
-        return
-    for owner_dir in base.iterdir():
-        manifest_path = owner_dir / "manifest.json"
-        if not owner_dir.is_dir() or not manifest_path.exists():
-            continue
-        try:
-            yield owner_dir, json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue  # one unreadable manifest must not hide every other share
-
-
-def find_shared_document(token: str) -> tuple[Path, dict] | None:
-    """Locate a document by its public share token across all users.
-
-    Returns ``(owner_dir, record)``; ``owner_dir`` holds the owner's chunk
-    files. Expiry is the caller's decision.
-    """
-    if not token:
-        return None
-    if metadata_backend_name() == "postgres":
-        from .metadata_db import PostgresDocumentMetadata
-
-        found = PostgresDocumentMetadata.find_share_token(_config.RAG_DATABASE_URL, token)
-        return (_config.RAG_USERS_DIR / found[0], found[1]) if found else None
-    for owner_dir, manifest in _legacy_manifests():
-        for record in (manifest.get("documents") or {}).values():
-            if record.get("share_token") == token:
-                return owner_dir, record
-    return None
-
-
-def documents_shared_with(username: str) -> list[dict]:
-    """Records other users shared with ``username`` (raw; callers strip private keys)."""
-    if not username:
-        return []
-    if metadata_backend_name() == "postgres":
-        from .metadata_db import PostgresDocumentMetadata
-
-        return PostgresDocumentMetadata.shared_with(_config.RAG_DATABASE_URL, username)
-    return [record
-            for _owner_dir, manifest in _legacy_manifests()
-            for record in (manifest.get("documents") or {}).values()
-            if username in (record.get("shared_with") or [])]
-
-
-def _conversation_title(question: str, limit: int = 80) -> str:
-    text = " ".join(str(question or "").split())
-    if len(text) <= limit:
-        return text or "New chat"
-    return text[:limit].rsplit(" ", 1)[0] + "…"
 
 
 class ConversationStore:
@@ -281,69 +183,8 @@ class ConversationStore:
             ):
                 messages.append({"role": role, "content": content, "sources": evidence,
                                  "metadata": metadata, "created_at": _utc_now()})
-            payload.setdefault("title", _conversation_title(question))
             payload["updated_at"] = _utc_now()
             _atomic_write(path, payload)
-
-    def exists(self, conversation_id: str) -> bool:
-        return self._path(conversation_id).exists()
-
-    def update_meta(self, conversation_id: str, *, scope_document_ids=None, set_scope: bool = False,
-                    title: str | None = None) -> None:
-        """Record session-level metadata (title, document scope) on an existing file.
-
-        ``scope_document_ids`` is the user's explicit selection for this chat;
-        ``None`` means "all of my documents". Older files without these fields
-        stay valid: readers treat missing keys as "no saved scope".
-        """
-        path = self._path(conversation_id)
-        if not path.exists():
-            return
-        with FileLock(str(path) + ".write.lock", timeout=30):
-            payload = self.load(conversation_id)
-            if set_scope:
-                payload["scope_document_ids"] = list(scope_document_ids) if scope_document_ids else None
-            if title and not payload.get("title"):
-                payload["title"] = title
-            payload["updated_at"] = payload.get("updated_at") or _utc_now()
-            _atomic_write(path, payload)
-
-    def summaries(self, limit: int = 50) -> list[dict]:
-        """Most recent conversations first, without message bodies."""
-        if not self.root.exists():
-            return []
-        files = sorted(self.root.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
-        out = []
-        for path in files[:max(1, limit)]:
-            conversation_id = path.stem
-            try:
-                self._safe_id(conversation_id)
-                payload = self.load(conversation_id)
-            except (ValueError, RuntimeError):
-                continue  # skip unreadable/foreign files rather than failing the list
-            messages = payload.get("messages") or []
-            first_question = next((m.get("content") for m in messages if m.get("role") == "user"), "")
-            out.append({
-                "conversation_id": conversation_id,
-                "title": payload.get("title") or _conversation_title(first_question),
-                "created_at": payload.get("created_at"),
-                "updated_at": payload.get("updated_at") or payload.get("created_at"),
-                "message_count": len(messages),
-                "scope_document_ids": payload.get("scope_document_ids"),
-            })
-        return out
-
-    def delete(self, conversation_id: str) -> bool:
-        path = self._path(conversation_id)
-        with FileLock(str(path) + ".write.lock", timeout=30):
-            existed = path.exists()
-            path.unlink(missing_ok=True)
-        for suffix in (".write.lock", ".turn.lock"):
-            try:
-                Path(str(path) + suffix).unlink(missing_ok=True)
-            except OSError:
-                pass  # a lock held by another request; harmless leftover
-        return existed
 
     def append(
         self,
@@ -422,59 +263,6 @@ def get_user_vector_store(user_id: str | int):
             _close_vector_store(evicted)
 
 
-_PROBE_TTL_SECONDS = 30.0
-_PROBE_CACHE: dict[str, tuple[float, dict]] = {}
-
-
-def _psycopg_url(url: str) -> str:
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+psycopg://", 1)
-    if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+psycopg://", 1)
-    if url.startswith("postgresql+psycopg2://"):
-        return url.replace("postgresql+psycopg2://", "postgresql+psycopg://", 1)
-    return url
-
-
-def probe_vector_database(*, timeout_seconds: int = 3) -> dict:
-    """Connect to the RAG database and confirm the pgvector extension exists.
-
-    Returns ``{"reachable": bool, "pgvector": bool, "error": str | None}``.
-    Cached briefly so a health dashboard polling the route cannot hammer the
-    database; the engine always uses a bounded connect timeout and is disposed.
-    """
-    import time
-
-    if not RAG_DATABASE_URL:
-        return {"reachable": False, "pgvector": False, "error": "not_configured"}
-    now = time.monotonic()
-    with _LOCK:
-        cached = _PROBE_CACHE.get(RAG_DATABASE_URL)
-        if cached and now - cached[0] < _PROBE_TTL_SECONDS:
-            return dict(cached[1])
-    result = {"reachable": False, "pgvector": False, "error": None}
-    engine = None
-    try:
-        from sqlalchemy import create_engine, text
-
-        engine = create_engine(_psycopg_url(RAG_DATABASE_URL), pool_pre_ping=False,
-                               connect_args={"connect_timeout": timeout_seconds})
-        with engine.connect() as conn:
-            result["reachable"] = True
-            row = conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")).first()
-            result["pgvector"] = row is not None
-            if row is None:
-                result["error"] = "pgvector_missing"
-    except Exception as exc:  # report the class only; never the DSN
-        result["error"] = type(exc).__name__
-    finally:
-        if engine is not None:
-            engine.dispose()
-    with _LOCK:
-        _PROBE_CACHE[RAG_DATABASE_URL] = (now, dict(result))
-    return result
-
-
 class UserPGVectorStore:
     """One isolated LangChain PGVector collection per authenticated user."""
 
@@ -492,7 +280,14 @@ class UserPGVectorStore:
                 "langchain-postgres is required for PDF RAG. Run: pip install langchain-postgres"
             ) from exc
 
-        connection = _psycopg_url(RAG_DATABASE_URL)
+        connection = RAG_DATABASE_URL
+        if connection.startswith("postgresql://"):
+            connection = connection.replace("postgresql://", "postgresql+psycopg://", 1)
+        elif connection.startswith("postgres://"):
+            connection = connection.replace("postgres://", "postgresql+psycopg://", 1)
+        elif connection.startswith("postgresql+psycopg2://"):
+            connection = connection.replace("postgresql+psycopg2://", "postgresql+psycopg://", 1)
+
         collection = f"{RAG_COLLECTION_PREFIX}_{user_key(user_id)}"
         self.store = PGVector(
             embeddings=FastBGEEmbeddings(),

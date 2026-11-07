@@ -12,7 +12,6 @@ import re
 from .conversation_layer import InsightPDFRAG as ConversationalInsightPDFRAG
 from .enterprise_quality import grounding_quality
 from .grounding import REFUSAL, citation_integrity
-from .source_view import build_visualization
 
 
 _CITATION_RE = re.compile(r"\[(S\d+)\]", re.IGNORECASE)
@@ -83,8 +82,6 @@ class InsightPDFRAG(ConversationalInsightPDFRAG):
 
         result["sources"] = sources
         result["retrieved_chunks"] = len(sources)
-        # Chart data comes only from cited table evidence; never from free text.
-        result["visualization"] = build_visualization(sources) if sources else None
         result["citation_status"] = citation_status
 
         context_plan = dict(result.get("context_plan") or {})

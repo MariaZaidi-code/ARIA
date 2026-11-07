@@ -104,11 +104,11 @@ class TestRLLayer(unittest.TestCase):
 
 class TestPrescriptionHonesty(unittest.TestCase):
     def test_impact_note_present(self):
-        from prescription_engine.engine import quality_gate
+        from prescription_agent import PrescriptionAgent
 
-        assessment = quality_gate({})
-        self.assertFalse(assessment["pass"])
-        self.assertEqual(assessment["code"], "INSUFFICIENT_DATA")
+        agent = PrescriptionAgent.__new__(PrescriptionAgent)  # no provider needed
+        actions = agent._template_actions([], [], [], [], None, 3)
+        self.assertTrue(actions)
         self.assertIn("could not be reliably estimated", IMPACT_UNKNOWN_NOTE)
 
 

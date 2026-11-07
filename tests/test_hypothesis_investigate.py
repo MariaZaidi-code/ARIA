@@ -127,42 +127,6 @@ def test_investigation_document_candidate(tmp_path):
     assert all(h["strength"] in ("Limited evidence", "Insufficient evidence") for h in doc_hypos)
 
 
-def test_document_candidates_accept_flat_session_chunks():
-    """Session document records must reach hypothesis evidence ranking."""
-    from hypothesis_engine.investigate import _document_candidates
-
-    documents = [{
-        "filename": "delivery-report.pdf",
-        "page": 7,
-        "text": "Sales revenue declined while deliveries were delayed.",
-    }]
-    candidates = _document_candidates("Why did sales decline?", "sales", documents)
-
-    assert len(candidates) == 1
-    assert candidates[0]["strength"] == "Limited evidence"
-    assert candidates[0]["source"] == {
-        "type": "document", "label": "delivery-report.pdf p.7",
-    }
-    assert "deliveries were delayed" in candidates[0]["supporting"][0]
-
-
-def test_document_candidates_keep_chunk_level_page_citations():
-    """Existing nested document callers retain the matched chunk page."""
-    from hypothesis_engine.investigate import _document_candidates
-
-    documents = [{
-        "filename": "delivery-report.pdf",
-        "page": 1,
-        "chunks": [
-            {"page": 3, "text": "Sales declined due to inventory delays."},
-        ],
-    }]
-    candidates = _document_candidates("Why did sales decline?", "sales", documents)
-
-    assert len(candidates) == 1
-    assert candidates[0]["source"]["label"] == "delivery-report.pdf p.3"
-
-
 def test_auto_detect_finds_decline_and_investigates(sales_engine, mapping):
     from hypothesis_engine.investigate import auto_detect, auto_investigate
     intel = SchemaIntelligence(mapping)

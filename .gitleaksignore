@@ -1,9 +1,0 @@
-# Historical test-fixture false positives verified from commit 60430d1.
-# Each entry identifies one specific rule/line in one historical commit.
-# Do not ignore the whole commit, entire tests directory, or generic-api-key rule.
-# Future credentials or other findings must remain actionable.
-60430d184d2ca54929a977dc1ce1932ebbda2543:tests/test_auth_hardening.py:generic-api-key:74
-60430d184d2ca54929a977dc1ce1932ebbda2543:tests/test_remediation.py:generic-api-key:42
-60430d184d2ca54929a977dc1ce1932ebbda2543:tests/test_remediation.py:generic-api-key:102
-60430d184d2ca54929a977dc1ce1932ebbda2543:tests/test_remediation.py:generic-api-key:114
-60430d184d2ca54929a977dc1ce1932ebbda2543:tests/test_remediation.py:generic-api-key:128

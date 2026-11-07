@@ -155,33 +155,23 @@ def bm25_search(query: str, documents: list[Document], *, limit: int,
     # corpus and keep the global top-``limit``. Page size keeps peak memory
     # flat regardless of library size.
     limit = max(0, int(limit))
-    total = len(documents)
-    query_set = set(query_terms)
-    # Pass 1: corpus-wide statistics (document frequency of query terms and
-    # average length) so IDF is identical for every scoring page. Only ints
-    # are kept, so peak memory stays flat.
-    frequency: Counter = Counter()
-    length_sum = 0
-    for doc in documents:
-        doc_terms = terms(_trunc(doc.page_content or "", max_chars_per_doc))
-        length_sum += len(doc_terms)
-        frequency.update(query_set.intersection(doc_terms))
-    average = length_sum / max(1, total) or 1.0
-    idf = {term: math.log(1 + (total - frequency[term] + 0.5) / (frequency[term] + 0.5))
-           for term in query_set}
     scored: list[tuple[float, int]] = []
     offset = 0
+    total = len(documents)
     while offset < total:
         page = documents[offset:offset + page_size]
         counts = [Counter(terms(_trunc(doc.page_content or "", max_chars_per_doc))) for doc in page]
         lengths = [sum(count.values()) for count in counts]
+        average = sum(lengths) / max(1, len(lengths)) or 1.0
+        frequency = Counter(term for count in counts for term in count)
         for local, count in enumerate(counts):
             score = 0.0
-            for term in query_set:
+            for term in set(query_terms):
                 tf = count.get(term, 0)
                 if not tf:
                     continue
-                score += idf[term] * tf * 2.5 / (tf + 1.5 * (0.25 + 0.75 * lengths[local] / average))
+                idf = math.log(1 + (len(counts) - frequency[term] + 0.5) / (frequency[term] + 0.5))
+                score += idf * tf * 2.5 / (tf + 1.5 * (0.25 + 0.75 * lengths[local] / average))
             if score > 0:
                 scored.append((score, offset + local))
         offset += page_size

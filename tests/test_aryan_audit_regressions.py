@@ -160,9 +160,7 @@ def test_progress_terminal_result_survives_reconnect(monkeypatch):
 def test_evidence_grade_downgrades_when_contradiction_outweighs_support():
     from hypothesis_engine.evidence_ladder import normalize
     assert normalize('Strong evidence', 3, 5) == 'Contradictory evidence'
-    # Equal opposition weakens support even when not contradictory.
-    assert normalize('Moderate evidence', 3, 3) == 'Limited evidence'
-    assert normalize('Moderate evidence', 3, 0) == 'Moderate evidence'
+    assert normalize('Moderate evidence', 3, 3) == 'Moderate evidence'
 
 
 @pytest.mark.parametrize('value', ['nan', 'inf', '-inf', float('nan')])

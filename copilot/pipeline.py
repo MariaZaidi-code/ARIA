@@ -104,42 +104,6 @@ class CopilotAnswer:
         return out
 
 
-def _clean_document_passage(raw: str) -> str:
-    """Flatten Markdown tables into readable document text without discarding values.
-
-    Keep headings and prose; represent each table row with its column labels.
-    No HTML is interpreted or executed.
-    """
-    lines = [line.strip() for line in str(raw or "").splitlines() if line.strip()]
-    output = []
-    headers = None
-
-    def cells(line: str) -> list[str]:
-        return [cell.strip() for cell in line.strip().strip("|").split("|")]
-
-    for index, line in enumerate(lines):
-        if "|" in line:
-            row = cells(line)
-            separator = all(re.fullmatch(r":?-{3,}:?", col) for col in row)
-            if separator:
-                # The preceding line is the table header, not ordinary prose.
-                if index > 0 and "|" in lines[index - 1] and output:
-                    header = cells(lines[index - 1])
-                    if len(header) == len(row):
-                        output.pop()
-                        headers = header
-                continue
-            if headers and len(row) == len(headers):
-                output.append("; ".join(
-                    f"{head}: {value}" for head, value in zip(headers, row)
-                    if head and value
-                ))
-                continue
-        headers = None
-        output.append(line)
-    return " ".join(" ".join(output).split())
-
-
 def _numeric(v) -> bool:
     if isinstance(v, bool):
         return False
@@ -820,7 +784,7 @@ class CopilotPipeline:
             for score, text, meta, fname in top:
                 page = meta.get("page")
                 label = f"{fname}" + (f" p.{page}" if page is not None else "")
-                snippet = _clean_document_passage(text)[:400]
+                snippet = " ".join(text.split())[:400]
                 parts.append(f"From {label}: {snippet}")
                 sources.append({"label": label, "page": page})
             lead = ("Here's what your document says on that:"

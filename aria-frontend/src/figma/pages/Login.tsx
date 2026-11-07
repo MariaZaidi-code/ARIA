@@ -156,7 +156,7 @@ export default function Login({ onLogin }: LoginProps) {
               </div>
 
               <div className="login-chart">
-                <span className="login-float-label">Data Discovery</span>
+                <span className="login-float-label">Schema Discovery</span>
                 <svg
                   className="login-chart-svg"
                   viewBox="0 0 140 44"
@@ -183,8 +183,8 @@ export default function Login({ onLogin }: LoginProps) {
           <div className="login-showcase-bottom">
             <ul className="login-showcase-features">
               <li>Connect your databases &amp; files</li>
-              <li>ARIA maps your tables automatically</li>
-              <li>Ask questions in plain English</li>
+              <li>Explore your schema automatically</li>
+              <li>Ask questions without SQL</li>
             </ul>
             <div className="login-showcase-footer">
               Secure intelligent analytics · ARIA

@@ -408,13 +408,10 @@ function HypothesesTab({ onAsk, onGoto }: { onAsk: (q: string) => void; onGoto: 
   const gradeOf = (h: any, factors: any[], evidenceCount: number): { label: string; reason: string; tone: string } => {
     const g = strOf(h?.evidence_grade || "").toLowerCase();
     const reason = strOf(h?.evidence_reason || "");
-    if (/contradictory/.test(g)) return { label: "Contradictory evidence", reason: reason || "Measured results point against this explanation.", tone: "bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/25" };
-    if (/insufficient/.test(g)) return { label: "Insufficient evidence", reason: reason || "Not enough measured data to assess this yet.", tone: "bg-secondary text-secondary-foreground border-border" };
-    if (/limited/.test(g)) return { label: "Limited evidence", reason: reason || "A measured pattern exists, but the cause is unknown.", tone: "bg-secondary text-secondary-foreground border-border" };
     if (/strong/.test(g)) return { label: "Strong evidence", reason: reason || "Strong — the pattern is backed by comparatively strong supporting signs.", tone: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25" };
     if (/mixed|moderate|medium/.test(g)) return { label: "Mixed evidence", reason: reason || "Mixed — there are supporting signs, but also reasons to keep checking.", tone: "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" };
     if (/weak/.test(g)) return { label: "Weak evidence", reason: reason || "Weak — only early signs so far, treat this as a question to explore.", tone: "bg-secondary text-secondary-foreground border-border" };
-    const s = strOf(h?.evidence_grade || h?.evidence_strength || h?.strength || "").toLowerCase();
+    const s = strOf(h?.evidence_strength || h?.strength || "").toLowerCase();
     if (/strong/.test(s)) return { label: "Strong evidence", reason: "Strong — the supporting signs behind this pattern look comparatively strong.", tone: "bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/25" };
     if (/moderate|medium/.test(s)) return { label: "Mixed evidence", reason: "Mixed — some supporting signs, but the picture is not yet firm.", tone: "bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/25" };
     if (/weak|limited|early/.test(s)) return { label: "Weak evidence", reason: "Weak — only early signs so far, treat this as a question to explore.", tone: "bg-secondary text-secondary-foreground border-border" };
@@ -2087,8 +2084,7 @@ function ReportsTab({ meta }: { meta: any }) {
     setDigBusyId(id);
     setActMsg("");
     try {
-      const result: any = await apiFetch(`/intelligence/digests/${encodeURIComponent(id)}/run`, { method: "POST" });
-      if (result?.ok === false) throw new Error(result.detail || "Digest run failed.");
+      await apiFetch(`/intelligence/digests/${encodeURIComponent(id)}/run`, { method: "POST" });
       setActMsg("Digest ran with fresh numbers — see the newest report below.");
       loadDigests();
       loadReports();
@@ -2161,21 +2157,6 @@ function ReportsTab({ meta }: { meta: any }) {
       setActMsg("Report downloaded as HTML — open it and Print → Save as PDF for a PDF copy.");
     } catch (e: any) {
       setActMsg(businessError(e?.message) || "ARIA couldn't download this report.");
-    } finally {
-      setRepBusyId(null);
-    }
-  };
-
-  const downloadServerPdf = async (id: string, fallbackName: string) => {
-    if (!id || repBusyId) return;
-    setRepBusyId(id);
-    setActMsg("");
-    try {
-      const result = await intelligenceApi.getReportPdf(id);
-      savePdf((result as any).data as Blob, fallbackName);
-      setActMsg("PDF downloaded.");
-    } catch (e: any) {
-      setActMsg(businessError(e?.message) || "ARIA couldn't download the PDF.");
     } finally {
       setRepBusyId(null);
     }
@@ -2255,44 +2236,29 @@ function ReportsTab({ meta }: { meta: any }) {
     if (secs.length) setSections(secs);
   };
 
-  const savePdf = (blob: Blob, fallbackName: string) => {
-    if (!blob || !blob.size) throw new Error("PDF response was empty.");
-    const safeName = (fallbackName || "aria-report").replace(/[^a-z0-9-_]+/gi, "-").toLowerCase();
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${safeName}.pdf`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 2000);
-  };
-
   const generatePdf = async () => {
-    if (readOnly || genBusy) return;
+    if (readOnly) return;
     setGenBusy(true);
     setGenError("");
     setGenOk("");
     try {
-      const generated = await intelligenceApi.generateReport({
+      /* Working-draft hypotheses ride along as items; the backend resolves
+         them against live hypotheses into a custom section. */
+      await intelligenceApi.generateReport({
         name: name || undefined, description: description || undefined,
         date_range: dateRange || undefined, sections,
         template: templateId || undefined,
         ...(draftItems.length ? { items: draftItems } : {}),
       });
-      const reportId = strOf((generated as any)?.data?.id);
-      if (!/^[0-9a-f]{12}$/i.test(reportId)) throw new Error("ARIA did not return a valid saved report ID.");
-      const downloaded = await intelligenceApi.getReportPdf(reportId);
-      savePdf((downloaded as any).data as Blob, name || "aria-report");
       if (draftItems.length) {
         clearReportDraft();
         setDraftItems([]);
       }
-      setGenOk("PDF report downloaded and saved to report history.");
+      setGenOk("Report generated. Opening print view — choose Save as PDF.");
       loadReports();
+      setTimeout(() => { try { window.print(); } catch { /* ignore */ } }, 400);
     } catch (e: any) {
-      setGenError(businessError(e?.message) || "ARIA couldn't generate this PDF.");
-      loadReports(); // A report may have been saved even if its download failed.
+      setGenError(businessError(e?.message) || "ARIA couldn't generate this report.");
     } finally {
       setGenBusy(false);
     }
@@ -2308,8 +2274,7 @@ function ReportsTab({ meta }: { meta: any }) {
         loadTemplates();
       } else if (kind === "schedule") {
         await apiFetch("/intelligence/reports/schedule", { method: "POST", body: JSON.stringify({ name, date_range: dateRange, sections, template: templateId }) });
-        setActMsg("Report scheduled — see Scheduled Digests below.");
-        loadDigests();
+        setActMsg("Report scheduled.");
       } else if (kind === "share") {
         await apiFetch("/intelligence/reports/share", { method: "POST", body: JSON.stringify({ name, date_range: dateRange, sections, template: templateId }) });
         setActMsg("Share link created.");
@@ -2581,7 +2546,6 @@ function ReportsTab({ meta }: { meta: any }) {
                   <button onClick={() => runDigestNow(d)} disabled={digBusyId === did || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Run digest now ${strOf(d?.name || "")}`}>{digBusyId === did ? "Running…" : "Run now"}</button>
                   <button onClick={() => toggleDigest(d)} disabled={digBusyId === did || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={d?.enabled ? `Pause digest ${strOf(d?.name || "")}` : `Enable digest ${strOf(d?.name || "")}`}>{d?.enabled ? "Pause" : "Enable"}</button>
                   {lastReportId && <button onClick={() => viewDigestHtml(lastReportId)} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline" aria-label={`View last digest report ${strOf(d?.name || "")}`}>View</button>}
-                  {lastReportId && <button onClick={() => downloadServerPdf(lastReportId, strOf(d?.name || "digest"))} disabled={repBusyId === lastReportId} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Download last digest PDF ${strOf(d?.name || "")}`}>PDF</button>}
                   {lastReportId && <button onClick={() => downloadServerHtml(lastReportId, strOf(d?.name || "digest"))} disabled={repBusyId === lastReportId} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Download last digest report ${strOf(d?.name || "")}`}>Download</button>}
                   <button onClick={() => deleteDigest(d)} disabled={digBusyId === did || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 disabled:opacity-40" aria-label={`Delete digest ${strOf(d?.name || "")}`}>Delete</button>
                 </div>
@@ -2603,7 +2567,6 @@ function ReportsTab({ meta }: { meta: any }) {
                 <p className="text-[11px] text-muted-foreground">{strOf(r?.generated_at || r?.created_at || "")}{asList(r?.sections).length ? ` · ${asList(r.sections).length} sections` : ""}</p>
               </div>
               <button onClick={() => viewReport(strOf(r?.id))} disabled={!r?.id} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`View report ${strOf(r?.name || "")}`}>View</button>
-              {strOf(r?.id) && <button onClick={() => downloadServerPdf(strOf(r.id), strOf(r?.name || "aria-report"))} disabled={repBusyId === strOf(r.id)} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Download report PDF ${strOf(r?.name || "")}`}>{repBusyId === strOf(r.id) ? "Working…" : "Download"}</button>}
               {strOf(r?.id) && <button onClick={() => downloadServerHtml(strOf(r.id), strOf(r?.name || "aria-report"))} disabled={repBusyId === strOf(r.id)} className="text-[11px] font-semibold text-blue-700 dark:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Download report HTML ${strOf(r?.name || "")}`}>{repBusyId === strOf(r.id) ? "Working…" : "Download"}</button>}
               {strOf(r?.id) && <button onClick={() => rerunOne(strOf(r.id))} disabled={repBusyId === strOf(r.id) || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label={`Re-run report ${strOf(r?.name || "")}`}>Re-run</button>}
               {strOf(r?.id) && <button onClick={() => deleteReport(strOf(r.id))} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[11px] font-medium text-muted-foreground hover:text-rose-600 dark:hover:text-rose-400 disabled:opacity-50" aria-label={`Delete report ${strOf(r?.name || "")}`}>Delete</button>}

@@ -549,16 +549,10 @@ class TestRateLimitAndErrors(unittest.TestCase):
 
 class TestSecretBoxKeepalive(unittest.TestCase):
     def test_roundtrip(self):
-        import sys
-        from core.secret_box import encrypt, decrypt, PREFIX, is_encrypted
+        from core.secret_box import encrypt, decrypt, PREFIX
 
         enc = encrypt("s3cr3t-value")
-        if sys.platform == "win32":
-            self.assertTrue(enc.startswith(PREFIX))
-            self.assertTrue(is_encrypted(enc))
-        else:
-            # DPAPI is Windows-only; on Linux plaintext must not claim encryption.
-            self.assertFalse(is_encrypted(enc))
+        self.assertTrue(enc.startswith(PREFIX))
         self.assertEqual(decrypt(enc), "s3cr3t-value")
         self.assertEqual(decrypt("plain"), "plain")
 

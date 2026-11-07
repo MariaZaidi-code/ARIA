@@ -48,9 +48,7 @@ from .config import (
 from .diagnostics import increment, record, stage
 from .enterprise_quality import quarantine_score, should_quarantine_chunk
 from .pdf_ingest import extract_pdf_documents
-from .locations import context_location
 from .retrieval import bm25_search, chunk_key
-from .source_view import clean_snippet, source_extras
 from .ingestion import PDFIngestion
 from .providers import configure_rag_models
 from .storage import ConversationStore, RAGMetadataStore, UserPGVectorStore
@@ -596,7 +594,7 @@ class InsightPDFRAG(PDFIngestion):
             label = self._source_label(index)
             content_type = meta.get("content_type", "text")
             table_index = meta.get("table_index")
-            title = f"[{label}] {meta.get('filename')} — {context_location(meta)} — {content_type}"
+            title = f"[{label}] {meta.get('filename')} — page {meta.get('page')} — {content_type}"
             if content_type == "table" and table_index:
                 title += f" {table_index}"
             remaining = MAX_CONTEXT_CHARS - used_chars - (2 if blocks else 0)
@@ -619,9 +617,8 @@ class InsightPDFRAG(PDFIngestion):
                     "content_type": content_type,
                     "table_index": table_index,
                     "chunk_id": meta.get("chunk_id"),
-                    "snippet": clean_snippet(content),
+                    "snippet": content[:280].replace("\n", " "),
                     "context_truncated": content != doc.page_content.strip(),
-                    **source_extras(meta, content),
                     "retrieval_votes": meta.get("retrieval_votes"),
                     "retrieval_query_count": meta.get("retrieval_query_count"),
                     "retrieval_channel_votes": meta.get("retrieval_channel_votes"),
