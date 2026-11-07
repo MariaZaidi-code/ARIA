@@ -6,6 +6,8 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { intelligenceApi, normalizeApiError } from "../../../services/api";
 import { asList, strOf, humanize, businessError } from "../../lib/intelHelpers";
+import { useReadOnly } from "../../lib/readonly";
+import { localStore, sessionStore } from "../../../utils/storage.js";
 
 export type RangeKey = "3m" | "6m" | "12m" | "all";
 
@@ -96,6 +98,7 @@ const optOf = (x: any): { value: string; label: string } => {
 };
 
 export function useExplore(meta: any) {
+  const readOnly = useReadOnly();
   const metrics: { value: string; label: string }[] = useMemo(() => {
     const m = meta?.metrics ?? meta?.measures ?? [];
     return asList(m).map(optOf).filter((o) => o.value);
@@ -171,19 +174,19 @@ export function useExplore(meta: any) {
     if (!metrics.length && !breakdowns.length) return;
     let prefill: { metric?: string; breakdown?: string } | null = null;
     try {
-      const raw = sessionStorage.getItem("aria_explore_prefill");
+      const raw = sessionStore.getItem("aria_explore_prefill");
       if (raw) {
         const parsed = JSON.parse(raw);
         prefill = {
           ...(parsed?.metric ? { metric: String(parsed.metric) } : {}),
           ...(parsed?.breakdown ? { breakdown: String(parsed.breakdown) } : {}),
         };
-        sessionStorage.removeItem("aria_explore_prefill");
+        sessionStore.removeItem("aria_explore_prefill");
       }
     } catch { prefill = null; }
     if (!prefill?.metric && !prefill?.breakdown) {
       try {
-        const raw = localStorage.getItem("aria_dashboard_drill");
+        const raw = localStore.getItem("aria_dashboard_drill");
         if (raw) {
           const parsed = JSON.parse(raw);
           if (parsed?.kind === "hypothesis" || parsed?.kind === "hypothesis-factor") {
@@ -258,6 +261,7 @@ export function useExplore(meta: any) {
 
   const runAnalysis = useCallback(
     async (override?: Record<string, unknown>) => {
+      if (readOnly) return;
       runAbort.current?.abort();
       const ctrl = new AbortController();
       runAbort.current = ctrl;
@@ -290,7 +294,7 @@ export function useExplore(meta: any) {
         if (runAbort.current === ctrl) setRunning(false);
       }
     },
-    [buildPayload],
+    [buildPayload, readOnly],
   );
 
   useEffect(() => () => runAbort.current?.abort(), []);
@@ -302,7 +306,7 @@ export function useExplore(meta: any) {
      honors ?run=1 in the URL hash for deep links. Guarded by ref to avoid
      loops; manual Run always still works. */
   useEffect(() => {
-    if (!metrics.length || !metric || result || running || error) return;
+    if (readOnly || !metrics.length || !metric || result || running || error) return;
     let wantAuto = false;
     try {
       if (/[?&]run=1/.test(window.location.hash || "")) wantAuto = true;
@@ -315,7 +319,7 @@ export function useExplore(meta: any) {
     if (autoRanFor.current === key) return;
     autoRanFor.current = key;
     runAnalysis();
-  }, [metrics, metric, breakdown, grain, comparison, rangeKey, result, running, error, runAnalysis]);
+  }, [metrics, metric, breakdown, grain, comparison, rangeKey, result, running, error, runAnalysis, readOnly]);
 
   /* Switching the range selector re-runs immediately with an explicit
      {start,end,label} window derived from the live trend (or the
@@ -392,7 +396,7 @@ export function useExplore(meta: any) {
 
   const deleteSavedAnalysis = useCallback(
     async (id: string) => {
-      if (!id) return;
+      if (readOnly || !id) return;
       try {
         await intelligenceApi.deleteAnalysis(id);
         loadRecent();
@@ -400,11 +404,11 @@ export function useExplore(meta: any) {
         setSaveMsg(businessError(e?.message) || "ARIA couldn't delete this analysis.");
       }
     },
-    [loadRecent],
+    [loadRecent, readOnly],
   );
 
   const saveAnalysis = useCallback(async () => {
-    if (!result) return;
+    if (readOnly || !result) return;
     setSaving(true);
     setSaveMsg("");
     try {
@@ -419,7 +423,7 @@ export function useExplore(meta: any) {
     } finally {
       setSaving(false);
     }
-  }, [result, buildPayload, loadRecent]);
+  }, [result, buildPayload, loadRecent, readOnly]);
 
   /* Honest range chip: what the last run actually sent. */
   const activeRangeLabel =

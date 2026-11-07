@@ -4,7 +4,10 @@ import { useTheme } from "../App";
 import { InsightChart, normalizeInsightViz } from "../components/charts";
 import type { DrillSelection } from "../components/charts";
 import { saveAnalysisContext } from "../lib/analysisContext";
+import { humanizeLabel } from "../lib/labels";
 import { apiFetch, normalizeApiError } from "../../services/api";
+import { localStore, sessionStore } from "../../utils/storage.js";
+import { datasetLabel } from "../lib/labels";
 
 /* =====================================================================
    ARIA Insights — premium list + explain experience (PNG 1 + PNG 2).
@@ -23,6 +26,8 @@ interface InsightEvidence {
   currentValue?: number;
   changePercent?: number;
   limitations?: string[] | string;
+  affectedSegment?: string;
+  affectedRecordCount?: number;
 }
 
 interface InsightBusinessImpact {
@@ -59,6 +64,7 @@ interface Insight {
   title: string;
   description: string;
   metric: string;
+  valueFormat?: "currency" | "number";
   metricValue?: number;
   previousValue?: number;
   magnitude: string;
@@ -112,7 +118,10 @@ function matchesFilter(type: string, filter: string): boolean {
     case "performance": return t.includes("growth") || t.includes("decline");
     case "anomalies": return t.includes("anomal") || t.includes("outlier");
     case "relationships": return t.includes("correl") || t.includes("relation");
-    case "opportunities": return t.includes("opportunit") || t.includes("growth");
+    // Growth is classified and labeled as Performance by primaryCategory.
+    // Keep the opportunity count/filter aligned with the category displayed
+    // on each card instead of counting growth cards in both categories.
+    case "opportunities": return t.includes("opportunit");
     case "risks": return t.includes("risk") || t.includes("decline");
     default: return true;
   }
@@ -138,13 +147,7 @@ function typeLabel(type: string): string {
    to the UI. humanize("total_amt") -> "Total amt" via schema-friendly words.
    Table-qualified refs ("orders.total_amt") resolve to the column label. ---- */
 function humanize(v: unknown): string {
-  const raw = String(v ?? "").trim();
-  if (!raw) return "";
-  const s = raw.includes(".") ? raw.slice(raw.lastIndexOf(".") + 1) : raw;
-  if (!s) return "";
-  const spaced = s.replace(/[_-]+/g, " ").replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/\s+/g, " ").trim();
-  if (/^[A-Z0-9_()%. ]+$/.test(s) && s.length <= 8) return s.replace(/_/g, " ");
-  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+  return humanizeLabel(v);
 }
 
 /* ---- Plain business language: backend prose can carry detector jargon
@@ -209,6 +212,21 @@ function plainBusiness(v: unknown): string {
   s = s.replace(/\s{2,}/g, " ").trim();
   s = s.replace(/^[,;:\-–—\s]+/, "").trim();
   return s;
+}
+
+/* Keep the first row per id: backend ids are unique today, but persisted
+   lists (older files, merged sources) can still carry duplicates and React
+   keys / openInsight(id) lookups must stay unambiguous. */
+function dedupeInsights(list: Insight[]): Insight[] {
+  const seen = new Set<string>();
+  const out: Insight[] = [];
+  for (const ins of Array.isArray(list) ? list : []) {
+    const key = String(ins?.id || "").slice(0, 160) || `${out.length}_blank`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ins);
+  }
+  return out;
 }
 
 /* Display helpers: title / description / magnitude in plain business words.
@@ -346,6 +364,15 @@ const fmtMoney = (v?: number | null) => {
   return `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
 };
 
+const MONEY_METRIC_TERMS = new Set(["price", "cost", "amount", "total", "revenue", "sales", "income", "expense", "profit", "freight", "tax", "payment", "balance", "charge", "fee", "wage", "salary", "billing"]);
+function fmtInsightValue(ins: Insight, value?: number | null): string {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+  if (ins.valueFormat === "currency") return fmtMoney(value);
+  const metricTokens = (ins.metric || "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (metricTokens.some((token) => MONEY_METRIC_TERMS.has(token))) return fmtMoney(value);
+  return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
 /* ---- Copilot-style error detail: backend `detail` verbatim when it adds
    context, capped + sanitized so SQL/traces never leak to the UI. ---- */
 function cleanDetail(v: unknown, fallback: string): string {
@@ -471,7 +498,7 @@ function EvidenceDataTable({ ins }: { ins: Insight }) {
   const cols = Object.keys(first).slice(0, 4);
   if (!cols.length) return null;
   const cell = (v: unknown): string => {
-    if (typeof v === "number" && !isNaN(v)) return fmtMoney(v);
+    if (typeof v === "number" && !isNaN(v)) return fmtInsightValue(ins, v);
     if (typeof v === "boolean") return v ? "yes" : "no";
     return String(v ?? "—").slice(0, 40);
   };
@@ -516,7 +543,7 @@ function writeCopilotContext(ins: Insight, question: string, segment?: string | 
   try {
     const dims = ins.recommendedNextAnalysis?.dimensions || [];
     const seg = (segment || dims[0] || "").trim() || null;
-    sessionStorage.setItem("aria_copilot_context", JSON.stringify({
+    sessionStore.setItem("aria_copilot_context", JSON.stringify({
       metric: (ins.metric || "").split(" (")[0] || null,
       period: ins.affectedPeriod || null,
       segment: seg,
@@ -710,7 +737,7 @@ function decisionSentenceOf(ins: Insight): string {
   const base = ins.evidence?.baseline;
   const cur = ins.evidence?.currentValue;
   if (!how && isFiniteNum(base) && isFiniteNum(cur)) {
-    how = `from ${fmtMoney(base)} to ${fmtMoney(cur)}`;
+    how = `from ${fmtInsightValue(ins, base)} to ${fmtInsightValue(ins, cur)}`;
   }
   if (!how) return "";
   const det = recommendationDetailOf(ins);
@@ -731,8 +758,8 @@ function anomalyBaselineOf(ins: Insight): string {
   const t = (ins.type || "").toLowerCase();
   if (!t.includes("anomal") && !t.includes("outlier")) return "";
   const usual = expectedRangePlain(ins)
-    || (isFiniteNum(ins.evidence?.baseline) ? fmtMoney(ins.evidence.baseline) : "");
-  const thisTime = isFiniteNum(ins.evidence?.currentValue) ? fmtMoney(ins.evidence.currentValue) : "";
+    || (isFiniteNum(ins.evidence?.baseline) ? fmtInsightValue(ins, ins.evidence.baseline) : "");
+  const thisTime = isFiniteNum(ins.evidence?.currentValue) ? fmtInsightValue(ins, ins.evidence.currentValue) : "";
   if (!usual || !thisTime || usual === "—" || thisTime === "—") return "";
   const started = fmtWhen(ins.detectedAt || "") || (ins.affectedPeriod || "").trim().slice(0, 60);
   const lasted = isFiniteNum(ins.evidence?.sampleSize) && (ins.evidence?.sampleSize as number) > 0
@@ -749,18 +776,9 @@ function anomalyBaselineOf(ins: Insight): string {
 
 /* 3) At-stake estimate: affected records x typical value, in plain words. */
 function atStakeOf(ins: Insight): string {
-  const records = ins.evidence?.sampleSize;
-  const typical = isFiniteNum(ins.evidence?.baseline)
-    ? ins.evidence?.baseline as number
-    : isFiniteNum(ins.evidence?.currentValue)
-      ? ins.evidence?.currentValue as number
-      : isFiniteNum(ins.metricValue)
-        ? ins.metricValue as number
-        : null;
-  if (!isFiniteNum(records) || (records as number) < 1 || typical === null || !isFinite(typical)) return "";
-  const total = (records as number) * (typical as number);
-  if (!isFinite(total) || total <= 0) return "";
-  return `About ${Math.round(records as number).toLocaleString()} records at roughly ${fmtMoney(typical)} each — about ${fmtMoney(total)} at stake.`;
+  const amount = ins.businessImpact?.value;
+  if (!isFiniteNum(amount) || amount <= 0) return "";
+  return `Estimated impact: ${fmtInsightValue(ins, amount)}.`;
 }
 
 /* 4) One plain "why shown" clause per evidence row. */
@@ -778,7 +796,7 @@ function whyShownFor(kind: string): string {
    (localStorage `aria_dashboard_drill`), then the caller navigates. */
 function storeDrillContextLocal(ctx: Record<string, unknown>): void {
   try {
-    localStorage.setItem("aria_dashboard_drill", JSON.stringify({ at: Date.now(), ...ctx }));
+    localStore.setItem("aria_dashboard_drill", JSON.stringify({ at: Date.now(), ...ctx }));
   } catch { /* private mode: navigation still works */ }
 }
 
@@ -926,7 +944,11 @@ export default function Insights({
   const propInsights: Insight[] = Array.isArray(insightResult?.keyInsights)
     ? insightResult.keyInsights.map(adaptLegacyInsight)
     : [];
-  const allInsights: Insight[] = insights.length > 0 ? insights : propInsights;
+  // Dedupe by id: legacy saved backends may emit duplicate deterministic
+  // ids; React keys and openInsight(lookup-by-id) must stay unambiguous.
+  const allInsights: Insight[] = dedupeInsights(
+    insights.length > 0 ? insights : propInsights,
+  );
 
   const metrics = useMemo(() => ["All", ...Array.from(new Set(allInsights.map((i) => (i.metric || "").split(" (")[0]).filter(Boolean))).slice(0, 12)], [allInsights]);
 
@@ -941,15 +963,19 @@ export default function Insights({
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { critical: 0 };
+    const matchesOtherFilters = (ins: Insight) =>
+      (!criticalOnly || (ins.severity || "").toLowerCase() === "high") &&
+      (metricFilter === "All" || (ins.metric || "").startsWith(metricFilter) || (ins.metric || "") === metricFilter);
     for (const f of FILTERS) {
       if (f.id === "all") continue;
-      c[f.id] = allInsights.filter((ins) => matchesFilter(ins.type, f.id)).length;
+      c[f.id] = allInsights.filter((ins) => matchesFilter(ins.type, f.id) && matchesOtherFilters(ins)).length;
     }
     for (const ins of allInsights) {
-      if ((ins.severity || "").toLowerCase() === "high") c.critical += 1;
+      if ((ins.severity || "").toLowerCase() === "high" &&
+          (metricFilter === "All" || (ins.metric || "").startsWith(metricFilter) || (ins.metric || "") === metricFilter)) c.critical += 1;
     }
     return c;
-  }, [allInsights]);
+  }, [allInsights, criticalOnly, metricFilter]);
 
   const openInsight = (id: string) => {
     setSelectedId(id);
@@ -976,7 +1002,7 @@ export default function Insights({
 
   const persistHandoff = (ins: Insight) => {
     try {
-      sessionStorage.setItem("aria_insight_handoff", JSON.stringify(handoffContext(ins)));
+      sessionStore.setItem("aria_insight_handoff", JSON.stringify(handoffContext(ins)));
     } catch { /* storage full: navigation still works */ }
     // Shared cross-module context (metric/dataset/date/filters/dimension
     // preserved; targets preselect without re-analyzing).
@@ -1024,13 +1050,13 @@ export default function Insights({
     // Copilot context preserved across Why/investigate (CopilotRequest.context).
     writeCopilotContext(ins, q, dims[0] || null);
     try {
-      const prev = JSON.parse(sessionStorage.getItem("aria_shared_context") || "{}");
-      sessionStorage.setItem("aria_shared_context", JSON.stringify({
+      const prev = JSON.parse(sessionStore.getItem("aria_shared_context") || "{}");
+      sessionStore.setItem("aria_shared_context", JSON.stringify({
         ...prev, question: q, metric: ins.metric, dimensions: dims,
         period: ins.affectedPeriod || prev.period, origin: "insights",
         updatedAt: Date.now(),
       }));
-      sessionStorage.setItem("aria_insight_handoff", JSON.stringify({
+      sessionStore.setItem("aria_insight_handoff", JSON.stringify({
         origin: "insights", question: q, metric: ins.metric,
       }));
     } catch { /* ignore */ }
@@ -1041,10 +1067,10 @@ export default function Insights({
   const openForecast = (ins: Insight) => {
     persistHandoff(ins);
     try {
-      sessionStorage.setItem("aria_forecast_prefill", JSON.stringify({ metric: ins.metric, period: ins.affectedPeriod, source: ins.source }));
+      sessionStore.setItem("aria_forecast_prefill", JSON.stringify({ metric: ins.metric, period: ins.affectedPeriod, source: ins.source }));
       // Shared Forecast context: metric + dataset + date preselected on the
       // Forecast page (localStorage key, consumed once).
-      localStorage.setItem("aria_forecast_context", JSON.stringify({
+      localStore.setItem("aria_forecast_context", JSON.stringify({
         metric: ins.metric,
         dataset: ins.source?.tables?.[0] || undefined,
         date: ins.affectedPeriod || undefined,
@@ -1103,13 +1129,13 @@ export default function Insights({
     const q = askText.trim();
     if (!q) return;
     try {
-      sessionStorage.setItem("aria_copilot_context", JSON.stringify({ origin: "insights", question: q }));
+      sessionStore.setItem("aria_copilot_context", JSON.stringify({ origin: "insights", question: q }));
     } catch { /* best-effort */ }
     setAskText("");
     if (onAskQuestion) onAskQuestion(q);
   };
 
-  const displayDbName = sessionInfo.dbName || propDbName || "";
+  const displayDbName = datasetLabel(sessionInfo.dbName || propDbName || "");
   const displaySourceType = sessionInfo.sourceType || propSourceType || "";
 
   const recentItems = useMemo(() => {
@@ -1246,7 +1272,7 @@ export default function Insights({
             key={id}
             onClick={() => { setActiveFilter(id); }}
             aria-pressed={on}
-            className={`text-[11px] font-semibold px-3.5 py-1.5 rounded-full border transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1 ${on ? "bg-blue-700 text-white border-blue-700 shadow-md ring-1 ring-blue-700/30" : "bg-white/80 text-secondary-foreground border-border hover:border-blue-300 dark:hover:border-blue-500/25 hover:text-foreground hover:shadow-sm"}`}
+            className={`text-[11px] font-semibold px-3.5 py-1.5 rounded-full border transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1 ${on ? "bg-blue-700 text-white border-blue-700 shadow-md ring-1 ring-blue-700/30" : "bg-white/80 dark:bg-white/5 text-secondary-foreground border-border hover:border-blue-300 dark:hover:border-blue-500/25 hover:text-foreground hover:shadow-sm"}`}
           >
             {f.label}{id !== "all" ? ` · ${n}` : ""}
           </button>
@@ -1293,7 +1319,7 @@ export default function Insights({
         </p>
       </div>
       <button onClick={() => setPage?.("data")} className="mt-3 w-full text-left rounded-xl hover:bg-secondary p-2 -m-1 transition-colors" title="Open data center">
-        <p className="text-[13px] font-semibold truncate">{displayDbName || selected?.source?.tables?.[0] || "Connected source"}</p>
+        <p className="text-[13px] font-semibold truncate">{displayDbName || datasetLabel(selected?.source?.tables?.[0]) || "Connected source"}</p>
         {displaySourceType && <p className="text-[11px] text-muted-foreground">{humanize(displaySourceType)}</p>}
       </button>
       <div className="mt-2 pt-2 border-t border-border flex items-center justify-between text-[11px] text-muted-foreground">
@@ -1387,8 +1413,7 @@ export default function Insights({
     const recoDetail = recommendationDetailOf(selected);
     const explains = explainsTextOf(selected);
     const explainsParas = explainsParagraphs(explains);
-    const dims = selected.recommendedNextAnalysis?.dimensions || [];
-    const affectedSegment = dims[0] || selected.tags?.[0] || "";
+    const affectedSegment = selected.evidence?.affectedSegment || "";
     const scenarioAvailable = selected.scenario?.available === true;
     const monitorAvailable = selected.monitoring?.available === true;
     const lims = limitationLines(selected);
@@ -1409,8 +1434,6 @@ export default function Insights({
       { id: "evidence", label: "Evidence" },
       ...(factors.length ? [{ id: "factors", label: "Associated Factors" }] : []),
       ...(recoDetail || recoText ? [{ id: "reco", label: "Recommendation" }] : []),
-      { id: "whatif", label: "What If" },
-      { id: "monitor", label: "Monitor" },
     ];
     const tabId = tabs.some((t) => t.id === activeTab) ? activeTab : "changed";
 
@@ -1527,7 +1550,7 @@ export default function Insights({
                         <div className="mb-2 flex items-center gap-2 rounded-lg border border-blue-200 dark:border-blue-500/25 bg-blue-50 dark:bg-blue-500/10 px-2.5 py-1.5 text-[11px]">
                           <span>
                             Context: <span className="font-semibold">{drill.label}</span>
-                            {typeof drill.value === "number" ? ` · ${fmtMoney(drill.value)}` : ""}
+                            {typeof drill.value === "number" ? ` · ${fmtInsightValue(selected, drill.value)}` : ""}
                           </span>
                           <button
                             onClick={() => askCopilot(selected, `Break down "${drill.label}" further: trend and top contributors within this segment for ${shortMetric(selected.metric) || "this metric"}.`, drill.label)}
@@ -1628,9 +1651,9 @@ export default function Insights({
                       {(selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined) ||
                       (selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined) ? (
                         <p className="mt-2 text-[11px] text-secondary-foreground">
-                          {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && <>Baseline <span className="font-semibold text-foreground">{fmtMoney(selected.evidence.baseline)}</span></>}
+                          {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && <>Baseline <span className="font-semibold text-foreground">{fmtInsightValue(selected, selected.evidence.baseline)}</span></>}
                           {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && " → "}
-                          {selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && <>Current <span className="font-semibold text-foreground">{fmtMoney(selected.evidence.currentValue)}</span></>}
+                          {selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && <>Current <span className="font-semibold text-foreground">{fmtInsightValue(selected, selected.evidence.currentValue)}</span></>}
                         </p>
                       ) : null}
                     </div>
@@ -1660,7 +1683,7 @@ export default function Insights({
                     )}
                     {impact?.value !== undefined && impact.value !== null && impact.direction !== "neutral" && impact.explanation && (
                       <p className="mt-2 text-xs text-muted-foreground">
-                        Estimated impact: <span className={`font-semibold ${impact.direction === "positive" ? "text-emerald-600 dark:text-emerald-400" : impact.direction === "negative" ? "text-rose-600 dark:text-rose-400" : "text-foreground"}`}>{fmtMoney(Math.abs(impact.value))}</span>
+                        Estimated impact: <span className={`font-semibold ${impact.direction === "positive" ? "text-emerald-600 dark:text-emerald-400" : impact.direction === "negative" ? "text-rose-600 dark:text-rose-400" : "text-foreground"}`}>{fmtInsightValue(selected, Math.abs(impact.value))}</span>
                       </p>
                     )}
                   </div>
@@ -1670,10 +1693,10 @@ export default function Insights({
                   <div className="space-y-3 min-w-0 max-w-full">
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
                       {selected.evidence?.currentValue !== null && selected.evidence?.currentValue !== undefined && (
-                        <div className="rounded-lg border border-border border-l-4 border-l-blue-600 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Current</p><p className="font-semibold break-words">{fmtMoney(selected.evidence.currentValue)}</p></div>
+                        <div className="rounded-lg border border-border border-l-4 border-l-blue-600 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Current</p><p className="font-semibold break-words">{fmtInsightValue(selected, selected.evidence.currentValue)}</p></div>
                       )}
                       {selected.evidence?.baseline !== null && selected.evidence?.baseline !== undefined && (
-                        <div className="rounded-lg border border-border border-l-4 border-l-indigo-500 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Baseline</p><p className="font-semibold break-words">{fmtMoney(selected.evidence.baseline)}</p></div>
+                        <div className="rounded-lg border border-border border-l-4 border-l-indigo-500 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Baseline</p><p className="font-semibold break-words">{fmtInsightValue(selected, selected.evidence.baseline)}</p></div>
                       )}
                       {selected.evidence?.sampleSize !== null && selected.evidence?.sampleSize !== undefined && (
                         <div className="rounded-lg border border-border border-l-4 border-l-blue-600 px-2.5 py-2 bg-card"><p className="text-muted-foreground">Sample</p><p className="font-semibold break-words">{selected.evidence.sampleSize} periods</p></div>
@@ -1775,32 +1798,6 @@ export default function Insights({
                         />
                       </label>
                     </div>
-                  </div>
-                )}
-
-                {tabId === "whatif" && (
-                  <div className="rounded-xl border border-border p-4 max-w-3xl">
-                    <p className="text-[12px] font-semibold">What If</p>
-                    {scenarioAvailable ? (
-                      <p className="mt-1 text-[12px] text-secondary-foreground">{plainBusiness(selected.scenario?.label) || selected.scenario?.label || "Scenario modeling is available for this insight — ask ARIA to model a change."}</p>
-                    ) : (
-                      <p className="mt-1 text-[12px] text-muted-foreground">Scenario modeling isn&apos;t available for this insight yet.</p>
-                    )}
-                  </div>
-                )}
-
-                {tabId === "monitor" && (
-                  <div className="rounded-xl border border-border p-4 max-w-3xl">
-                    <p className="text-[12px] font-semibold">Watch this</p>
-                    {monitorAvailable ? (
-                      <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
-                        {selected.monitoring?.metric && <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Metric</p><p className="font-semibold">{plainBusiness(humanize(selected.monitoring.metric)) || humanize(selected.monitoring.metric)}</p></div>}
-                        {rangePlain ? <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Usual range</p><p className="font-semibold">{rangePlain}</p></div> : null}
-                        {selected.monitoring?.nextReview && <div className="rounded-lg border border-border px-2.5 py-2"><p className="text-muted-foreground">Next review</p><p className="font-semibold">{selected.monitoring.nextReview}</p></div>}
-                      </div>
-                    ) : (
-                      <p className="mt-1 text-[12px] text-muted-foreground">Monitoring isn&apos;t configured for this insight yet.</p>
-                    )}
                   </div>
                 )}
 

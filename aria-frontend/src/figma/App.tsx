@@ -1,16 +1,17 @@
 import { createContext, useContext, useState, useEffect, useRef, lazy, Suspense } from "react";
 import type { ReactNode } from "react";
-import "./index.css";
 import "../aria-enhance.css";
 import AppShell from "./components/AppShell";
 import ErrorBoundary from "./components/ErrorBoundary";
 import MiniAria from "./components/MiniAria";
+import FeedbackPopup from "./components/FeedbackPopup";
 import Login from "./pages/Login";
 // Route pages are code-split: each hash route loads its own chunk on
 // first visit (vendor/charts/motion stay in shared manualChunks — see
 // vite.config.js). The hash router itself is untouched.
 const LLMSelection = lazy(() => import("./pages/LLMSelection"));
 const Dashboard = lazy(() => import("./pages/Dashboard"));
+const AdminDashboard = lazy(() => import("./pages/AdminDashboard"));
 const AIAnalytics = lazy(() => import("./pages/AIAnalytics"));
 const Insights = lazy(() => import("./pages/Insights"));
 const Predictive = lazy(() => import("./pages/Predictive"));
@@ -42,10 +43,11 @@ import {
 } from "../services/api";
 import { clearAuthSession, getAuthUser } from "../utils/authStorage";
 import { KEYS, storage } from "../utils/storage";
-import { ToastProvider } from "../components/Toast";
+import { ReadOnlyContext, looksLikeMobile } from "./lib/readonly";
 
 export type Page =
   | "dashboard"
+  | "admin"
   | "analytics"
   | "insights"
   | "predictive"
@@ -56,7 +58,7 @@ export type Page =
   | "history"
   | "settings";
 
-const VALID_PAGES: Page[] = ["dashboard","analytics","insights","predictive","intelligence","data","documents","copilot","history","settings"];
+const VALID_PAGES: Page[] = ["dashboard","admin","analytics","insights","predictive","intelligence","data","documents","copilot","history","settings"];
 
 // Legacy aliases: "hypothesis" -> AI Analytics (the standalone Hypothesis
 // page was removed; its capability surfaces as Possible drivers inside
@@ -93,8 +95,18 @@ export const useTheme = () => useContext(ThemeContext);
 export default function App() {
   // ---- Auth stage ----
   const [appStage, setAppStage] = useState<AppStage>("login");
-  const [currentUser, setCurrentUser] = useState<{ email?: string } | null>(null);
+  const [currentUser, setCurrentUser] = useState<{ email?: string; is_admin?: boolean } | null>(null);
   const [selectedLLM, setSelectedLLM] = useState("");
+  const bootSessionCheckRef = useRef<AbortController | null>(null);
+  const uploadCancelledRef = useRef(false);
+  useEffect(() => {
+    return () => { uploadCancelledRef.current = true; };
+  }, []);
+  const lastPageVisitRef = useRef("");
+
+  // Mobile read-only: server verdict (session/status) with a UA guess until
+  // the first response lands. Gates write affordances across the shell/pages.
+  const [readOnly, setReadOnly] = useState(looksLikeMobile);
 
   // ---- Theme ----
   const [isDark, setIsDark] = useState(() => {
@@ -109,6 +121,8 @@ export default function App() {
       window.location.hash = `#/${p}`;
     } catch { /* ignore */ }
   };
+  const pageRef = useRef(page);
+  useEffect(() => { pageRef.current = page; }, [page]);
 
   useEffect(() => {
     const onHash = () => {
@@ -121,8 +135,24 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", isDark);
+    // Native controls and scrollbars follow the theme too (index.html sets
+    // the same before first paint).
+    document.documentElement.style.colorScheme = isDark ? "dark" : "light";
     storage.set(KEYS.theme, isDark ? "dark" : "light");
   }, [isDark]);
+
+  useEffect(() => {
+    if (appStage !== "app" || !currentUser?.email) return;
+    const visitKey = `${currentUser.email}:${page}`;
+    if (lastPageVisitRef.current === visitKey) return;
+    lastPageVisitRef.current = visitKey;
+    void apiFetch("/admin/page-visit", {
+      method: "POST",
+      body: JSON.stringify({ page }),
+    }).catch((error: unknown) => {
+      console.warn("ARIA could not record this page visit:", error);
+    });
+  }, [appStage, currentUser?.email, page]);
 
   // Cookie auth: the session lives in the httpOnly `aria_token` cookie.
   // On mount, probe the live backend session (credentials:include). 401
@@ -138,16 +168,55 @@ export default function App() {
     window.addEventListener("aria:unauthorized", onUnauthorized);
     (async () => {
       const ctrl = new AbortController();
+      bootSessionCheckRef.current = ctrl;
       const t = setTimeout(() => ctrl.abort(), 10000);
       try {
-        // Single client: apiFetch carries credentials + 401 cleanup.
-        // A 10s caller signal keeps the boot probe snappy; slower
-        // failures stay AbortErrors so blips never log the user out.
-        const body: any = await apiFetch("/session/status", { signal: ctrl.signal }).catch((e: any) => {
+        // A boot-time 401 describes the session at the moment the probe
+        // started; it must not emit a global logout event after a user has
+        // successfully signed in. The probe is explicitly aborted by
+        // handleLogin and handles its own 401 below.
+        const body: any = await apiFetch("/session/status", {
+          signal: ctrl.signal,
+          suppressUnauthorized: true,
+        }).catch((e: any) => {
           if (e?.status === 401) throw e;
           return null;
         });
+        if (ctrl.signal.aborted) return;
         if (!body) return;
+        // Restore the authenticated UI stage as well as data connectivity.
+        // A valid httpOnly cookie survives reloads, but React state does not;
+        // leaving appStage at its initial "login" value strands a valid
+        // session on the sign-in screen after every refresh.
+        if (body?.ok) {
+          const savedUser = getAuthUser();
+          let identity = savedUser?.email || savedUser?.username || "user";
+          let isAdmin = false;
+          try {
+            const me: any = await apiFetch("/auth/me", {
+              signal: ctrl.signal,
+              suppressUnauthorized: true,
+            });
+            identity = me.username || identity;
+            isAdmin = me.is_admin === true;
+          } catch (err: any) {
+            if (err?.status === 401) {
+              toLogin();
+              return;
+            }
+          }
+          setCurrentUser({ email: identity, is_admin: isAdmin });
+          const savedMode = storage.getString(KEYS.llmMode, "");
+          if (isAdmin) {
+            if (pageRef.current === "dashboard") setPage("admin");
+            setAppStage("app");
+          } else if (savedMode) {
+            setSelectedLLM(savedMode);
+            setAppStage("app");
+          } else {
+            setAppStage("llm-selection");
+          }
+        }
         // Restore connection state from the live server session so a page
         // reload does not drop every page to "Connect a data source" while
         // the backend still holds the connection (connectionStatus is
@@ -162,16 +231,42 @@ export default function App() {
           }
           if (body.db_name) setDbName(body.db_name);
           if (body.source_type) setSelectedSourceType(body.source_type);
+          if (body.db_type === "postgresql" || body.db_type === "mysql") setDbType(body.db_type);
+          try {
+            const schemaJson: any = await apiFetch("/schema");
+            if (schemaJson?.ok && schemaJson.schema) {
+              setSchemaData(schemaJson.schema);
+              setSchemaStatus("success");
+            } else {
+              setSchemaStatus("idle");
+              setSchemaData(null);
+            }
+          } catch (e: any) {
+            if (e?.status === 401) {
+              clearAuthSession();
+              setCurrentUser(null);
+              setAppStage("login");
+              return;
+            }
+            setSchemaStatus("idle");
+            setSchemaData(null);
+          }
         }
       } catch (e: any) {
         // 401 returns to login; blips/offline keep the current stage so
         // a flaky network does not log the user out. Pages retry.
+        if (ctrl.signal.aborted) return;
         if (e?.status === 401) toLogin();
       } finally {
         clearTimeout(t);
+        if (bootSessionCheckRef.current === ctrl) bootSessionCheckRef.current = null;
       }
     })();
-    return () => window.removeEventListener("aria:unauthorized", onUnauthorized);
+    return () => {
+      bootSessionCheckRef.current?.abort();
+      bootSessionCheckRef.current = null;
+      window.removeEventListener("aria:unauthorized", onUnauthorized);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -180,6 +275,7 @@ export default function App() {
   // ---- Connection state ----
   const [connectionStatus, setConnectionStatus] = useState("not-connected");
   const [dbName, setDbName] = useState("");
+  const [dbType, setDbType] = useState("postgresql");
   const [schemaData, setSchemaData] = useState<any>(null);
   const [schemaStatus, setSchemaStatus] = useState("idle");
   const [schemaError, setSchemaError] = useState("");
@@ -222,24 +318,53 @@ export default function App() {
   // =========================================================
 
   const handleLogin = () => {
+    // Do not let a session probe started before authentication overwrite a
+    // successful login with its stale unauthenticated result.
+    bootSessionCheckRef.current?.abort();
+    bootSessionCheckRef.current = null;
+    // Clear any cross-page context left by a previous account in this tab
+    // so stale metric/dataset/filters cannot pollute the new session.
+    try {
+      for (const k of ["aria_shared_context", "aria_forecast_prefill", "aria_insight_handoff", "aria_hypothesis_prefill", "aria_copilot_context", "aria_explore_prefill", "aria_whatif_prefill"]) {
+        sessionStorage.removeItem(k);
+      }
+    } catch { /* ignore */ }
+    try {
+      localStorage.removeItem("aria_analysis_context");
+      localStorage.removeItem("aria_forecast_context");
+      localStorage.removeItem("aria_dashboard_drill");
+    } catch { /* ignore */ }
     const user = getAuthUser();
-    setCurrentUser(user ? { email: user.email || user.username } : { email: "user" });
-    setAppStage("llm-selection");
+    setCurrentUser(user
+      ? { email: user.email || user.username, is_admin: user.is_admin === true }
+      : { email: "user", is_admin: false });
+    if (user?.is_admin) {
+      setPage("admin");
+      setAppStage("app");
+    } else {
+      setAppStage("llm-selection");
+    }
   };
 
-  const handleLLMSelect = async (mode: string, apiKey?: string) => {
+  const handleLLMSelect = async (mode: string, apiKey?: string, model?: string) => {
+    // Persist the UI choice synchronously BEFORE the server round-trip: a
+    // reload that races the /provider/switch call would otherwise kill the
+    // in-flight continuation and lose the choice, stranding the user on the
+    // engine chooser after every refresh. The key is removed again if the
+    // switch fails so a rejected choice never persists.
     setSelectedLLM(mode);
     storage.set(KEYS.llmMode, mode);
     // Materialize the choice server-side so the session provider matches
     // the UI immediately (prevents "choose an LLM provider" right after).
-    // Provider isolation: the Groq key is sent ONLY when Cloud is selected;
+    // Provider isolation: the key is sent only to its selected hosted provider;
     // Local AI switches keyless and never touches stored keys.
     try {
       await apiFetch("/provider/switch", {
         method: "POST",
-        body: JSON.stringify(mode === "cloud" && apiKey ? { provider: mode, api_key: apiKey } : { provider: mode }),
+        body: JSON.stringify({ provider: mode, ...(mode !== "local" ? { api_key: apiKey, model } : {}) }),
       });
     } catch (err: any) {
+      storage.remove(KEYS.llmMode);
       if (err?.status === 401) {
         clearAuthSession();
         setCurrentUser(null);
@@ -249,15 +374,22 @@ export default function App() {
       // Surface the failure so the user knows the switch did not happen.
       throw new Error(err?.message || `Could not switch to ${mode}.`);
     }
+    setSelectedLLM(mode);
+    storage.set(KEYS.llmMode, mode);
     // Restore connection state from the stored session so the Dashboard
     // shows KPIs/charts without requiring a fresh connect.
     (async () => {
       const result = await fetchSessionStatus();
       if (result.success && result.data) {
+        if (typeof (result.data as any).read_only === "boolean") setReadOnly((result.data as any).read_only);
         if (result.data.connection_status === "connected") {
           setConnectionStatus("connected");
           setDbName(result.data.db_name || "");
           setSelectedSourceType(result.data.source_type || "relational");
+          if (result.data.db_type === "postgresql" || result.data.db_type === "mysql") setDbType(result.data.db_type);
+          if (result.data.db_host) setDbHost(result.data.db_host);
+          if (result.data.db_port) setDbPort(String(result.data.db_port));
+          if (result.data.db_username) setDbUsername(result.data.db_username);
           // Load schema from the server when reconnecting so the Data
           // section never shows "pending" — the DB was never disconnected.
           // Load schema directly (skip extraction) when reconnecting so the
@@ -323,6 +455,7 @@ export default function App() {
     try {
       const st = await fetchSessionStatus();
       const body: any = (st as any)?.data || {};
+      if (typeof body.read_only === "boolean") setReadOnly(body.read_only);
       const display = body?.display_state || body?.connection_status || "";
       const schemaSt = body?.schema_status || "";
       if (display === "ready" || body?.connection_status === "connected") {
@@ -331,8 +464,12 @@ export default function App() {
         } else {
           setConnectionStatus("connected");
         }
-        if (body.db_name) setDbName(body.db_name);
-        if (body.source_type) setSelectedSourceType(body.source_type);
+          if (body.db_name) setDbName(body.db_name);
+          if (body.source_type) setSelectedSourceType(body.source_type);
+          if (body.db_type === "postgresql" || body.db_type === "mysql") setDbType(body.db_type);
+          if (body.db_host) setDbHost(body.db_host);
+          if (body.db_port) setDbPort(String(body.db_port));
+          if (body.db_username) setDbUsername(body.db_username);
         return "connected";
       }
       if (display === "schema-loading") {
@@ -358,6 +495,7 @@ export default function App() {
         setConnectionStatus("connected");
         setDbName(result?.data?.database || details?.db || "");
         setSelectedSourceType("relational");
+        if (details?.sourceType === "postgresql" || details?.sourceType === "mysql") setDbType(details.sourceType);
         // Auto-fetch schema after connect
         await handleSchemaFetch();
         // Verify against backend truth; downgrade to error when the
@@ -385,6 +523,7 @@ export default function App() {
     }
     setConnectionStatus("not-connected");
     setDbName("");
+    setDbType("postgresql");
     setSchemaData(null);
     setSchemaStatus("idle");
   };
@@ -425,7 +564,14 @@ export default function App() {
       formData.append("file", file);
       formData.append("provider", selectedLLM || "local");
       
-      let path = sourceType === 'csv' ? `/connect_file` : (sourceType === 'pdf' ? `/connect_pdf` : `/connect_${sourceType}`);
+      // File uploads only: CSV and PDF have dedicated routes. Any other
+      // type is a programming error, never a guessed "/connect_<type>" path.
+      if (sourceType !== 'csv' && sourceType !== 'pdf') {
+        throw new Error(`Unsupported file source type: ${sourceType}`);
+      }
+      const path = sourceType === 'csv' ? `/connect_file` : `/connect_pdf`;
+      // A PDF has no tables, so there is no schema to read after upload.
+      const isDocument = sourceType === 'pdf';
       const data: any = await apiFetch(path, {
         method: "POST",
         body: formData,
@@ -451,10 +597,12 @@ export default function App() {
           /* Large file: backend processes in background. Poll progress
              (30s cap per round, up to ~20 min) until ready or error. */
           setConnectionStatus("schema-loading");
+          uploadCancelledRef.current = false;
           const deadline = Date.now() + 20 * 60 * 1000;
           let done = false;
-          while (Date.now() < deadline && !done) {
+          while (Date.now() < deadline && !done && !uploadCancelledRef.current) {
             await new Promise((r) => setTimeout(r, 3000));
+            if (uploadCancelledRef.current) return;
             try {
               const prog: any = await apiFetch("/upload/progress");
               if (prog?.error) {
@@ -464,14 +612,14 @@ export default function App() {
               }
               if (prog?.done && prog?.result) {
                 const res: any = prog.result;
-                await handleSchemaFetch();
+                if (!isDocument) await handleSchemaFetch();
                 setConnectionStatus("connected");
                 setDbName(res?.table || res?.file || file.name.replace(/\.[^.]+$/, ""));
                 setSelectedSourceType(res?.source_type || "semi-structured");
                 return;
               }
               if (prog?.done) {
-                await handleSchemaFetch();
+                if (!isDocument) await handleSchemaFetch();
                 setConnectionStatus("connected");
                 return;
               }
@@ -479,13 +627,16 @@ export default function App() {
               /* transient poll failure — keep waiting */
             }
           }
+          if (uploadCancelledRef.current) return;
           setConnectionStatus("error");
           setConnectionError("Processing is taking longer than expected — check Data for progress.");
           return;
         }
         // After successful file connect, fetch schema and mark connected
-        setConnectionStatus("schema-loading");
-        await handleSchemaFetch();
+        if (!isDocument) {
+          setConnectionStatus("schema-loading");
+          await handleSchemaFetch();
+        }
         setConnectionStatus("connected");
         setDbName(data?.table || data?.file || file.name.replace(/\.[^.]+$/, ""));
         setSelectedSourceType(data?.source_type || "semi-structured");
@@ -581,6 +732,12 @@ export default function App() {
     <ErrorBoundary key={`${key}-${page}`} page={key}>{node}</ErrorBoundary>
   );
 
+  useEffect(() => {
+    if (appStage === "app" && page === "admin" && !currentUser?.is_admin) {
+      setPage("dashboard");
+    }
+  }, [appStage, currentUser?.is_admin, page]);
+
   if (appStage === "login") {
     return <Login onLogin={handleLogin} />;
   }
@@ -594,19 +751,33 @@ export default function App() {
   }
 
   return (
+    <ReadOnlyContext.Provider value={readOnly}>
     <ThemeContext.Provider value={{ isDark, toggleTheme, page, setPage }}>
-      {/* ToastProvider mounts the toast region: figma/pages/Documents.tsx
-          already calls useToast(), which throws without a provider. */}
-      <ToastProvider>
+      {/* Toasts come from the single root <ToastProvider> in main.jsx
+          (it also covers Login); a second provider here would split them. */}
       <AppShell
         user={currentUser}
+        isAdmin={currentUser?.is_admin === true}
         selectedLLM={selectedLLM}
         dbName={dbName}
         onChangeLLM={() => setAppStage("llm-selection")}
         onSignOut={handleSignOut}
       >
-        <div key={page} className="page-enter"><Suspense fallback={<PageFallback />}>{wrapPage(page, (() => {
+        <div key={page} className="page-enter h-full"><Suspense fallback={<PageFallback />}>{wrapPage(page, (() => {
           switch (page) {
+            case "admin":
+              return currentUser?.is_admin
+                ? <AdminDashboard />
+                : <Dashboard
+                    setPage={setPage}
+                    onAsk={goCopilot}
+                    user={currentUser}
+                    connectionStatus={connectionStatus}
+                    dbName={dbName}
+                    insightResult={insightResult}
+                    analysisResult={analysisResult}
+                    connectionError={connectionError}
+                  />;
             case "dashboard":
               return (
                 <Dashboard
@@ -656,6 +827,7 @@ export default function App() {
                   connectionStatus={connectionStatus}
                   selectedSourceType={selectedSourceType}
                   dbName={dbName}
+                  dbType={dbType}
                   schemaData={schemaData}
                   schemaStatus={schemaStatus}
                   schemaError={schemaError}
@@ -709,9 +881,11 @@ export default function App() {
           }
         })())}</Suspense></div>
       </AppShell>
-      {/* Mini ARIA robot: every page except the Copilot page itself. */}
-      {page !== "copilot" && <MiniAria />}
-      </ToastProvider>
+      {/* Documents has its own contextual assistant; avoid an overlapping global widget. */}
+      {page !== "copilot" && page !== "documents" && <MiniAria />}
+      {/* Random RL feedback popup (probability + cooldown; /api/rl/feedback) */}
+      <FeedbackPopup page={page} />
     </ThemeContext.Provider>
+    </ReadOnlyContext.Provider>
   );
 }

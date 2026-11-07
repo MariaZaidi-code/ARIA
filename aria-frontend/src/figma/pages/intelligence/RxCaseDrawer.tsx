@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Bookmark, CalendarDays, RefreshCw, User, X } from "lucide-react";
 import { asList, strOf, numOf, humanize, fmtMetric } from "../../lib/intelHelpers";
+import { READ_ONLY_HINT } from "../../lib/readonly";
 import { btnPrimary, btnGhost } from "./cards";
 
 /* =====================================================================
@@ -31,7 +32,7 @@ function dotsOf(conf: unknown): { filled: number; label: string } {
 }
 
 export default function RxCaseDrawer({
-  item, onClose, onTrack, onPatch, onRecheck, rechecking,
+  item, onClose, onTrack, onPatch, onRecheck, rechecking, readOnly = false,
 }: {
   item: RxCaseInput | null;
   onClose: () => void;
@@ -39,6 +40,7 @@ export default function RxCaseDrawer({
   onPatch: (patch: Record<string, string>) => Promise<void>;
   onRecheck: () => void;
   rechecking: boolean;
+  readOnly?: boolean;
 }) {
   const [owner, setOwner] = useState("");
   const [due, setDue] = useState("");
@@ -229,21 +231,21 @@ export default function RxCaseDrawer({
                     aria-label="Review date"
                   />
                 </label>
-                <button onClick={saveOwnerDue} disabled={patchBusy} className={btnGhost} aria-label="Save owner and review date">
+                <button onClick={saveOwnerDue} disabled={patchBusy || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={btnGhost} aria-label="Save owner and review date">
                   {patchBusy ? "Saving…" : "Save"}
                 </button>
               </div>
               <div className="flex items-center gap-2 flex-wrap">
-                <button onClick={() => void mark("achieved")} disabled={patchBusy} className="text-[12px] font-medium text-emerald-700 dark:text-emerald-400 hover:underline disabled:opacity-40" aria-label="Mark case achieved">Mark achieved</button>
-                <button onClick={() => void mark("missed")} disabled={patchBusy} className="text-[12px] font-medium text-rose-600 dark:text-rose-400 hover:underline disabled:opacity-40" aria-label="Mark case missed">Mark missed</button>
-                <button onClick={onRecheck} disabled={rechecking} className="inline-flex items-center gap-1 text-[12px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label="Re-check this case now">
+                <button onClick={() => void mark("achieved")} disabled={patchBusy || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[12px] font-medium text-emerald-700 dark:text-emerald-400 hover:underline disabled:opacity-40" aria-label="Mark case achieved">Mark achieved</button>
+                <button onClick={() => void mark("missed")} disabled={patchBusy || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="text-[12px] font-medium text-rose-600 dark:text-rose-400 hover:underline disabled:opacity-40" aria-label="Mark case missed">Mark missed</button>
+                <button onClick={onRecheck} disabled={rechecking || readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className="inline-flex items-center gap-1 text-[12px] font-medium text-muted-foreground hover:text-blue-700 dark:hover:text-blue-400 hover:underline disabled:opacity-40" aria-label="Re-check this case now">
                   <RefreshCw size={12} className={rechecking ? "animate-spin" : ""} /> {rechecking ? "Checking…" : "Re-check"}
                 </button>
               </div>
               {patchMsg && <p className="text-[11.5px] text-secondary-foreground" role="status">{patchMsg}</p>}
             </div>
           ) : (
-            <button onClick={() => onTrack(p)} className={`${btnPrimary} w-full`} aria-label="Track this action">
+            <button onClick={() => onTrack(p)} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined} className={`${btnPrimary} w-full`} aria-label="Track this action">
               <Bookmark size={13} /> Track this action
             </button>
           )}

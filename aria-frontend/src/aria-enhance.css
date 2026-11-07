@@ -35,6 +35,26 @@
   --aria-ease: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
+/* Night mode for the overlay tokens. The app switches theme with the
+   `.dark` class on <html> (App.tsx + the blocking script in index.html),
+   so these must follow `.dark` — without this block every h1-h4 kept the
+   light-mode navy (#17233c) and looked dull on the dark background. */
+.dark {
+  --aria-bg: #09090b;
+  --aria-card: #18181b;
+  --aria-border: rgba(255, 255, 255, 0.1);
+  --aria-border-soft: rgba(255, 255, 255, 0.06);
+  --aria-text: #f4f6fb;
+  --aria-text-2: #d4d4d8;
+  --aria-muted: #a1a1aa;
+  --aria-accent: #6b9bf7;
+  --aria-accent-deep: #8db2fa;
+  --aria-accent-2: #a78bfa;
+  --aria-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 12px rgba(0, 0, 0, 0.25);
+  --aria-shadow-md: 0 6px 16px rgba(0, 0, 0, 0.35), 0 2px 6px rgba(0, 0, 0, 0.25);
+  --aria-shadow-lg: 0 18px 42px rgba(0, 0, 0, 0.45), 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+
 /* =========================================================
    LOGIN SEMANTIC DESIGN TOKENS
    Light + Dark with OS-aware switching and an explicit
@@ -3693,6 +3713,42 @@ h4 {
     box-shadow 0.2s ease,
     background-color 0.25s ease,
     color 0.25s ease;
+}
+
+.login-page--signin .login-password-field {
+  position: relative;
+}
+
+.login-page--signin .login-password-field input {
+  padding-right: 48px;
+}
+
+.login-page--signin .login-password-toggle {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  display: inline-flex;
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--login-muted);
+  cursor: pointer;
+  transition: color 0.2s ease, background-color 0.2s ease;
+}
+
+.login-page--signin .login-password-toggle:hover {
+  background: var(--login-danger-soft);
+  color: var(--login-accent);
+}
+
+.login-page--signin .login-password-toggle:focus-visible {
+  outline: 2px solid var(--login-accent);
+  outline-offset: 2px;
 }
 
 .login-page--signin .login-form-group input::placeholder {

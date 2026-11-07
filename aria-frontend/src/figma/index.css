@@ -747,8 +747,6 @@ html, body, #root {
   font-weight: 700;
 }
 
-/*
-
 /* Visible keyboard focus (a11y) */
 :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: 6px; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
@@ -775,4 +773,39 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
   aside, nav, .no-print { display: none !important; }
   body { background: #fff !important; }
   #intel-report-preview { box-shadow: none !important; border: 1px solid #ddd !important; }
+}
+
+/* Shared minimal range navigator used by dashboard, charts and forecasts. */
+.aria-chart-brush > rect:first-child {
+  rx: 7px;
+  fill: var(--muted) !important;
+  stroke: var(--border) !important;
+  stroke-opacity: 0.65;
+}
+.aria-chart-brush .recharts-brush-slide {
+  fill: var(--primary) !important;
+  fill-opacity: 0.14 !important;
+  stroke: var(--primary) !important;
+  stroke-opacity: 0.18;
+}
+.aria-chart-brush .recharts-brush-texts text {
+  fill: var(--muted-foreground);
+  font-size: 10px;
+  font-weight: 500;
+}
+.aria-chart-brush .recharts-brush-traveller {
+  cursor: ew-resize !important;
+  outline: none;
+  filter: drop-shadow(0 1px 2px rgba(15, 23, 42, 0.16));
+}
+.aria-chart-brush .recharts-brush-traveller rect {
+  transition: fill 120ms ease, stroke-width 120ms ease;
+}
+.aria-chart-brush .recharts-brush-traveller:hover rect {
+  fill: var(--card);
+  stroke-width: 2px;
+}
+.aria-chart-brush .recharts-brush-traveller:focus-visible rect {
+  stroke-width: 2.5px;
+  filter: drop-shadow(0 0 3px var(--primary));
 }

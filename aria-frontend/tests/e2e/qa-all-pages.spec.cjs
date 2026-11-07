@@ -1,5 +1,6 @@
 // QA: drive login -> LLM selection -> every non-Data page, capturing runtime errors.
 const { test, expect } = require("@playwright/test");
+const { signInVerified } = require("./auth-helper");
 
 const BASE = process.env.ARIA_BASE || "http://localhost:8000";
 
@@ -8,11 +9,11 @@ const PAGES = [
   { id: "analytics", nav: "AI Analytics" },
   { id: "insights", nav: "Insights" },
   { id: "predictive", nav: "Forecast" },
-  { id: "decision-center", nav: "Decision Center" },
-  // No standalone prescription/hypothesis pages (removed): prescription is
-  // verified via Decision Center recommendations; hypothesis via Insights
-  // "Investigate why" -> AI Analytics Possible drivers (see
-  // qa-connected-flow.spec.cjs for the contextual coverage).
+  { id: "intelligence", nav: "Intelligence" },
+  // No standalone prescription/hypothesis/decision-center pages (removed):
+  // prescription is verified via the prescription APIs / Intelligence;
+  // hypothesis via Insights "Investigate why" -> AI Analytics Possible
+  // drivers (see qa-connected-flow.spec.cjs for the contextual coverage).
   // "data" intentionally skipped (out of scope)
   { id: "documents", nav: "Documents" },
   { id: "copilot", nav: "Copilot" },
@@ -45,23 +46,6 @@ function attach(page, sink) {
   });
 }
 
-async function registerAndLogin(page, email, password) {
-  await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded" });
-
-  // Switch to register mode and create the account.
-  await page.getByRole("button", { name: /create account/i }).first().click();
-  await page.locator("#login-email").fill(email);
-  await page.locator("#login-password").fill(password);
-  await page.locator("#login-confirm").fill(password);
-  await page.getByRole("button", { name: /create account/i }).last().click();
-  await page.waitForTimeout(800);
-
-  // Now sign in (register flips back to login mode).
-  await page.locator("#login-email").fill(email);
-  await page.locator("#login-password").fill(password);
-  await page.getByRole("button", { name: /access intelligence hub/i }).click();
-}
-
 async function chooseLLM(page, label) {
   await expect(page.getByText(/choose your ai engine/i)).toBeVisible({ timeout: 15000 });
   await page.getByRole("button", { name: new RegExp(label, "i") }).first().click();
@@ -74,11 +58,11 @@ test.describe("ARIA QA - non-Data pages", () => {
     const sink = { consoleErrors: [], pageErrors: [], failedResponses: [] };
     attach(page, sink);
 
-    const email = `qa_${Date.now()}@aria.test`;
-    const password = "QaPass123!";
-
-    await registerAndLogin(page, email, password);
-    await chooseLLM(page, "Cloud AI");
+    await signInVerified(page, BASE);
+    // Local AI only: the default suite must never touch cloud providers
+    // (no user key use, no data egress). Ollama availability is asserted by
+    // the selection screen itself; the switch to local is ping-free.
+    await chooseLLM(page, "Local AI");
 
     const perPage = {};
 

@@ -1,3 +1,4 @@
+import CsvStatisticalEvidence from "../components/CsvStatisticalEvidence";
 /* AI Analytics — Dashboard home + inline analysis results.
    Search bar and popular actions call /api/ask (Goal Agent) and display
    chart + insights + table directly on the page. No copilot redirect. */
@@ -9,6 +10,7 @@ import {
   Target, FileText, Sparkles, ArrowUpRight, ArrowDownRight, Database,
   Copy, MoreHorizontal, Brain, Lightbulb, GitCompareArrows, Zap,
   Compass, Share2, X, Info, CheckCircle2, Shield,
+  BellPlus, FileDown, Code2, TrendingDown,
 } from "lucide-react";
 import {
   BarChart, Bar, LineChart, Line, AreaChart, Area,
@@ -28,8 +30,10 @@ import {
   CountUp, Sparkline, selectCls, inputCls, btnPrimary, btnGhost,
 } from "./intelligence/cards";
 import { useExplore, RANGE_OPTIONS, type RangeKey } from "./intelligence/useExplore";
-import { intelligenceApi, analyzeQuestion, normalizeApiError, apiFetch } from "../../services/api";
+import { intelligenceApi, analyzeQuestion, normalizeApiError, apiFetch, workspaceApi, downloadStoryExport, AI_ANSWER_TIMEOUT_MS } from "../../services/api";
 import EvidenceDrawer, { type EvidenceContext } from "./intelligence/EvidenceDrawer";
+import { localStore, sessionStore } from "../../utils/storage.js";
+import { ANALYTICS_QUESTION_KEY } from "../lib/analysisContext";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -908,22 +912,59 @@ export default function AIAnalytics({
   const [followUpQuery, setFollowUpQuery] = useState("");
   const [history, setHistory] = useState<{ q: string; r: any }[]>([]);
   const abortRef = useRef<AbortController | null>(null);
+  const [chatLoading, setChatLoading] = useState(true);
+  const [chatNotice, setChatNotice] = useState("");
+  const restoreGeneration = useRef(0);
+  const conversationRef = useRef<string>(crypto.randomUUID());
+
+  /* ---- Workspace actions: show SQL / monitors / export / drill trail ---- */
+  const [showSql, setShowSql] = useState(false);
+  const [monitorOpen, setMonitorOpen] = useState(false);
+  const [monitorText, setMonitorText] = useState("");
+  const [monitorMsg, setMonitorMsg] = useState("");
+  const [monitorBusy, setMonitorBusy] = useState(false);
+  const [exportMsg, setExportMsg] = useState("");
+  /* One-click drill chains: every run pushes its question; breadcrumbs let
+     the user step back up the chain and re-run any earlier link. */
+  const [drillTrail, setDrillTrail] = useState<string[]>([]);
 
   /* ---- Autocomplete ---- */
   const [acOptions, setAcOptions] = useState<string[]>([]);
-  const [acOpen, setAcOpen] = useState(false);
+  /* Which input owns the dropdown: several search boxes can be on screen
+     at once, and only the one being typed in may show suggestions. */
+  const [acOpen, setAcOpen] = useState<null | "search" | "start" | "followup">(null);
+  const [acIndex, setAcIndex] = useState(-1);
+  const acSeq = useRef(0);
   const acTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchAc = useCallback((partial: string) => {
     if (acTimer.current) clearTimeout(acTimer.current);
+    const seq = ++acSeq.current;
     if (!partial || partial.length < 1) { setAcOptions([]); return; }
     acTimer.current = setTimeout(async () => {
       try {
         const data: any = await apiFetch(`/autocomplete?partial=${encodeURIComponent(partial)}&limit=6`);
         const list = Array.isArray(data?.suggestions) ? data.suggestions.map((s: any) => typeof s === "string" ? s : s?.text || "").filter(Boolean) : [];
-        setAcOptions(list);
-      } catch { setAcOptions([]); }
+        // A slower reply for an older keystroke must never replace newer ones.
+        if (seq === acSeq.current) setAcOptions(list);
+      } catch { if (seq === acSeq.current) setAcOptions([]); }
     }, 200);
   }, []);
+  useEffect(() => () => { if (acTimer.current) clearTimeout(acTimer.current); }, []);
+
+  /* Arrow keys move through the list, Enter runs the highlighted
+     suggestion (or the typed text), Escape closes the list. */
+  const acKeyDown = (e: React.KeyboardEvent<HTMLInputElement>, owner: "search" | "start" | "followup",
+                     pick: (v: string) => void, submit: () => void) => {
+    const open = acOpen === owner && acOptions.length > 0;
+    if (open && e.key === "ArrowDown") { e.preventDefault(); setAcIndex((i) => Math.min(i + 1, acOptions.length - 1)); return; }
+    if (open && e.key === "ArrowUp") { e.preventDefault(); setAcIndex((i) => Math.max(i - 1, -1)); return; }
+    if (e.key === "Escape") { setAcOpen(null); setAcIndex(-1); return; }
+    if (e.key === "Enter") {
+      setAcOpen(null);
+      if (open && acIndex >= 0 && acOptions[acIndex]) pick(acOptions[acIndex]); else submit();
+      setAcIndex(-1);
+    }
+  };
 
   /* ---- Suggestions (starter chips) — refreshed for the connected
      database, and stale analysis is cleared on dataset switch so old
@@ -933,7 +974,7 @@ export default function AIAnalytics({
   const prevDatasetRef = useRef<string | null>(null);
   const loadSuggestions = useCallback(async () => {
     try {
-      const data: any = await apiFetch("/copilot/suggestions");
+      const data: any = await apiFetch("/suggestions", { method: "POST", body: JSON.stringify({ limit: 4 }) });
       if (Array.isArray(data?.suggestions) && data.suggestions.length) setSuggestions(data.suggestions.slice(0, 4));
       else setSuggestions([]);
     } catch { /* keep previous chips on transient errors */ }
@@ -942,12 +983,39 @@ export default function AIAnalytics({
     loadSuggestions();
     if (prevDatasetRef.current !== null && prevDatasetRef.current !== datasetKey) {
       abortRef.current?.abort();
+      conversationRef.current = crypto.randomUUID();
+      setRunning(false);
       setResult(null); setError(""); setHistory([]); setAskedQuestion("");
-      setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(false);
+      setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(null);
       setSidebarCtx({});
+      setDrillTrail([]); setShowSql(false); setMonitorOpen(false);
+      setMonitorMsg(""); setExportMsg("");
     }
     prevDatasetRef.current = datasetKey;
   }, [connectionStatus, datasetKey, loadSuggestions]);
+
+  useEffect(() => {
+    const generation = ++restoreGeneration.current;
+    const controller = new AbortController();
+    setChatLoading(true);
+    apiFetch("/csv/conversation", { signal: controller.signal }).then((data: any) => {
+      if (controller.signal.aborted || generation !== restoreGeneration.current) return;
+      const chat = data?.conversation;
+      if (chat) {
+        conversationRef.current = chat.conversation_id;
+        const turns = Array.isArray(chat.turns) ? chat.turns.map((turn: any) => ({ q: turn.q, r: { success: true, data: turn.r } })) : [];
+        setHistory(turns);
+        const latest = turns[turns.length - 1];
+        setResult(latest?.r || null); setAskedQuestion(latest?.q || "");
+        setChatNotice(turns.length ? "Restored your saved chat for this dataset." : "");
+      }
+    }).catch((err: any) => {
+      if (err?.name !== "AbortError" && generation === restoreGeneration.current) setChatNotice("Could not restore saved chat. You can start a new analysis.");
+    }).finally(() => {
+      if (generation === restoreGeneration.current) setChatLoading(false);
+    });
+    return () => controller.abort();
+  }, [datasetKey, connectionStatus]);
 
   /* ---- Navigation ---- */
   const gotoTab = useCallback((tab: string) => {
@@ -986,14 +1054,14 @@ export default function AIAnalytics({
     const h = hypothesisHandoff();
     try {
       if (h.metric || h.breakdown) {
-        sessionStorage.setItem("aria_explore_prefill", JSON.stringify({
+        sessionStore.setItem("aria_explore_prefill", JSON.stringify({
           ...(h.metric ? { metric: h.metric } : {}),
           ...(h.breakdown ? { breakdown: h.breakdown } : {}),
         }));
       }
     } catch { /* best-effort */ }
     try {
-      localStorage.setItem("aria_dashboard_drill", JSON.stringify({
+      localStore.setItem("aria_dashboard_drill", JSON.stringify({
         at: Date.now(), kind: "hypothesis",
         ...(h.metric ? { metric: h.metric } : {}),
         ...(h.breakdown ? { dimension: h.breakdown, breakdown: h.breakdown } : {}),
@@ -1014,7 +1082,7 @@ export default function AIAnalytics({
       const key = "aria_report_draft";
       let cur: any[] = [];
       try {
-        const v = JSON.parse(localStorage.getItem(key) || "[]");
+        const v = JSON.parse(localStore.getItem(key) || "[]");
         if (Array.isArray(v)) cur = v;
       } catch { cur = []; }
       if (cur.some((x) => String(x?.title || "") === title)) {
@@ -1022,7 +1090,7 @@ export default function AIAnalytics({
         return;
       }
       cur.push({ id: "", title });
-      localStorage.setItem(key, JSON.stringify(cur));
+      localStore.setItem(key, JSON.stringify(cur));
       setReportMsg(`Added to the report draft (${cur.length}). Open Intelligence → Reports to generate.`);
     } catch { setReportMsg("Couldn't update the report draft."); }
   }, [result, askedQuestion]);
@@ -1030,14 +1098,16 @@ export default function AIAnalytics({
   /* ---- Run analysis on-page ---- */
   const runOnPage = useCallback(async (question: string) => {
     const q = question.trim();
-    if (!q || running) return;
+    if (!q || running || chatLoading) return;
     setAskedQuestion(q);
-    setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(false);
+    setSearchQuery(""); setFollowUpQuery(""); setAcOptions([]); setAcOpen(null);
     setRunning(true); setError(""); setResult(null);
+    setShowSql(false); setMonitorMsg(""); setExportMsg("");
+    setDrillTrail((t) => (t[t.length - 1] === q ? t : [...t.slice(-5), q]));
     abortRef.current?.abort();
     const ctrl = new AbortController(); abortRef.current = ctrl;
     try {
-      const data = await analyzeQuestion(q, null, { dataset: datasetKey || undefined }, null, { signal: ctrl.signal, timeoutMs: 120000 });
+      const data = await analyzeQuestion(q, null, { dataset: datasetKey || undefined }, { conversationId: conversationRef.current }, { signal: ctrl.signal, timeoutMs: AI_ANSWER_TIMEOUT_MS, useSharedContext: false });
       if (ctrl.signal.aborted) return;
       setResult(data);
       setSidebarCtx({ metric: data?.analytics_envelope?.metric || data?.display?.metric, breakdown: (data?.analytics_envelope?.dimensions || [])[0] });
@@ -1045,8 +1115,23 @@ export default function AIAnalytics({
     } catch (e: any) {
       if (e?.name === "AbortError") return;
       setError(e?.message || "Could not analyze this question.");
-    } finally { setRunning(false); }
-  }, [running, datasetKey]);
+    } finally { if (abortRef.current === ctrl) setRunning(false); }
+  }, [running, datasetKey, chatLoading]);
+
+  /* One-shot question handoff from other pages (e.g. clicking a Dashboard
+     KPI card): the question runs here as soon as the page opens, so the
+     user lands on an answer instead of an empty page. */
+  const handoffDone = useRef(false);
+  useEffect(() => {
+    if (handoffDone.current || (connectionStatus !== undefined && connectionStatus !== "connected")) return;
+    handoffDone.current = true;
+    let q = "";
+    try {
+      q = String(sessionStore.getItem(ANALYTICS_QUESTION_KEY) || "").trim();
+      if (q) sessionStore.removeItem(ANALYTICS_QUESTION_KEY);
+    } catch { q = ""; }
+    if (q) { setSearchQuery(q); runOnPage(q); }
+  }, [connectionStatus, runOnPage]);
 
   /* ---- Follow-up submit ---- */
   const submitFollowUp = () => {
@@ -1081,10 +1166,28 @@ export default function AIAnalytics({
   };
 
   /* ---- Back to home ---- */
-  const goHome = () => { setResult(null); setError(""); setHistory([]); setAskedQuestion(""); };
+  const goHome = async () => {
+    const generation = ++restoreGeneration.current;
+    setChatLoading(true); setChatNotice("");
+    abortRef.current?.abort(); abortRef.current = null;
+    conversationRef.current = crypto.randomUUID();
+    setRunning(false); setResult(null); setError(""); setHistory([]); setAskedQuestion("");
+    setSearchQuery(""); setFollowUpQuery(""); setSidebarCtx({});
+    setDrillTrail([]); setShowSql(false); setMonitorOpen(false);
+    setMonitorMsg(""); setExportMsg("");
+    try {
+      const data: any = await apiFetch("/csv/conversation/new", { method: "POST" });
+      if (generation === restoreGeneration.current) conversationRef.current = data.conversation_id;
+    } catch {
+      if (generation === restoreGeneration.current) setChatNotice("New chat is ready, but its empty state could not be saved yet.");
+    } finally {
+      if (generation === restoreGeneration.current) setChatLoading(false);
+    }
+  };
 
   /* ---- Result normalization (analyzeQuestion returns {success, data: goalData}) ---- */
   const gd = result?.data || result;  // goalData or raw
+  const csvResults: any[] = Array.isArray(gd?.analysis_results) ? gd.analysis_results : [];
   const answerMessage = strOf(gd?.answer || gd?.message || "");
   const findings: string[] = asList(gd?.findings || []).map((f: any) => strOf(typeof f === "string" ? f : f?.text)).filter(Boolean);
   const vizData = gd?.visualization?.data || gd?.data || [];
@@ -1219,6 +1322,74 @@ export default function AIAnalytics({
   /* Is the answer text-only (no chart, no findings, just narrative)? */
   const isTextOnly = !showChart && visibleFindings.length === 0 && !story;
 
+  /* Auto "why" annotation attached by the backend to trend chart specs
+     (period-over-period change decomposition). Rendered as a caption. */
+  const chartAnnotation = strOf((_cs as any)?.annotation?.text || "");
+  /* The SQL behind this answer (asked SQL first, then first evidence block). */
+  const sqlUsed = strOf(gd?.generatedSql || (gd as any)?.sql_used || (gd as any)?.evidence?.[0]?.sql || "");
+
+  /* ------------------------------------------------------------------ */
+  /*  Workspace actions (monitor / export) — server storage only         */
+  /* ------------------------------------------------------------------ */
+
+  /* The exact envelope this page displays, posted to /api/export/story so
+     the deck/spreadsheet can never drift from the on-screen numbers. */
+  const storyEnvelope = (): any => ({
+    question: strOf(askedQuestion) || strOf(gd?.interpretedGoal),
+    answer: answerMessage,
+    story,
+    why: strOf((gd as any)?.why?.what_happened || ""),
+    hypothesis: hypothesis ? strOf(hypothesis?.text || hypothesis) : "",
+    drivers: drivers.slice(0, 12),
+    columns: vizData.length
+      ? Object.keys(vizData[0] || {}).filter((k) => k !== "_idx")
+      : columns,
+    rows: vizData.slice(0, 500),
+    sql: sqlUsed,
+    as_of: new Date().toISOString(),
+    include_sql: true,
+  });
+
+  const createMonitorFromResult = async () => {
+    const text = monitorText.trim();
+    if (!text || monitorBusy) return;
+    setMonitorBusy(true); setMonitorMsg("");
+    try {
+      const env = storyEnvelope();
+      if (!env.sql) throw new Error("This answer has no stored query to monitor.");
+      const r = await workspaceApi.createMonitor({
+        name: text.slice(0, 80),
+        question: env.question,
+        sql: env.sql,
+        condition_text: text,
+        measure_column: chartMetric,
+      });
+      const cond = r.data?.condition || {};
+      setMonitorMsg(`Monitor created (${strOf(cond.type)} ${strOf(cond.value)}, ${strOf(r.data?.cadence) || "daily"}). Alerts land in the bell.`);
+      setMonitorText("");
+      setMonitorOpen(false);
+    } catch (e: any) {
+      setMonitorMsg(e?.message || "Couldn't create the monitor.");
+    } finally { setMonitorBusy(false); }
+  };
+
+  const exportStory = async (format: "pptx" | "xlsx" | "html") => {
+    setExportMsg("");
+    try {
+      const r = await downloadStoryExport(storyEnvelope(), format);
+      setExportMsg(`Saved ${r.filename}`);
+    } catch (e: any) {
+      setExportMsg(e?.message || "Export failed.");
+    }
+  };
+
+  /* Drill-chain breadcrumbs: re-run an earlier question and truncate the
+     trail (the run itself re-pushes the question as the new tail). */
+  const replayDrill = (q: string) => {
+    setDrillTrail((t) => (t.includes(q) ? t.slice(0, t.indexOf(q) + 1) : t));
+    runOnPage(q);
+  };
+
   /* ------------------------------------------------------------------ */
   /*  Not connected / Loading / Error / No dataset                       */
   /* ------------------------------------------------------------------ */
@@ -1252,6 +1423,7 @@ export default function AIAnalytics({
       <div className="flex gap-6 p-4 md:p-6 max-w-[1440px] mx-auto">
         {/* ---- Main column ---- */}
         <div className="flex-1 min-w-0 space-y-5">
+          {(chatLoading || chatNotice) && <p role="status" className="text-xs text-muted-foreground">{chatLoading ? "Loading current chat…" : chatNotice}</p>}
           {/* Header */}
           <div>
             <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">ARIA <span className="text-muted-foreground font-normal tracking-normal">/ Analytics</span></p>
@@ -1271,7 +1443,7 @@ export default function AIAnalytics({
                     <Plus size={14} /> New analysis
                   </button>
                 ) : (
-                  <button onClick={() => gotoTab("explore")} className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[12.5px] font-semibold text-white bg-blue-700 hover:bg-blue-800 transition-colors">
+                  <button onClick={goHome} className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-[12.5px] font-semibold text-white bg-blue-700 hover:bg-blue-800 transition-colors">
                     <Plus size={14} /> New analysis
                   </button>
                 )}
@@ -1286,23 +1458,23 @@ export default function AIAnalytics({
                 <Search size={15} className="text-muted-foreground flex-shrink-0" />
                 <input
                   value={searchQuery}
-                  onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
-                  onFocus={() => setAcOpen(true)}
-                  onBlur={() => setTimeout(() => setAcOpen(false), 200)}
-                  onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); runOnPage(searchQuery); } }}
+                  onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen("search"); setAcIndex(-1); }}
+                  onFocus={() => setAcOpen("search")}
+                  onBlur={() => setTimeout(() => setAcOpen((cur) => (cur === "search" ? null : cur)), 200)}
+                  onKeyDown={(e) => acKeyDown(e, "search", (v) => { setSearchQuery(v); runOnPage(v); }, () => runOnPage(searchQuery))}
                   placeholder="Ask another question..."
                   className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground"
                   aria-label="Ask a question"
                 />
-                <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
+                <button onClick={() => { setAcOpen(null); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" disabled={chatLoading || running} aria-label="Submit">
                   <Send size={14} />
                 </button>
               </div>
-              {acOpen && acOptions.length > 0 && (
+              {acOpen === "search" && acOptions.length > 0 && (
                 <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
                   {acOptions.map((s, i) => (
-                    <button key={s + i} onMouseDown={() => { setAcOpen(false); setSearchQuery(s); runOnPage(s); }}
-                      className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left">
+                    <button key={s + i} role="option" aria-selected={i === acIndex} onMouseDown={() => { setAcOpen(null); setSearchQuery(s); runOnPage(s); }}
+                      className={`w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left ${i === acIndex ? "bg-secondary" : ""}`}>
                       <Zap size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
                       <span className="truncate">{s}</span>
                     </button>
@@ -1327,23 +1499,23 @@ export default function AIAnalytics({
                   <Search size={15} className="text-muted-foreground flex-shrink-0" />
                   <input
                     value={searchQuery}
-                    onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
-                    onFocus={() => setAcOpen(true)}
-                    onBlur={() => setTimeout(() => setAcOpen(false), 200)}
-                    onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); runOnPage(searchQuery); } }}
+                    onChange={(e) => { setSearchQuery(e.target.value); fetchAc(e.target.value); setAcOpen("start"); setAcIndex(-1); }}
+                    onFocus={() => setAcOpen("start")}
+                    onBlur={() => setTimeout(() => setAcOpen((cur) => (cur === "start" ? null : cur)), 200)}
+                    onKeyDown={(e) => acKeyDown(e, "start", (v) => { setSearchQuery(v); runOnPage(v); }, () => runOnPage(searchQuery))}
                     placeholder="E.g. Why did revenue drop last month?"
                     className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground"
                     aria-label="Ask a question"
                   />
-                  <button onClick={() => { setAcOpen(false); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Submit">
+                  <button onClick={() => { setAcOpen(null); runOnPage(searchQuery); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" disabled={chatLoading || running} aria-label="Submit">
                     <ChevronRight size={15} />
                   </button>
                 </div>
-                {acOpen && acOptions.length > 0 && (
+                {acOpen === "start" && acOptions.length > 0 && (
                   <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
                     {acOptions.map((s, i) => (
-                      <button key={s + i} onMouseDown={() => { setAcOpen(false); setSearchQuery(s); runOnPage(s); }}
-                        className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left">
+                      <button key={s + i} role="option" aria-selected={i === acIndex} onMouseDown={() => { setAcOpen(null); setSearchQuery(s); runOnPage(s); }}
+                        className={`w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left ${i === acIndex ? "bg-secondary" : ""}`}>
                         <Zap size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
                         <span className="truncate">{s}</span>
                       </button>
@@ -1393,6 +1565,36 @@ export default function AIAnalytics({
               {/* Answer + Chart + Insights */}
               {!running && !error && result && (
                 <div className="space-y-4 chart-reveal">
+                  {/* Drill chain — step back up through this analysis thread */}
+                  {drillTrail.length > 1 && (
+                    <div className="flex items-center gap-1 flex-wrap text-[11.5px]">
+                      <button onClick={goHome} className="font-medium text-muted-foreground hover:text-foreground transition-colors">Home</button>
+                      {drillTrail.map((q, i) => {
+                        const last = i === drillTrail.length - 1;
+                        return (
+                          <span key={q + i} className="flex items-center gap-1">
+                            <ChevronRight size={11} className="text-muted-foreground flex-shrink-0" />
+                            <button
+                              onClick={() => { if (!last) replayDrill(q); }}
+                              disabled={last}
+                              className={`max-w-[220px] truncate ${last ? "font-semibold text-foreground" : "text-blue-700 dark:text-blue-400 hover:underline"}`}
+                              title={q}>
+                              {q.length > 32 ? `${q.slice(0, 32)}…` : q}
+                            </button>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {history.length > 1 && <details className="rounded-xl border border-border p-4 text-sm">
+                    <summary className="cursor-pointer font-semibold">Current chat · {history.length} turns</summary>
+                    {history.slice(0, -1).map((turn, index) => <div key={index} className="mt-3 border-t pt-3">
+                      <p className="font-medium">You: {turn.q}</p>
+                      <p className="mt-1 text-muted-foreground">ARIA: {turn.r?.data?.answer || turn.r?.data?.message || turn.r?.answer || turn.r?.message}</p>
+                      <button type="button" className="mt-1 text-xs underline" onClick={() => { setResult(turn.r); setAskedQuestion(turn.q); }}>View this result</button>
+                    </div>)}
+                    <p className="mt-3 text-xs text-muted-foreground">Follow-ups use this chat’s context. Saved CSV chats restore after refresh while the same dataset is connected. New analysis starts a separate chat.</p>
+                  </details>}
                   {/* Asked question — stays until the user dismisses it */}
                   {askedQuestion && (
                     <div className="flex items-start gap-2.5 rounded-xl border border-border bg-secondary/70 px-4 py-3">
@@ -1414,8 +1616,71 @@ export default function AIAnalytics({
                       aria-label="Add this analysis to the report draft">
                       <FileText size={13} /> Add to report
                     </button>
+                    <button
+                      onClick={() => setShowSql((v) => !v)}
+                      disabled={!sqlUsed}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold border transition-colors disabled:opacity-50 ${showSql ? "text-white bg-blue-700 border-blue-700 hover:bg-blue-800" : "text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/25 hover:bg-blue-50 dark:hover:bg-blue-500/10"}`}
+                      aria-label="Show the SQL behind this answer"
+                      aria-pressed={showSql}>
+                      <Code2 size={13} /> {showSql ? "Hide SQL" : "Show SQL"}
+                    </button>
+                    <button
+                      onClick={() => { setMonitorOpen((v) => !v); setMonitorMsg(""); }}
+                      disabled={!sqlUsed}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold border transition-colors disabled:opacity-50 ${monitorOpen ? "text-white bg-blue-700 border-blue-700 hover:bg-blue-800" : "text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/25 hover:bg-blue-50 dark:hover:bg-blue-500/10"}`}
+                      aria-label="Create an alert for this question"
+                      aria-pressed={monitorOpen}>
+                      <BellPlus size={13} /> Monitor
+                    </button>
+                    <span className="inline-flex items-center gap-1">
+                      <FileDown size={13} className="text-muted-foreground" />
+                      <button onClick={() => exportStory("pptx")} className="px-2 py-1.5 rounded-lg text-[11.5px] font-semibold text-secondary-foreground border border-border hover:bg-secondary" aria-label="Export as PowerPoint">PPTX</button>
+                      <button onClick={() => exportStory("xlsx")} className="px-2 py-1.5 rounded-lg text-[11.5px] font-semibold text-secondary-foreground border border-border hover:bg-secondary" aria-label="Export as Excel">Excel</button>
+                      <button onClick={() => exportStory("html")} className="px-2 py-1.5 rounded-lg text-[11.5px] font-semibold text-secondary-foreground border border-border hover:bg-secondary" aria-label="Export a printable page">Print</button>
+                    </span>
                     {reportMsg && <span className="text-[11.5px] text-secondary-foreground" role="status">{reportMsg}</span>}
+                    {exportMsg && <span className="text-[11.5px] text-secondary-foreground" role="status">{exportMsg}</span>}
                   </div>
+                  {/* Natural-language monitor creator (server-parsed condition) */}
+                  {monitorOpen && (
+                    <Card className="p-4">
+                      <p className="text-[12px] font-semibold text-foreground">Tell ARIA when to alert you</p>
+                      <p className="mt-0.5 text-[11.5px] text-muted-foreground">
+                        Plain words — e.g. “alert me when this drops more than 10%” or “when it goes above 5K”.
+                      </p>
+                      <div className="mt-2 flex items-center gap-2 flex-wrap">
+                        <input
+                          value={monitorText}
+                          onChange={(e) => setMonitorText(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === "Enter") createMonitorFromResult(); }}
+                          placeholder="alert me when revenue drops more than 10%"
+                          className="flex-1 min-w-[240px] rounded-lg border border-border bg-secondary/60 px-3 py-2 text-[12.5px] text-foreground outline-none focus:border-blue-400"
+                          aria-label="Monitor condition in plain words"
+                        />
+                        <button
+                          onClick={createMonitorFromResult}
+                          disabled={monitorBusy || !monitorText.trim()}
+                          className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12px] font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-60">
+                          <BellPlus size={13} /> {monitorBusy ? "Creating…" : "Create monitor"}
+                        </button>
+                        <button onClick={() => { setMonitorOpen(false); setMonitorMsg(""); }} className="px-3 py-2 rounded-lg text-[12px] font-medium text-secondary-foreground border border-border hover:bg-secondary">Cancel</button>
+                      </div>
+                      {monitorMsg && <p className="mt-2 text-[11.5px] text-secondary-foreground" role="status">{monitorMsg}</p>}
+                    </Card>
+                  )}
+                  {/* Show SQL / explain toggle: the exact query that ran */}
+                  {showSql && sqlUsed && (
+                    <Card className="p-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-[12px] font-semibold text-foreground flex items-center gap-1.5"><Code2 size={13} className="text-blue-700 dark:text-blue-400" /> SQL behind this answer</p>
+                        <span className="text-[11px] text-muted-foreground">Read-only · exactly what ran against your data</span>
+                      </div>
+                      <pre className="mt-2 max-h-[260px] overflow-auto rounded-lg bg-secondary/70 border border-border px-3 py-2 text-[11.5px] leading-relaxed text-secondary-foreground whitespace-pre-wrap break-words">{sqlUsed}</pre>
+                    </Card>
+                  )}
+                  {gd?.context_resolution?.uses_history && <p className="text-xs text-muted-foreground px-1">Interpreted as: {gd.resolved_question}</p>}
+                  {gd?.narrative_status === "unavailable" && <p role="status" className="text-sm text-amber-700">Calculation available · AI explanation unavailable. The tables below contain the executed results.</p>}
+                  {gd?.context_resolution?.mode === "recall" && <p className="text-xs text-muted-foreground">Recalled from this chat · no new calculation performed</p>}
                   {/* Answer message */}
                   {answerMessage && (
                     <Card className="p-5">
@@ -1463,18 +1728,64 @@ export default function AIAnalytics({
                     );
                   })()}
 
+                  {csvResults.map((item: any, index: number) => {
+                    const rows: any[] = item.data || [];
+                    const spec = item.chart_spec || {};
+                    const chartRows = rows.filter(row => typeof row[spec.y] === "number");
+                    return <Card key={index} className="p-5">
+                      <CardHead title={item.title} sub={item.reason} />
+                      {spec.chart_type !== "table" && spec.x && spec.y && chartRows.length > 0 && <div className="h-[260px] mt-3">
+                        <DynamicChart data={chartRows} chartSpec={spec} metric={spec.y} />
+                      </div>}
+                      {chartRows.length !== rows.length && spec.chart_type !== "table" && <p className="text-xs mt-2 text-muted-foreground">Unavailable values are omitted from the chart; see the table for all values.</p>}
+                      {rows.length > 60 && spec.chart_type !== "table" && <p className="text-xs mt-2 text-muted-foreground">Chart shows the first 60 available points. The table contains all returned rows.</p>}
+                      <div className="overflow-auto max-h-80 mt-3">
+                        {rows.length ? <table className="w-full text-xs"><thead><tr>{item.columns.map((col: string) => <th key={col} className="text-left p-2 border-b">{humanize(col)}</th>)}</tr></thead>
+                          <tbody>{rows.map((row: any, i: number) => <tr key={i}>{item.columns.map((col: string) => <td key={col} className="p-2 border-b">{row[col] == null ? "Unavailable (NULL)" : typeof row[col] === "number" ? row[col].toLocaleString(undefined, { maximumSignificantDigits: 12 }) : String(row[col])}</td>)}</tr>)}</tbody></table>
+                          : !item.statistical_evidence && <p className="text-sm text-muted-foreground">No matching rows. This does not imply a zero total.</p>}
+                      </div>
+                      <CsvStatisticalEvidence result={item} />
+                      {item.sql && <details className="mt-3 text-xs"><summary className="cursor-pointer">How this was calculated</summary><pre className="overflow-auto whitespace-pre-wrap mt-2">{item.sql}</pre></details>}
+                    </Card>;
+                  })}
+                  {gd?.dataset_understanding && <Card className="p-5 text-sm space-y-2">
+                    <p>{gd.dataset_understanding.description}</p>
+                    {(gd.dataset_understanding.assumptions || []).map((text: string, i: number) => <p key={i}>Assumption: {text}</p>)}
+                    {(gd.limitations || []).map((text: string, i: number) => <p key={i} className="text-muted-foreground">{text}</p>)}
+                    {gd.dataset_profile?.profile && <p className="text-xs text-muted-foreground">Data quality profile: {gd.dataset_profile.profile.scope}. Analysis queries use the connected dataset.</p>}
+                  </Card>}
+                  {gd?.validation && <details className="text-xs rounded-xl border p-4">
+                    <summary className="cursor-pointer">Result checks and AI review</summary>
+                    {(gd.validation.checks || []).map((check: any, i: number) => <p key={i} className="mt-2">{check.detail}</p>)}
+                    <p className="mt-2">AI review: {gd.validation.semantic_review?.status}. {gd.validation.semantic_review?.reason}</p>
+                    <p className="mt-2 text-muted-foreground">This review is not independent verification of metric meaning.</p>
+                  </details>}
+                  {gd?.ranked_insights?.length > 0 && <details className="text-xs rounded-xl border p-4"><summary className="cursor-pointer">Patterns to investigate</summary>{gd.ranked_insights.map((item: any, i: number) => <p key={i} className="mt-2">{item.title} — {item.effect_measure.replace(/_/g, " ")}: {item.largest_absolute_effect ?? "Unavailable"}. {item.note}</p>)}</details>}
+                  {gd?.llm_trace && <details className="text-xs text-muted-foreground rounded-xl border p-4">
+                    <summary className="cursor-pointer">AI execution details</summary>
+                    <p className="mt-2">Provider: {gd.llm_trace.provider} · {gd.llm_trace.cached ? "Cached result" : "Fresh analysis"} · Provider invocations: {gd.llm_trace.cached ? 0 : gd.llm_trace.provider_invocation_count}</p>
+                    <p>Statistical tool invocations: {gd.llm_trace.statistical_tool_count || 0}</p>
+                    {(gd.llm_trace.calls || []).map((call: any, i: number) => <p key={i}>{call.stage} · {call.model} · {call.duration_ms} ms · {call.status}</p>)}
+                  </details>}
+
                   {/* Chart — adapts to result type: chart for visual data, table for tabular, nothing for text-only */}
-                  {showChart && (
+                  {!csvResults.length && showChart && (
                     <Card className="p-5">
                       <CardHead title={chartSpec.label || (chartMetric ? `${humanize(chartMetric)} Analysis` : "Analysis Results")} sub={`${vizData.length} data points`} />
                       <div className="h-[260px] mt-3">
                         <DynamicChart data={vizData} chartSpec={chartSpec} metric={chartMetric} />
                       </div>
+                      {chartAnnotation && (
+                        <div className="mt-3 flex items-start gap-1.5 text-[11.5px] text-secondary-foreground bg-amber-50/70 dark:bg-amber-500/10 border border-amber-100 dark:border-amber-500/20 rounded-lg px-2.5 py-2">
+                          <TrendingDown size={12} className="text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+                          <span>{chartAnnotation}</span>
+                        </div>
+                      )}
                     </Card>
                   )}
 
                   {/* Table — for table-type results or when chart axes are missing but data exists */}
-                  {!showChart && vizData.length > 0 && (() => {
+                  {!csvResults.length && !showChart && vizData.length > 0 && (() => {
                     const keys = vizData.length > 0 ? Object.keys(vizData[0]).filter((k) => k !== "_idx") : [];
                     if (keys.length === 0) return null;
                     return (
@@ -1538,7 +1849,7 @@ export default function AIAnalytics({
                                       <span className="text-muted-foreground"> ({identLabel(d?.dimension)})</span>
                                     )}
                                     {share !== null && (
-                                      <span> — about <span className="font-semibold text-foreground tabular-nums">{Math.round(share)}%</span> of the total</span>
+                                      <span> — about <span className="font-semibold text-foreground tabular-nums">{Math.round(share)}%</span> of the {strOf(d?.basis) === "change" ? "change" : "total"}</span>
                                     )}
                                   </span>
                                 </li>
@@ -1642,23 +1953,23 @@ export default function AIAnalytics({
                       <Search size={15} className="text-muted-foreground flex-shrink-0" />
                       <input
                         value={followUpQuery}
-                        onChange={(e) => { setFollowUpQuery(e.target.value); fetchAc(e.target.value); setAcOpen(true); }}
-                        onFocus={() => setAcOpen(true)}
-                        onBlur={() => setTimeout(() => setAcOpen(false), 200)}
-                        onKeyDown={(e) => { if (e.key === "Enter") { setAcOpen(false); submitFollowUp(); } }}
+                        onChange={(e) => { setFollowUpQuery(e.target.value); fetchAc(e.target.value); setAcOpen("followup"); setAcIndex(-1); }}
+                        onFocus={() => setAcOpen("followup")}
+                        onBlur={() => setTimeout(() => setAcOpen((cur) => (cur === "followup" ? null : cur)), 200)}
+                        onKeyDown={(e) => acKeyDown(e, "followup", (v) => { setFollowUpQuery(v); runOnPage(v); }, () => submitFollowUp())}
                         placeholder="Ask a follow-up..."
                         className="flex-1 bg-transparent outline-none text-[13px] text-foreground placeholder:text-muted-foreground"
                         aria-label="Ask a follow-up question"
                       />
-                      <button onClick={() => { setAcOpen(false); submitFollowUp(); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Send">
+                      <button onClick={() => { setAcOpen(null); submitFollowUp(); }} className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-blue-700 text-white hover:bg-blue-800 transition-colors flex-shrink-0" aria-label="Send">
                         <Send size={14} />
                       </button>
                     </div>
-                    {acOpen && acOptions.length > 0 && (
+                    {acOpen === "followup" && acOptions.length > 0 && (
                       <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg py-1.5 z-30 max-h-[240px] overflow-y-auto">
                         {acOptions.map((s, i) => (
-                          <button key={s + i} onMouseDown={() => { setAcOpen(false); setFollowUpQuery(s); runOnPage(s); }}
-                            className="w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left">
+                          <button key={s + i} role="option" aria-selected={i === acIndex} onMouseDown={() => { setAcOpen(null); setFollowUpQuery(s); runOnPage(s); }}
+                            className={`w-full flex items-center gap-3 px-4 py-2.5 text-[12px] text-foreground hover:bg-secondary transition-colors text-left ${i === acIndex ? "bg-secondary" : ""}`}>
                             <Zap size={13} className="text-blue-600 dark:text-blue-400 flex-shrink-0" />
                             <span className="truncate">{s}</span>
                           </button>
@@ -1733,10 +2044,14 @@ export default function AIAnalytics({
         <aside className="w-[300px] flex-shrink-0 hidden lg:block space-y-4">
           {/* 360 degree business view — side panel keeps the main column short */}
           {b360 && (
-            <div className="bg-card border border-blue-200/80 dark:border-blue-500/25 rounded-2xl shadow-[0_1px_3px_rgba(0,0,0,0.04)] p-4 bg-gradient-to-b from-blue-50/60 dark:from-blue-500/10 to-card">
-              <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">360 DEGREE BUSINESS VIEW</p>
-              <h3 className="text-[14px] font-bold text-foreground tracking-tight mt-1 leading-snug">{strOf(b360?.headline || "Here's the full picture")}</h3>
-              <p className="mt-1.5 text-[12px] text-secondary-foreground leading-relaxed">{strOf(b360?.what_happened?.summary || "")}</p>
+            <div className="bg-card border border-blue-200/80 dark:border-blue-500/25 rounded-2xl shadow-[0_2px_8px_rgba(0,0,0,0.06)] p-4 bg-gradient-to-br from-blue-50/70 via-card dark:from-blue-500/10 dark:via-card to-card overflow-hidden relative">
+              <div className="absolute top-0 right-0 w-24 h-24 bg-blue-500/5 dark:bg-blue-400/5 rounded-full -translate-y-8 translate-x-8 pointer-events-none" />
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center justify-center w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 text-white shadow-sm"><Sparkles size={13} /></span>
+                <p className="text-[11px] font-bold tracking-[0.14em] text-blue-700 dark:text-blue-400">360° BUSINESS VIEW</p>
+              </div>
+              <h3 className="text-[15px] font-bold text-foreground tracking-tight mt-2 leading-snug">{strOf(b360?.headline || "Here's the full picture")}</h3>
+              <p className="mt-1.5 text-[12.5px] text-secondary-foreground leading-relaxed">{strOf(b360?.what_happened?.summary || "")}</p>
               {asList(b360?.likely_causes).length > 0 && (
                 <div className="mt-2.5">
                   <p className="text-[11px] font-semibold text-foreground">Most likely causes</p>
