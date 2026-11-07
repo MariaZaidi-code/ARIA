@@ -7,7 +7,7 @@
 const { test, expect } = require('@playwright/test');
 const { seedAuth } = require('./auth-helper');
 
-const BASE = 'http://localhost:8000';
+const BASE = process.env.ARIA_E2E_BASE_URL || 'http://localhost:8000';
 
 test.describe('Main App pages', () => {
   let page;
@@ -109,8 +109,12 @@ test.describe('Main App pages', () => {
       if (url.pathname.endsWith('/summary')) {
         return route.fulfill({ json: { ok: true, summary: document.summary, summary_version: 2 } });
       }
+      if (url.pathname.endsWith('/upload-jobs')) {
+        return route.fulfill({ json: { ok: true, jobs: [] } });
+      }
       return route.fulfill({ json: { documents: [document] } });
     });
+    await page.route('**/api/insight/pdf/conversations**', (route) => route.fulfill({ json: { ok: true, conversations: [] } }));
     await page.route('**/api/insight/pdf/chat', async (route) => {
       chatAttempts += 1;
       if (chatAttempts === 1) {
@@ -128,8 +132,21 @@ test.describe('Main App pages', () => {
             filename: document.name,
             page: 1,
             content_type: 'table',
+            location_label: 'p. 1',
             snippet: '| Region | Sales | | --- | --- | | North | 120 | | South | 95 |',
+            table: { columns: ['Region', 'Sales'], rows: [['North', '120'], ['South', '95']] },
           }],
+          visualization: {
+            type: 'bar',
+            title: 'Sales by Region',
+            x_key: 'label',
+            x_label: 'Region',
+            y_label: 'Sales',
+            series: [{ key: 'Sales', label: 'Sales', source_id: 'S1' }],
+            data: [{ label: 'North', Sales: 120 }, { label: 'South', Sales: 95 }],
+            cross_document: false,
+            source_ids: ['S1'],
+          },
         },
       });
     });
@@ -192,11 +209,11 @@ test.describe('Main App pages', () => {
     await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
     await page.getByRole('button', { name: 'Try again' }).click();
     await expect(page.getByText('Sales by region [S1]', { exact: true })).toBeVisible();
-    await expect(page.locator('.documents-answer-chart')).toBeVisible();
-    await expect(page.getByRole('figure', { name: 'Chart of Sales' })).toBeVisible();
-    await expect(page.locator('.documents-answer-chart-row')).toHaveCount(2);
-    await expect(page.locator('.documents-chat-answer > p').last()).not.toContainText('*');
-    const answerFontSize = await page.locator('.documents-chat-answer > p').last().evaluate((element) => (
+    await expect(page.getByRole('figure', { name: 'Chart: Sales by Region' })).toBeVisible();
+    await expect(page.locator('.doc-answer-chart .recharts-surface').first()).toBeVisible();
+    await expect(page.getByRole('button', { name: 'View cited data [S1]' })).toBeVisible();
+    await expect(page.locator('.documents-chat-answer .doc-answer-markdown p').last()).not.toContainText('*');
+    const answerFontSize = await page.locator('.documents-chat-answer .doc-answer-markdown p').last().evaluate((element) => (
       Number.parseFloat(getComputedStyle(element).fontSize)
     ));
     expect(answerFontSize).toBeGreaterThanOrEqual(14);
