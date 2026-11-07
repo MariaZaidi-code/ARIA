@@ -119,7 +119,7 @@ test.describe('Intelligence module', () => {
     await openTab('Hypotheses');
     const questionBox = page.getByRole('textbox', { name: 'Question to investigate' });
     await expect(
-      questionBox.or(page.getByText(/no hypotheses found yet|couldn't load/i).first())
+      questionBox.or(page.getByText(/no hypotheses found yet|couldn't load/i).first()).first()
     ).toBeVisible({ timeout: 30000 });
     await expect(page.getByText(BARE_FETCH)).toHaveCount(0);
     const viewBtn = page.getByRole('button', { name: /^view$/i }).first();
@@ -162,7 +162,7 @@ test.describe('Intelligence module', () => {
     await openIntelligence();
     await openTab('What-If');
     await expect(
-      page.getByLabel('Scenario variable').or(page.getByText(/no scenario variables available|couldn't load/i).first())
+      page.getByLabel('Scenario variable').or(page.getByText(/no scenario variables available|couldn't load/i).first()).first()
     ).toBeVisible({ timeout: 30000 });
     await expect(page.getByText(BARE_FETCH)).toHaveCount(0);
     if (await page.getByLabel('Scenario variable').count()) {

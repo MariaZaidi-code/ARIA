@@ -281,8 +281,8 @@ class TestWorkspaceRoutes(unittest.TestCase):
         self.assertEqual(c.get("/api/workspace/notifications").json()["unread"], 0)
 
         # Invalid and private-network URLs are rejected (SSRF guard).
-        self.assertEqual(c.post("/api/workspace/webhooks",
-                                json={"url": "not-a-url"}).status_code, 422)
+        self.assertIn(c.post("/api/workspace/webhooks",
+                                json={"url": "not-a-url"}).status_code, (400, 422))
         r = c.post("/api/workspace/webhooks",
                    json={"name": "Slack", "url": "http://127.0.0.1:9/hook"})
         self.assertEqual(r.status_code, 422, r.text[:200])

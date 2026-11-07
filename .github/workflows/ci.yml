@@ -173,6 +173,11 @@ jobs:
         working-directory: aria-frontend
         run: npm run typecheck && npm run build
       - name: Start backend on :8000 and probe health
+        # The E2E suite deliberately exercises many pages rapidly from one CI IP.
+        # Disable dev-only throttling for this isolated functional-flow server;
+        # separate unit tests still enforce real production rate-limit behaviour.
+        env:
+          ARIA_RATE_LIMIT: "off"
         run: |
           python app.py > /tmp/aria_e2e.log 2>&1 &
           echo $! > /tmp/aria_e2e.pid

@@ -487,12 +487,14 @@ class TestBatch23Guards(unittest.TestCase):
         self.assertGreater(out2["momentum_pct"], 0)
 
     def test_prose_not_promoted_to_actions(self):
-        from prescription_agent import PrescriptionAgent
+        from prescription_engine import recommendation_for_decision
 
         prose = "Sales went up last quarter. Costs also rose. Demand looks strong."
-        self.assertEqual(PrescriptionAgent._parse_actions(prose, 5), [])
         listed = "1. Cut waste\n2. Renegotiate supply\n3. Push top product"
-        self.assertEqual(len(PrescriptionAgent._parse_actions(listed, 5)), 3)
+        for unverified in (prose, listed):
+            self.assertIsNone(recommendation_for_decision(
+                {"title": "Unverified action", "recommendation": unverified}
+            ))
 
 
 class TestExecuteGuarded(unittest.TestCase):
