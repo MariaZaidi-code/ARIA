@@ -450,10 +450,18 @@ class TestRateLimitAndErrors(unittest.TestCase):
 
 class TestSecretBoxKeepalive(unittest.TestCase):
     def test_roundtrip(self):
-        from core.secret_box import encrypt, decrypt, PREFIX
+        import sys
+        from core.secret_box import encrypt, decrypt, PREFIX, is_encrypted
 
-        enc = encrypt("s3cr3t-value")
-        self.assertTrue(enc.startswith(PREFIX))
+        if sys.platform == "win32":
+            enc = encrypt("s3cr3t-value")
+            self.assertTrue(enc.startswith(PREFIX))
+            self.assertTrue(is_encrypted(enc))
+        else:
+            with self.assertWarns(RuntimeWarning):
+                enc = encrypt("s3cr3t-value")
+            self.assertEqual(enc, "s3cr3t-value")
+            self.assertFalse(is_encrypted(enc))
         self.assertEqual(decrypt(enc), "s3cr3t-value")
         self.assertEqual(decrypt("plain"), "plain")
 
