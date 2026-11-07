@@ -11,10 +11,10 @@ import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from core.config import get_session
-from core.deps import get_current_user, require_data, require_writable, get_request_id
+from core.deps import get_current_user, require_writable, get_request_id
 from services import intelligence_service as intel
 
 log = logging.getLogger("aria.intelligence.api")
@@ -27,6 +27,7 @@ router = APIRouter(prefix="/api/intelligence", tags=["intelligence"])
 # ---------------------------------------------------------------------------
 
 class ExploreRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     metric: str
     breakdown: str | None = None
     secondary_breakdown: str | None = None
@@ -40,11 +41,11 @@ class ExploreRequest(BaseModel):
     dateRange: dict | str | None = None
     filters: list | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class WhatIfRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     variable: str | None = None
     metric: str | None = None
     column: str | None = None
@@ -56,11 +57,11 @@ class WhatIfRequest(BaseModel):
     applyTo: str | None = None
     scope: str | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class GoalRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     title: str | None = None
     name: str | None = None
     metric: str | None = None
@@ -75,11 +76,11 @@ class GoalRequest(BaseModel):
     due: str | None = None
     status: str | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class ReportRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     name: str = "ARIA Report"
     description: str = ""
     date_range: str | None = None
@@ -87,11 +88,11 @@ class ReportRequest(BaseModel):
     sections: list | None = None
     template: str = "professional"
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class AnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     title: str = "Untitled Analysis"
     name: str | None = None
     metric: str | None = None
@@ -101,11 +102,11 @@ class AnalysisRequest(BaseModel):
     result_summary: str | None = None
     summary: str | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class ScenarioRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     title: str | None = None
     name: str | None = None
     variable: str | None = None
@@ -113,21 +114,21 @@ class ScenarioRequest(BaseModel):
     change_type: str | None = None
     result: dict | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class TemplateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     name: str = "Untitled template"
     description: str = ""
     sections: list | None = None
     template: str | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class DigestRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     name: str = "Daily Digest"
     description: str = ""
     frequency: str = "daily"
@@ -135,11 +136,11 @@ class DigestRequest(BaseModel):
     template: str = "professional"
     sections: list | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class DigestPatch(BaseModel):
+    model_config = ConfigDict(extra="allow")
     name: str | None = None
     description: str | None = None
     frequency: str | None = None
@@ -147,8 +148,7 @@ class DigestPatch(BaseModel):
     template: str | None = None
     sections: list | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +210,10 @@ def _explore_cache_get(key):
     try:
         ts, val = _EXPLORE_CACHE.get(key, (0, None))
         if val is not None and __import__("time").time() - ts < _EXPLORE_CACHE_TTL:
-            return val
+            # Hand out a copy: callers must never be able to mutate the
+            # cached payload for subsequent requests.
+            import copy as _copy
+            return _copy.deepcopy(val)
         _EXPLORE_CACHE.pop(key, None)
     except Exception:
         pass
@@ -237,12 +240,11 @@ def _schema_cache_tag(session: dict) -> str:
 
 
 @router.post("/explore")
-def run_explore(req: ExploreRequest, request: Request, user: dict = Depends(get_current_user)):
+def run_explore(req: ExploreRequest, request: Request, user: dict = Depends(require_writable)):
     """Run a server-side aggregation analysis."""
-    try:
-        session, user = _get_session_and_user(request, user)
-    except HTTPException as exc:
-        return {"ok": False, "detail": exc.detail, "code": "NO_DATA"}
+    # No connected dataset is a client-side precondition, not a success
+    # body: raise so normalizeApiError-based clients see a real error.
+    session, user = _get_session_and_user(request, user)
     payload = req.model_dump()
     # normalize frontend aliases for service
     if not payload.get("time") and (payload.get("time_grain") or payload.get("timeGrain")):
@@ -280,6 +282,10 @@ def run_explore(req: ExploreRequest, request: Request, user: dict = Depends(get_
 @router.post("/hypotheses")
 def list_hypotheses(request: Request, user: dict = Depends(get_current_user)):
     """Return hypothesis candidates from the connected dataset."""
+    if request.method != "GET":
+        # POST shares this path with GET for convenience; it is a write
+        # (persists a refreshed list), so it obeys the mobile read-only rule.
+        user = require_writable(request, user)
     try:
         session, user = _get_session_and_user(request, user)
     except HTTPException:
@@ -294,10 +300,7 @@ def list_hypotheses(request: Request, user: dict = Depends(get_current_user)):
 @router.get("/hypotheses/{hypothesis_id}")
 def get_hypothesis(hypothesis_id: str, request: Request, user: dict = Depends(get_current_user)):
     """Single hypothesis detail for the Hypotheses tab."""
-    try:
-        session, user = _get_session_and_user(request, user)
-    except HTTPException as exc:
-        return {"ok": False, "detail": exc.detail, "code": "NO_DATA"}
+    session, user = _get_session_and_user(request, user)
     detail = intel.get_hypothesis_detail(session, hypothesis_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Hypothesis not found.")
@@ -320,7 +323,7 @@ def list_goals(request: Request, user: dict = Depends(get_current_user), status:
 
 
 @router.post("/goals")
-def create_goal(req: GoalRequest, request: Request, user: dict = Depends(get_current_user)):
+def create_goal(req: GoalRequest, request: Request, user: dict = Depends(require_writable)):
     session = get_session(user["user_id"])
     did = _dataset_id(session)
     data = req.model_dump(exclude_unset=True)
@@ -333,7 +336,7 @@ def create_goal(req: GoalRequest, request: Request, user: dict = Depends(get_cur
 
 
 @router.patch("/goals/{goal_id}")
-def update_goal(goal_id: str, req: GoalRequest, request: Request, user: dict = Depends(get_current_user)):
+def update_goal(goal_id: str, req: GoalRequest, request: Request, user: dict = Depends(require_writable)):
     """Update a goal's status or fields."""
     session = get_session(user["user_id"])
     did = _dataset_id(session)
@@ -344,7 +347,7 @@ def update_goal(goal_id: str, req: GoalRequest, request: Request, user: dict = D
 
 
 @router.delete("/goals/{goal_id}")
-def delete_goal(goal_id: str, request: Request, user: dict = Depends(get_current_user)):
+def delete_goal(goal_id: str, request: Request, user: dict = Depends(require_writable)):
     """Delete a goal."""
     session = get_session(user["user_id"])
     if not intel.delete_goal(user["user_id"], goal_id):
@@ -353,7 +356,7 @@ def delete_goal(goal_id: str, request: Request, user: dict = Depends(get_current
 
 
 @router.post("/goals/{goal_id}/refresh")
-def refresh_goal(goal_id: str, request: Request, user: dict = Depends(get_current_user)):
+def refresh_goal(goal_id: str, request: Request, user: dict = Depends(require_writable)):
     """Recompute one goal's current value from live data (auto-progress).
 
     Loads the stored goal, re-runs the run_explore-equivalent aggregation
@@ -389,12 +392,9 @@ def whatif_meta(request: Request, user: dict = Depends(get_current_user)):
 
 
 @router.post("/what-if/run")
-def run_whatif(req: WhatIfRequest, request: Request, user: dict = Depends(get_current_user)):
+def run_whatif(req: WhatIfRequest, request: Request, user: dict = Depends(require_writable)):
     """Run a What-If scenario."""
-    try:
-        session, user = _get_session_and_user(request, user)
-    except HTTPException as exc:
-        return {"ok": False, "detail": exc.detail, "code": "NO_DATA"}
+    session, user = _get_session_and_user(request, user)
     payload = req.model_dump()
     if not payload.get("variable"):
         payload["variable"] = payload.get("metric") or payload.get("column")
@@ -429,7 +429,7 @@ def list_analyses(request: Request, user: dict = Depends(get_current_user)):
 
 
 @router.post("/analyses")
-def save_analysis(req: AnalysisRequest, request: Request, user: dict = Depends(get_current_user)):
+def save_analysis(req: AnalysisRequest, request: Request, user: dict = Depends(require_writable)):
     """Save an analysis."""
     session = get_session(user["user_id"])
     did = _dataset_id(session)
@@ -451,7 +451,7 @@ def list_scenarios(request: Request, user: dict = Depends(get_current_user)):
 
 
 @router.post("/what-if/scenarios")
-def save_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(get_current_user)):
+def save_scenario(req: ScenarioRequest, request: Request, user: dict = Depends(require_writable)):
     session = get_session(user["user_id"])
     did = _dataset_id(session)
     item = intel.save_scenario(user["user_id"], did, req.model_dump())
@@ -465,13 +465,13 @@ def list_report_templates(request: Request, user: dict = Depends(get_current_use
 
 
 @router.post("/reports/templates")
-def save_report_template(req: TemplateRequest, request: Request, user: dict = Depends(get_current_user)):
+def save_report_template(req: TemplateRequest, request: Request, user: dict = Depends(require_writable)):
     item = intel.save_report_template(user["user_id"], req.model_dump())
     return {"ok": True, "item": item, "data": item}
 
 
 @router.post("/reports/schedule")
-def schedule_report(req: ReportRequest, request: Request, user: dict = Depends(get_current_user)):
+def schedule_report(req: ReportRequest, request: Request, user: dict = Depends(require_writable)):
     """Create a real daily/weekly digest, not a one-time report."""
     session = get_session(user["user_id"])
     data = req.model_dump()
@@ -491,7 +491,7 @@ def schedule_report(req: ReportRequest, request: Request, user: dict = Depends(g
 
 
 @router.post("/reports/share")
-def share_report(req: ReportRequest, request: Request, user: dict = Depends(get_current_user)):
+def share_report(req: ReportRequest, request: Request, user: dict = Depends(require_writable)):
     session = get_session(user["user_id"])
     did = _dataset_id(session)
     payload = req.model_dump(); payload["shared"] = True
@@ -500,7 +500,7 @@ def share_report(req: ReportRequest, request: Request, user: dict = Depends(get_
 
 
 @router.post("/reports/export")
-def export_report(request: Request, user: dict = Depends(get_current_user)):
+def export_report(request: Request, user: dict = Depends(require_writable)):
     session = get_session(user["user_id"])
     did = _dataset_id(session)
     item = intel.generate_report(user["user_id"], did, {"name": "Export", "template": "professional", "sections": []})
@@ -517,7 +517,7 @@ def list_reports(request: Request, user: dict = Depends(get_current_user)):
 
 
 @router.post("/reports/generate")
-def generate_report(req: ReportRequest, request: Request, user: dict = Depends(get_current_user)):
+def generate_report(req: ReportRequest, request: Request, user: dict = Depends(require_writable)):
     """Generate a structured report."""
     session = get_session(user["user_id"])
     did = _dataset_id(session)
@@ -531,7 +531,7 @@ def generate_report(req: ReportRequest, request: Request, user: dict = Depends(g
 
 
 @router.delete("/analyses/{analysis_id}")
-def delete_analysis(analysis_id: str, request: Request, user: dict = Depends(get_current_user)):
+def delete_analysis(analysis_id: str, request: Request, user: dict = Depends(require_writable)):
     """Delete a saved analysis."""
     if not intel.delete_analysis(user["user_id"], analysis_id):
         raise HTTPException(status_code=404, detail="Analysis not found.")
@@ -539,7 +539,7 @@ def delete_analysis(analysis_id: str, request: Request, user: dict = Depends(get
 
 
 @router.delete("/what-if/scenarios/{scenario_id}")
-def delete_scenario(scenario_id: str, request: Request, user: dict = Depends(get_current_user)):
+def delete_scenario(scenario_id: str, request: Request, user: dict = Depends(require_writable)):
     """Delete a saved scenario."""
     if not intel.delete_scenario(user["user_id"], scenario_id):
         raise HTTPException(status_code=404, detail="Scenario not found.")
@@ -553,8 +553,8 @@ def _validate_report_id(report_id: str) -> None:
 
 
 @router.delete("/reports/{report_id}")
-def delete_report(report_id: str, request: Request, user: dict = Depends(get_current_user)):
-    """Delete a report only when it belongs to this user and dataset."""
+def delete_report(report_id: str, request: Request, user: dict = Depends(require_writable)):
+    """Delete a generated report."""
     _validate_report_id(report_id)
     session = get_session(user["user_id"])
     if not intel.get_report(user["user_id"], _dataset_id(session), report_id):
@@ -624,7 +624,7 @@ def get_report_pdf(report_id: str, request: Request, user: dict = Depends(get_cu
 
 
 @router.post("/reports/{report_id}/rerun")
-def rerun_report(report_id: str, request: Request, user: dict = Depends(get_current_user)):
+def rerun_report(report_id: str, request: Request, user: dict = Depends(require_writable)):
     """Re-run a stored report definition with fresh numbers (new history entry)."""
     _validate_report_id(report_id)
     session = get_session(user["user_id"])
@@ -675,7 +675,7 @@ def list_digests(request: Request, user: dict = Depends(get_current_user)):
 
 
 @router.post("/digests")
-def create_digest(req: DigestRequest, request: Request, user: dict = Depends(get_current_user)):
+def create_digest(req: DigestRequest, request: Request, user: dict = Depends(require_writable)):
     """Create a digest schedule (daily/weekly, enabled by default)."""
     freq = str(req.frequency or "daily").strip().lower()
     if freq not in ("daily", "weekly"):
@@ -685,7 +685,7 @@ def create_digest(req: DigestRequest, request: Request, user: dict = Depends(get
 
 
 @router.patch("/digests/{digest_id}")
-def update_digest(digest_id: str, req: DigestPatch, request: Request, user: dict = Depends(get_current_user)):
+def update_digest(digest_id: str, req: DigestPatch, request: Request, user: dict = Depends(require_writable)):
     """Update a digest schedule (enable/disable, frequency, name, ...)."""
     patch = req.model_dump(exclude_unset=True)
     if "frequency" in patch and patch["frequency"] is not None:
@@ -700,7 +700,7 @@ def update_digest(digest_id: str, req: DigestPatch, request: Request, user: dict
 
 
 @router.delete("/digests/{digest_id}")
-def delete_digest(digest_id: str, request: Request, user: dict = Depends(get_current_user)):
+def delete_digest(digest_id: str, request: Request, user: dict = Depends(require_writable)):
     """Delete a digest schedule."""
     if not _digests().delete_digest(user["user_id"], digest_id):
         raise HTTPException(status_code=404, detail="Digest not found.")
@@ -708,7 +708,7 @@ def delete_digest(digest_id: str, request: Request, user: dict = Depends(get_cur
 
 
 @router.post("/digests/{digest_id}/run")
-def run_digest(digest_id: str, request: Request, user: dict = Depends(get_current_user)):
+def run_digest(digest_id: str, request: Request, user: dict = Depends(require_writable)):
     """One-click digest run: generate now from live data (new history entry).
 
     Failures record a failed run entry on the schedule and return
@@ -748,7 +748,7 @@ def get_coverage(request: Request, user: dict = Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 
 @router.post("/refresh")
-def refresh(request: Request, user: dict = Depends(get_current_user)):
+def refresh(request: Request, user: dict = Depends(require_writable)):
     """Re-run analytics and return updated Intelligence state."""
     try:
         session, user = _get_session_and_user(request, user)

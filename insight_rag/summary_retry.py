@@ -29,12 +29,14 @@ def apply_summary_retry_patch() -> None:
         *,
         conversation_id: str | None = None,
         document_ids: list[str] | None = None,
+        document_only: bool = False,
     ) -> dict:
         first = original_chat(
             self,
             question,
             conversation_id=conversation_id,
             document_ids=document_ids,
+            document_only=document_only,
         )
 
         routing = first.get("routing") or {}
@@ -54,6 +56,7 @@ def apply_summary_retry_patch() -> None:
             question,
             conversation_id=conversation_id,
             document_ids=document_ids,
+            document_only=document_only,
         )
         if second.get("evidence_status") == "supported" and second.get("sources"):
             record("summary_retry", "recovered")

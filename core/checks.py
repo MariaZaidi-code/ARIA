@@ -45,6 +45,8 @@ _OPTIONAL_PACKAGES = {
     "scikit-learn": ("sklearn", "scikit-learn"), # tabular prediction; graceful fallback when absent
     "statsmodels": ("statsmodels", "statsmodels"), # forecast models; skipped when absent
     "httpx": ("httpx", "httpx"),             # dev/test only (FastAPI TestClient); no prod module imports it
+    "openpyxl": ("openpyxl", "openpyxl"),    # XLSX story export; 501 when absent
+    "python-pptx": ("pptx", "python-pptx"),  # PPTX story export; 501 when absent
 }
 
 
@@ -165,9 +167,8 @@ def check_default_db():
 def check_shared_store():
     """Report multi-worker shared-store readiness (sessions + rate limits).
 
-    Info-only: ok=False when workers > 1 without ARIA_REDIS_URL (sessions
-    diverge per-process, rate limits are per-process). Never raises; Redis
-    reachability is best-effort with a short timeout.
+    Info-only: ok=False when workers > 1 without a reachable Redis store.
+    Never raises; Redis reachability is best-effort with a short timeout.
     """
     workers = 1
     for var in ("ARIA_WORKERS", "WEB_CONCURRENCY", "UVICORN_WORKERS"):
@@ -212,7 +213,15 @@ def check_shared_store():
             )
         else:
             detail = f"single worker (workers={workers}, store={store}); file/memory stores ok"
-    ok = True if (workers <= 1 or redis_url) else False
+    ok = workers <= 1 or (
+        bool(redis_url) and reachable is True and store == "redis"
+    )
+    try:
+        from core.config import session_store_status
+
+        session_store = session_store_status()
+    except Exception as exc:
+        session_store = {"ok": False, "error": type(exc).__name__}
     return {
         "workers": workers,
         "redis_configured": bool(redis_url),
@@ -221,6 +230,7 @@ def check_shared_store():
         "store": store,
         "ok": ok,
         "detail": detail,
+        "session_store": session_store,
     }
 
 

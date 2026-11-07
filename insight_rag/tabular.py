@@ -172,9 +172,14 @@ def dataframe_to_table_documents(
         raise ValueError("Tabular source has no columns to index.")
     frame = _normalise_columns(frame)
     total_rows = int(len(frame))
+    source_row_count = total_rows
+    # 1-based row numbers in the original source, kept through sampling so
+    # citations can point at real rows instead of a meaningless page number.
+    source_rows = list(range(1, total_rows + 1))
     if total_rows > TABULAR_MAX_ROWS:
         keep = _stratified_indices(total_rows, TABULAR_MAX_ROWS)
         frame = frame.iloc[keep].reset_index(drop=True)
+        source_rows = [index + 1 for index in keep]
         total_rows = int(len(frame))
         sampled_for_summary = True
     else:
@@ -204,11 +209,15 @@ def dataframe_to_table_documents(
     preview_rows = [[_clean_cell(value) for value in row] for row in preview.itertuples(index=False, name=None)]
     preview_markdown = table_to_markdown([header_row] + preview_rows) if total_rows else ""
 
-    scope_note = (
-        f"Row chunks are a stratified sample; aggregates below cover all {total_rows} rows."
-        if (sampled_for_summary or total_rows > max_row_chunks * rows_per_chunk)
-        else f"Aggregates below cover all {total_rows} rows."
-    )
+    if sampled_for_summary:
+        scope_note = (
+            f"Row chunks are a stratified sample; aggregates below cover a stratified sample "
+            f"of {total_rows} of {source_row_count} rows."
+        )
+    elif total_rows > max_row_chunks * rows_per_chunk:
+        scope_note = f"Row chunks are a stratified sample; aggregates below cover all {total_rows} rows."
+    else:
+        scope_note = f"Aggregates below cover all {total_rows} rows."
     summary_text = (
         f"Table summary for {label}: {total_rows} rows, {len(columns)} columns.\n"
         f"Columns: " + ", ".join(f"{name} ({kinds[name]})" for name in columns) + "\n"
@@ -233,6 +242,7 @@ def dataframe_to_table_documents(
                 "table_chunk_index": -1,
                 "table_chunk_count": 1,  # summary stands alone; row chunks are samples
                 "table_row_count": total_rows,
+                "source_row_count": source_row_count,
                 "table_sampled": bool(sampled_for_summary or total_rows > max_row_chunks * rows_per_chunk),
                 "column_names": columns,
                 "column_kinds": kinds,
@@ -248,13 +258,15 @@ def dataframe_to_table_documents(
         wanted = _stratified_indices(total_rows, min(total_rows, body_capacity))
         sampled = len(wanted) < total_rows
         rows = [[_clean_cell(value) for value in frame.iloc[i].tolist()] for i in wanted]
+        starts = list(range(0, len(rows), rows_per_chunk))
         chunks = [
             table_to_markdown([header_row] + rows[start:start + rows_per_chunk])
-            for start in range(0, len(rows), rows_per_chunk)
+            for start in starts
         ]
         for ordinal, chunk_text in enumerate(chunks):
             if not chunk_text.strip():
                 continue
+            chunk_rows = [source_rows[i] for i in wanted[starts[ordinal]:starts[ordinal] + rows_per_chunk]]
             documents.append(
                 Document(
                     page_content=chunk_text,
@@ -271,6 +283,9 @@ def dataframe_to_table_documents(
                         "table_chunk_count": len(chunks),
                         "table_row_count": total_rows,
                         "table_sampled": bool(sampled),
+                        "row_start": chunk_rows[0],
+                        "row_end": chunk_rows[-1],
+                        "rows_contiguous": chunk_rows == list(range(chunk_rows[0], chunk_rows[-1] + 1)),
                         "column_names": columns,
                         "chunk_id": _stable_chunk_id(document_id, table_index, f"rows-{ordinal}"),
                     },

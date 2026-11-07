@@ -64,13 +64,19 @@ def validate_goal_text(goal: str) -> str:
             raise HTTPException(status_code=400, detail="That doesn't look like a real question. Please type a meaningful business goal.")
         if len(token) >= 4 and len(set(token)) <= 2:
             raise HTTPException(status_code=400, detail="That doesn't look like a real question. Please type a meaningful business goal.")
-        if len(token) >= 4 and not any(ch in _GOAL_VOWELS for ch in token):
-            raise HTTPException(status_code=400, detail="That doesn't look like a real question. Please type a meaningful business goal.")
         if token in _GIBSMASH:
             raise HTTPException(status_code=400, detail="That doesn't look like a real question. Please type a meaningful business goal.")
 
     content_words = [t for t in real_words if t not in _GOAL_STOPWORDS]
     if not content_words:
+        raise HTTPException(status_code=400, detail="That doesn't look like a real question. Please type a meaningful business goal.")
+
+    # Vowel-less words are normal data shorthand ('txns', 'mthd', 'qty'),
+    # so one alone never rejects a question. Only input that is mostly
+    # vowel-less long tokens ('sdfg hjkl', 'wrtp xzcv') is treated as noise.
+    vowelless = [t for t in content_words
+                 if len(t) >= 4 and not any(ch in _GOAL_VOWELS for ch in t)]
+    if vowelless and len(vowelless) * 2 > len(content_words):
         raise HTTPException(status_code=400, detail="That doesn't look like a real question. Please type a meaningful business goal.")
 
     return cleaned

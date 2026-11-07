@@ -153,6 +153,30 @@ def is_read_only(sql: str) -> bool:
     return _shared_is_read_only(sql)
 
 
+def _mask_quotes(s: str) -> str:
+    """Length-preserving copy of *s* with quoted literals blanked."""
+    chars = list(s)
+    n = len(s)
+    i = 0
+    while i < n:
+        ch = s[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if s[j] == ch:
+                    if j + 1 < n and s[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            for k in range(i, min(j + 1, n)):
+                chars[k] = " "
+            i = j + 1
+        else:
+            i += 1
+    return "".join(chars)
+
+
 def clean_sql(raw: str) -> str:
     """Extract a single SQL statement from possibly fenced/chatty LLM output."""
     if not raw:
@@ -162,13 +186,22 @@ def clean_sql(raw: str) -> str:
     m = re.search(r"\b(select|with)\b", candidate, re.IGNORECASE)
     if not m:
         return candidate.strip()
-    stmt = candidate[m.start():].strip()
-    # For CTEs (WITH ... ; SELECT ...), find the last semicolon-terminated
-    # statement so the full CTE + final SELECT is preserved.
-    semi = stmt.rfind(";")
-    if semi != -1:
-        stmt = stmt[:semi]
-    return stmt.strip()
+    stmt = candidate[m.start():].strip().rstrip(";").strip()
+    masked = _mask_quotes(stmt)
+    if ";" not in masked:
+        return stmt
+    # Multi-statement output: the single-statement contract keeps the FIRST
+    # statement — except the CTE pattern (`WITH ... ; SELECT ...`), where the
+    # separator merely sits between the CTE block and its final SELECT and
+    # dropping the tail would execute a bare CTE. Re-join top-level segments
+    # (quote-aware: semicolons inside '...' never split).
+    idx = [i for i, c in enumerate(masked) if c == ";"]
+    if stmt.lstrip().lower().startswith("with"):
+        joined = list(stmt)
+        for i in idx:
+            joined[i] = " "
+        return "".join(joined).strip()
+    return stmt[:idx[0]].strip()
 
 
 def _dialect_rules(dialect: str) -> str:

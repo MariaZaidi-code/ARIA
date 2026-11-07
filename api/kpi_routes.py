@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from urllib.parse import quote_plus
 from sqlalchemy import create_engine, text
 
-from core.config import get_session, SCHEMA_DIR
+from core.config import get_session, SCHEMA_DIR, _read_text_locked
 from core.deps import require_data, get_current_user, reject_document_sql
 from core.errors import DB_ERRORS, PURE_ERRORS, get_request_id, log_and_sanitize
 from core.secret_box import decrypt as _decrypt_secret
@@ -32,6 +32,24 @@ router = APIRouter()
 _KPI_CACHE: dict = {}
 _KPI_CACHE_TTL = 300
 _KPI_CACHE_MAX = 100
+
+# Dashboard-config cache: same shape as _KPI_CACHE (schema-mtime key).
+_DASH_CONFIG_CACHE: dict = {}
+_DASH_CONFIG_CACHE_MAX = 200
+
+
+def _dash_evict_oldest() -> None:
+    """Evict oldest-first instead of wholesale clear (doc §Cache owners rows
+    match; an over-size purge must not dump every user's warm config at once)."""
+    if len(_DASH_CONFIG_CACHE) <= _DASH_CONFIG_CACHE_MAX:
+        return
+    try:
+        oldest = sorted(_DASH_CONFIG_CACHE.items(),
+                        key=lambda kv: kv[1][0])[: len(_DASH_CONFIG_CACHE) - _DASH_CONFIG_CACHE_MAX]
+        for key, _v in oldest:
+            _DASH_CONFIG_CACHE.pop(key, None)
+    except Exception:
+        _DASH_CONFIG_CACHE.clear()
 from services.kpi_service import (_fmt, _is_currency_col, _safe, _validate_schema_ident, _bound_limit, _recommend_chart, _profile_numeric, _rollback, _variation, _score_kpi, _time_grain_expr, _parse_full_date, _parse_date_to_month, _pretty_month, _pretty_date, _discover_special_columns, _fetch_time_series, _fetch_count_series, _holiday_lift, _retail_candidates_for_table, _measure_expr, _coerce_num, _SERIES_FALLBACK_MAX, _CHART_BY_INTENT, DASHBOARD_MIN_SCORE, _AMOUNT_HINTS, _ENTITY_HINTS, _DATE_HINTS, _STORE_HINTS, _HOLIDAY_HINTS, _SALES_HINTS, _DATE_PARSE_FORMATS, _MONTH_NAMES)  # noqa: F401,E402  # thin-wrapper re-export
 
 
@@ -147,6 +165,8 @@ def _build_engine(session):
     _db = db_config.get("db")
     if not all([_user, _pw, _host, _db]):
         return None, db_type, db_type
+    from core.db import format_db_host
+    _host = format_db_host(_host)
     if db_type == "mysql":
         uri = (f"mysql+pymysql://{quote_plus(str(_user))}:{quote_plus(str(_pw))}"
                f"@{_host}:{db_config.get('port', 3306)}/{_db}")
@@ -168,7 +188,7 @@ def _load_schema(session, user_id=None):
     schema_path = session.get("schema_path")
     # Try user-specific DB schema file first (set by connect_routes)
     if schema_path and Path(str(schema_path)).exists():
-        mapping = json.loads(Path(str(schema_path)).read_text(encoding="utf-8"))
+        mapping = json.loads(_read_text_locked(Path(str(schema_path))))
         return SchemaIntelligence(mapping)
     # NOTE: no global SCHEMA_DIR/schema_mapping_latest.json fallback here.
     # A shared default would leak one user's tables into another user's
@@ -181,12 +201,12 @@ def _load_schema(session, user_id=None):
         user_dir = f"user_{user_id}"
         alt_path = SCHEMA_DIR / user_dir / f"schema_mapping_{safe_name}_latest.json"
         if alt_path.exists():
-            mapping = json.loads(alt_path.read_text(encoding="utf-8"))
+            mapping = json.loads(_read_text_locked(alt_path))
             return SchemaIntelligence(mapping)
         # Also try the user's directory without DB name suffix
         user_default = SCHEMA_DIR / user_dir / "schema_mapping_latest.json"
         if user_default.exists():
-            mapping = json.loads(user_default.read_text(encoding="utf-8"))
+            mapping = json.loads(_read_text_locked(user_default))
             return SchemaIntelligence(mapping)
     # Last resort: try to trigger auto-extraction from the session DB info.
     # Canonical stack is schema_engine/; schema_agent/ is legacy and used here
@@ -194,7 +214,7 @@ def _load_schema(session, user_id=None):
     if session.get("db") and session.get("db_type") in ("postgresql", "mysql"):
         try:
             import warnings as _warnings
-            import schema_agent  # noqa: DEPRECATED legacy fallback only
+            import schema_agent  # noqa: F401 — DEPRECATED legacy fallback only
             _warnings.warn(
                 "kpi_routes legacy schema_agent fallback in use; prefer schema_engine.",
                 DeprecationWarning, stacklevel=2)
@@ -218,8 +238,6 @@ def _load_schema(session, user_id=None):
                     user_path = user_dir_path / f"schema_mapping_{safe_db}_latest.json"
                     user_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
                     session["schema_path"] = user_path
-                    from core.config import save_session
-                    # We can't save here easily without user_id — skip persistence
                     return SchemaIntelligence(mapping)
             except Exception:
                 pass
@@ -250,7 +268,7 @@ def _load_schema(session, user_id=None):
                     try:
                         conn2 = sqlite3.connect(str(sqlite_path_obj))
                         cur2 = conn2.cursor()
-                        cur2.execute(f'PRAGMA table_info("{tname}")')
+                        cur2.execute(f'PRAGMA table_info("{str(tname).replace(chr(34), chr(34) * 2)}")')
                         col_rows = cur2.fetchall()
                         conn2.close()
                         columns = []
@@ -862,6 +880,13 @@ def get_dashboard_summaries(request: Request, user: dict = Depends(get_current_u
 
 # ── Unified dashboard config (backend-driven, frontend renders) ───────────
 
+def _dataset_phrase(name) -> str:
+    """'dataset_c_messy_txns' -> 'Dataset c messy transactions'."""
+    from schema_engine.lexical import humanize_identifier
+    text = humanize_identifier(str(name or "")) if name else ""
+    return (text[:1].upper() + text[1:]) if text else "your data"
+
+
 @router.get("/api/dashboard/config")
 def get_dashboard_config(request: Request, user: dict = Depends(get_current_user)):
     """Return a structured dashboard configuration generated from the connected data.
@@ -872,6 +897,19 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
     import time as _time
 
     session = get_session(user["user_id"])
+    from csv_engine.analyst import is_csv_session, dashboard, CsvAnalysisError
+    if is_csv_session(session):
+        from core.config import save_session
+        try:
+            config = dashboard(session, user["user_id"])
+            save_session(user["user_id"], session)
+            return {"ok": True, "config": config, "cached": config["llm_trace"]["cached"]}
+        except CsvAnalysisError as exc:
+            logging.warning("CSV dashboard rejected request=%s reason=%s", exc.trace.get("request_id"), str(exc))
+            raise HTTPException(status_code=502, detail={"message": str(exc), "llm_trace": exc.trace}) from None
+        except Exception:
+            logging.exception("CSV dashboard LLM analysis failed")
+            raise HTTPException(status_code=502, detail="CSV AI dashboard could not complete. No template dashboard was substituted.") from None
     intel = _load_schema(session, user["user_id"])
     if not intel or not intel.tables:
         _empty_config = {
@@ -898,11 +936,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
 
     # Short-TTL cache (§40): keyed by schema file mtime so reconnects/uploads
     # invalidate automatically. Bounded size, no stale-data risk beyond TTL.
-    global _DASH_CONFIG_CACHE
-    try:
-        _DASH_CONFIG_CACHE
-    except NameError:
-        _DASH_CONFIG_CACHE = {}
+    _schema_mtime = 0.0
     try:
         _schema_mtime = Path(str(session.get("schema_path", ""))).stat().st_mtime
     except Exception:
@@ -921,8 +955,7 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
             except Exception:
                 return {"ok": True, "config": _cached[1], "cached": True}
         return {"ok": True, "config": _cached_config, "cached": True}
-    if len(_DASH_CONFIG_CACHE) > 200:
-        _DASH_CONFIG_CACHE.clear()
+    _dash_evict_oldest()
 
     engine, dialect, db_type = _build_engine(session)
     db_name = session.get("db_name", session.get("source_type", "data"))
@@ -956,6 +989,9 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
     recommendations = []
     total_rows = 0
     quality_issues = []
+    # A quality score is meaningful only after the data-backed scan runs.
+    # The frontend supplements this with the shared Data Quality endpoint.
+    quality_score = None
 
     if engine is not None:
         try:
@@ -1413,11 +1449,16 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     for tname in tables_list[:6]:
                         if intel.tables[tname].get("empty"):
                             continue
-                        num_cols = intel.get_numeric_cols(tname)
+                        # Correlate true analytical measures only. Raw numeric
+                        # identifiers (order IDs, codes, and keys) create
+                        # meaningless scatter plots that look like findings.
+                        num_cols = intel.find_all_measures(tname)
                         if len(num_cols) < 2:
                             continue
-                        m1 = num_cols[0]
-                        m2 = num_cols[1]
+                        m1 = intel.find_best_measure(tname) or num_cols[0]
+                        m2 = next((col for col in num_cols if col != m1), None)
+                        if not m2:
+                            continue
                         try:
                             result = conn.execute(text(
                                 f"SELECT {_measure_expr(intel, tname, m1, dialect)} AS x, "
@@ -1661,33 +1702,6 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
                     if measure and dim and len(recommendations) < 6:
                         recommendations.append({"id": f"rec_{tname}_breakdown", "question": f"Show {humanize(measure).lower()} breakdown by {humanize(dim).lower()}", "type": "breakdown"})
 
-                # ── Data quality ──
-                quality_score = 100
-                for tname in tables_list[:5]:
-                    measure = intel.find_best_measure(tname)
-                    if not measure:
-                        continue
-                    try:
-                        result = conn.execute(text(
-                            f"SELECT COUNT(*) FROM {_safe_name(tname, dialect)} WHERE {_safe_name(measure, dialect)} IS NULL"
-                        ))
-                        row = result.fetchone()
-                        if row and row[0] > 0:
-                            total_q = conn.execute(text(f"SELECT COUNT(*) FROM {_safe_name(tname, dialect)}")).fetchone()
-                            if total_q and total_q[0] > 0:
-                                pct = (row[0] / total_q[0]) * 100
-                                if pct > 0:
-                                    quality_issues.append({
-                                        "field": f"{tname}.{measure}",
-                                        "issue": f"{pct:.1f}% null values",
-                                        "severity": "warning" if pct < 10 else "critical",
-                                        "affectedRecords": row[0],
-                                    })
-                                    quality_score -= min(10, int(pct))
-                    except Exception:
-                        _rollback(conn)
-                        continue
-
         except Exception:
             pass
 
@@ -1736,8 +1750,12 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
 
     config = {
         "summary": {
-            "title": f"Data Analysis: {db_name}",
-            "description": f"ARIA analyzed {len(tables_list)} tables with {_fmt(total_rows)} total records.",
+            # Plain-English dataset name ("dataset_c_messy_txns" -> "Dataset c
+            # messy transactions"); singular/plural follows the count.
+            "title": f"Data Analysis: {_dataset_phrase(db_name)}",
+            "description": (f"ARIA analyzed {len(tables_list)} "
+                            f"{'table' if len(tables_list) == 1 else 'tables'} with "
+                            f"{_fmt(total_rows)} total records."),
             "tableCount": len(tables_list),
             "totalRows": total_rows,
             "database": db_name,
@@ -1747,7 +1765,10 @@ def get_dashboard_config(request: Request, user: dict = Depends(get_current_user
         "sections": sections[:5],
         "insights": auto_insights,
         "anomalies": auto_anomalies,
-        "quality": {"score": max(0, quality_score), "issues": quality_issues[:10]},
+        "quality": {
+            "score": max(0, quality_score) if quality_score is not None else None,
+            "issues": quality_issues[:10],
+        },
         "recommendations": recommendations[:6],
     }
     # JSON-safety boundary (generic): statistical detectors can emit

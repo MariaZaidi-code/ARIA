@@ -862,17 +862,10 @@ def _document_candidates(question, metric, documents):
 def _validated_suggestions(intel, table, metric, time_col):
     """Next questions guaranteed structurally investigable.
 
-    Built only from resolved schema roles (real table/metric/dims), never
-    from the user's phrasing — so every suggestion can actually run.
-    Prefers metrics that have a time field, so suggestions lead somewhere.
+    Built only from resolved schema roles (real metric/time fields), never
+    from the user's phrasing. Change investigations require a time axis.
     """
     out = []
-
-    def _dims(t):
-        try:
-            return [d for d in (intel.find_all_dimensions(t) or [])][:2]
-        except Exception:
-            return []
 
     def _time(t):
         try:
@@ -900,18 +893,15 @@ def _validated_suggestions(intel, table, metric, time_col):
     for t in ordered:
         m = _first_table_metric(intel, t)
         if m:
-            timed.append((t, m, _time(t)))
+            dt = _time(t)
+            if dt:
+                timed.append((t, m, dt))
         if len([x for x in timed if x[2] is not None]) >= 3 and len(timed) >= 6:
             break
-    timed.sort(key=lambda x: (x[2] is None, x[0] != table))
-    for t, m, dt in timed[:2]:
+    timed.sort(key=lambda x: x[0] != table)
+    for _, m, _ in timed[:2]:
         out.append(f"Why did {_plain(m)} change?")
-        for d in _dims(t):
-            out.append(f"How does {_plain(m)} vary by {_plain(d)}?")
-            break
-        if dt:
-            out.append(f"How has {_plain(m)} changed over time?")
-            break
+        out.append(f"How has {_plain(m)} changed over time?")
     seen, clean = set(), []
     for s in out:
         if s not in seen:

@@ -10,12 +10,12 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 from typing import Any
 
-from core.config import get_session
+from core.config import get_session, PROCESSED_DIR
 from core.data_intelligence import hint_hit as _hint_hit
-from core.deps import require_data, require_writable, get_current_user, reject_document_sql
+from core.deps import require_writable, get_current_user, reject_document_sql
 from core.secret_box import decrypt as _decrypt_secret
 
 log = logging.getLogger("aria.predictive_routes")
@@ -23,6 +23,7 @@ router = APIRouter()
 
 
 class ForecastFilter(BaseModel):
+    model_config = ConfigDict(extra="allow")
     """Structured row filter: applied as SQL WHERE + in-memory post-filter.
 
     Additive-only: optional ``filters`` on ForecastRequest. Generic —
@@ -36,6 +37,7 @@ class ForecastFilter(BaseModel):
 
 
 class ForecastRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     question: str = ""
     column: str | None = None
     time_dim: str | None = None
@@ -49,10 +51,12 @@ class ForecastRequest(BaseModel):
 
 
 class PrescriptionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     insight_id: str = ""
 
 
 class ScenarioRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     column: str | None = None
     pct_change: float = 10.0
     periods: int = 3
@@ -340,6 +344,25 @@ def _apply_stmt_timeout(conn, dialect):
         pass
 
 
+_LATER_DATE_WORDS = {"ship", "shipped", "due", "delivery", "delivered", "updated",
+                     "modified", "closed", "end", "expiry", "expires"}
+_EVENT_DATE_WORDS = {"order", "transaction", "txn", "created", "sale", "invoice",
+                     "booking", "purchase", "start"}
+
+
+def _time_dim_rank(column: str) -> int:
+    """0 = the date the event happened (order/transaction/created), 1 =
+    neutral, 2 = a follow-up date (ship/due/updated): forecasts default
+    to when things happened, like the Dashboard trend."""
+    from schema_engine.lexical import identifier_words
+    words = set(identifier_words(column))
+    if words & _EVENT_DATE_WORDS:
+        return 0
+    if words & _LATER_DATE_WORDS:
+        return 2
+    return 1
+
+
 def _validate_time_dim(engine_or_conn, dialect, table, column, dtype):
     """Check a candidate time column against REAL data.
 
@@ -511,13 +534,25 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
     for tname in list(tables)[:15]:
         cols = _table_columns(tables, tname)
         measures = [m for m in (intel.find_all_measures(tname) or [])]
-        # Time candidates: real date dtypes first, then date-hinted text cols.
-        # Token-based hints (never substrings): "holiday" must not match "day".
+        # Headline measure first (the one the Dashboard leads with, e.g.
+        # Total Due before Sub Total) so the default forecast matches it.
+        try:
+            _best = intel.find_best_measure(tname)
+            if _best in measures:
+                measures = [_best] + [m for m in measures if m != _best]
+        except Exception:
+            pass
+        # Time candidates: real date dtypes first, then date-hinted text cols
+        # (shorthand such as 'txn_dt' included). Token-based hints (never
+        # substrings): "holiday" must not match "day". Event dates (order,
+        # transaction, created) rank before follow-up dates (ship, due).
+        from core.data_intelligence import is_date_name as _is_date_name
         date_cols = [n for n, d in cols
                      if any(k in d.lower() for k in ("date", "time", "timestamp"))]
         text_hints = [n for n, d in cols
-                      if n not in date_cols and _hint_hit(n, _DATE_NAME_HINTS)]
-        _plan.append((tname, cols, measures, (date_cols + text_hints)[:3]))
+                      if n not in date_cols and _is_date_name(n)]
+        _plan.append((tname, cols, measures,
+                      sorted(date_cols + text_hints, key=_time_dim_rank)[:3]))
 
     def _scan_one(tname, cols, measures, cands):
         """Validate one table on its own connection (thread-safe)."""
@@ -583,7 +618,12 @@ def forecast_eligibility(request: Request, user: dict = Depends(get_current_user
     recommended = None
     for t in out_tables:
         if t["measures"] and t["time_dims"]:
-            best_td = max(t["time_dims"], key=lambda d: (d["kind"] == "date", d["distinct"]))
+            # Among usable axes (>= 5 points), the event date (order /
+            # transaction) beats a follow-up date (ship / due) even when
+            # the latter has a few more distinct values.
+            _usable = [d for d in t["time_dims"] if d["distinct"] >= 5] or t["time_dims"]
+            best_td = max(_usable, key=lambda d: (d["kind"] == "date",
+                                                  -_time_dim_rank(d["column"]), d["distinct"]))
             if best_td["distinct"] >= 5:
                 recommended = {
                     "table": t["table"],
@@ -903,7 +943,10 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
         raise HTTPException(status_code=400, detail="No database connected.")
 
     db_config = dict(session.get("db") or {})
-    if not db_config:
+    # CSV / SQLite sessions may carry only a db_uri (or legacy csv_db_path)
+    # rather than a db dict. Match _build_engine's behaviour instead of
+    # rejecting a source that eligibility already reported as forecastable.
+    if not db_config and not (session.get("db_uri") or session.get("csv_db_path")):
         raise HTTPException(status_code=400, detail="No database configuration found.")
     if db_config.get("password"):
         try:
@@ -1190,7 +1233,13 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
         # No 500: fall through to the deterministic path, then return an
         # honest invalid forecast with the reason if nothing works.
         log.error("GoalAgent failed: %s\n%s", e, _tb.format_exc())
-        goal_error = str(e)[:300]
+        # This text can reach the client (`reason`); sanitize it like every
+        # other user-facing error (no creds/hosts/paths), never the raw exc.
+        try:
+            from core.errors import sanitize_error as _san_goal
+            goal_error = f"Data preparation issue: {_san_goal(e)}"[:300]
+        except Exception:
+            goal_error = "Data preparation failed."
 
     # Step 2: Run PredictionAgent (dicts in-memory; single shared engine;
     # single deterministic-fallback attempt; GROUP BY grain + LIMIT 2000).
@@ -1362,6 +1411,16 @@ def generate_forecast(req: ForecastRequest, request: Request, user: dict = Depen
                 if len(_hits) == 1:
                     return _hits[0]
             return None
+
+        _missing_selected_column = bool(
+            (valid_measure and _resolve_target(processed_data) is None)
+            or (valid_time and _resolve_time(processed_data) is None)
+        )
+        if _missing_selected_column:
+            _try_fallback_once()
+            if ((valid_measure and _resolve_target(processed_data) is None)
+                    or (valid_time and _resolve_time(processed_data) is None)):
+                processed_data["data"] = []
 
         forecast = pred_agent.forecast(
             processed_data,
@@ -1581,7 +1640,6 @@ def generate_prescription(req: PrescriptionRequest, request: Request, user: dict
     quality_gate) via /api/prescriptions/* or the Decision Center
     (/api/decision-center/*), which never calls PrescriptionAgent. DO NOT
     delete this endpoint (old clients still call it)."""
-    import traceback as _tb
     session = get_session(user["user_id"])
     reject_document_sql(session)
     schema_path = session.get("schema_path")
@@ -1608,7 +1666,7 @@ def generate_prescription(req: PrescriptionRequest, request: Request, user: dict
         from goal_agent.schema import load_user_overrides
         from core.config import resolve_provider_key
 
-        output_dir = Path("artifacts/processed_data") / f"user_{user['user_id']}"
+        output_dir = PROCESSED_DIR / f"user_{user['user_id']}"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"prescription_input_{int(time.time())}.json"
 

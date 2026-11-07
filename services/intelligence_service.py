@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from core.config import SCHEMA_DIR, USERS_DIR
+from core.errors import sanitize_error
 from core.semantic import (
     classify_field_role,
     display_name,
@@ -64,12 +65,29 @@ def _dataset_id(session: dict) -> str:
 def _load_json(path: Path) -> dict | list:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        # Corrupt/unreadable JSON is surfaced in logs instead of silently
+        # resetting to empty with no trace of why data vanished.
+        log.warning("intelligence: unreadable JSON at %s (%s); treating as empty",
+                    path.name, exc)
         return {}
 
 
 def _save_json(path: Path, data) -> None:
-    path.write_text(json.dumps(data, default=str, ensure_ascii=False), encoding="utf-8")
+    """Atomic write: a reader never observes a torn/truncated file."""
+    payload = json.dumps(data, default=str, ensure_ascii=False)
+    tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex[:8]}")
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _load_user_items(user_id: int, kind: str) -> list:
@@ -121,6 +139,8 @@ def _load_schema_mapping(session: dict) -> dict:
     schema_mapping_*_latest.json by mtime. Never raises; logs chosen file.
     """
     session = session or {}
+    if session.get("source_type") == "document" or session.get("db_type") == "document" or str(session.get("db_uri", "")).startswith("document://"):
+        return {}
     sp = session.get("schema_path")
     if sp:
         try:
@@ -239,7 +259,14 @@ def get_intelligence_meta(session: dict) -> dict:
             if role in ("BUSINESS_MEASURE", "MEASURE", "DERIVED_METRIC"):
                 metrics.append(entry)
             elif role in ("DIMENSION", "CATEGORY", "TEXT"):
-                dimensions.append(entry)
+                # A text column named like a date ('txn_dt', 'order_date')
+                # is a time axis, never a breakdown: grouping by single days
+                # gives "50 groups" of dates instead of business segments.
+                from core.data_intelligence import is_date_name as _is_date_name
+                if _is_date_name(cname):
+                    date_columns.append({**entry, "role": "DATE", "detected": "date_name"})
+                else:
+                    dimensions.append(entry)
             elif role == "DATE":
                 date_columns.append(entry)
         # Role-poor tables (no text dimensions / no DATE role, e.g. a
@@ -909,26 +936,40 @@ import threading
 
 _ENGINE_POOL: dict = {}
 _ENGINE_LOCK = threading.Lock()
+_ENGINE_POOL_MAX = 32
 
 
 def _pooled_engine(db_uri: str):
-    """Return a cached SQLAlchemy engine for db_uri (pool_size=5)."""
+    """Return a cached SQLAlchemy engine for db_uri (pool_size=5).
+
+    Engines are evicted FIFO when the bounded pool is full. SQLAlchemy's
+    ``Engine.dispose()`` leaves checked-out connections alive until callers
+    return them; subsequent work uses a fresh pool. Pool keys hold the full
+    connection URI (credentials) — never log them.
+    """
     key = str(db_uri or "")
+    doomed: list = []  # engines to dispose outside the lock
     with _ENGINE_LOCK:
         eng = _ENGINE_POOL.get(key)
         if eng is None:
             from sqlalchemy import create_engine as _ce
             eng = _ce(key or "sqlite://", pool_pre_ping=True,
                       pool_size=5, max_overflow=10, pool_recycle=1800)
-            if len(_ENGINE_POOL) >= 32:
-                try:
-                    _old_k, _old_e = next(iter(_ENGINE_POOL.items()))
-                    _ENGINE_POOL.pop(_old_k, None)
-                    _old_e.dispose()
-                except Exception:
-                    pass
+            while len(_ENGINE_POOL) >= _ENGINE_POOL_MAX:
+                # Dicts preserve insertion order. Dispose outside the lock so
+                # concurrent borrowers are not blocked by pool cleanup.
+                victim_k = next(iter(_ENGINE_POOL), None)
+                if victim_k is not None:
+                    doomed.append(_ENGINE_POOL.pop(victim_k))
+                else:
+                    break
             _ENGINE_POOL[key] = eng
-        return eng
+    for old_engine in doomed:
+        try:
+            old_engine.dispose()
+        except Exception:
+            pass
+    return eng
 
 
 def run_explore(session: dict, request: dict) -> dict:
@@ -940,6 +981,8 @@ def run_explore(session: dict, request: dict) -> dict:
     Accepts both legacy keys (time/compare) and frontend keys
     (time_grain/comparison/secondary_breakdown/date_range string).
     """
+    if session.get("source_type") == "document" or session.get("db_type") == "document" or str(session.get("db_uri", "")).startswith("document://"):
+        return {"ok": False, "reason": "document_source", "message": "Ask a question about your PDF in Document Chat. SQL Explore requires a CSV or database.", "data": [], "columns": []}
     roles_pre = _classify_columns(_load_schema_mapping(session)) if request.get("metric") else {}
     metric_col = _resolve_column(roles_pre, request.get("metric")) or request.get("metric")
     breakdown_col = _resolve_column(roles_pre, request.get("breakdown")) or request.get("breakdown")
@@ -1626,7 +1669,11 @@ def run_explore(session: dict, request: dict) -> dict:
                             _p = dict(_params)
                         _res = _exec(_sql, _p)
                         _cols = list(_res.keys())
-                        for _row in _res.fetchall():
+                        # Streamed, never fetchall(): on the non-native path
+                        # this cursor is the whole table (no SQL date filter),
+                        # so materializing every row scaled memory/latency
+                        # with table size on every explore.
+                        for _row in _res.yield_per(1000):
                             _d = dict(zip(_cols, _row))
                             _dt = _to_date(_d.get("_d"))
                             if _dt is None:
@@ -2143,7 +2190,10 @@ def run_explore(session: dict, request: dict) -> dict:
                     else:
                         bullets.append("Performance held broadly steady across the window.")
                 basis = (
-                    f"Based on {_raw_count} records from {primary_table} "
+                    # Plain words, schema dropped: "sales.SalesOrderDetail"
+                    # -> "Sales Order Detail".
+                    f"Based on {_raw_count} records from "
+                    f"{display_name(str(primary_table).split('.')[-1], str(primary_table))} "
                     f"({_cur_start.isoformat()} to {_cur_end.isoformat()} vs "
                     f"{_prev_start.isoformat()} to {_prev_end.isoformat()}; {date_label}). "
                     "Category and monthly figures are summed from your data; "
@@ -2177,7 +2227,10 @@ def run_explore(session: dict, request: dict) -> dict:
 
             _change_all = (_r2(total_current - total_previous)
                            if total_previous is not None else None)
-            _groups = len(_cells) if _has_time else len(_cat_only)
+            # Distinct breakdown groups (companies, regions ...), never the
+            # (group x period x bucket) cells: 150 companies must read
+            # "150 groups", not the number of month cells they span.
+            _groups = (len({k[0] for k in _cells}) if _has_time else len(_cat_only))
             chart_data = {
                 "type": "bar" if breakdown_col else "line",
                 "title": _trend_title,
@@ -2293,7 +2346,7 @@ def run_explore(session: dict, request: dict) -> dict:
                 _result["ok"] = False
                 _result["code"] = "VALIDATION_FAILED"
                 _result["detail"] = (
-                    f"Validation error (validator_error): {_vexc}. "
+                    f"Validation error (validator_error): {sanitize_error(_vexc)}. "
                     "Numbers withheld as unverified.")
             return _result
     except _NoJoinPath as njp:
@@ -2317,81 +2370,139 @@ def _hypothesis_items(session: dict) -> list:
     _h_db_uri = session.get("db_uri") if isinstance(session, dict) else None
     for tname, col_roles in roles.items():
         measures = [c for c, r in col_roles.items() if r in ("BUSINESS_MEASURE", "MEASURE", "DERIVED_METRIC")]
-        dims = [c for c, r in col_roles.items() if r in ("DIMENSION", "CATEGORY", "TEXT")]
         dates = [c for c, r in col_roles.items() if r == "DATE"]
-        if (not dims or not dates) and _h_db_uri:
-            # Same role-poor gap as meta (e.g. walmart: TEXT date + store
-            # held as IDENTIFIERs): value-verified extras so trend/segment
-            # hypotheses exist instead of an empty Hypotheses tab.
+        if not dates and _h_db_uri:
+            # Value-check unclassified columns for a date field so trend
+            # questions work across schemas with imperfect type metadata.
             try:
                 _he = _probe_table_extras(
                     mapping, tname, col_roles or {}, _h_db_uri)
-                if not dims:
-                    dims = [c for c in (_he.get("low_card_dims") or [])
-                            if c in (col_roles or {})][:3]
-                if not dates:
-                    dates = [c for c in (_he.get("date_cols") or [])
-                             if c in (col_roles or {})][:1]
+                dates = [c for c in (_he.get("date_cols") or [])
+                         if c in (col_roles or {})][:1]
             except Exception:
                 pass
-        for m in measures[:5]:
-            ml = display_name(m, m)
-            for d in dims[:3]:
-                dl = display_name(d, d)
-                hid = hashlib.sha256(f"{tname}:{m}:{d}".encode()).hexdigest()[:12]
-                items.append({
-                    "id": hid, "type": "segment", "metric": m, "dimension": d,
-                    "table": tname, "metric_label": ml, "dimension_label": dl,
-                    "title": f"Why does {ml.lower()} vary by {dl.lower()}?",
-                    "question": f"Why might {ml} have changed?",
-                    "period": "All data",
-                    "verdict": "Ready to investigate",
-                    "drivers": [{"driver": dl, "type": "Segment", "association": "Segment difference", "evidence_strength": "Moderate"}],
-                    "summary": f"Performance in {ml.lower()} differs across {dl.lower()} groups — ARIA can test which segments stand apart.",
-                    "description": f"Segment comparison of {ml} across {dl} in {display_name(tname, tname)}.",
-                    "evidence_strength": "Moderate", "strength": "Moderate", "status": "Ready to investigate",
-                    "observed_pattern": {
-                        "headline": f"{ml} is unevenly distributed across {dl.lower()}",
-                        "detail": f"Some {dl.lower()} groups contribute far more {ml.lower()} than others. Open this hypothesis to see the breakdown.",
-                    },
-                    "key_takeaways": [
-                        f"{ml} concentration differs meaningfully across {dl.lower()}.",
-                        "Focus follow-up on the top and bottom segments first.",
-                    ],
-                    "takeaways": [f"{ml} concentration differs across {dl.lower()}."],
-                    "associated_factors": [{"factor": dl, "name": dl, "type": "Segment", "kind": "Segment",
-                                            "association": f"Groups differ in {ml.lower()}", "relationship": "Segment difference",
-                                            "evidence_strength": "Moderate", "strength": "Moderate"}],
-                    "factors": [{"factor": dl, "type": "Segment", "association": "Segment difference", "evidence_strength": "Moderate"}],
-                    "evidence": [f"Grouped totals of {ml.lower()} by {dl.lower()} show a clear spread between leaders and laggards."],
-                    "evidence_points": [f"Grouped totals of {ml.lower()} by {dl.lower()} show spread."],
-                    "related": [], "next_steps": [f"Open Explore with {ml} broken down by {dl} to see the leaders.", "Test a scenario on the top segment."],
-                    "context": {"metric": ml, "breakdown": dl, "dimension": dl, "table": display_name(tname, tname), "period": "All data"},
-                })
+        tbl_label = display_name(tname, tname)
         for m in measures[:3]:
             ml = display_name(m, m)
+            # Qualify the measure with its table ("Invoice Total") — a bare
+            # column label like "Total" reads ambiguous everywhere it appears.
+            subj = f"{tbl_label} {ml}".strip() if tbl_label.lower() not in ml.lower() else ml
             for dt in dates[:1]:
                 hid = hashlib.sha256(f"{tname}:{m}:{dt}:trend".encode()).hexdigest()[:12]
                 items.append({
                     "id": hid, "type": "trend", "metric": m, "time": dt,
-                    "table": tname, "metric_label": ml,
-                    "title": f"Is {ml.lower()} trending up or down over time?",
-                    "question": f"Why might {ml} have changed?",
+                    "table": tname, "metric_label": subj,
+                    "title": f"Why did {subj} change over time?",
+                    "question": f"Why might {subj} have changed?",
                     "period": "All data",
                     "verdict": "Ready to investigate",
                     "drivers": [],
-                    "summary": f"ARIA can trace {ml.lower()} over time to describe momentum in plain language.",
-                    "description": f"Trend of {ml} over {display_name(dt, dt)}.",
-                    "evidence_strength": "Moderate", "strength": "Moderate", "status": "Ready to investigate",
-                    "observed_pattern": {"headline": f"{ml} moves over time", "detail": f"Run Explore on {ml} to see whether momentum is building or softening."},
-                    "key_takeaways": [f"Direction of {ml.lower()} over time is testable from your history."],
-                    "takeaways": [f"Direction of {ml.lower()} is testable."],
+                    "summary": f"Investigate whether {subj} increased, declined, or held steady over time.",
+                    "description": f"Trend of {subj} over {display_name(dt, dt)}.",
+                    "evidence_strength": "Not tested", "strength": "Not tested", "status": "Ready to investigate",
+                    "observed_pattern": {"headline": "Change not tested yet", "detail": f"Open this question to measure whether {subj} increased, declined, or held steady."},
+                    "key_takeaways": [f"Historical change in {subj} can be tested using the available time field."],
+                    "takeaways": [f"Test whether {subj} changed over time."],
                     "associated_factors": [],
-                    "evidence": [f"Time-ordered totals of {ml.lower()} reveal the current direction."],
-                    "related": [], "next_steps": [f"Open Explore with {ml} over time."],
-                    "context": {"metric": ml, "breakdown": "Time", "table": display_name(tname, tname), "period": "All data"},
+                    "evidence": [],
+                    "related": [], "next_steps": [f"Measure how {subj} changed over time and investigate the largest movement."],
+                    "context": {"metric": subj, "breakdown": "Time", "table": tbl_label, "period": "All data"},
                 })
     return items
+
+
+def _attach_trend_summary(session: dict, item: dict) -> None:
+    """Attach a real earliest-vs-latest measurement to a trend item (list view).
+
+    Two bounded TOP-1 grouped queries on the item's metric/date pair — cheap
+    enough for a page of list cards. Numbers round through _human_total like
+    everywhere else; when the pair cannot be measured the item gets a
+    plain-worded trend_limitation — never a fabricated number.
+    """
+    try:
+        if item.get("type") != "trend":
+            return
+        db_uri = session.get("db_uri")
+        t, m, dt = item.get("table"), item.get("metric"), item.get("time")
+        if not (db_uri and t and m and dt):
+            return
+        mapping = _load_schema_mapping(session)
+        hd = _dialect_of(db_uri)
+        try:
+            mdt = _col_data_type(mapping, t, m)
+            expr = _nan_safe_sql(
+                _numeric_metric_sql(_qident(hd, m), mdt, hd), mdt, hd)
+        except Exception:
+            mdt, expr = "", _qident(hd, m)
+        if not _is_native_date_dtype(_col_data_type(mapping, t, dt)) or _is_text_dtype(mdt):
+            item["trend_limitation"] = ("Dates are stored as text in this table — "
+                                        "open the question to measure it there.")
+            return
+        engine = _pooled_engine(db_uri)
+        from sqlalchemy import text as sql_text
+        base = (f"SELECT {_qident(hd, dt)} AS p, SUM({expr}) AS v "
+                f"FROM {_qident(hd, t)} GROUP BY {_qident(hd, dt)} "
+                f"ORDER BY {_qident(hd, dt)}")
+        with engine.connect() as conn:
+            if hd == "sqlite":
+                try:
+                    from services.intelligence_validation import (
+                        ensure_sqlite_helpers as _esh3)
+                    _esh3(engine)
+                except Exception:
+                    pass
+            first = conn.execute(sql_text(base + " ASC LIMIT 1")).first()
+            last = conn.execute(sql_text(base + " DESC LIMIT 1")).first()
+        if not first or not last:
+            item["trend_limitation"] = "No periods of data to measure yet."
+            return
+        f_lab, l_lab = str(first[0] or ""), str(last[0] or "")
+        if f_lab == l_lab:
+            item["trend_limitation"] = "Only one period of data — a trend needs at least two."
+            return
+        f_val, l_val = float(first[1] or 0), float(last[1] or 0)
+        pct = ((l_val - f_val) / f_val * 100) if f_val else 0.0
+        direction = "declined" if pct < 0 else "increased" if pct > 0 else "held steady"
+        item["trend_summary"] = {
+            "change_pct": round(pct, 1),
+            "direction": direction,
+            "first_label": f_lab, "last_label": l_lab,
+            "first_display": _human_total(f_val), "last_display": _human_total(l_val),
+            "basis": "earliest vs latest period",
+        }
+    except Exception:
+        item["trend_limitation"] = "ARIA couldn't measure this trend just now."
+
+
+def _no_time_search_hint(session: dict, search: str) -> str:
+    """Plain-worded reason when a searched measure has no time column.
+
+    Search matched no hypothesis — if the term names a real numeric measure
+    whose table has no date field, say that instead of showing a blank
+    result the user can't explain.
+    """
+    try:
+        mapping = _load_schema_mapping(session)
+        roles = _classify_columns(mapping)
+    except Exception:
+        return ""
+    no_date: list[str] = []
+    for tname, col_roles in (roles or {}).items():
+        has_date = any(r == "DATE" for r in col_roles.values())
+        for c, r in col_roles.items():
+            if r not in ("BUSINESS_MEASURE", "MEASURE", "DERIVED_METRIC"):
+                continue
+            if search in f"{display_name(c, c)} {c}".lower() and not has_date:
+                label = f"{display_name(tname, tname)} {display_name(c, c)}".strip()
+                if label not in no_date:
+                    no_date.append(label)
+    if not no_date:
+        return ""
+    shown = ", ".join(no_date[:3])
+    verb = "has" if len(no_date) == 1 else "have"
+    pronoun = "it" if len(no_date) == 1 else "them"
+    return (f"{shown} {verb} no time column — trend questions need a date "
+            f"field, so no hypothesis was created for {pronoun}.")
 
 
 def generate_hypotheses(session: dict, request: dict) -> dict:
@@ -2411,8 +2522,11 @@ def generate_hypotheses(session: dict, request: dict) -> dict:
                 "total_candidates": 0, "total": 0, "count": 0,
                 "reason": NO_SCHEMA_REASON, "hint": NO_SCHEMA_HINT}
     search = str(request.get("search") or "").strip().lower()
+    hint = ""
     if search:
         items = [h for h in items if search in f"{h.get('title','')} {h.get('summary','')} {h.get('metric_label','')}".lower()]
+        if not items:
+            hint = _no_time_search_hint(session, search)
     sort = str(request.get("sort") or "recent").lower()
     if sort == "az":
         items = sorted(items, key=lambda h: str(h.get("title", "")))
@@ -2430,6 +2544,10 @@ def generate_hypotheses(session: dict, request: dict) -> dict:
     total = len(items)
     start = (page - 1) * page_size
     sliced = items[start:start + page_size]
+    # Real measured move per list card (bounded: first 10 rows of the page).
+    # Failures attach a plain-worded trend_limitation instead of a number.
+    for h in sliced[:10]:
+        _attach_trend_summary(session, h)
     return {
         "ok": True,
         "candidates": items,
@@ -2440,6 +2558,7 @@ def generate_hypotheses(session: dict, request: dict) -> dict:
         "count": total,
         "page": page,
         "page_size": page_size,
+        "hint": hint,
     }
 
 
@@ -2448,8 +2567,8 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
 
     Computes a real observed pattern from the database (top/bottom segment
     totals with share + mini-series for segment hypotheses; first-half vs
-    second-half totals with direction for trend hypotheses). All numbers are
-    rounded to a human scale — never fabricated.
+    second-half totals over the full time range with direction for trend
+    hypotheses). All numbers are rounded to a human scale — never fabricated.
     """
     items = _hypothesis_items(session)
     found = next((h for h in items if str(h.get("id")) == str(hypothesis_id)), None)
@@ -2479,7 +2598,6 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                 engine = _pooled_engine(db_uri)
                 with engine.connect() as conn:
                     t, m, d = found["table"], found["metric"], found["dimension"]
-                    qm = "`" if db_uri and "mysql" in db_uri else '"'
                     # TEXT-stored measures (currency strings) need the shared
                     # numeric coercion — raw SUM(text) raises and the card
                     # silently loses its enrichment.
@@ -2488,7 +2606,7 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                         _hmap = _load_schema_mapping(session)
                         _hdt = _col_data_type(_hmap, t, m)
                         _hexpr = _nan_safe_sql(
-                            _numeric_metric_sql(f"{qm}{m}{qm}", _hdt, _hd),
+                            _numeric_metric_sql(_qident(_hd, m), _hdt, _hd),
                             _hdt, _hd)
                         if _hd == "sqlite":
                             try:
@@ -2498,8 +2616,10 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                             except Exception:
                                 pass
                     except Exception:
-                        _hexpr = f"{qm}{m}{qm}"
-                    sql = f"SELECT {qm}{d}{qm} AS c, SUM({_hexpr}) AS v FROM {qm}{t}{qm} GROUP BY {qm}{d}{qm} ORDER BY v DESC LIMIT 8"
+                        _hexpr = _qident(_hd, m)
+                    sql = (f"SELECT {_qident(_hd, d)} AS c, SUM({_hexpr}) AS v "
+                           f"FROM {_qident(_hd, t)} GROUP BY {_qident(_hd, d)} "
+                           f"ORDER BY v DESC LIMIT 8")
                     _r = conn.execute(sql_text(sql))
                     _c = list(_r.keys())
                     rows = _r.fetchall()
@@ -2566,12 +2686,11 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                 engine = _pooled_engine(db_uri)
                 with engine.connect() as conn:
                     t, m = found["table"], found["metric"]
-                    qm = "`" if db_uri and "mysql" in db_uri else '"'
                     _hd2 = _dialect_of(db_uri)
                     try:
                         _mdt = _col_data_type(_hmap2, t, m)
                         _mexpr = _nan_safe_sql(
-                            _numeric_metric_sql(f"{qm}{m}{qm}", _mdt, _hd2),
+                            _numeric_metric_sql(_qident(_hd2, m), _mdt, _hd2),
                             _mdt, _hd2)
                         if _hd2 == "sqlite":
                             try:
@@ -2581,12 +2700,19 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                             except Exception:
                                 pass
                     except Exception:
-                        _mdt, _mexpr = "", f"{qm}{m}{qm}"
+                        _mdt, _mexpr = "", _qident(_hd2, m)
                     _native_dt = _is_native_date_dtype(
                         _col_data_type(_hmap2, t, dt))
                     pts: list = []
                     if _native_dt and not _is_text_dtype(_mdt):
-                        sql = f"SELECT {qm}{dt}{qm} AS p, SUM({_mexpr}) AS v FROM {qm}{t}{qm} GROUP BY {qm}{dt}{qm} ORDER BY {qm}{dt}{qm} ASC LIMIT 24"
+                        # Full-range buckets: the headline says "All data", so
+                        # the first-half vs second-half comparison must span
+                        # the whole range — not just the earliest buckets.
+                        # 4000 is a bounded safety cap (~11 years of daily
+                        # points), never the window itself.
+                        sql = (f"SELECT {_qident(_hd2, dt)} AS p, SUM({_mexpr}) AS v "
+                               f"FROM {_qident(_hd2, t)} GROUP BY {_qident(_hd2, dt)} "
+                               f"ORDER BY {_qident(_hd2, dt)} ASC LIMIT 4000")
                         _r = conn.execute(sql_text(sql))
                         _c = list(_r.keys())
                         rows = _r.fetchall()
@@ -2597,9 +2723,11 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                         # TEXT/odd-stored dates (or TEXT measures): SQL
                         # ORDER BY over stored spellings is meaningless
                         # (DD-MM-YYYY scrambles), so bucket in SQL but sort
-                        # by the shared tolerant parser in Python. Earliest
-                        # 24 buckets mirrors the native LIMIT 24 ASC window.
-                        _sql2 = f"SELECT {qm}{dt}{qm} AS p, SUM({_mexpr}) AS v FROM {qm}{t}{qm} GROUP BY {qm}{dt}{qm}"
+                        # by the shared tolerant parser in Python. The
+                        # whole sorted range is kept (same 4000 cap as the
+                        # native path) so halves span all data.
+                        _sql2 = (f"SELECT {_qident(_hd2, dt)} AS p, SUM({_mexpr}) AS v "
+                                 f"FROM {_qident(_hd2, t)} GROUP BY {_qident(_hd2, dt)}")
                         _r = conn.execute(sql_text(_sql2))
                         _c = list(_r.keys())
                         _pairs = []
@@ -2614,7 +2742,7 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                                 continue
                             _pairs.append((_pd, str(_dd.get("p") or ""), _vv))
                         _pairs.sort(key=lambda x: x[0])
-                        pts = [(lab, v) for _, lab, v in _pairs[:24]]
+                        pts = [(lab, v) for _, lab, v in _pairs[:4000]]
                     if pts and len(pts) >= 2:
                         half = max(1, len(pts) // 2)
                         before = sum(v for _, v in pts[:half]) or 0
@@ -2679,8 +2807,13 @@ def run_whatif(session: dict, request: dict) -> dict:
         change_type = "decrease"
     try:
         change_value = float(request.get("change_value", request.get("changeValue", 10)))
+        if not math.isfinite(change_value):
+            change_value = 10
     except Exception:
         change_value = 10
+    # Docstring promises "with backend range": clamp the scenario to the
+    # advertised supported_range so arbitrary multipliers never hit the DB.
+    change_value = max(-50.0, min(100.0, change_value))
     apply_to = request.get("apply_to") or request.get("applyTo") or request.get("scope") or "All data"
 
     if not variable:
@@ -2820,7 +2953,6 @@ def run_whatif(session: dict, request: dict) -> dict:
             try:
                 if date_col:
                     with engine.connect() as _c3:
-                        _qm = '`' if _wdialect == "mysql" else '"'
                         _mcol = rev_col or variable
                         if _mcol == COUNT_METRIC:
                             _mexpr = "COUNT(*)"
@@ -2828,14 +2960,21 @@ def run_whatif(session: dict, request: dict) -> dict:
                             # Table-qualified expr is valid in this
                             # single-table FROM (no alias), so keep it as-is.
                             _mexpr, _ = _wsum(_mcol, table)
-                        _msql = (f"SELECT {_qm}{date_col}{_qm} AS p, {_mexpr} AS v "
-                                 f"FROM {_qm}{table}{_qm} GROUP BY {_qm}{date_col}{_qm} "
-                                 f"ORDER BY {_qm}{date_col}{_qm} ASC LIMIT 6")
+                        _msql = (f"SELECT {_qident(_wdialect, date_col)} AS p, {_mexpr} AS v "
+                                 f"FROM {_qident(_wdialect, table)} "
+                                 f"GROUP BY {_qident(_wdialect, date_col)} "
+                                 f"ORDER BY {_qident(_wdialect, date_col)} ASC LIMIT 6")
                         _r3 = _c3.execute(sql_text(_msql))
                         _k3 = list(_r3.keys())
                         for _rr in _r3.fetchall():
                             _dd = dict(zip(_k3, _rr))
-                            _lbl = str(_dd.get("p") or "")[:7] or "Period"
+                            # Label honestly: only trim to YYYY-MM when the
+                            # stored value IS that shape; raw text dates
+                            # ("9/2024", "3/14/97") keep their full label
+                            # instead of a lexicographic-truncated garbage.
+                            _lbl = str(_dd.get("p") or "") or "Period"
+                            if not re.fullmatch(r"\d{4}-\d{2}", _lbl) and len(_lbl) > 24:
+                                _lbl = _lbl[:24]
                             _bv = float(_dd.get("v") or 0)
                             monthly.append({"label": _lbl, "baseline": _bv,
                                             "scenario": _bv * (1 + sign * factor)})

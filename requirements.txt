@@ -13,13 +13,17 @@ fastapi==0.141.1
 uvicorn==0.52.2
 python-multipart==0.0.32
 pdfplumber==0.11.10
-reportlab>=4.4,<5  # Generate downloadable Intelligence report PDFs
+reportlab>=4.4,<5  # Intelligence report PDF downloads
 PyJWT==2.13.0
 pdf2image==1.17.0
 pytesseract==0.3.13
 sentence-transformers==5.5.0
 faiss-cpu==1.13.2
 pillow==12.3.0
+python-pptx==1.0.2
+python-docx==1.2.0
+openpyxl==3.1.5
+requests==2.34.2
 scikit-learn==1.8.0
 scipy==1.17.1
 statsmodels==0.15.0
@@ -38,4 +42,3 @@ fastembed
 pymupdf
 langchain-postgres
 mysql-connector-python
-

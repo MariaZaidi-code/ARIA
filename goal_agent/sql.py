@@ -324,11 +324,32 @@ class SqlMixin:
             "first_ref": None,
             "intro": {},
         }
+        # Mask single-quoted string literals (length preserved) so keywords
+        # and parens inside them are never parsed as SQL structure.
+        _scan = list(sql)
+        _i = 0
+        _n = len(sql)
+        while _i < _n:
+            if sql[_i] == "'":
+                _j = _i + 1
+                while _j < _n:
+                    if sql[_j] == "'":
+                        if _j + 1 < _n and sql[_j + 1] == "'":
+                            _j += 2
+                            continue
+                        break
+                    _j += 1
+                for _k in range(_i, min(_j + 1, _n)):
+                    _scan[_k] = " "
+                _i = _j + 1
+                continue
+            _i += 1
+        scan_sql = "".join(_scan)
         pos = 0
         first = True
         depth = 0
         while pos < len(sql):
-            ch = sql[pos]
+            ch = scan_sql[pos]
             if ch == "(":
                 depth += 1
                 pos += 1
@@ -346,9 +367,9 @@ class SqlMixin:
             # The lookahead accepts a closing quote or any non-identifier char.
             m = re.search(
                 r"\b(?:FROM|JOIN)\s+[\"'`\[]?([A-Za-z_][A-Za-z0-9_]*)"
-                r"(?:[\"'`\]])?(?:\s*\.\s*[\"'`\[]?([A-Za-z_][A-Za-z0-9]*)"
+                r"(?:[\"'`\]])?(?:\s*\.\s*[\"'`\[]?([A-Za-z_][A-Za-z0-9_]*)"
                 r"(?:[\"'`\]])?)?(?![A-Za-z0-9_])",
-                sql[pos:], re.IGNORECASE,
+                scan_sql[pos:], re.IGNORECASE,
             )
             if not m:
                 break
@@ -387,6 +408,19 @@ class SqlMixin:
         n = len(sql)
         while i < n:
             ch = sql[i]
+            if ch == "'":
+                # Skip the whole string literal: parens/semicolons inside it
+                # are data, not structure.
+                i += 1
+                while i < n:
+                    if sql[i] == "'":
+                        if i + 1 < n and sql[i + 1] == "'":
+                            i += 2
+                            continue
+                        break
+                    i += 1
+                i += 1
+                continue
             if ch == "(":
                 depth += 1
             elif ch == ")":
@@ -812,16 +846,21 @@ class SqlMixin:
                 )
 
         # Resolve aliases to table names: FROM x [AS] a, JOIN y [AS] b.
+        # SQL keywords are never treated as aliases (FROM orders WHERE ...
+        # must not register "where" -> orders).
+        _kw_guard = (r"(?!WHERE\b|GROUP\b|ORDER\b|HAVING\b|LIMIT\b|OFFSET\b|"
+                     r"LEFT\b|RIGHT\b|INNER\b|FULL\b|CROSS\b|JOIN\b|ON\b|AS\b|"
+                     r"UNION\b|SET\b|WINDOW\b|QUALIFY\b)")
         alias_to_table = {}
         for m in re.finditer(
-            r"\b(FROM|JOIN)\s+([\"'`]?)(\w+)\2\s+(?:AS\s+)?([a-zA-Z_]\w*)",
+            r"\b(FROM|JOIN)\s+([\"'`]?)(\w+)\2(\s+(?:AS\s+)?" + _kw_guard + r"([a-zA-Z_]\w*))?",
             sql,
             re.IGNORECASE,
         ):
-            table, alias = m.group(3), m.group(4)
-            alias_to_table[alias.lower()] = table
-            if not m.group(4):
-                alias_to_table[table.lower()] = table
+            table, alias = m.group(3), m.group(5)
+            alias_to_table[table.lower()] = table
+            if alias:
+                alias_to_table[alias.lower()] = table
 
         suspects = []
         # Capture each ON clause and the equality conditions inside it.
@@ -857,16 +896,22 @@ class SqlMixin:
             for fk in info.get("foreign_keys", []):
                 fk_of.setdefault(name, {})[fk["column"]] = (fk["referenced_table"], fk["referenced_column"])
 
+        # Resolve aliases to table names (keyword-guarded, like
+        # _find_suspicious_pk_joins): FROM orders WHERE ... must not
+        # register "where" -> orders, and bare table names self-map.
+        _kw_guard = (r"(?!WHERE\b|GROUP\b|ORDER\b|HAVING\b|LIMIT\b|OFFSET\b|"
+                     r"LEFT\b|RIGHT\b|INNER\b|FULL\b|CROSS\b|JOIN\b|ON\b|AS\b|"
+                     r"UNION\b|SET\b|WINDOW\b|QUALIFY\b)")
         alias_to_table = {}
         for m in re.finditer(
-            r"\b(FROM|JOIN)\s+([\"'`]?)(\w+)\2\s+(?:AS\s+)?([a-zA-Z_]\w*)",
+            r"\b(FROM|JOIN)\s+([\"'`]?)(\w+)\2(\s+(?:AS\s+)?" + _kw_guard + r"([a-zA-Z_]\w*))?",
             sql,
             re.IGNORECASE,
         ):
-            table, alias = m.group(3), m.group(4)
-            alias_to_table[alias.lower()] = table
-            if not m.group(4):
-                alias_to_table[table.lower()] = table
+            table, alias = m.group(3), m.group(5)
+            alias_to_table[table.lower()] = table
+            if alias:
+                alias_to_table[alias.lower()] = table
 
         suspects = []
         for on_m in re.finditer(
@@ -1175,9 +1220,14 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 _tgt = f'"{target_col}"'
         except Exception:
             _tgt = f'"{target_col}"'
-        # If multiple aggregates, simplify to just the requested one
+        # If multiple aggregates AND the query is a scalar (no GROUP BY),
+        # simplify to just the requested one. Grouped queries keep every
+        # aggregate: multi-aggregate + GROUP BY is a legitimate shape
+        # (trend/compare/breakdown), and collapsing it would silently
+        # discard joins, filters and dimensions.
+        has_grouping = bool(re.search(r'\bGROUP\s+BY\b', sql, re.IGNORECASE))
         agg_count = len(re.findall(r'\b(AVG|SUM|COUNT)\s*\(', sql, re.IGNORECASE))
-        if agg_count > 1:
+        if agg_count > 1 and not has_grouping:
             return f'SELECT {agg_match}({_tgt}) AS result FROM {self._qtab(target_table)};'
         # Fix wrong column in the aggregate
         agg_pattern = re.compile(rf'{agg_match}\s*\(\s*["\']?(\w+)["\']?\s*\)', re.IGNORECASE)
@@ -1331,6 +1381,33 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                any(k in name.lower() for k in ("date", "time", "month", "year", "day", "week", "quarter", "period")):
                 return name, dt
         return None, None
+
+    _YEARLY_RE = re.compile(r"\b(yearly|annual(ly)?|by year|per year|each year|"
+                            r"year by year|by years|year over year|yoy)\b")
+
+    def _period_expr(self, table, col, dtype, goal=""):
+        """Period key for a time grouping: the year when the question asks
+        for years ('by year', 'yearly', 'annual'), else the month. The year
+        is the first four characters of the TEXT-date-safe month key
+        ('2024-03' / '2024-03-01 00:00:00' -> '2024'), so it works for every
+        dialect and date storage the month key supports."""
+        month = self._month_expr(table, col, dtype)
+        if not self._YEARLY_RE.search(str(goal or "").lower()):
+            return month
+        if getattr(self, "dialect", "postgresql") == "mysql":
+            return f"SUBSTRING({month}, 1, 4)"
+        return f"SUBSTR(CAST({month} AS TEXT), 1, 4)"
+
+    def _current_question_text(self, user_goal):
+        """The user's own words for this turn: history-augmented goals
+        ('Conversation context: ... Current question: X') must never let an
+        earlier turn's 'by year' change this turn's grouping."""
+        cur = str(getattr(self, "_active_current_question", "") or "").strip()
+        if cur:
+            return cur
+        m = re.search(r"current question\s*:\s*(.+)$", str(user_goal or ""),
+                      re.IGNORECASE | re.DOTALL)
+        return m.group(1).strip() if m else str(user_goal or "")
 
     def _month_expr(self, table, col, dtype):
         """Dialect-aware month truncation, TEXT-date safe (DD-MM-YYYY + ISO)."""
@@ -1886,21 +1963,43 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 progressed = True
         parts = [f"FROM {self._qtab(base)}"]
         joined = {base}
-        for (a, b) in pair_edges:
-            if (a, b) not in used_pairs:
-                continue
-            # Attach the side not yet in the query (both orders validated).
-            nxt = b if a in joined else a
-            try:
-                _conds = " AND ".join(
-                    f"{self._qcol(e['left_table'], e['left_column'])} = "
-                    f"{self._qcol(e['right_table'], e['right_column'])}"
-                    for e in pair_edges[(a, b)]
-                )
-            except Exception:
-                continue
-            parts.append(f"JOIN {self._qtab(nxt)} ON {_conds}")
-            joined.add(nxt)
+        # Emit used pairs in dependency order: an edge may only be emitted
+        # once one of its sides is already in the query (fix-point). The
+        # discovery order of pair_edges is NOT guaranteed topological, so a
+        # straight iteration can emit `JOIN mid ON mid.k = leaf.k` before
+        # `mid` exists and then a duplicate `JOIN mid`, leaving `leaf`
+        # unjoined. Each used pair still introduces exactly one new table.
+        pending = [key for key in pair_edges if key in used_pairs]
+        progressed = True
+        while progressed and pending:
+            progressed = False
+            for key in list(pending):
+                a, b = key
+                if a in joined and b in joined:
+                    # Cycle edge: both sides already attached elsewhere.
+                    pending.remove(key)
+                    progressed = True
+                    continue
+                if a in joined:
+                    nxt = b
+                elif b in joined:
+                    nxt = a
+                else:
+                    continue
+                try:
+                    _conds = " AND ".join(
+                        f"{self._qcol(e['left_table'], e['left_column'])} = "
+                        f"{self._qcol(e['right_table'], e['right_column'])}"
+                        for e in pair_edges[key]
+                    )
+                except Exception:
+                    pending.remove(key)
+                    progressed = True
+                    continue
+                parts.append(f"JOIN {self._qtab(nxt)} ON {_conds}")
+                joined.add(nxt)
+                pending.remove(key)
+                progressed = True
         return " ".join(parts), included
 
     # ---- _render_fallback_where (_render_fallback_where) ----
@@ -1942,11 +2041,24 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                     f"{self._qcol(real_t, real_c)} IS NOT NULL")
                 continue
             v = str(val).strip()
-            if (len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"')) \
-                    or re.fullmatch(r"-?\d+(\.\d+)?", v):
+            # Strip ONE pair of matching outer quotes (user-typed literals
+            # like 'Electronics'), then ALWAYS render via proper escaping.
+            # Pre-quoted text is never passed through verbatim: a value such
+            # as  'x' OR 1=1 --'  would otherwise become injected SQL.
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                v = v[1:-1]
+            if re.fullmatch(r"-?\d+(\.\d+)?", v):
                 lit = v
             else:
-                lit = "'" + v.replace("'", "''") + "'"
+                body = v.replace("'", "''")
+                if str(getattr(self, "dialect", "postgresql")).lower() == "mysql":
+                    # MySQL (default sql_mode) treats backslash as an escape
+                    # character inside string literals: a value ending in a
+                    # backslash would escape the closing quote and re-open
+                    # injection. Double the backslashes so the literal closes
+                    # where it should (PG/SQLite treat backslash literally).
+                    body = body.replace("\\", "\\\\")
+                lit = "'" + body + "'"
             conds.append(f"{self._qcol(real_t, real_c)} {op} {lit}")
         return ("WHERE " + " AND ".join(conds)) if conds else ""
 
@@ -2004,7 +2116,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         metrics = (ir or {}).get("metrics", []) or []
         dims = (ir or {}).get("dimensions", []) or []
         filters = (ir or {}).get("filters", []) or []
-        time = (ir or {}).get("time") if ir else None
+        time_ir = (ir or {}).get("time") if ir else None
         ranking = (ir or {}).get("ranking") if ir else None
         if ranking is None:
             try:
@@ -2196,7 +2308,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         except Exception:
             ir_intent = None
         wants_trend = bool(ir_intent == "trend" or trend_words
-                            or (isinstance(time, dict) and time.get("granularity")))
+                            or (isinstance(time_ir, dict) and time_ir.get("granularity")))
         # DEFECT 2: month-over-month decline ("in which month did revenue
         # decline/drop/fall"): trend intent + decline words forces a monthly
         # GROUP BY even when the phrasing uses bare "month" instead of
@@ -2374,7 +2486,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         # --- datetime for trends --------------------------------------------
         date_table, date_col, date_dtype = None, None, None
         if wants_trend:
-            tc = (time or {}).get("column") if isinstance(time, dict) else None
+            tc = (time_ir or {}).get("column") if isinstance(time_ir, dict) else None
             if tc and "." in str(tc):
                 t0, _, c0 = str(tc).partition(".")
                 if t0 in included:
@@ -2504,7 +2616,8 @@ Use date_trunc('quarter', date_col) for quarter filtering.
         # --- assemble --------------------------------------------------------
         if wants_trend and date_col is not None:
             try:
-                month_expr = self._month_expr(date_table, date_col, date_dtype)
+                month_expr = self._period_expr(date_table, date_col, date_dtype,
+                                               self._current_question_text(user_goal))
             except Exception:
                 month_expr = self._qcol(date_table, date_col)
             sql = (f"SELECT {month_expr} AS period, {value_list} "
@@ -2528,8 +2641,9 @@ Use date_trunc('quarter', date_col) for quarter filtering.
             lim = f" LIMIT {int(limit_n)}"
             if date_col is not None:
                 try:
-                    month_expr = self._month_expr(
-                        date_table, date_col, date_dtype)
+                    month_expr = self._period_expr(
+                        date_table, date_col, date_dtype,
+                        self._current_question_text(user_goal))
                 except Exception:
                     month_expr = self._qcol(date_table, date_col)
                 sql = (f"SELECT {month_expr} AS period, {value_list} "
@@ -2782,7 +2896,7 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 date_col, date_dtype = self._date_col_for_table(t)
                 if not date_col:
                     continue
-                month_expr = self._month_expr(t, date_col, date_dtype)
+                month_expr = self._period_expr(t, date_col, date_dtype, goal)
                 sum_expr, _col = _measure_sum(t)
                 if sum_expr:
                     return (f"SELECT {month_expr} AS period, "
@@ -3451,7 +3565,8 @@ Use date_trunc('quarter', date_col) for quarter filtering.
                 for table_name in self.tables:
                     try:
                         from core.relational import quote_identifier
-                        result = conn.execute(text(f'SELECT count(*) FROM {quote_identifier(table_name, "postgresql")}'))
+                        dialect = getattr(self, "dialect", "") or "postgresql"
+                        result = conn.execute(text(f'SELECT count(*) FROM {quote_identifier(table_name, dialect)}'))
                         counts[table_name] = int(result.scalar() or 0)
                     except Exception:
                         counts[table_name] = -1

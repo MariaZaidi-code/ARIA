@@ -75,6 +75,24 @@ def test_router_prefers_strict_structured_output_path():
     assert llm.plain_calls == 0
 
 
+def test_router_preserves_selected_provider_scope_model():
+    llm = StructuredFakeLLM(_payload())
+    llm.models["rag_scope"] = "selected-provider-model"
+
+    SemanticRouter(llm)
+
+    assert llm.models["rag_scope"] == "selected-provider-model"
+
+
+def test_router_sets_default_scope_model_when_provider_has_no_override(monkeypatch):
+    llm = StructuredFakeLLM(_payload())
+    monkeypatch.setattr("insight_rag.semantic_router.RAG_LLM_MODEL", "default-rag-model")
+
+    SemanticRouter(llm)
+
+    assert llm.models["rag_scope"] == "default-rag-model"
+
+
 def test_router_strict_schema_contains_nullable_control_fields():
     schema = SemanticRouter._strict_json_schema()
     props = schema["properties"]

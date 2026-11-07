@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -44,7 +45,9 @@ def _measure_expr(intel, tname: str, col: str, dialect: str) -> str:
     try:
         q = _safe_name(col, dialect)
     except Exception:
-        return str(col)
+        # Fallback must still be a quoted identifier — an unquoted raw column
+        # name can break SQL or allow keyword collisions.
+        return f'"{str(col).replace(chr(34), chr(34) + chr(34))}"'
     try:
         dtype = intel.dtype_of(tname, col) if intel is not None else ""
     except Exception:
@@ -81,35 +84,59 @@ def _coerce_num(value):
         from core.text_numeric import try_parse_text_number as _tpn
         parsed = _tpn(value)
         if parsed is not None:
-            return parsed
+            import math
+            return parsed if math.isfinite(parsed) else None
     except Exception:
         pass
     try:
-        return float(str(value).replace(",", "").strip())
+        import math
+        parsed = float(str(value).replace(",", "").strip())
+        return parsed if math.isfinite(parsed) else None
     except (TypeError, ValueError):
         return None
 
 
 def _fmt(v, is_currency=False):
-    if v is None:
+    """Card-sized number that never misstates the value.
+
+    Below 10,000 the full number is shown (1,500 - never '2K'); larger
+    values are shortened with enough precision to stay honest (47.3K,
+    151K, 1.8M, 2.1B). Small fractions keep two decimals (4.37).
+    """
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
         return "N/A"
-    if is_currency:
-        if abs(v) >= 1_000_000:
-            return f"${v/1_000_000:,.1f}M"
-        if abs(v) >= 1_000:
-            return f"${v/1_000:,.0f}K"
-        return f"${v:,.0f}"
-    if abs(v) >= 1_000_000:
-        return f"{v/1_000_000:,.1f}M"
-    if abs(v) >= 1_000:
-        return f"{v/1_000:,.0f}K"
-    return f"{v:,.0f}"
+    if math.isnan(v) or math.isinf(v):
+        return "N/A"
+    a = abs(v)
+    if a >= 1_000_000_000:
+        s = f"{v/1_000_000_000:,.1f}B"
+    elif a >= 1_000_000:
+        s = f"{v/1_000_000:,.1f}M"
+    elif a >= 100_000:
+        s = f"{v/1_000:,.0f}K"
+    elif a >= 10_000:
+        s = f"{v/1_000:,.1f}K"
+    elif a >= 100 or v == int(v):
+        s = f"{v:,.0f}"
+    else:
+        s = f"{v:,.2f}"
+    return f"${s}" if is_currency else s
 
 
 def _is_currency_col(col_name: str) -> bool:
-    from core.schema_intel import AMOUNT_HINTS
-    cl = col_name.lower()
-    return any(k in cl for k in AMOUNT_HINTS)
+    from core.schema_intel import _name_tokens
+    tokens = set(_name_tokens(col_name))
+    # Counts and physical quantities are additive but are not money. Keep
+    # them out of currency formatting even though they can be KPI measures.
+    if tokens & {"quantity", "qty", "count", "weight", "percent", "percentage", "rate"}:
+        return False
+    return bool(tokens & {
+        "amount", "revenue", "sales", "profit", "price", "cost", "total",
+        "value", "payment", "expense", "income", "salary", "turnover",
+        "billing", "balance", "discount", "freight", "tax", "charge", "fee",
+    })
 
 
 def _safe(val):
@@ -624,7 +651,9 @@ def _fetch_time_series(conn, tname: str, dt_col: str, measure: str,
     # Fallback for non-ISO date text: real SQL fetches raw pairs, Python
     # only buckets them to months (no values invented). Bounded: at most
     # _SERIES_FALLBACK_MAX raw pairs feed the month buckets, and the chart
-    # itself carries at most `limit` (≤500) aggregated points.
+    # itself carries at most `limit` (≤500) aggregated points. ORDER BY on
+    # the raw date keeps the window deterministic and chronological
+    # (earliest rows first) instead of an arbitrary scan order.
     try:
         result = conn.execute(
             text(
@@ -632,6 +661,7 @@ def _fetch_time_series(conn, tname: str, dt_col: str, measure: str,
                 f"{_mref} AS v "
                 f"FROM {_safe_name(tname, dialect)} "
                 f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
+                f"ORDER BY {_safe_name(dt_col, dialect)} "
                 f"LIMIT :fallback_limit"
             ),
             {"fallback_limit": _SERIES_FALLBACK_MAX},
@@ -677,6 +707,7 @@ def _fetch_count_series(conn, tname: str, dt_col: str, dialect: str,
                 f"SELECT {_safe_name(dt_col, dialect)} AS d "
                 f"FROM {_safe_name(tname, dialect)} "
                 f"WHERE {_safe_name(dt_col, dialect)} IS NOT NULL "
+                f"ORDER BY {_safe_name(dt_col, dialect)} "
                 f"LIMIT :fallback_limit"
             ),
             {"fallback_limit": _SERIES_FALLBACK_MAX},

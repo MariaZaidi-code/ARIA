@@ -16,17 +16,17 @@ _logger = logging.getLogger("uvicorn.error")
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(override=True)
 except ImportError:
     pass
 
-# Secrets in .env may be stored DPAPI-encrypted (`enc1:<base64>`) so the file
+# Secrets in .env may be stored DPAPI-encrypted (`enc2:<base64>`) so the file
 # is unreadable at rest. Decrypt them back into the environment now that dotenv
 # has loaded, before any module reads os.getenv for credentials.
-from core.secret_box import decrypt, encrypt, PREFIX  # noqa: E402
+from core.secret_box import decrypt, encrypt, is_encrypted  # noqa: E402
 
 for _name, _value in list(os.environ.items()):
-    if isinstance(_value, str) and _value.startswith(PREFIX):
+    if is_encrypted(_value):
         try:
             os.environ[_name] = decrypt(_value)
         except Exception:
@@ -38,6 +38,8 @@ for _name, _value in list(os.environ.items()):
 # There is intentionally no cross-provider fallback (e.g. DeepSeek must never
 # silently pick up GROQ_API_KEY).
 PROVIDER_ENV_KEYS = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
     "cloud": "GROQ_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "omniroute": "OMNIROUTE_API_KEY",
@@ -72,14 +74,14 @@ def resolve_provider_key(provider_name, api_keys=None):
 def _encrypt_api_keys(api_keys):
     """Encrypt per-provider API keys for at-rest storage.
 
-    Plaintext values get `enc1:` prefix via DPAPI; already-encrypted
+    Plaintext values get the current DPAPI envelope; already-encrypted
     values pass through unchanged. Non-string values are left as-is.
     """
     if not isinstance(api_keys, dict):
         return api_keys
     out = {}
     for k, v in api_keys.items():
-        if isinstance(v, str) and v and not v.startswith(PREFIX):
+        if isinstance(v, str) and v and not is_encrypted(v):
             try:
                 out[k] = encrypt(v)
             except Exception:
@@ -99,7 +101,7 @@ def _decrypt_api_keys(api_keys):
         return api_keys
     out = {}
     for k, v in api_keys.items():
-        if isinstance(v, str) and v.startswith(PREFIX):
+        if is_encrypted(v):
             try:
                 out[k] = decrypt(v)
             except Exception:
@@ -140,7 +142,7 @@ def _ensure_relational_uri(session):
         if not (cfg.get("host") and cfg.get("db")):
             return session
         pwd = cfg.get("password")
-        if isinstance(pwd, str) and pwd.startswith(PREFIX):
+        if is_encrypted(pwd):
             try:
                 with _PWD_CACHE_LOCK:
                     _cached = _PWD_CACHE.get(pwd)
@@ -166,11 +168,12 @@ def _ensure_relational_uri(session):
                 pwd = _plain
         if not pwd:
             return session
-        from urllib.parse import quote_plus as _qp, quote as _q
+        from urllib.parse import quote_plus as _qp
+        from core.db import format_db_host as _format_db_host
         scheme = "mysql+pymysql" if session.get("db_type") == "mysql" else "postgresql+psycopg2"
         session["db_uri"] = (
             f"{scheme}://{_qp(str(cfg.get('user', '')))}:{_qp(str(pwd))}"
-            f"@{_q(str(cfg.get('host', '')), safe='')}:{cfg.get('port')}/{_qp(str(cfg.get('db', '')))}"
+            f"@{_format_db_host(cfg.get('host', ''))}:{cfg.get('port')}/{_qp(str(cfg.get('db', '')))}"
         )
     except Exception:
         pass
@@ -201,11 +204,23 @@ def _decrypt_session_keys(session):
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
-DATA_DIR = BASE_DIR / "data"
+# Keep mutable runtime state separate from the source tree when configured.
+# This is required for read-only installs, managed sandboxes, and packaged builds.
+_configured_data_dir = os.getenv("ARIA_DATA_DIR")
+DATA_DIR = (
+    Path(_configured_data_dir).expanduser().resolve()
+    if _configured_data_dir
+    else BASE_DIR / "data"
+)
 # Dedicated folder for all schema mapping JSON files, keeping them out of the
 # code tree (everything under data/ is gitignored and regenerable).
 SCHEMA_DIR = DATA_DIR / "schemas"
-ARTIFACTS_DIR = BASE_DIR / "artifacts"
+_configured_artifacts_dir = os.getenv("ARIA_ARTIFACTS_DIR")
+ARTIFACTS_DIR = (
+    Path(_configured_artifacts_dir).expanduser().resolve()
+    if _configured_artifacts_dir
+    else BASE_DIR / "artifacts"
+)
 PROCESSED_DIR = ARTIFACTS_DIR / "processed_data"
 INSIGHTS_DIR = ARTIFACTS_DIR / "insights"
 FLOW_REPORTS_DIR = ARTIFACTS_DIR / "flow_reports"
@@ -251,13 +266,16 @@ def redis_url() -> str:
 
 
 def require_shared_store() -> bool:
-    """Return True when ARIA_REQUIRE_SHARED_STORE=1 (fail-closed prod mode)."""
-    try:
-        return (os.getenv("ARIA_REQUIRE_SHARED_STORE", "0") or "").strip().lower() in {
-            "1", "true", "yes", "on",
-        }
-    except Exception:
-        return False
+    """Sessions and rate limits use the same deployment policy."""
+    return _shared_store_required()
+
+
+def _session_store_unavailable():
+    from fastapi import HTTPException
+    raise HTTPException(
+        status_code=503,
+        detail="Shared session store is unavailable. Try again shortly.",
+    )
 
 
 def get_redis_client():
@@ -325,14 +343,31 @@ def _lock_handle(fh, exclusive: bool) -> None:
     try:
         if os.name == "nt":
             import msvcrt
+            import time as _time
 
             # msvcrt.locking locks a byte range; lock the first byte.
+            # LK_NBLCK fails fast instead of hanging; short retry loop keeps
+            # contention tolerable. On Windows all byte-range locks are
+            # exclusive, so "shared" mode is really mutual exclusion too —
+            # both modes use the same lock so readers and writers serialize.
             fh.seek(0)
-            mode = msvcrt.LK_LOCK if exclusive else msvcrt.LK_LOCK
-            try:
-                msvcrt.locking(fh.fileno(), mode, 1)
-            except OSError:
-                pass
+            mode = msvcrt.LK_NBLCK
+            for attempt in range(40):
+                try:
+                    msvcrt.locking(fh.fileno(), mode, 1)
+                    return
+                except PermissionError:
+                    _time.sleep(0.025)
+                except OSError as exc:
+                    _logger.warning(
+                        "file lock contention on %s (attempt %d): %s",
+                        getattr(fh, "name", "?"), attempt + 1, exc,
+                    )
+                    _time.sleep(0.025)
+            # Last resort: fall back to the blocking lock (up to ~10 retry
+            # bursts inside the C runtime, then raises).
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
         else:
             import fcntl
 
@@ -362,8 +397,47 @@ def _unlock_handle(fh) -> None:
         pass
 
 
+def _recover_staged_json(path: Path) -> None:
+    """Restore a flushed JSON staging file after an interrupted Windows write."""
+    if path.suffix.lower() != ".json":
+        return
+    import os as _os
+    staged_files = list(path.parent.glob(f"{path.name}.*.tmp"))
+    legacy_staged = path.with_suffix(path.suffix + ".tmp")
+    if legacy_staged.exists():
+        staged_files.append(legacy_staged)
+    if not staged_files:
+        return
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as lock_fh:
+        _lock_handle(lock_fh, exclusive=True)
+        try:
+            for staged in sorted(
+                (p for p in staged_files if p.exists()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            ):
+                import json as _json
+                try:
+                    payload = staged.read_text(encoding="utf-8")
+                    _json.loads(payload)
+                except Exception:
+                    continue
+                with open(staged, "rb") as src, open(path, "wb") as dst:
+                    import shutil as _shutil
+                    _shutil.copyfileobj(src, dst)
+                    dst.flush()
+                    _os.fsync(dst.fileno())
+                staged.unlink(missing_ok=True)
+                break
+        finally:
+            _unlock_handle(lock_fh)
+
+
 def _read_text_locked(path: Path) -> str:
     """Read a file under a shared lock (best-effort; falls back to plain read)."""
+    _recover_staged_json(path)
     try:
         lock_path = path.with_suffix(path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -382,9 +456,13 @@ def _atomic_write_text(target: Path, text: str) -> None:
     import os as _os
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target.with_suffix(target.suffix + ".tmp")
+    import uuid as _uuid
+
+    tmp_path = target.with_name(f"{target.name}.{_uuid.uuid4().hex}.tmp")
     # Create tmp with 0600 from the start (POSIX); Windows relies on DPAPI ACLs.
-    fd = _os.open(str(tmp_path), _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+    # Read/write access lets the Windows fallback and crash-recovery path
+    # consume the staged payload without relaxing its private-file mode.
+    fd = _os.open(str(tmp_path), _os.O_RDWR | _os.O_CREAT | _os.O_TRUNC, 0o600)
     try:
         with _os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -412,17 +490,25 @@ def _atomic_write_text(target: Path, text: str) -> None:
         except Exception:
             pass
         # Hold an exclusive sidecar lock across the replace to reduce races.
-        try:
-            lock_path = target.with_suffix(target.suffix + ".lock")
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(lock_path, "a+b") as lock_fh:
-                _lock_handle(lock_fh, exclusive=True)
+        lock_path = target.with_suffix(target.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+b") as lock_fh:
+            _lock_handle(lock_fh, exclusive=True)
+            try:
                 try:
                     _os.replace(tmp_path, target)
-                finally:
-                    _unlock_handle(lock_fh)
-        except Exception:
-            _os.replace(tmp_path, target)
+                except PermissionError:
+                    # Some Windows-managed folders allow creating and writing
+                    # files but deny rename/replace operations. The staged file
+                    # is already flushed, so copy it into the existing target
+                    # under the same inter-process lock instead of failing the
+                    # entire connection or session save.
+                    with open(target, "w", encoding="utf-8") as dst:
+                        dst.write(text)
+                        dst.flush()
+                        _os.fsync(dst.fileno())
+            finally:
+                _unlock_handle(lock_fh)
         try:
             if os.name != "nt":
                 _os.chmod(target, 0o600)
@@ -444,6 +530,8 @@ def _atomic_write_text(target: Path, text: str) -> None:
 
 def _coerce_user_id(user_id) -> int:
     """Validate user_id as an int (prevents path traversal via crafted ids)."""
+    if isinstance(user_id, bool) or not isinstance(user_id, (int, str)):
+        raise ValueError("Invalid user id.")
     try:
         uid = int(user_id)
     except (TypeError, ValueError):
@@ -532,14 +620,21 @@ def _ensure_user_paths(session: dict, user_id) -> dict:
         cur = session.get(key)
         try:
             cur_s = str(cur) if cur is not None else ""
-            # Keep per-user per-DB files already under this user's dir.
-            # Segment match (never bare substring: "user_1" is inside
-            # "user_10"). Resolve + verify the parent dir name instead.
+            # Keep files only when their resolved parent is this user's
+            # configured artifact directory. During a data-root migration,
+            # rebase an existing per-DB filename to the new root if its copy
+            # exists there; never trust a matching `user_<id>` basename alone.
             _keep = False
             if cur_s:
                 try:
-                    _parent = Path(cur_s).parent.name
-                    _keep = (_parent == tag)
+                    cur_path = Path(cur_s)
+                    resolved_user_dir = user_dir.resolve()
+                    _keep = cur_path.parent.resolve() == resolved_user_dir
+                    if not _keep and cur_path.parent.name == tag:
+                        rebased = resolved_user_dir / cur_path.name
+                        if rebased.is_file():
+                            session[key] = rebased
+                            _keep = True
                 except Exception:
                     _keep = False
             if _keep:
@@ -555,7 +650,7 @@ def _ensure_user_paths(session: dict, user_id) -> dict:
     return session
 
 SOURCE_TYPES = {"relational", "semi-structured", "document"}
-PROVIDER_NAMES = {"local", "cloud", "deepseek", "omniroute", "grok"}
+PROVIDER_NAMES = {"local", "cloud", "deepseek", "omniroute", "grok", "openai", "anthropic"}
 DB_TYPES = {"postgresql", "mysql"}
 
 DEFAULT_SESSION = {
@@ -576,7 +671,25 @@ DEFAULT_SESSION = {
 SESSION = deepcopy(DEFAULT_SESSION)
 SESSION_STORE: dict[int, tuple[float, dict]] = {}
 SESSION_LOCK = threading.RLock()
+# Orders full-store snapshots and writes without holding SESSION_LOCK during
+# disk or Redis I/O.
+_SESSION_PERSIST_LOCK = threading.Lock()
 _SESSION_FILE_MTIME: float | None = None
+_SESSION_STORE_STATUS = {"ok": True, "error": None}
+
+
+def session_store_status() -> dict:
+    """Return whether the local session store was read successfully."""
+    return dict(_SESSION_STORE_STATUS)
+
+
+def _shared_store_required() -> bool:
+    """Whether shared state is authoritative (same policy as rate limits)."""
+    try:
+        from core.ratelimit import shared_store_required
+        return shared_store_required()
+    except Exception:
+        return False
 
 # Load persisted sessions from disk (survives server restarts).
 def _session_to_disk_dict(session: dict) -> dict:
@@ -584,6 +697,25 @@ def _session_to_disk_dict(session: dict) -> dict:
     sess_disk = dict(session)
     if isinstance(sess_disk.get("api_keys"), dict):
         sess_disk["api_keys"] = _encrypt_api_keys(sess_disk["api_keys"])
+    # Migrate legacy user-scoped DB credentials when this process runs as the
+    # identity that can decrypt them. If it cannot, preserve the ciphertext;
+    # never overwrite it with plaintext or with a second encryption layer.
+    from core.secret_box import LEGACY_PREFIX as _LEGACY_SECRET_PREFIX
+    for _config_key in ("db", "linked_db"):
+        _db_config = sess_disk.get(_config_key)
+        if not isinstance(_db_config, dict):
+            continue
+        _password = _db_config.get("password")
+        if not (isinstance(_password, str) and _password.startswith(_LEGACY_SECRET_PREFIX)):
+            continue
+        try:
+            _plain_password = decrypt(_password)
+            if _plain_password:
+                _db_config = dict(_db_config)
+                _db_config["password"] = encrypt(_plain_password)
+                sess_disk[_config_key] = _db_config
+        except Exception:
+            pass
     # Never persist live provider objects; reconstructed via _ensure_provider.
     if not isinstance(sess_disk.get("provider"), (str, type(None))):
         sess_disk["provider"] = None
@@ -613,27 +745,36 @@ def _disk_dict_to_session(loaded: dict) -> dict:
     return _decrypt_session_keys(loaded)
 
 
-def _redis_save_one(user_id: int, created: float, session: dict) -> None:
-    """Best-effort write-through of one session to Redis (never raises)."""
+def _session_store_authoritative() -> bool:
+    """True when a shared store is configured or required (fail closed)."""
+    return bool(redis_url()) or _shared_store_required()
+
+
+def _redis_save_one(user_id: int, created: float, session: dict) -> bool:
+    """Write one session to Redis and report whether the write succeeded.
+
+    When a shared store is configured/required, a failure raises 503 instead
+    of acknowledging a write that did not reach the shared state.
+    """
     try:
         client = get_redis_client()
         if client is None:
-            return
+            if _session_store_authoritative():
+                _session_store_unavailable()
+            return False
         import json as _json
 
         payload = _json.dumps(
             {"created": float(created), "session": _session_to_disk_dict(session)},
             default=str,
         )
-        try:
-            client.setex(_redis_session_key(user_id), int(SESSION_TTL_SECONDS), payload)
-        except Exception as exc:
-            _logger.warning(
-                "Redis session save failed (%s); file store remains authoritative.",
-                type(exc).__name__,
-            )
-    except Exception:
-        pass
+        client.setex(_redis_session_key(user_id), int(SESSION_TTL_SECONDS), payload)
+        return True
+    except Exception as exc:
+        _logger.warning("Redis session save failed (%s).", type(exc).__name__)
+        if _session_store_authoritative():
+            _session_store_unavailable()
+        return False
 
 
 def _redis_load_one(user_id: int):
@@ -641,6 +782,8 @@ def _redis_load_one(user_id: int):
     try:
         client = get_redis_client()
         if client is None:
+            if _session_store_authoritative():
+                _session_store_unavailable()
             return None
         raw = client.get(_redis_session_key(user_id))
         if not raw:
@@ -651,22 +794,42 @@ def _redis_load_one(user_id: int):
         created = float(data.get("created", 0) or 0)
         session = _disk_dict_to_session(dict(data.get("session") or {}))
         return (created, session)
-    except Exception:
+    except Exception as exc:
+        if _session_store_authoritative():
+            _session_store_unavailable()
         return None
 
 
 def _load_session_store():
     """Load persisted session store from disk (locked read; file fallback)."""
+    global _SESSION_FILE_MTIME
     try:
         import json as _json
-        if SESSION_STORE_PATH.exists():
-            data = _json.loads(_read_text_locked(SESSION_STORE_PATH))
-            for uid_str, (created, session) in data.items():
-                uid = int(uid_str)
-                loaded = _disk_dict_to_session(dict(session))
-                SESSION_STORE[uid] = (float(created), loaded)
-    except Exception:
-        pass
+        if not SESSION_STORE_PATH.exists():
+            _SESSION_STORE_STATUS.update(ok=True, error=None)
+            return
+        data = _json.loads(_read_text_locked(SESSION_STORE_PATH))
+        loaded_sessions = {}
+        for uid_str, (created, session) in data.items():
+            uid = int(uid_str)
+            loaded_sessions[uid] = (
+                float(created),
+                _disk_dict_to_session(dict(session)),
+            )
+        with SESSION_LOCK:
+            SESSION_STORE.update(loaded_sessions)
+        try:
+            _SESSION_FILE_MTIME = SESSION_STORE_PATH.stat().st_mtime
+        except OSError:
+            _SESSION_FILE_MTIME = None
+        _SESSION_STORE_STATUS.update(ok=True, error=None)
+    except Exception as exc:
+        _SESSION_STORE_STATUS.update(ok=False, error=type(exc).__name__)
+        _logger.warning(
+            "session store load failed (%s): %s; persisted sessions are "
+            "unavailable and disk writes are paused until the store can be read",
+            type(exc).__name__, SESSION_STORE_PATH,
+        )
 
 _load_session_store()
 
@@ -730,6 +893,12 @@ SESSION_TTL_SECONDS = 4 * 60 * 60  # 4 hours
 
 def check_session_store_shared() -> None:
     """Fail closed when workers > 1 without a shared session/rate-limit store."""
+    if _shared_store_required() and get_redis_client() is None:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=503,
+            detail="Multi-worker deployment requires an available shared session store.",
+        )
     try:
         from core.ratelimit import _check_shared_store
         _check_shared_store()
@@ -738,35 +907,34 @@ def check_session_store_shared() -> None:
 
 
 def _ensure_provider(session):
-    """Reconstruct the LLMProvider instance if session['provider'] is a string
-    (happens after deserialization from disk where default=str serializes the
-    LLMProvider object to its string representation).
+    """Reconstruct only the user's selected provider, without a silent switch.
 
-    Fail-closed: if the configured provider cannot be reconstructed (missing
-    API key, consent, or package), fall back to local Ollama so downstream
-    agents never receive provider=None."""
-    from llm_provider import create_provider
+    A configured hosted provider that cannot be reconstructed must stay
+    visibly unavailable (surfaced via ``_provider_error``); silently falling
+    back to local Ollama would execute the user's prompt on a different
+    provider than the one they selected.
+    """
     prov = session.get("provider")
-    if prov is None or isinstance(prov, str):
-        name = session.get("provider_name")
-        if name:
-            api_key = resolve_provider_key(name, session.get("api_keys", {}))
-            try:
-                session["provider"] = create_provider(provider=name, api_key=api_key)
-                session.pop("_provider_error", None)
-                return
-            except Exception as exc:
-                _logger.warning("create_provider(%s) failed: %s – falling back to local", name, exc)
-                session["_provider_error"] = str(exc)
-        # Fall back to local Ollama so the provider is never None.
-        try:
-            session["provider"] = create_provider(provider="local")
-            session["provider_name"] = "local"
-            _logger.info("_ensure_provider: fallback to local Ollama")
-        except Exception:
-            _logger.warning("_ensure_provider: local fallback also failed – provider stays None")
-            session["provider"] = None
-            session["_provider_error"] = session.get("_provider_error") or "No provider available"
+    if prov is not None and not isinstance(prov, str):
+        return
+    name = session.get("provider_name")
+    if not name:
+        return
+    try:
+        from llm_provider import create_provider
+
+        api_key = resolve_provider_key(name, session.get("api_keys", {}))
+        models = (session.get("provider_models") or {}).get(name)
+        session["provider"] = create_provider(
+            provider=name, api_key=api_key, models=models,
+        )
+        session.pop("_provider_error", None)
+    except Exception as exc:
+        _logger.warning("Selected provider initialization failed (%s)", type(exc).__name__)
+        session["provider"] = None
+        session["_provider_error"] = (
+            "Selected AI provider is unavailable. Check its settings and credentials."
+        )
 
 
 def _copy_session(session):
@@ -814,14 +982,21 @@ def get_session(user_id=None):
 
     now = time.time()
     global _SESSION_FILE_MTIME
+    # Redis is network I/O: fetch outside SESSION_LOCK so one slow shared
+    # store doesn't serialize every concurrent request (only dict/CPU work
+    # runs under the lock).
+    _shared_authoritative = _session_store_authoritative()
+    try:
+        _redis_hit = _redis_load_one(user_id)
+    except Exception:
+        if _shared_authoritative:
+            raise
+        _redis_hit = None
     with SESSION_LOCK:
         # Redis-first when configured: shared store is authoritative across
         # workers. Fall back to file/memory when Redis is unset/unreachable
-        # (backward compat for local/dev single-process runs).
-        try:
-            _redis_hit = _redis_load_one(user_id)
-        except Exception:
-            _redis_hit = None
+        # (backward compat for local/dev single-process runs). The redis hit
+        # was already fetched to avoid holding the lock during network I/O.
         if _redis_hit is not None:
             try:
                 _created, _sess = _redis_hit
@@ -833,6 +1008,17 @@ def get_session(user_id=None):
                     return _copy_session(_sess)
             except Exception:
                 pass
+        if _shared_authoritative:
+            # A configured shared store is authoritative. Never revive a
+            # potentially stale per-process or file copy on a miss, including
+            # when an expired Redis entry is present.
+            SESSION_STORE.pop(user_id, None)
+            fresh = dict(DEFAULT_SESSION)
+            _ensure_user_paths(fresh, user_id)
+            SESSION_STORE[user_id] = (now, fresh)
+            _ensure_relational_uri(fresh)
+            _ensure_provider(fresh)
+            return _copy_session(fresh)
         # mtime-gated reconcile: avoid re-reading/parsing session_store.json
         # on every request. Only reload when the file actually changed.
         # save_session updates _SESSION_FILE_MTIME so our own writes never
@@ -849,8 +1035,11 @@ def get_session(user_id=None):
                             loaded = _disk_dict_to_session(dict(session))
                             SESSION_STORE[uid] = (float(created), loaded)
                     _SESSION_FILE_MTIME = mtime
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.warning(
+                "session store reconcile failed (%s): %s",
+                type(exc).__name__, SESSION_STORE_PATH,
+            )
 
         # Opportunistic cleanup of expired sessions.
         if len(SESSION_STORE) >= SESSION_MAX_USERS or (len(SESSION_STORE) > 10 and len(SESSION_STORE) % 5 == 0):
@@ -876,14 +1065,17 @@ def get_session(user_id=None):
             SESSION_STORE[user_id] = (now, entry[1])
         _ensure_relational_uri(entry[1])
         _ensure_provider(entry[1])
-        # Warm the shared store on file/memory hits so the next worker
-        # finds this session in Redis (best-effort, never raises).
-        try:
-            if redis_url():
-                _redis_save_one(user_id, SESSION_STORE[user_id][0], SESSION_STORE[user_id][1])
-        except Exception:
-            pass
-        return _copy_session(entry[1])
+        _warm_created = SESSION_STORE[user_id][0]
+        _warm_sess = SESSION_STORE[user_id][1]
+    # Warm the shared store on file/memory hits so the next worker
+    # finds this session in Redis (best-effort, never raises) — network
+    # I/O stays outside the session lock.
+    try:
+        if redis_url():
+            _redis_save_one(user_id, _warm_created, _warm_sess)
+    except Exception:
+        pass
+    return _copy_session(entry[1])
 
 
 def save_session(user_id, session):
@@ -893,32 +1085,79 @@ def save_session(user_id, session):
     on-disk JSON copy carries encrypted `api_keys`. When ARIA_REDIS_URL is
     configured the session is also written through to Redis (preferred for
     multi-worker); Redis failures fall back to the file store. File writes
-    are atomic (.tmp + replace) with 0600 perms and a sidecar lock.
+    are atomic (.tmp + replace) with 0600 perms and a sidecar lock. The
+    consistency snapshot is taken under SESSION_LOCK, but the slow disk and
+    Redis I/O happen outside it so one save never serializes every request.
     """
     user_id = _coerce_user_id(user_id)
     _ensure_user_paths(session, user_id)
     now = time.time()
-    with SESSION_LOCK:
-        SESSION_STORE[user_id] = (now, session)
-        # Also write to disk so sessions survive server restarts.
+    import json as _json
+    # Snapshot the full store under the lock (CPU-only deep copies); the
+    # atomic replace itself takes the sidecar file lock, which is what
+    # actually serializes writers across processes.
+    with _SESSION_PERSIST_LOCK:
+        if not _SESSION_STORE_STATUS["ok"]:
+            # Re-read before writing: otherwise a permission/corruption
+            # failure at startup could cause an incomplete snapshot to
+            # replace the user's existing session file.
+            _load_session_store()
+        with SESSION_LOCK:
+            _previous_entry = SESSION_STORE.get(user_id)
+            SESSION_STORE[user_id] = (now, session)
+            _entry_created, _entry_sess = SESSION_STORE[user_id]
+            try:
+                disk_store = {}
+                for uid, (created, sess) in SESSION_STORE.items():
+                    disk_store[str(uid)] = (created, _session_to_disk_dict(sess))
+            except Exception as exc:
+                _logger.warning("session store snapshot failed (%s)", type(exc).__name__)
+                return
         try:
-            import json as _json
-            disk_store = {}
-            for uid, (created, sess) in SESSION_STORE.items():
-                disk_store[str(uid)] = (created, _session_to_disk_dict(sess))
-            _atomic_write_text(
-                SESSION_STORE_PATH, _json.dumps(disk_store, default=str)
+            payload = _json.dumps(disk_store, default=str)
+        except Exception as exc:
+            _logger.warning("session store serialization failed (%s)", type(exc).__name__)
+            return
+        if _session_store_authoritative():
+            try:
+                if not _redis_save_one(user_id, _entry_created, _entry_sess):
+                    _session_store_unavailable()
+            except Exception:
+                # Fail closed: never expose a session this worker failed to
+                # commit to the shared store (even from local memory).
+                with SESSION_LOCK:
+                    if _previous_entry is None:
+                        SESSION_STORE.pop(user_id, None)
+                    else:
+                        SESSION_STORE[user_id] = _previous_entry
+                raise
+            return
+        if not _SESSION_STORE_STATUS["ok"]:
+            _logger.error(
+                "session store write skipped because persisted state could not "
+                "be loaded (%s)", _SESSION_STORE_STATUS["error"],
             )
+            return
+        # Slow I/O stays outside SESSION_LOCK. The persistence lock orders
+        # snapshots and writes, preventing a stale concurrent snapshot from
+        # overwriting newer session state on disk.
+        try:
+            _atomic_write_text(SESSION_STORE_PATH, payload)
+        except Exception as exc:
+            # The in-memory session was already updated. Keep the request
+            # working on transient filesystem failures and retry on a later
+            # save rather than turning unrelated API mutations into 500s.
+            _logger.warning("session store write failed (%s): %s",
+                            type(exc).__name__, SESSION_STORE_PATH)
+        else:
             try:
                 global _SESSION_FILE_MTIME
                 _SESSION_FILE_MTIME = SESSION_STORE_PATH.stat().st_mtime
             except Exception:
                 pass
-        except Exception:
-            pass
         # Write-through to the shared store (best-effort; file remains fallback).
         try:
-            _redis_save_one(user_id, now, session)
+            _redis_save_one(user_id, _entry_created, _entry_sess)
         except Exception:
             pass
 
@@ -943,19 +1182,31 @@ def get_session_for_request(request):
         # Guard against frontend sending literal "null"/"undefined"/empty.
         if candidate and candidate.lower() not in ("null", "undefined", "none"):
             token = candidate
-    if not token:
+    import auth
+    payload = None
+    if token and isinstance(token, str):
+        try:
+            payload = auth.verify_token(token)
+        except Exception:
+            payload = None
+    elif not token:
         try:
             cookies = getattr(request, "cookies", {}) or {}
-            token = cookies.get("aria_token") or cookies.get("__Host-aria_token") or None
+            # Validate both supported cookie names instead of letting an
+            # expired cookie mask a valid session issued under the other name.
+            for cookie_name in ("aria_token", "__Host-aria_token"):
+                candidate = cookies.get(cookie_name)
+                if not candidate or not isinstance(candidate, str):
+                    continue
+                try:
+                    payload = auth.verify_token(candidate)
+                except Exception:
+                    payload = None
+                if payload:
+                    token = candidate
+                    break
         except Exception:
-            token = None
-    if not token or not isinstance(token, str):
-        raise HTTPException(status_code=401, detail="Not authenticated. Provide a valid Bearer token.")
-    try:
-        import auth
-        payload = auth.verify_token(token)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Not authenticated. Provide a valid Bearer token.")
+            payload = None
     if not payload:
         raise HTTPException(status_code=401, detail="Not authenticated. Provide a valid Bearer token.")
     try:

@@ -53,7 +53,9 @@ def test_inventory_route_becomes_local_inventory_plan():
     )
     assert plan.intent == "document_inventory"
     answer = engine.inventory_answer(plan.metadata_kind, documents=DOCS)
-    assert "2 PDFs" in answer
+    assert "2 documents" in answer
+    assert "First 3 topic.pdf" in answer
+    assert "Sales Report 2025.pdf" in answer
 
 
 def test_router_clarification_is_preserved_without_guessing():

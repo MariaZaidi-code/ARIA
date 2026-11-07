@@ -13,24 +13,80 @@ from pathlib import Path
 from urllib.parse import quote_plus
 from typing import AsyncGenerator
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 
 import csv_orchestrator
 import schema_agent
-from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session, save_session, get_user_artifact_paths
+from core.config import DB_TYPES, PROVIDER_NAMES, SOURCE_TYPES, SCHEMA_DIR, PROCESSED_DIR, INSIGHTS_DIR, DATA_DIR, get_session, save_session, get_user_artifact_paths, _atomic_write_text
 from core.db import build_db_uri
-from core.deps import require_writable, get_current_user
+from core.deps import require_writable, get_current_user, is_mobile
 from core.secret_box import decrypt as _decrypt_secret
 from csv_handler import CsvValidationError
 from llm_provider import create_provider
-from document_processor import create_document_processor
 
 router = APIRouter()
+@router.get("/session/status")
+def session_status(user: dict = Depends(get_current_user)):
+    from pathlib import Path as _Path
+    session = get_session(user["user_id"])
+    try:
+        from core.config import _ensure_relational_uri as _eru
+        _eru(session)
+        try:
+            save_session(user["user_id"], session)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    source_type = session.get("source_type")
+    db_name = session.get("db_name")
+    db_uri = session.get("db_uri")
+    db_type = session.get("db_type") or "postgresql"
+    cfg = session.get("db") if isinstance(session.get("db"), dict) else {}
+    connected = bool(source_type) and (
+        bool(db_uri) if source_type == "relational" else True
+    )
+    schema_status = "pending"
+    sp = session.get("schema_path")
+    if sp:
+        try:
+            pp = _Path(str(sp))
+            if pp.exists() and pp.stat().st_size > 0:
+                schema_status = "ready"
+        except Exception:
+            schema_status = "pending"
+    if connected:
+        if schema_status == "pending":
+            connection_status = "schema-loading"
+            display_state = "schema-loading"
+        else:
+            connection_status = "connected"
+            display_state = "ready"
+    else:
+        connection_status = "disconnected"
+        display_state = "idle"
+    out = {
+        "connection_status": connection_status,
+        "display_state": display_state,
+        "schema_status": schema_status,
+        "db_name": db_name,
+        "source_type": source_type,
+        "db_type": db_type,
+    }
+    if connected and isinstance(cfg, dict):
+        if cfg.get("host"):
+            out["db_host"] = cfg.get("host")
+        if cfg.get("port"):
+            out["db_port"] = cfg.get("port")
+        if cfg.get("user"):
+            out["db_username"] = cfg.get("user")
+    return out
+
 
 # Hosted providers run inference off-machine (need an API key, can serve vision).
-HOSTED_PROVIDERS = {"cloud", "deepseek", "omniroute", "grok"}
+HOSTED_PROVIDERS = {"cloud", "deepseek", "omniroute", "grok", "openai", "anthropic"}
 
 # Upload bounds (§40): enforced while streaming so oversized bodies never
 # fill the disk. CSV cap matches the handler's 100 MB post-write check.
@@ -192,17 +248,26 @@ def _host_is_numeric(host: str) -> bool:
         return False
 
 
-def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql") -> int:
+def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql",
+                          pin_to=None) -> int:
     """Shared SSRF/host validation for database connect + test paths.
 
     Used by both the real connect path and /api/database/test so probing
     via error oracle is blocked consistently. Returns validated port int.
 
-    Loopback (localhost/127.0.0.1/::1) stays allowed for local-dev DBs;
+    Loopback is allowed for local-dev DBs and blocked by default in production;
     cloud-metadata (169.254.169.254 in any numeric form), private ranges,
     link-local/multicast/reserved, and DNS names resolving to them are blocked.
+
+    When ``pin_to`` carries a ``host`` attribute (the connect request model),
+    a hostname is replaced with its first validated resolved IP: the actual
+    connection then uses the same address that was checked, closing the
+    DNS-rebind window (resolve→check→connect re-resolution).
     """
     host = (host or "").strip()
+    _env = (os.getenv("ARIA_ENV", "") or "").strip().lower()
+    _loopback_flag = (os.getenv("ARIA_ALLOW_LOOPBACK_DB", "") or "").strip().lower()
+    allow_loopback = _loopback_flag in {"1", "true", "yes", "on"} if _loopback_flag else _env != "production"
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", host) or len(host) > 253:
         raise HTTPException(status_code=400, detail="Invalid host.")
     low = host.lower().rstrip(".")
@@ -211,17 +276,24 @@ def _validate_db_endpoint(host, port, db=None, user=None, db_type="postgresql") 
     # Numeric-form bypasses (decimal/octal/hex/integer IP).
     norm = _normalize_host_ip(host)
     if norm is not None:
-        # allow loopback for local dev, block everything else private/reserved
-        if _ip_is_blocked(norm, allow_loopback=True):
+        if _ip_is_blocked(norm, allow_loopback=allow_loopback):
             raise HTTPException(status_code=400, detail="Host is blocked.")
     else:
         # Hostname: block nip.io-style suffixes and resolve-then-check.
         if ".nip.io" in low or ".sslip.io" in low:
             # e.g. 169.254.169.254.nip.io — resolves to the embedded IP
             raise HTTPException(status_code=400, detail="Host is blocked.")
-        for rip in _resolve_host_ips(host):
-            if _ip_is_blocked(rip, allow_loopback=True):
+        resolved = _resolve_host_ips(host)
+        for rip in resolved:
+            if _ip_is_blocked(rip, allow_loopback=allow_loopback):
                 raise HTTPException(status_code=400, detail="Host resolves to a blocked address.")
+        if pin_to is not None and getattr(pin_to, "host", None) == host and resolved:
+            # All resolved IPs passed the blocklist — pin the first so the
+            # connect cannot re-resolve to a different (attacker-chosen) IP.
+            try:
+                pin_to.host = resolved[0]
+            except Exception:
+                pass
     try:
         port_int = int(port)
     except (TypeError, ValueError):
@@ -391,17 +463,19 @@ def _drop_progress(user_id: int, timestamp) -> None:
 def _get_progress_snapshot(user_id: int, terminal: bool = False) -> dict | None:
     """Copy of the user's progress entry (None when absent).
 
-    ``terminal=True`` means the caller is a consumer that just observed the
-    finished/failed state: the entry is removed so its ``result`` payload is
-    not held forever after it has been delivered.
+    The legacy ``terminal`` argument is retained for compatibility. Terminal
+    results expire by TTL rather than being consumed by the first reader.
     """
     with _upload_progress_lock:
         prog = _upload_progress.get(user_id)
         if not prog:
             return None
         snap = dict(prog)
-        if terminal and (snap.get("done") or snap.get("error")):
+        # Retain terminal results until TTL: a dropped SSE packet or a second
+        # polling tab must still be able to retrieve the completed result.
+        if time.time() - float(snap.get("timestamp") or 0) > _PROGRESS_TTL_S:
             _upload_progress.pop(user_id, None)
+            return None
         return snap
 
 
@@ -409,8 +483,7 @@ def _get_progress_snapshot(user_id: int, terminal: bool = False) -> dict | None:
 async def get_upload_progress(user: dict = Depends(get_current_user)):
     """Return current ingestion progress for the user.
 
-    The terminal (done/error) payload is returned once, then the entry is
-    dropped — subsequent polls honestly report ``active: false``.
+    Terminal results remain available for ten minutes for reconnecting clients.
     """
     prog = _get_progress_snapshot(user["user_id"], terminal=True)
     if not prog:
@@ -439,8 +512,9 @@ async def stream_upload_progress(user: dict = Depends(require_writable)):
                         break
                 await asyncio.sleep(1)
         finally:
-            if consumed:
-                _drop_progress(uid, last_ts)
+            # Delivery of a yield is not an acknowledgement from the browser.
+            # Polling/reconnected streams can recover the result until TTL.
+            pass
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
@@ -477,9 +551,39 @@ def _validate_hosted_base_url(base_url: str | None) -> None:
 
 
 class ProviderSwitchRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     provider: str = "local"
     api_key: str | None = None      # optional key override for hosted providers
     base_url: str | None = None     # optional endpoint override for hosted providers
+    model: str | None = None
+
+
+@router.get("/api/provider/options")
+def provider_options(user: dict = Depends(get_current_user)):
+    from llm_provider import PROVIDERS
+    from core.config import resolve_provider_key
+    session = get_session(user["user_id"])
+    labels = {"cloud": "Cloud AI (Groq)", "deepseek": "DeepSeek", "openai": "OpenAI / GPT",
+              "anthropic": "Anthropic / Claude", "grok": "xAI / Grok", "local": "Local AI (Ollama)"}
+    return {"providers": [{"id": name, "label": label,
+        "model": session.get("provider_models", {}).get(name, PROVIDERS[name]["models"]).get("semi", ""),
+        "has_key": bool(resolve_provider_key(name, session.get("api_keys")))}
+        for name, label in labels.items()]}
+
+
+@router.post("/api/provider/models")
+def provider_models(request: ProviderSwitchRequest, user: dict = Depends(require_writable)):
+    from core.config import resolve_provider_key
+    if request.provider not in HOSTED_PROVIDERS or request.provider == "omniroute":
+        raise HTTPException(status_code=400, detail="Choose a supported hosted provider.")
+    session = get_session(user["user_id"])
+    try:
+        llm = create_provider(provider=request.provider,
+            api_key=request.api_key or resolve_provider_key(request.provider, session.get("api_keys")))
+        result = llm._cloud_client.with_options(timeout=15).models.list()
+        return {"models": sorted({m.id for m in result.data})[:200]}
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not load models. Check your provider key and backend cloud consent, or enter a model ID manually.")
 
 
 @router.post("/api/provider/switch")
@@ -492,8 +596,15 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
     # Local provider (ollama) may use loopback http; hosted must not probe internal http.
     if request.base_url and request.provider != "local":
         _validate_hosted_base_url(request.base_url)
+    if request.model is not None and (not request.model.strip() or len(request.model) > 200
+                                      or any(ord(c) < 32 for c in request.model)):
+        raise HTTPException(status_code=400, detail="Enter a valid model ID (up to 200 characters).")
+    models = session.get("provider_models", {}).get(request.provider)
+    if request.model:
+        models = {role: request.model.strip() for role in ("sql", "story", "suggest", "semi", "schema", "vision")}
     current = session.get("provider_name")
-    if current == request.provider:
+    if (current == request.provider and not request.api_key and not request.base_url and not request.model
+            and session.get("provider") is not None and not session.get("_provider_error")):
         return {"ok": True, "provider": current, "changed": False}
 
     try:
@@ -509,23 +620,33 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
             provider=request.provider,
             api_key=request.api_key or _saved,
             base_url=request.base_url,
+            models=models,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {exc}")
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {_san(exc)}")
 
-    # Validate hosted keys with a no-cost ping so a bad key fails here,
-    # not pages later inside an analysis.
-    if request.provider != "local" and (request.api_key or request.provider in ("cloud", "deepseek", "omniroute", "grok")):
+    # A real, small generation checks both credentials and model access.
+    if request.provider in HOSTED_PROVIDERS:
+        if not llm.model_for("suggest"):
+            raise HTTPException(status_code=400, detail="Choose a model ID for this provider.")
         try:
-            llm.ping(timeout=25)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"The {request.provider} key was rejected or unreachable ({exc}). Check the key and try again.",
-            )
-
+            reply = llm.chat("suggest", [{"role": "user", "content": "Reply with OK."}],
+                             num_predict=2048, timeout=45, user_id=user["user_id"])
+            if not reply:
+                raise ValueError("Model returned no text")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Provider/model check failed. Check API key, model access, billing and backend logs.")
+    _llm_models = getattr(llm, "models", None)
+    session.setdefault("provider_models", {})[request.provider] = (
+        dict(_llm_models) if isinstance(_llm_models, dict) else {})
+    session.pop("csv_llm_dashboard", None)
     session["provider"] = llm
     session["provider_name"] = request.provider
+    configured = session.setdefault("configured_providers", [])
+    if request.provider not in configured:
+        configured.append(request.provider)
+    session.pop("_provider_error", None)
     # Provider isolation: API keys are stored per hosted provider only.
     # Local (Ollama) uses no key, so a key sent with provider=local is ignored
     # rather than stored.
@@ -538,6 +659,7 @@ def switch_provider(request: ProviderSwitchRequest, user: dict = Depends(require
 
 
 class ConnectRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     provider: str | None = None
     source_type: str = "relational"
     db_type: str = "postgresql"   # 'postgresql' | 'mysql'
@@ -629,15 +751,16 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
         if not (request.db and request.user and request.password):
             raise HTTPException(status_code=400, detail="Relational source requires db, user, and password.")
         request.port = _validate_db_endpoint(
-            request.host, request.port, request.db, request.user, db_type
+            request.host, request.port, request.db, request.user, db_type, pin_to=request
         )
 
     # Use user's saved API key for hosted providers if available
     user_key = session.get("api_keys", {}).get(request.provider) if request.provider in HOSTED_PROVIDERS else None
     try:
-        llm = create_provider(provider=request.provider, api_key=user_key or None)
+        llm = create_provider(provider=request.provider, api_key=user_key or None, models=session.get("provider_models", {}).get(request.provider))
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {exc}")
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=f"Could not initialise '{request.provider}' LLM provider: {_san(exc)}")
 
     # The provider in this connect request is an explicit user choice.
     session["provider"] = llm
@@ -671,8 +794,9 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
             else:
                 cur.execute("SELECT current_database(), current_schema();")
                 db_name, current_db_schema = cur.fetchone()
-    except SystemExit as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    except (SystemExit, schema_agent.SchemaConnectionError) as exc:
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=_san(exc))
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid port number.")
     except Exception as exc:
@@ -739,12 +863,13 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
                                 "reconnect with a fresh password. (%s)", exc)
                 raise HTTPException(
                     status_code=400,
-                    detail="Stored database credential is unreadable. "
-                           "Please reconnect with your password.",
+                    detail=("ARIA could not decrypt the saved database password. "
+                            "Start ARIA under the same Windows account that saved it, "
+                            "or reconnect and enter the database password again."),
                 )
         try:
             conn = schema_agent.get_connection(types.SimpleNamespace(**config))
-        except SystemExit as _sx:
+        except (SystemExit, schema_agent.SchemaConnectionError) as _sx:
             _conn_log.error("Schema extraction refused connection setup: %s", _sx)
             raise
         try:
@@ -822,8 +947,8 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
                                       type(o).__name__)
                     return str(o)
 
-                user_path.write_text(json.dumps(mapping, indent=2, default=_json_safe),
-                                     encoding="utf-8")
+                _atomic_write_text(user_path,
+                                   json.dumps(mapping, indent=2, default=_json_safe))
                 session["schema_path"] = user_path
                 session["schema_status"] = "ok"
                 save_session(user["user_id"], session)
@@ -837,7 +962,7 @@ def _do_connect(request: ConnectRequest, user: dict, db_type: str) -> dict:
             save_session(user["user_id"], session)
             _conn_log.exception("Schema extraction failed for db '%s' (user %s).",
                                 db_name, user["user_id"])
-    except SystemExit:
+    except (SystemExit, schema_agent.SchemaConnectionError):
         pass
     except Exception as exc:
         session["schema_status"] = "failed"
@@ -901,7 +1026,9 @@ def _finish_csv_connect(*, file_path, upload_dir, safe_name, stamp, filename,
         mapping = csv_orchestrator.build_csv_schema_mapping(
             file_path, table_name=table_name, profile=profile)
     except CsvValidationError as exc:
-        _set_progress(uid, "error", 0, f"Invalid CSV: {exc}", error=str(exc))
+        from core.errors import sanitize_error as _san
+        _safe_csv_err = _san(exc)
+        _set_progress(uid, "error", 0, f"Invalid CSV: {_safe_csv_err}", error=_safe_csv_err)
         try:
             file_path.unlink(missing_ok=True)
         except Exception:
@@ -910,8 +1037,8 @@ def _finish_csv_connect(*, file_path, upload_dir, safe_name, stamp, filename,
             return None
         _msg = str(exc).lower()
         if "limit" in _msg or "too large" in _msg or "exceed" in _msg:
-            raise HTTPException(status_code=413, detail=f"CSV exceeds the {int(os.getenv('ARIA_MAX_UPLOAD_CSV_MB', '512'))} MB upload limit: {exc}")
-        raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}")
+            raise HTTPException(status_code=413, detail=f"CSV exceeds the {int(os.getenv('ARIA_MAX_UPLOAD_CSV_MB', '512'))} MB upload limit: {_safe_csv_err}")
+        raise HTTPException(status_code=400, detail=f"Invalid CSV: {_safe_csv_err}")
     except Exception as exc:
         from core.errors import sanitize_error as _san
         _set_progress(uid, "error", 0, "Validation failed", error=_san(exc))
@@ -949,7 +1076,9 @@ def _finish_csv_connect(*, file_path, upload_dir, safe_name, stamp, filename,
     _set_progress(uid, "profiling", 65, f"Profiling {row_count} rows...")
     safe_db_name = mapping["database"]
     schema_path = _upaths["schema_dir"] / f"schema_mapping_{safe_db_name}_latest.json"
-    schema_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+    # Atomic: a crash mid-write must not corrupt _latest.json (insights + {
+    # intelligence meta 500 on a truncated store).
+    _atomic_write_text(schema_path, json.dumps(mapping, indent=2))
 
     _set_progress(uid, "understanding", 80, "Understanding data structure...")
     session = get_session(uid)
@@ -966,9 +1095,14 @@ def _finish_csv_connect(*, file_path, upload_dir, safe_name, stamp, filename,
     session["insights_path"] = _upaths["insights_dir"] / f"insights_{safe_db_name}.json"
     session["dialect"] = "sqlite"
     session["file_type"] = "csv"
+    # The upload remains a deterministic import. AI planning is an explicit
+    # dashboard request, so its failure cannot discard a successfully imported CSV.
+    session.pop("csv_llm_dashboard", None)
+    session.pop("conversation_id", None)
+    session.pop("conversation_history", None)
     save_session(uid, session)
 
-    _set_progress(uid, "generating", 90, "Generating insights...")
+    _set_progress(uid, "generating", 90, "Saving imported data; AI analysis runs when the dashboard opens...")
     columns = [c["column"] for c in mapping["tables"][table_name]["columns"]]
     quality = mapping["tables"][table_name]["csv_profile"]["quality"]
     result = {
@@ -986,39 +1120,10 @@ def _finish_csv_connect(*, file_path, upload_dir, safe_name, stamp, filename,
         "db_file": sqlite_path.name,
     }
     _set_progress(uid, "ready", 100, "Ready", done=True, result=result)
-    # Warm the dashboard KPI cache while the data is fresh: the first
-    # dashboard visit then renders instantly instead of recomputing
-    # full-table aggregates. Best-effort, never fails the upload.
-    # (Runs for inline and background finishes alike.)
-    _warm_dashboard_cache(uid)
+    # Dashboard KPIs are computed on first dashboard visit (services.kpi_service
+    # derives them from the live connection; there is no separate cache to
+    # prime, so no warm-up thread is spawned here).
     return result
-
-
-def _warm_dashboard_cache(uid: int) -> None:
-    """Precompute dashboard KPIs for a freshly connected source (thread).
-
-    Best-effort, never fails the upload. Uses the in-process KPI service
-    directly — no self-HTTP and no minted bearer token (avoids internal
-    SSRF surface and token-mint-in-thread).
-    """
-    def _run():
-        try:
-            from core.config import get_session as _get_session
-            _session = _get_session(uid)
-        except Exception:
-            return
-        try:
-            # Prime the per-dataset KPI path without network I/O.
-            # services.kpi_service exposes pure helpers; full dashboard
-            # assembly stays on first-visit path (correct, just not pre-warmed
-            # when the service API changes — hence best-effort).
-            import services.kpi_service as _kpi_svc  # noqa: F401
-        except Exception:
-            pass
-    try:
-        threading.Thread(target=_run, name=f"kpi-warm-{uid}", daemon=True).start()
-    except Exception:
-        pass
 
 
 @router.post("/api/connect_file")
@@ -1057,10 +1162,15 @@ def connect_file(provider: str | None = Form(None), file: UploadFile = File(...)
             detail="Only .csv files are accepted for file sources right now. "
                    "Tabular PDF extraction is not available in this build.",
         )
+    session = get_session(user["user_id"])
+    # CSV uploads reuse the authenticated user's selected hosted-provider key.
+    # Local providers must never inherit a saved cloud key.
+    saved_key = (session.get("api_keys") or {}).get(provider) if provider in HOSTED_PROVIDERS else None
     try:
-        llm = create_provider(provider=provider, api_key=llm_api_key, base_url=llm_base_url)
+        llm = create_provider(provider=provider, api_key=llm_api_key or saved_key, base_url=llm_base_url, models=session.get("provider_models", {}).get(provider))
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {exc}")
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {_san(exc)}")
 
     uid = user["user_id"]
     _set_progress(uid, "uploading", 10, "Uploading file...")
@@ -1126,8 +1236,7 @@ def connect_pdf(
     
     The PDF is processed through ARIA's document intelligence pipeline:
     - Validation and integrity check
-    - Document type detection (digital, scanned, handwritten, mixed)
-    - Content extraction (text, OCR, vision LLM)
+    - Text-PDF extraction (scanned PDFs are rejected; OCR is out of scope)
     - Table extraction
     - Chunking with metadata
     - Embedding generation
@@ -1163,9 +1272,11 @@ def connect_pdf(
             provider=provider,
             api_key=llm_api_key or saved_key,
             base_url=llm_base_url,
+            models=session.get("provider_models", {}).get(provider),
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {exc}")
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=f"Could not initialise '{provider}' LLM provider: {_san(exc)}")
 
     # Keep raw PDFs within the owning user's upload directory (validated id).
     _pdf_upaths = get_user_artifact_paths(user["user_id"])
@@ -1200,166 +1311,53 @@ def connect_pdf(
         file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Could not read uploaded PDF.")
 
-    # Create document processor (dirs isolated per authenticated user).
-    processed_dir = _pdf_upaths["documents_dir"]
-    vector_index_dir = _pdf_upaths["processed_dir"] / "vector_store"
-    vector_index_dir.mkdir(parents=True, exist_ok=True)
-    
-    processor = create_document_processor(
-        upload_dir=upload_dir,
-        processed_dir=processed_dir,
-        llm_provider=llm if provider in HOSTED_PROVIDERS else None,
-    )
-    
-    # Process document (this runs synchronously - could be made async with background tasks)
-    result = processor.process_document(
-        file_path=file_path,
-        user_id=user["user_id"],
-        original_name=filename,
-    )
-    
-    if not result.success:
+    # One canonical extraction + PGVector indexing path. No OCR or duplicate FAISS work.
+    from insight_rag.ingestion import PDFIngestion
+    try:
+        ingested = PDFIngestion(user["user_id"]).ingest_pdf(file_path, original_filename=filename)
+    except ValueError as exc:
+        from core.errors import sanitize_error as _san
+        raise HTTPException(status_code=400, detail=_san(exc))
+    except Exception as exc:
+        import logging
+        logging.getLogger("aria.connect").exception("PDF indexing failed")
+        raise HTTPException(status_code=503, detail="PDF indexing failed. Check the RAG database and embedding model, then retry.") from exc
+    finally:
         file_path.unlink(missing_ok=True)
-        # Size/page-limit violations are 413 (not 500): spool layer catches
-        # oversized bodies; processor backup catches 50MB/500pp violations.
-        _err = str(result.error or "").lower()
-        if ("too large" in _err or "too many pages" in _err
-                or "exceed" in _err or "max 50mb" in _err or "max 500" in _err):
-            raise HTTPException(status_code=413, detail=result.error or "PDF exceeds the 50 MB / 500-page limit.")
-        raise HTTPException(status_code=500, detail=result.error or "Document processing failed")
-    
-    document = result.document
-
-    # Update session to include document reference
-    session = get_session(user["user_id"])
-    # Multi-source (§7): a PDF upload must not destroy a live database
-    # connection. Stash the queryable relational/file source so Copilot can
-    # answer from both (with per-source attribution) in one session.
-    try:
-        _prev_uri = session.get("db_uri") or ""
-        _prev_type = session.get("db_type", "")
-        if _prev_type in ("postgresql", "mysql", "sqlite") and not str(_prev_uri).startswith("document://"):
-            _sp = session.get("schema_path")
-            _stash: dict = {
-                "db": session.get("db"),
-                "db_type": _prev_type,
-                "db_name": session.get("db_name"),
-                "dialect": session.get("dialect", _prev_type),
-                "source_type": session.get("source_type"),
-                "schema_path": str(_sp) if _sp else None,
-            }
-            # File-based sqlite URIs carry no secret and are safe to stash;
-            # relational URIs embed the password and are rebuilt instead.
-            if _prev_type == "sqlite":
-                _stash["db_uri"] = _prev_uri
-            session["linked_db"] = _stash
-    except Exception:
-        pass
-    # A new document connection must honour the provider selected for this upload.
-    session["provider"] = llm
-    session["provider_name"] = provider
-    session["source_type"] = "document"
-    session["db"] = {".pdf": str(file_path)}
-    session["db_type"] = "document"
-    session["db_uri"] = f"document://{document.id}"
-    session["db_name"] = document.id
-    session["dialect"] = "document"
-    session["document_id"] = document.id
-    session["document_name"] = filename
-    session["document_type"] = document.document_type.value if document.document_type else "unknown"
-
-    # Structured PDF tables become queryable SQLite + schema mapping (§5/§15).
-    # RAG over the narrative keeps working regardless.
-    pdf_tables_loaded: list[str] = []
-    try:
-        _pdf_uri, _pdf_mapping, pdf_tables_loaded = _pdf_tables_to_sqlite(
-            document, upload_dir, safe_name, stamp)
-        if _pdf_uri and _pdf_mapping:
-            _safe_db = re.sub(r"[^a-zA-Z0-9_-]+", "_", f"pdf_{safe_name}")[:64] or "pdf_doc"
-            _schema_path = _pdf_upaths["schema_dir"] / f"schema_mapping_{_safe_db}_latest.json"
-            _schema_path.write_text(json.dumps({
-                "database": _safe_db,
-                "tables": _pdf_mapping,
-            }, indent=2), encoding="utf-8")
-            session["source_type"] = "semi-structured"
-            session["db"] = {"document_tables": _pdf_uri}
-            session["db_type"] = "sqlite"
-            session["db_uri"] = _pdf_uri
-            session["db_name"] = _safe_db
-            session["dialect"] = "sqlite"
-            session["schema_path"] = _schema_path
-    except Exception:
-        pass
-
-    if not pdf_tables_loaded:
-        # Text-only PDF: stay a `document` source and drop every stale
-        # analytical pointer (schema/db/artifact refs from a previous
-        # connection). SQL analytics must never run against the old source.
-        for _key in ("schema_path", "processed_path", "insights_path",
-                     "schema_status", "pending_history_id", "file_type"):
-            session.pop(_key, None)
-        session["schema_status"] = "document"
-    
-    # Ensure processed directories exist
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    vector_index_dir.mkdir(parents=True, exist_ok=True)
-
-    # Bridge (§7/§21): mirror the manifest + text chunks into the shared RAG
-    # metadata store so Copilot's document/combined branches read the same
-    # content the Documents page indexed. Best-effort; never fails the upload.
-    try:
-        from insight_rag.storage import RAGMetadataStore as _RAGStore
-        from langchain_core.documents import Document as _LCDocument
-        _rag = _RAGStore(user["user_id"])
-        _rag.put_document({
-            "document_id": document.id,
-            "filename": filename,
-            "original_filename": filename,
-            "document_type": document.document_type.value if document.document_type else "unknown",
-            "page_count": document.page_count,
-            "chunk_count": len(document.chunks),
-            "created_at": document.created_at,
-            "source": "upload",
-        })
-        _lcdocs = [_LCDocument(
-            page_content=c.content or "",
-            metadata={"page": c.page_number, "section": c.section,
-                      "chunk_id": c.id, "document_id": document.id},
-        ) for c in (document.chunks or []) if (c.content or "").strip()]
-        if _lcdocs:
-            _rag.save_chunks(document.id, _lcdocs)
-    except Exception as _bridge_exc:
-        import logging as _logging
-        _logging.getLogger("aria.connect").info(
-            "RAG store mirroring skipped (%s).", type(_bridge_exc).__name__)
-
+    doc = ingested["document"]
+    if session.get("db_type") in ("postgresql", "mysql", "sqlite"):
+        linked = {key: session.get(key) for key in ("db", "db_type", "db_name", "dialect", "source_type")}
+        linked["schema_path"] = str(session["schema_path"]) if session.get("schema_path") else None
+        if session.get("db_type") == "sqlite":
+            linked["db_uri"] = session.get("db_uri")
+        session["linked_db"] = linked
+    for key in ("schema_path", "processed_path", "insights_path", "pending_history_id", "file_type"):
+        session.pop(key, None)
+    session.update(provider=llm, provider_name=provider, source_type="document",
+                   db={"document": doc["document_id"]}, db_type="document",
+                   db_uri=f"document://{doc['document_id']}", db_name=doc["document_id"],
+                   dialect="document", document_id=doc["document_id"], document_name=filename,
+                   document_type="digital", schema_status="document")
     save_session(user["user_id"], session)
-    
-    return {
-        "ok": True,
-        "provider": provider,
-        "source_type": "document",
-        "file": filename,
-        "type": "pdf",
-        "document_id": document.id,
-        "document_type": document.document_type.value if document.document_type else "unknown",
-        "page_count": document.page_count,
-        "element_count": len(document.elements),
-        "chunk_count": len(document.chunks),
-        "table_count": len(document.tables),
-        "tables_loaded": pdf_tables_loaded,
-        "queryable": bool(pdf_tables_loaded),
-        "status": document.status.value,
-        "processing_method": document.processing_method,
-        "failed_pages": result.failed_pages,
-        "warnings": result.warnings,
-    }
+    return {"ok": True, "provider": provider, "source_type": "document", "file": filename,
+            "type": "pdf", "document_id": doc["document_id"], "document_type": "digital",
+            "page_count": doc.get("pages", 0), "chunk_count": doc.get("total_chunks", 0),
+            "table_count": doc.get("tables", 0), "element_count": doc.get("text_chunks", 0),
+            "tables_loaded": [], "queryable": False, "status": "ready",
+            "processing_method": "text_pdf_pgvector", "duplicate": ingested.get("duplicate", False),
+            "failed_pages": [], "warnings": []}
 
 
 @router.get("/api/session/status")
-def session_status(user: dict = Depends(get_current_user)):
-    """Return the current session's connectivity and DB info so the frontend can restore state."""
+def session_status(request: Request, user: dict = Depends(get_current_user)):
+    """Return the current session's connectivity and DB info so the frontend can restore state.
+
+    Includes the server-side read-only verdict for mobile clients so the UI
+    mirrors ``require_writable`` (single source of truth) instead of guessing
+    from the user-agent on its own.
+    """
     session = get_session(user.get("user_id"))
+    db_config = session.get("db") if isinstance(session.get("db"), dict) else {}
     is_connected = bool(session.get("db") or session.get("db_uri") or
                         session.get("source_type") == "semi-structured")
     # Never expose credentials: db_uri embeds user:password (§41).
@@ -1381,13 +1379,24 @@ def session_status(user: dict = Depends(get_current_user)):
         display_state = "error"
     else:
         display_state = "connected"
+    readonly = is_mobile(request)
     return {
         "ok": True,
         "connection_status": "connected" if is_connected else "not-connected",
         "display_state": display_state,
         "schema_status": schema_status,
+        # Mobile clients are read-only (view saved history); the frontend
+        # uses this server verdict to gate write affordances up front.
+        "read_only": readonly,
+        "client_type": "mobile" if readonly else "desktop",
+        "provider_name": session.get("provider_name"),
+        "provider_error": session.get("_provider_error"),
         "db_name": session.get("db_name", ""),
         "source_type": session.get("source_type", ""),
+        "db_type": session.get("db_type", ""),
+        "db_host": db_config.get("host", ""),
+        "db_port": db_config.get("port", ""),
+        "db_username": db_config.get("user", ""),
         "db_uri": safe_uri,
         # Multi-source (§7): a linked database and/or document stay visible
         # so the UI can show what ARIA can reason over.
@@ -1408,12 +1417,14 @@ def disconnect_source(user: dict = Depends(require_writable)):
         "document_id", "document_name", "document_type", "linked_db",
         "conversation_id", "conversation_history",
         "pending_history_id", "schemas", "db_type",
+        "csv_llm_dashboard", "csv_llm_suggestions", "csv_dataset_profile", "csv_dataset_understanding", "csv_conversations",
     ):
         session.pop(key, None)
     save_session(user["user_id"], session)
     return {"ok": True, "message": "Data source disconnected"}
 
 class DatabaseTestRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     host: str = "localhost"
     port: int = 5432
     db: str = ""
@@ -1425,8 +1436,9 @@ class DatabaseTestRequest(BaseModel):
 @router.post("/api/database/test")
 async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depends(require_writable)):
     """Test a database connection before actually connecting (writable sessions only)."""
-    # Shared SSRF/host validation (same as real connect path).
-    port = _validate_db_endpoint(req.host, req.port, req.db, req.user, req.dbType)
+    # Shared SSRF/host validation (same as real connect path); also pins the
+    # validated IP so the connect below cannot re-resolve (DNS rebind).
+    port = _validate_db_endpoint(req.host, req.port, req.db, req.user, req.dbType, pin_to=req)
     try:
         from sqlalchemy import create_engine, text
         from core.secret_box import decrypt as _decrypt_secret
@@ -1435,13 +1447,19 @@ async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depen
         if password:
             try:
                 password = _decrypt_secret(password)
-            except Exception:
-                pass
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=("ARIA cannot decrypt this saved database credential. "
+                            "Re-enter the database password in the connection form."),
+                ) from exc
 
+        from core.db import format_db_host
+        host = format_db_host(req.host)
         if req.dbType == "mysql":
-            url = f"mysql+pymysql://{quote_plus(str(req.user))}:{quote_plus(str(password))}@{req.host}:{req.port}/{req.db}"
+            url = f"mysql+pymysql://{quote_plus(str(req.user))}:{quote_plus(str(password))}@{host}:{req.port}/{req.db}"
         else:
-            url = f"postgresql+psycopg2://{quote_plus(str(req.user))}:{quote_plus(str(password))}@{req.host}:{req.port}/{req.db}"
+            url = f"postgresql+psycopg2://{quote_plus(str(req.user))}:{quote_plus(str(password))}@{host}:{req.port}/{req.db}"
 
         engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
         try:
@@ -1451,10 +1469,11 @@ async def test_database_connection(req: DatabaseTestRequest, _user: dict = Depen
             engine.dispose()
 
         return {"ok": True, "message": "Connection successful"}
+    except HTTPException:
+        raise
     except Exception as e:
         from core.errors import sanitize_error
 
         return {"ok": False, "message": f"Connection failed: {sanitize_error(e)}"}
-
 
 

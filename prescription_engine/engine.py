@@ -124,7 +124,9 @@ _HIGHER_BETTER_HINTS = ("revenue", "revenues", "profit", "profits", "margin",
                         "conversions", "retention", "satisfaction", "growth",
                         "gain", "gains", "yield", "booking", "bookings",
                         "demand", "attendance", "enrollment", "signup",
-                        "signups", "subscription", "subscriptions")
+                        "signups", "subscription", "subscriptions",
+                        "visit", "visits", "traffic", "session", "sessions",
+                        "click", "clicks", "lead", "leads")
 
 # Telemetry/system measurement vocabulary: analytic signal, never a lever.
 _TECHNICAL_MEASURE_HINTS = (
@@ -356,6 +358,14 @@ def classify_driver(name, col_category):
             return ("potentially_controllable",
                     "Length of stay can be influenced (offers, minimum-stay rules) but not set directly.")
         return "potentially_controllable", "This driver may be adjustable; treat estimates cautiously."
+    # Recognized business outcomes (revenue, signups, conversions ...) are
+    # effects, not causes: using one as a driver inverts causality, so they
+    # are only ever tested as metrics. Generalized vocabulary; checked before
+    # the segmentation/default branches so an outcome is never mistaken for
+    # a lever.
+    if any(h in low for h in _HIGHER_BETTER_HINTS):
+        return ("not_controllable",
+                "This is a business outcome, not a lever — ARIA will only test it as a metric.")
     if col_category != "numeric" or any(h in low for h in _SEGMENT_HINTS):
         return "segmentation", "This field segments the business — target an intervention at a group, don't change the field itself."
     return "potentially_controllable", "No evidence this driver is directly settable; estimates are exploratory."
@@ -3747,10 +3757,15 @@ def build_refusal(out: dict, *, engine=None, dialect=None, intel=None,
     out = out if isinstance(out, dict) else {}
     m = metric or out.get("metric")
     d = driver or out.get("driver")
-    headline = f"No supported action for {_sem_display(m)}"
+    # Plain product voice — says what was checked and why nothing is shown,
+    # never engine grammar like "No supported action for X using Y".
     if d:
-        headline += f" using {_sem_display(d, 'this factor')}"
-    headline += "."
+        headline = (f"ARIA checked {_sem_display(d, 'this factor')} against "
+                    f"{_sem_display(m)} — the evidence doesn't support a "
+                    "specific action yet.")
+    else:
+        headline = (f"No evidence-backed action for {_sem_display(m)} yet — "
+                    "ARIA would rather say so than guess.")
     try:
         alternatives = compute_refusal_alternatives(
             engine, dialect, intel, table or out.get("table"), m, exclude=d)

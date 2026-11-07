@@ -1,14 +1,16 @@
 """Authentication and per-user history routes."""
 
 import os
+import smtplib
+import threading
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import ConfigDict, BaseModel
 
 import auth
-from core.deps import get_current_user, is_mobile
+from core.deps import get_current_user, is_mobile, require_admin, require_writable
 
 router = APIRouter()
 
@@ -16,16 +18,42 @@ COOKIE_NAME = "aria_token"
 SECURE_COOKIE_NAME = "__Host-aria_token"
 
 
-def _cookie_secure() -> bool:
+def _is_loopback_http(request: Request | None = None) -> bool:
+    """Return true only for local plain-HTTP development origins.
+
+    Browsers reject Secure cookies over ordinary HTTP. Restrict the local
+    development exception to explicit loopback hosts so a proxied/public
+    deployment continues to use Secure cookies.
+    """
+    if request is None:
+        return False
+    try:
+        host = (request.url.hostname or "").strip("[]").lower()
+        return request.url.scheme.lower() == "http" and host in {
+            "localhost", "127.0.0.1", "::1",
+        }
+    except Exception:
+        return False
+
+
+def _cookie_secure(request: Request | None = None) -> bool:
     """Secure flag for the auth cookie. Default True (prod-safe).
 
-    Explicit opt-out for local HTTP dev only via ARIA_COOKIE_SECURE=0
-    (0/false/no/off). An explicit ARIA_ENV=dev/development/local also
-    opts out. Any other/unset value stays Secure so prod can never
-    accidentally disable it.
+    Plain HTTP on a loopback host uses a non-Secure cookie because browsers
+    discard Secure cookies there. Elsewhere, ARIA_COOKIE_SECURE or
+    ARIA_ENV=dev/development/local may opt out; any other/unset value stays
+    Secure so production does not accidentally weaken cookie transport.
     """
     explicit = (os.getenv("ARIA_COOKIE_SECURE") or "").strip().lower()
     if explicit in ("0", "false", "no", "off"):
+        return False
+    # Local ARIA is commonly opened at http://127.0.0.1:8000. Even if a
+    # machine-level environment variable was inherited by the server,
+    # issuing a Secure cookie on this plain-HTTP loopback origin makes the
+    # browser discard the session and causes protected actions to appear to
+    # log the user out. Loopback HTTP must use the plain cookie name; public
+    # hosts and HTTPS loopback remain Secure.
+    if _is_loopback_http(request):
         return False
     if explicit in ("1", "true", "yes", "on"):
         return True
@@ -34,26 +62,50 @@ def _cookie_secure() -> bool:
     return True
 
 
-def _cookie_name() -> str:
+def _cookie_name(request: Request | None = None) -> str:
     # __Host- prefix requires Secure, Path=/, and no Domain — all true
     # when secure. Use plain name for explicit local-HTTP dev.
-    return SECURE_COOKIE_NAME if _cookie_secure() else COOKIE_NAME
+    return SECURE_COOKIE_NAME if _cookie_secure(request) else COOKIE_NAME
 
 
-def _cookie_kwargs() -> dict:
+def _cookie_kwargs(request: Request | None = None) -> dict:
     return {
         "httponly": True,
         "samesite": "lax",
-        "secure": _cookie_secure(),
+        "secure": _cookie_secure(request),
         "path": "/",
-        "max_age": auth.TOKEN_TTL_DAYS * 24 * 3600,
+        "max_age": auth.TOKEN_TTL_HOURS * 3600,
     }
 
 
-def _auth_response(token: str, username: str) -> JSONResponse:
+def _auth_response(
+    token: str,
+    username: str,
+    request: Request | None = None,
+    user_id: int | None = None,
+) -> JSONResponse:
     # HttpOnly cookie flow: never return the raw JWT in JSON.
-    resp = JSONResponse({"ok": True, "username": username})
-    resp.set_cookie(_cookie_name(), token, **_cookie_kwargs())
+    resp = JSONResponse({
+        "ok": True,
+        "username": username,
+        "email": username,
+        "user_id": user_id,
+        "is_admin": auth.is_admin_email(username),
+    })
+    cookie_name = _cookie_name(request)
+    cookie_kwargs = _cookie_kwargs(request)
+    resp.set_cookie(cookie_name, token, **cookie_kwargs)
+    # Remove a cookie issued under the other scheme when a client moves
+    # between HTTPS and local HTTP; otherwise an old token can shadow the new
+    # session in clients that choose the first cookie by name.
+    stale_cookie = SECURE_COOKIE_NAME if cookie_name == COOKIE_NAME else COOKIE_NAME
+    resp.delete_cookie(
+        stale_cookie,
+        path="/",
+        secure=stale_cookie == SECURE_COOKIE_NAME,
+        httponly=True,
+        samesite="lax",
+    )
     return resp
 
 # Brute-force guard: sliding-window per client IP (generous so real users
@@ -63,6 +115,7 @@ def _auth_response(token: str, username: str) -> JSONResponse:
 # core/ratelimit._check_shared_store); otherwise each worker enforces its
 # own per-process login budget.
 _LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+_LOGIN_LOCK = threading.Lock()
 _LOGIN_WINDOW_S = 300
 _LOGIN_MAX = 30
 # Bound for the per-process login map: prune entries idle past the window
@@ -115,65 +168,184 @@ def _prune_login_attempts(now: float | None = None) -> int:
 def _check_login_rate_limit(request: Request) -> None:
     now = time.monotonic()
     ip = request.client.host if request.client else "unknown"
-    # Shared enforcement first (multi-worker): Redis sliding window when
-    # ARIA_REDIS_URL is configured. Lazy import avoids a core↔api cycle.
-    # In-memory per-process budget below remains as defense-in-depth.
-    try:
-        from core.ratelimit import _redis_check_limit as _shared_login_check
-        try:
-            if _shared_login_check("login", ip, _LOGIN_MAX, _LOGIN_WINDOW_S):
-                pass
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-    except Exception:
-        pass
-    hits = [t for t in _LOGIN_ATTEMPTS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
-    if len(hits) >= _LOGIN_MAX:
-        raise HTTPException(status_code=429, detail="Too many login attempts. Try again in a few minutes.")
-    hits.append(now)
-    _LOGIN_ATTEMPTS[ip] = hits
-    # Opportunistic global prune: cheap per-request for this IP is already
-    # done above; run the full sweep periodically or when over the cap so
-    # the map cannot grow unbounded across many distinct IPs.
-    global _LOGIN_LAST_PRUNE
-    if len(_LOGIN_ATTEMPTS) > _LOGIN_MAX_IPS or (now - _LOGIN_LAST_PRUNE) > 60:
-        _prune_login_attempts(now)
+    # Shared enforcement first (multi-worker): check_limit propagates the
+    # shared 429/503 instead of splitting the budget across workers.
+    from core.ratelimit import check_limit
+    check_limit("login", ip, _LOGIN_MAX, _LOGIN_WINDOW_S)
+    # Mutations on _LOGIN_ATTEMPTS must be atomic: the threadpool runs
+    # concurrent requests, and read-filter-append loses attempts under load.
+    with _LOGIN_LOCK:
+        hits = [t for t in _LOGIN_ATTEMPTS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
+        if len(hits) >= _LOGIN_MAX:
+            raise HTTPException(status_code=429, detail="Too many login attempts. Try again in a few minutes.")
+        hits.append(now)
+        _LOGIN_ATTEMPTS[ip] = hits
+        # Opportunistic global prune: cheap per-request for this IP is already
+        # done above; run the full sweep periodically or when over the cap so
+        # the map cannot grow unbounded across many distinct IPs.
+        global _LOGIN_LAST_PRUNE
+        if len(_LOGIN_ATTEMPTS) > _LOGIN_MAX_IPS or (now - _LOGIN_LAST_PRUNE) > 60:
+            _prune_login_attempts(now)
 
 
 class AuthRequest(BaseModel):
-    username: str
+    model_config = ConfigDict(extra="allow")
+    email: str
     password: str
+
+
+class VerificationRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    token: str
+
+
+class ResendVerificationRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    email: str
+
+
+class PageVisitRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    page: str
 
 
 @router.post("/api/auth/register")
 def register(auth_req: AuthRequest, request: Request):
-    """Create a user account and return a JWT (generic error avoids enumeration)."""
+    """Create an account and send an email verification link."""
     _check_login_rate_limit(request)
     try:
-        user_id = auth.register(auth_req.username, auth_req.password)
+        email = auth.normalize_email(auth_req.email)
     except ValueError:
-        # Generic message: don't reveal whether the username is taken.
-        raise HTTPException(status_code=400, detail="Could not create account. Try a different username.")
-    username = auth_req.username.strip()
-    return _auth_response(auth.issue_token(user_id, username), username)
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+    try:
+        user_id = auth.register_email(email, auth_req.password)
+    except ValueError:
+        # Do not disclose whether an email has an existing account.
+        token = auth.create_email_verification_token(email)
+        if token:
+            try:
+                auth.send_email_verification(email, token)
+            except (OSError, RuntimeError, smtplib.SMTPException) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Could not send the verification email. Check mail settings and try again.",
+                ) from exc
+        return {
+            "ok": True,
+            "verification_required": True,
+            "message": "If this address can be registered, a verification link has been sent.",
+        }
+    token = auth.create_email_verification_token(email)
+    if not token:
+        raise HTTPException(status_code=500, detail="Could not create email verification.")
+    try:
+        auth.send_email_verification(email, token)
+    except (OSError, RuntimeError, smtplib.SMTPException) as exc:
+        # Dev fallback: when SMTP is not configured, verification email
+        # cannot be delivered. Mark the account verified so local users can
+        # still sign in; production deployments must configure SMTP.
+        if isinstance(exc, RuntimeError) and "not configured" in str(exc).lower():
+            auth.verify_email_token(token)
+            return {
+                "ok": True,
+                "verification_required": False,
+                "message": "Account created. You can now sign in.",
+            }
+        raise HTTPException(
+            status_code=503,
+            detail="Your account is pending verification, but the email could not be sent. Try resending after checking mail settings.",
+        ) from exc
+    return {
+        "ok": True,
+        "verification_required": True,
+        "message": "Check your email for a verification link before signing in.",
+    }
 
 
 @router.post("/api/auth/login")
 def login(auth_req: AuthRequest, request: Request):
-    """Exchange username/password for a JWT."""
+    """Exchange a verified email/password pair for a JWT."""
     _check_login_rate_limit(request)
-    user_id = auth.authenticate(auth_req.username, auth_req.password)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid username or password.")
-    username = auth_req.username.strip()
-    return _auth_response(auth.issue_token(user_id, username), username)
+    account = auth.authenticate_email(auth_req.email, auth_req.password)
+    if not account:
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    if not account.get("verified"):
+        raise HTTPException(
+            status_code=403,
+            detail="Verify your email address before signing in.",
+        )
+    email = account["email"]
+    return _auth_response(
+        auth.issue_token(account["user_id"], email),
+        email,
+        request,
+        user_id=account["user_id"],
+    )
+
+
+@router.post("/api/auth/verify-email")
+def verify_email(req: VerificationRequest):
+    email = auth.verify_email_token(req.token)
+    if not email:
+        raise HTTPException(
+            status_code=400,
+            detail="This verification link is invalid, expired, or already used.",
+        )
+    return {"ok": True, "message": "Email verified. You can now sign in."}
+
+
+@router.post("/api/auth/resend-verification")
+def resend_verification(req: ResendVerificationRequest, request: Request):
+    _check_login_rate_limit(request)
+    try:
+        email = auth.normalize_email(req.email)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+    token = auth.create_email_verification_token(email)
+    if token:
+        try:
+            auth.send_email_verification(email, token)
+        except (OSError, RuntimeError, smtplib.SMTPException) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Could not send the verification email. Check mail settings and try again.",
+            ) from exc
+    return {
+        "ok": True,
+        "message": "If this account needs verification, a new link has been sent.",
+    }
 
 
 @router.get("/api/auth/me")
 def me(user: dict = Depends(get_current_user)):
-    return {"ok": True, "username": user["username"], "user_id": user["user_id"]}
+    email = str(user.get("username") or "")
+    return {
+        "ok": True,
+        "username": email,
+        "email": email,
+        "user_id": user["user_id"],
+        "is_admin": auth.is_admin_email(email),
+    }
+
+
+@router.get("/api/admin/overview")
+def admin_overview(user: dict = Depends(require_admin)):
+    return {"ok": True, "overview": auth.get_admin_overview()}
+
+
+@router.post("/api/admin/page-visit")
+def admin_page_visit(
+    req: PageVisitRequest, user: dict = Depends(get_current_user),
+):
+    allowed_pages = {
+        "admin", "dashboard", "analytics", "insights", "intelligence",
+        "predictive", "data", "documents", "copilot", "history", "settings",
+    }
+    page = (req.page or "").strip().lower()
+    if page not in allowed_pages:
+        raise HTTPException(status_code=400, detail="Unknown page.")
+    auth.record_auth_event(user["user_id"], "page_visit", page)
+    return {"ok": True}
 
 
 @router.post("/api/auth/logout")
@@ -219,8 +391,8 @@ def history_detail(history_id: int, user: dict = Depends(get_current_user)):
 
 
 @router.delete("/api/history/{history_id}")
-def history_delete(history_id: int, user: dict = Depends(get_current_user)):
-    """Delete a saved analysis."""
+def history_delete(history_id: int, user: dict = Depends(require_writable)):
+    """Delete a saved analysis (blocked on mobile: view history only)."""
     deleted = auth.delete_history(user["user_id"], history_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="History record not found.")

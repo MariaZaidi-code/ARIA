@@ -380,8 +380,6 @@ def run_correlation(engine, dialect, table, driver, metric):
     rs, ps = _spearman(x, y)
     slope, intercept, r2, _ = _ols(x, y)
     n = len(x)
-    if n <= 3:
-        return None, [f"Only {n} usable rows for {driver} vs {metric} — at least {MIN_N} are needed."]
     z = 0.5 * math.log((1 + r) / (1 - r)) if abs(r) < 1 else 0.0
     se = 1.0 / math.sqrt(max(1, n - 3))
     if abs(r) < 1:
@@ -623,18 +621,45 @@ def analyze_question(engine, dialect, intel, tables, question, table_hint=None,
     intent = parse_intent(question, intel, tables)
     intent = fill_defaults(intent, intel, tables)
     if metric_override:
+        metric_matches = []
         for t in tables:
-            if metric_override in (intel.get_numeric_cols(t) + intel.get_text_cols(t)):
-                intent["metric"], intent["metric_table"] = metric_override, t
-                intent["metric_explicit"] = True
-                break
+            metric_matches.extend(
+                (t, c) for c in intel.get_numeric_cols(t) + intel.get_text_cols(t)
+                if c == metric_override
+            )
+        if not metric_matches:
+            return dict(_fail(
+                "NOT TESTABLE", CODE_COLUMN_NOT_FOUND,
+                f"The selected metric '{metric_override}' is not available in this data.",
+                hypothesis=build_hypothesis_text(question, intent),
+            ))
+        metric_table, metric_column = metric_matches[0]
+        if metric_column not in intel.get_numeric_cols(metric_table):
+            return dict(_fail(
+                "NOT TESTABLE", CODE_INCOMPATIBLE_DATA_TYPE,
+                f"The selected metric '{metric_override}' is not numeric.",
+                hypothesis=build_hypothesis_text(question, intent),
+            ))
+        intent["metric"], intent["metric_table"] = metric_column, metric_table
+        intent["metric_explicit"] = True
     if driver_override:
+        driver_matches = []
         for t in tables:
-            if driver_override in (intel.get_numeric_cols(t) + intel.get_text_cols(t)
-                                   + intel.get_datetime_cols(t)):
-                intent["driver"], intent["driver_table"] = driver_override, t
-                intent["driver_explicit"] = True
-                break
+            driver_matches.extend(
+                (t, c) for c in (intel.get_numeric_cols(t)
+                                 + intel.get_text_cols(t)
+                                 + intel.get_datetime_cols(t))
+                if c == driver_override
+            )
+        if not driver_matches:
+            return dict(_fail(
+                "NOT TESTABLE", CODE_COLUMN_NOT_FOUND,
+                f"The selected driver '{driver_override}' is not available in this data.",
+                hypothesis=build_hypothesis_text(question, intent),
+            ))
+        driver_table, driver_column = driver_matches[0]
+        intent["driver"], intent["driver_table"] = driver_column, driver_table
+        intent["driver_explicit"] = True
     metric, mtable = intent["metric"], intent["metric_table"]
     if table_hint and table_hint in tables:
         mtable = table_hint
@@ -874,6 +899,9 @@ def _explain(result, verdict, metric):
         base = "There isn't enough evidence yet. "
     if a == "correlation":
         d = result.get("driver", "").replace("_", " ")
+        if verdict == "NOT SUPPORTED" and result.get("p_value", 1.0) >= 0.05:
+            return (base + f"there is no clear relationship between {d} and {m}. "
+                           "This does not prove that no relationship exists.")
         which = "rise together" if result.get("direction") == "up" else "move in opposite directions"
         return (base + f"{d} and {m} {which} ({result.get('strength')} link). "
                        f"Knowing one gives a useful read on the other, but it doesn't prove cause.")
@@ -906,99 +934,47 @@ def _usable_measures(intel, table):
 
 
 def rank_prominent(engine, dialect, intel, tables, limit=5):
-    """Find the most prominent testable patterns in the actual data.
+    """Find meaningful metric changes over time in the actual data.
 
-    Scores real effects — strongest correlations, biggest group gaps,
-    clearest trends — and returns them ranked with evidence, so every
-    suggestion is guaranteed testable (pre-validated, never an error).
+    Hypothesis suggestions focus on business movement, not arbitrary
+    metric-by-dimension comparisons or measure correlations.
     """
     cands = []
     reserve = []
     for t in tables[:8]:
-        measures = _usable_measures(intel, t)[:4]
+        measures = _usable_measures(intel, t)[:3]
         if not measures:
             continue
-        dims = intel.find_all_dimensions(t)[:3]
         dts = intel.get_datetime_cols(t)[:2]
         if not dts:
             for c in intel.get_text_cols(t):
                 if any(h in c.lower() for h in ("date", "time", "day", "month", "year", "period")):
                     dts.append(c)
                     break
-        # 1) Correlations between measure pairs (pre-validated).
-        for i in range(len(measures)):
-            for j in range(i + 1, min(i + 3, len(measures))):
-                try:
-                    rows = _fetch_pairs(engine, dialect, t, measures[i], measures[j], limit=500)
-                    x = np.array([float(r[0]) for r in rows])
-                    y = np.array([float(r[1]) for r in rows])
-                    if len(x) < MIN_N:
-                        continue
-                    r, p = _pearson(x, y)
-                    a, b = measures[i].replace("_", " "), measures[j].replace("_", " ")
-                    entry = {
-                        "score": abs(r),
-                        "text": f"Are {a} and {b} related?",
-                        "kind": "correlation",
-                        "evidence": f"Link r={r:+.2f} across {len(x):,} records",
-                        "metric": measures[j], "driver": measures[i],
-                    }
-                    if p < 0.05 and abs(r) >= 0.3:
-                        entry["evidence"] = f"Strong link (r={r:+.2f}) across {len(x):,} records"
-                        cands.append(entry)
-                    else:
-                        reserve.append(entry)
-                except Exception:
-                    continue
-        # 2) Biggest group gaps.
-        m0 = measures[0]
-        for d in dims[:2]:
+        # Only changes with a usable date/time axis can become hypothesis
+        # prompts. A cross-sectional dimension gap is not evidence of a
+        # business change and is deliberately excluded here.
+        if not dts:
+            continue
+        for metric in measures:
             try:
-                if not (2 <= _distinct_count(engine, dialect, t, d) <= 12):
-                    continue
-                rows = _fetch_pairs(engine, dialect, t, d, m0, limit=1000)
-                df = pd.DataFrame(rows, columns=["g", "v"])
-                df["v"] = pd.to_numeric(df["v"], errors="coerce")
-                df = df.dropna()
-                df["g"] = df["g"].astype(str)
-                g = df.groupby("g")["v"].agg(["mean", "count"])
-                g = g[g["count"] >= 5]
-                if len(g) < 2:
-                    continue
-                top = g.sort_values("mean", ascending=False)
-                gap = (top["mean"].iloc[0] - top["mean"].iloc[-1]) / abs(top["mean"].mean()) \
-                    if top["mean"].mean() else 0.0
-                entry = {
-                    "score": min(1.0, abs(gap)),
-                    "text": f"Does {m0.replace('_', ' ')} differ across {d.replace('_', ' ')}?",
-                    "kind": "groups",
-                    "evidence": (f"{top.index[0]} averages {top['mean'].iloc[0]:,.1f} vs "
-                                 f"{top.index[-1]} at {top['mean'].iloc[-1]:,.1f}"),
-                    "metric": m0, "dimension": d,
-                }
-                if abs(gap) >= 0.2:
-                    cands.append(entry)
-                else:
-                    reserve.append(entry)
-            except Exception:
-                continue
-        # 3) Clearest trend over time.
-        if dts:
-            try:
-                rows = _fetch_pairs(engine, dialect, t, dts[0], m0, limit=1000)
+                rows = _fetch_pairs(engine, dialect, t, dts[0], metric, limit=1000)
                 ts = pd.to_datetime([r[0] for r in rows], errors="coerce")
                 vals = pd.to_numeric([r[1] for r in rows], errors="coerce")
                 ok = ts.notna() & vals.notna()
                 if ok.sum() >= MIN_N:
                     x = np.arange(ok.sum(), dtype=float)
                     slope, _, r2, p = _ols(x, vals[ok].to_numpy())
-                    direction = "rising" if slope > 0 else "falling"
+                    direction = "increased" if slope > 0 else "declined"
+                    metric_label = metric.replace("_", " ")
                     entry = {
                         "score": r2,
-                        "text": f"Is {m0.replace('_', ' ')} {direction} over time?",
+                        "text": (f"Why did {metric_label} {direction} over time?"
+                                 if p < 0.05 and r2 >= 0.3
+                                 else f"How has {metric_label} changed over time?"),
                         "kind": "trend",
                         "evidence": f"{direction.title()} pattern across {ok.sum():,} dated rows",
-                        "metric": m0, "time_col": dts[0],
+                        "metric": metric, "time_col": dts[0],
                     }
                     if p < 0.05 and r2 >= 0.3:
                         entry["evidence"] = f"{direction.title()} trend across {ok.sum():,} dated rows"
@@ -1007,7 +983,7 @@ def rank_prominent(engine, dialect, intel, tables, limit=5):
                         reserve.append(entry)
             except Exception:
                 continue
-        if len(cands) >= limit + 2:
+        if len(cands) >= limit:
             break
     cands.sort(key=lambda c: c["score"], reverse=True)
     reserve.sort(key=lambda c: c["score"], reverse=True)
@@ -1023,7 +999,7 @@ def rank_prominent(engine, dialect, intel, tables, limit=5):
 
 
 def suggest_hypotheses(engine, dialect, intel, tables, limit=4):
-    """Backward-compatible text suggestions (schema-only, no data scan)."""
+    """Backward-compatible change-over-time suggestions."""
     ranked = []
     try:
         ranked = rank_prominent(engine, dialect, intel, tables, limit=limit)
@@ -1034,16 +1010,18 @@ def suggest_hypotheses(engine, dialect, intel, tables, limit=4):
     out = []
     for t in tables[:10]:
         measures = _usable_measures(intel, t)[:3]
-        dims = intel.find_all_dimensions(t)[:3]
-        if not measures:
+        dates = intel.get_datetime_cols(t)[:1]
+        if not dates:
+            dates = [
+                c for c in intel.get_text_cols(t)
+                if any(h in c.lower() for h in ("date", "time", "day", "month", "year", "period"))
+            ][:1]
+        if not measures or not dates:
             continue
-        m = measures[0]
-        mh = m.replace("_", " ")
-        if len(measures) > 1:
-            d = measures[1].replace("_", " ")
-            out.append(f"Are {d} and {mh} related?")
-        if dims:
-            out.append(f"Does {mh} differ across {dims[0].replace('_', ' ')}?")
+        for m in measures:
+            out.append(f"How has {m.replace('_', ' ')} changed over time?")
+            if len(out) >= limit:
+                break
         if len(out) >= limit:
             break
     return out[:limit]

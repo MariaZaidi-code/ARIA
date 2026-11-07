@@ -59,15 +59,15 @@ _UNDEFINED_COLUMN_RES = (
 def _extract_undefined_column(exc):
     """Pull the offending column name out of a DB undefined-column error."""
     try:
-        text = str(exc or "")
+        exc_text = str(exc or "")
     except Exception:
         return None
     for rx in _UNDEFINED_COLUMN_RES:
-        m = rx.search(text)
+        m = rx.search(exc_text)
         if m:
             return m.group(1).strip().strip("\"'`[]")
-    if re.search(r"undefinedcolumn|undefined_column", text, re.IGNORECASE):
-        m = re.search(r'["`\'\[]?([\w.]+)["`\'\]]?', text)
+    if re.search(r"undefinedcolumn|undefined_column", exc_text, re.IGNORECASE):
+        m = re.search(r'["`\'\[]?([\w.]+)["`\'\]]?', exc_text)
         if m:
             return m.group(1)
     return None
@@ -132,6 +132,25 @@ class DataMixin:
                 int((time.monotonic() - _t_start) * 1000), (user_goal or "")[:120])
             return [], None, {"failed": True, "message": _SAFE_FAIL}
         current_sql = self._clean_sql(raw_sql)
+        # Cache the repair-brief schema ONCE for this run: every fix_prompt
+        # below re-embeds the same (join_path-scoped) DDL, and rebuilding it
+        # per attempt just burned CPU before each LLM round-trip.
+        _schema_ddl_cache: dict = {}
+        def _brief_schema() -> str:
+            try:
+                key = (str(join_path), False)
+                hit = _schema_ddl_cache.get(key)
+                if hit is None:
+                    hit = self._build_schema_ddl(join_path, full=False)
+                    _schema_ddl_cache[key] = hit
+                if len(hit) > 60_000:
+                    # Big warehouses: keep the brief bounded (tables nearest
+                    # the join path are already first; truncation keeps the
+                    # model aligned without unbounded prompt growth).
+                    hit = hit[:60_000]
+                return hit
+            except Exception:
+                return ""
         # Fail-closed allowlist gate: read-only + unknown tables/columns must
         # pass before EVERY execution (enforced at the execution point below,
         # after repairs). Resolves via SqlMixin when composed in GoalAgent,
@@ -175,7 +194,7 @@ User goal:
 {user_goal}
 
 Schema:
-{self._build_schema_ddl(join_path, full=False)}
+{_brief_schema()}
 
 Broken SQL:
 {current_sql}
@@ -246,7 +265,7 @@ User goal:
 {user_goal}
 
 Schema:
-{self._build_schema_ddl(join_path, full=False)}
+{_brief_schema()}
 
 Broken SQL:
 {current_sql}
@@ -307,7 +326,7 @@ User goal:
 {user_goal}
 
 Schema:
-{self._build_schema_ddl(join_path, full=False)}
+{_brief_schema()}
 
 Broken SQL:
 {current_sql}
@@ -359,7 +378,7 @@ User goal:
 {user_goal}
 
 Schema:
-{self._build_schema_ddl(join_path, full=False)}
+{_brief_schema()}
 
 Broken SQL:
 {current_sql}
@@ -421,7 +440,7 @@ User goal:
 {user_goal}
 
 Schema:
-{self._build_schema_ddl(join_path, full=False)}
+{_brief_schema()}
 
 Broken SQL:
 {current_sql}
@@ -476,7 +495,7 @@ User goal:
 {user_goal}
 
 Schema:
-{self._build_schema_ddl(join_path, full=False)}
+{_brief_schema()}
 
 Broken SQL:
 {current_sql}
@@ -527,7 +546,7 @@ User goal:
 {user_goal}
 
 Schema:
-{self._build_schema_ddl(join_path, full=False)}
+{_brief_schema()}
 
 Broken SQL:
 {current_sql}
@@ -597,7 +616,7 @@ Resolved goal plan (treat as ground truth):
 {plan_json}
 
 Schema:
-{self._build_schema_ddl(join_path, full=False)}
+{_brief_schema()}
 
 Broken SQL:
 {current_sql}
@@ -800,7 +819,7 @@ User goal:
 {user_goal}
 
 Relevant schema:
-{self._build_schema_ddl(join_path, full=False)}
+{_brief_schema()}
 
 Broken SQL:
 {current_sql}

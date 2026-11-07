@@ -179,7 +179,7 @@ def export_my_data(
     """Export current user's data summary (HTML) or table records (CSV)."""
     session = get_session(user["user_id"])
     reject_document_sql(session)
-    mapping = _get_schema_mapping(session, user["user_id"])
+    mapping = _get_schema_mapping(session)
     if not mapping or not mapping.get("tables"):
         raise HTTPException(status_code=400, detail="Connect a tabular data source and extract its schema first.")
 

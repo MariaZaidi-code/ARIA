@@ -472,14 +472,18 @@ def validate_explore(engine, dialect: str, qm: str, qt: str,
                 return None
             _sel = f"{qd} AS _d" if is_count else f"{qd} AS _d, {qm} AS _v"
             with engine.connect() as _conn:
-                _rs = _conn.execute(
+                # Stream in chunks: a validation probe must not materialize
+                # the whole table in memory (fetchall on big tables pushed
+                # latency up and duplicated the explore's own scan).
+                _rs = _conn.execution_options(
+                    stream_results=True).execute(
                     _stext(f"SELECT {_sel} FROM {qt}"
                            f"{where_base_sql or ''}"),
                     base_params)
                 _ks = list(_rs.keys())
                 _tot = 0.0
                 _n = 0
-                for _row in _rs.fetchall():
+                for _row in _rs.yield_per(1000):
                     _dd = dict(zip(_ks, _row))
                     _dt = to_date(_dd.get("_d"))
                     if _dt is None or _dt < lo or _dt > hi:
@@ -508,11 +512,13 @@ def validate_explore(engine, dialect: str, qm: str, qt: str,
             if lo is None or hi is None or not qd:
                 return None
             with engine.connect() as _conn:
-                _rs = _conn.execute(
+                # Streamed like _window_sum — no whole-table fetchall().
+                _rs = _conn.execution_options(
+                    stream_results=True).execute(
                     _stext(f"SELECT {qd} AS _d FROM {qt}{where_base_sql or ''}"),
                     base_params)
                 _n = 0
-                for _row in _rs.fetchall():
+                for _row in _rs.yield_per(1000):
                     _dt = to_date(_row[0])
                     if _dt is not None and lo <= _dt <= hi:
                         _n += 1
@@ -691,8 +697,6 @@ def validate_explore(engine, dialect: str, qm: str, qt: str,
             else:
                 _tr = _check_truncated_rows(rows, total, prev_total)
                 _ok("breakdown_sum", _tr[0], _tr[1])
-        except Exception as exc:
-            _ok("breakdown_sum", False, f"check failed (fail-closed): {exc}")
         except Exception as exc:
             _ok("breakdown_sum", False, f"check failed (fail-closed): {exc}")
 

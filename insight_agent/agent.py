@@ -30,7 +30,10 @@ from llm_provider import LLMProvider, create_provider
 from core.validation import clean_llm_text, validate_chart_choice
 from .chart_catalog import compatible_chart_options
 from prediction import PredictionAgent
-from prescription_agent import PrescriptionAgent
+try:
+    from prescription_agent import PrescriptionAgent as _PrescriptionAgent
+except Exception:  # legacy shim removed; prescriptions become optional
+    _PrescriptionAgent = None
 
 logging.basicConfig(level=logging.INFO)
 
@@ -127,7 +130,7 @@ class InsightAgent:
             )
         self.llm = provider
         self.prediction = PredictionAgent()
-        self.prescription = PrescriptionAgent(provider=self.llm)
+        self.prescription = _PrescriptionAgent(provider=self.llm) if _PrescriptionAgent is not None else None
         self._templates = None
         self.last_story_status = "SUCCESS"
 
@@ -701,17 +704,14 @@ class InsightAgent:
         reflects how strongly the numbers support the claim.
         """
         hyps = []
-        score = 0.0
 
         def add(text, basis, confidence, pts):
-            nonlocal score
             hyps.append({
                 "hypothesis": text,
                 "basis": basis,
                 "confidence": confidence,
                 "score": float(pts),
             })
-            score += float(pts)
 
         # Identifier-like columns are keys, not measures: hypotheses must talk
         # about real business measures, never about row IDs or foreign keys.
@@ -848,7 +848,11 @@ class InsightAgent:
             )
 
         hyps.sort(key=lambda h: h["score"], reverse=True)
-        return hyps[:5], score
+        # The ranking score must describe what is actually returned: sum the
+        # top-N list only (previously it summed every candidate, including
+        # the ones truncated away, inflating hypothesis_ranking_score).
+        top_hyps = hyps[:5]
+        return top_hyps, sum(h["score"] for h in top_hyps)
 
     # ------------------------------------------------------------------
     # Business story via Mistral 7B
@@ -898,7 +902,9 @@ class InsightAgent:
             "kpis": kpis[:6],
             "trends": trends[:3],
             "anomalies": anomalies[:5],
-            "hypotheses": hypotheses,
+            # Same bounded slicing as every other section — an unbounded
+            # hypotheses list let large-schema runs inflate prompt size.
+            "hypotheses": (hypotheses or [])[:3],
         }
         if predictions and predictions.get("valid") and predictions.get("points"):
             context["prediction"] = {
@@ -1168,8 +1174,10 @@ Rules:
                 return False, f"unmapped percent {token.strip()}"
             if abs(num) < 10 and not suffix:
                 continue  # counts / ranks / small prose numbers
-            if 1900 <= abs(num) <= 2100 and num.is_integer() and not suffix:
+            if _re.fullmatch(r"(?:19|20|21)\d{2}", token.strip()):
                 # Year-like periods must exist in evidence; otherwise invented.
+                # Match on the RAW token: "2,000" is a thousands-separated
+                # count, not a period (it previously false-rejected counts).
                 if str(int(num)) not in evidence_text:
                     return False, f"unmapped period {token.strip()}"
                 continue
@@ -1424,13 +1432,14 @@ Rules:
                 warnings.append(f"prediction: {exc}")
 
         prescriptions = None
-        try:
-            prescriptions = self.prescription.prescribe(
-                processed_data, kpis, trends, anomalies, hypotheses, predictions
-            )
-        except Exception as exc:
-            logging.warning("Prescription Agent failed: %s", exc)
-            warnings.append(f"prescription: {exc}")
+        if self.prescription is not None:
+            try:
+                prescriptions = self.prescription.prescribe(
+                    processed_data, kpis, trends, anomalies, hypotheses, predictions
+                )
+            except Exception as exc:
+                logging.warning("Prescription Agent failed: %s", exc)
+                warnings.append(f"prescription: {exc}")
 
         story = safe(
             "generate_business_story",

@@ -60,7 +60,7 @@ JSON_INDENT = 2
 K = 2
 
 from .connection import (
-    _apply_session_timeout, get_connection, _dict_cursor,
+    SchemaConnectionError, _apply_session_timeout, get_connection, _dict_cursor,
     _lower_keys, _quote_ident, _qname,
 )
 from .introspection import (

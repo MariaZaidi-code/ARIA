@@ -36,7 +36,11 @@ except ImportError:
 # Load .env centrally (in core.config) before any module-level os.getenv below.
 import core.config  # noqa: E402,F401
 
-logging.basicConfig(level=logging.INFO)
+# Library module: never grab root logging config at import (app.py configures
+# logging); module-level loggers only.
+logger = logging.getLogger("aria.llm_provider")
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
 
 # ---------------------------------------------------------------------------
 # DeepSeek (OpenAI-compatible) configuration
@@ -82,6 +86,12 @@ def _llm_rate_limit(key="default") -> None:
         if getattr(exc, "status_code", None) in (429, 503):
             raise
     now = time.monotonic()
+    if len(_llm_buckets) > 512:
+        # Bound the fallback map: drop expired/empty buckets so one-shot
+        # keys cannot grow it without limit.
+        for _k in [k for k, v in _llm_buckets.items()
+                   if not v or now - v[-1] >= _LLM_BUCKET_WINDOW_S]:
+            _llm_buckets.pop(_k, None)
     hits = [t for t in _llm_buckets.get(bucket_key, []) if now - t < _LLM_BUCKET_WINDOW_S]
     if len(hits) >= _LLM_BUCKET_MAX:
         raise RuntimeError(
@@ -230,6 +240,74 @@ def _require_cloud_consent(provider: str, consent=None):
         )
 
 
+def validate_llm_base_url(base_url: str, provider: str = "cloud") -> str:
+    """Validate a hosted LLM ``base_url`` override (single source of truth).
+
+    Rules for hosted providers (cloud/deepseek/omniroute/grok):
+      - must be https://, no userinfo/credentials in the URL;
+      - hostname must not be a literal internal IP (private/loopback/
+        link-local/metadata/decimal-hex-octal forms);
+      - DNS names must not resolve to those ranges (resolve-then-check at
+        creation time — the SSRF guard for SDK-driven HTTP clients).
+
+    ``provider == "local"`` keeps dev-local semantics: http and loopback
+    allowed (Ollama on 127.0.0.1 is the normal setup).
+    Raises ValueError on any violation; returns the validated URL string.
+    """
+    try:
+        from urllib.parse import urlsplit as _urlsplit
+        import ipaddress as _ip
+
+        parsed = _urlsplit(str(base_url or ""))
+        if provider != "local" and parsed.scheme != "https":
+            raise ValueError("Provider base URL must use https.")
+        if provider == "local" and parsed.scheme not in ("http", "https"):
+            raise ValueError("Provider base URL must be http(s).")
+        if parsed.username or parsed.password:
+            raise ValueError("Provider base URL must not embed credentials.")
+        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+        if not hostname or len(hostname) > 253 or not re.fullmatch(r"[A-Za-z0-9_.-]+", hostname):
+            raise ValueError("Invalid provider base URL host.")
+
+        def _blocked(ir) -> bool:
+            return (
+                ir.is_private or ir.is_loopback or ir.is_link_local
+                or ir.is_multicast or ir.is_reserved or ir.is_unspecified
+            )
+
+        # Literal-form bypasses first (decimal/octal/hex/integer IPs).
+        host_raw = hostname
+        norm_ip = None
+        try:
+            norm_ip = _ip.ip_address(host_raw)
+        except Exception:
+            try:
+                if host_raw.isdigit() or host_raw.lower().startswith("0x"):
+                    norm_ip = _ip.ip_address(int(host_raw, 0 if host_raw.lower().startswith("0x") else 10))
+            except Exception:
+                norm_ip = None
+        is_local_provider = provider == "local"
+        if norm_ip is not None:
+            if _blocked(norm_ip):
+                if not (is_local_provider and norm_ip.is_loopback):
+                    raise ValueError("Provider base URL host is blocked.")
+        else:
+            import socket as _sock
+            infos = _sock.getaddrinfo(host_raw, None, family=_sock.AF_UNSPEC, type=_sock.SOCK_STREAM)
+            for _fam, _typ, _proto, _canon, sockaddr in infos:
+                try:
+                    ir = _ip.ip_address(str(sockaddr[0]))
+                except Exception:
+                    continue
+                if _blocked(ir) and not (is_local_provider and ir.is_loopback):
+                    raise ValueError("Provider base URL host resolves to a blocked address.")
+        return str(base_url)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Invalid provider base URL: {exc}")
+
+
 _SECRET_PATTERNS = [
     re.compile(r"(gsk_[A-Za-z0-9]{8,})"),
     re.compile(r"(xai-[A-Za-z0-9\-_]{8,})"),
@@ -319,6 +397,21 @@ def _minimize_for_cloud(messages, max_chars: int = 4000):
             out.append(m)
     return out
 
+
+def _prepare_role_messages(role, messages):
+    """Preserve bounded RAG evidence and trailing questions across provider I/O.
+
+    RAG builds its own context budget. The generic 4k minimizer must not cut
+    evidence, JSON schemas, candidate answers, or the latest question silently.
+    Secret redaction still applies; oversized RAG payloads fail explicitly.
+    """
+    if role not in {"rag", "rag_scope", "rag_verify", "rag_rewrite", "rag_plan"}:
+        return _minimize_for_cloud(messages)
+    limit = 64000
+    if _content_chars(messages) > limit:
+        raise ValueError("Document request exceeds the 64000-character provider context budget; narrow the document scope.")
+    return _minimize_for_cloud(messages, max_chars=limit)
+
 # ---------------------------------------------------------------------------
 # Provider metadata
 # ---------------------------------------------------------------------------
@@ -382,6 +475,12 @@ PROVIDERS = {
     },
 }
 
+# New providers deliberately require an account-supported model ID.
+for _name, _label, _env in (("openai", "OpenAI / GPT", "OPENAI_MODEL"),
+                             ("anthropic", "Anthropic / Claude", "ANTHROPIC_MODEL")):
+    PROVIDERS[_name] = {"label": _label, "models": {
+        role: os.getenv(_env, "") for role in ("sql", "story", "suggest", "semi", "schema", "vision")}}
+
 GROQ_MODEL = PROVIDERS["cloud"]["models"]["sql"]
 
 # Local Ollama models default to a small runtime context (often 4096 tokens),
@@ -400,15 +499,18 @@ class LLMProvider:
         # provider without backend consent fails closed (no network touched).
         if provider != "local":
             _require_cloud_consent(provider)
+        if base_url:
+            # Single shared SSRF validator: hosted clients must not point at
+            # internal hosts; local (Ollama) keeps http/loopback semantics.
+            base_url = validate_llm_base_url(base_url, provider)
         self.provider = provider
         self.base_url = base_url
         self.models = dict(PROVIDERS[provider]["models"])
         if models:
             self.models.update(models)
 
-        # Unified cloud client used by all hosted providers (Groq "cloud" and
-        # DeepSeek "deepseek"). Kept as a single attribute so every cloud path
-        # shares the same retry/error handling.
+        # Hosted clients use ARIA's bounded retry handling; SDK retries are
+        # disabled to prevent nested backoff from extending request timeouts.
         self._cloud_client = None
         if provider == "cloud":
             if not GROQ_AVAILABLE:
@@ -418,11 +520,15 @@ class LLMProvider:
             self._cloud_client = Groq(api_key=api_key or os.getenv("GROQ_API_KEY"), max_retries=0, base_url=base_url) if base_url else Groq(api_key=api_key or os.getenv("GROQ_API_KEY"), max_retries=0)
             if not self._cloud_client.api_key:
                 raise RuntimeError("Missing GROQ_API_KEY. Set it in .env or pass api_key.")
+        elif provider in ("openai", "anthropic"):
+            from services.hosted_clients import make_client
+            self._cloud_client = make_client(provider, api_key, base_url)
         elif provider == "deepseek":
             from openai import OpenAI
             self._cloud_client = OpenAI(
                 api_key=api_key or os.getenv("DEEPSEEK_API_KEY"),
                 base_url=base_url or DEEPSEEK_BASE_URL,
+                max_retries=0,
             )
             if not self._cloud_client.api_key:
                 raise RuntimeError("Missing DEEPSEEK_API_KEY. Set it in .env or pass api_key.")
@@ -431,6 +537,7 @@ class LLMProvider:
             self._cloud_client = OpenAI(
                 api_key=api_key or os.getenv("OMNIROUTE_API_KEY"),
                 base_url=base_url or OMNIROUTE_BASE_URL,
+                max_retries=0,
             )
             if not self._cloud_client.api_key:
                 raise RuntimeError("Missing OMNIROUTE_API_KEY. Set it in .env or pass api_key.")
@@ -439,6 +546,7 @@ class LLMProvider:
             self._cloud_client = OpenAI(
                 api_key=api_key or os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY"),
                 base_url=base_url or GROK_BASE_URL,
+                max_retries=0,
             )
             if not self._cloud_client.api_key:
                 raise RuntimeError("Missing GROK_API_KEY (or XAI_API_KEY). Set it in .env or pass api_key.")
@@ -536,7 +644,7 @@ class LLMProvider:
             *messages,
         ]
         extra_body = self._thinking_body(role)
-        structured_messages = _minimize_for_cloud(structured_messages)
+        structured_messages = _prepare_role_messages(role, structured_messages)
         try:
             def _request():
                 kwargs = {
@@ -591,7 +699,7 @@ class LLMProvider:
         if self.provider == "local" and _content_chars(messages) > _LLM_LOCAL_MINIMIZE_THRESHOLD:
             # Same data-minimization as the cloud path (4000 chars/msg) when
             # local context exceeds 24k chars: bounds memory/time on CPU.
-            messages = _minimize_for_cloud(messages)
+            messages = _prepare_role_messages(role, messages)
         model = self.model_for(role)
         if not model:
             raise ValueError(f"No model configured for role '{role}'")
@@ -709,7 +817,7 @@ class LLMProvider:
 
     def _chat_cloud(self, role, model, messages, temperature, num_predict, timeout):
         _require_cloud_consent(self.provider)
-        messages = _minimize_for_cloud(messages)
+        messages = _prepare_role_messages(role, messages)
         extra_body = self._thinking_body(role)
         def _request():
             kwargs = {
@@ -815,6 +923,9 @@ class LLMProvider:
                 "with a vision model. Switch backend and retry."
             )
         _require_cloud_consent(self.provider)
+        # Cap the request like chat(): an unbounded image list lets one call
+        # blow up payload size / token spend with no budget.
+        images = list(images or [])[:10]
         prompt = _minimize_for_cloud(prompt)
         content = [{"type": "text", "text": prompt}]
         for b64 in images:
@@ -878,6 +989,8 @@ def create_provider(provider=_UNSET, api_key=None, models=None, base_url=None,
     # client construction, or network I/O for hosted providers).
     if provider != "local":
         _require_cloud_consent(provider)
+    if base_url:
+        base_url = validate_llm_base_url(base_url, provider)
     if provider == "cloud":
         if not GROQ_AVAILABLE:
             raise RuntimeError(
@@ -924,4 +1037,8 @@ def create_provider(provider=_UNSET, api_key=None, models=None, base_url=None,
         if not llm._cloud_client.api_key:
             raise RuntimeError("Missing GROK_API_KEY (or XAI_API_KEY). Set it in .env or pass api_key.")
         return llm
+    if provider in ("openai", "anthropic"):
+        return LLMProvider(provider, api_key=api_key, models=models, base_url=base_url)
+    if provider != "local":
+        raise ValueError(f"Unknown provider '{provider}'")
     return LLMProvider("local", models=models)

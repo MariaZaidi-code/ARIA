@@ -1,4 +1,4 @@
-"""Data section routes: preview, profiling, quality, connection health, user overrides."""
+﻿"""Data section routes: preview, profiling, quality, connection health, user overrides."""
 
 import json
 import re
@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, field_validator
+from pydantic import ConfigDict, BaseModel, field_validator
 from sqlalchemy import create_engine, text
 
 import schema_agent
@@ -32,22 +32,59 @@ def _get_db_config(session):
     if "password" in config and config["password"] is not None:
         try:
             config["password"] = _decrypt_secret(config["password"])
-        except Exception:
-            pass
+        except Exception as exc:
+            # Never use ciphertext as if it were the password. That would
+            # turn a local Windows identity mismatch into a misleading server
+            # authentication error.
+            import logging as _logging
+            _logging.getLogger("aria.data").warning(
+                "data_routes: saved DB password decrypt failed (%s).",
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "ARIA could not decrypt the saved database password. "
+                    "Start ARIA under the same Windows account that saved it, "
+                    "or reconnect and enter the database password again."
+                ),
+            ) from exc
     driver = "mysql" if db_type == "mysql" else "postgresql"
     dialect = "mysql" if driver == "mysql" else "postgresql"
+    from core.db import format_db_host
+    host = format_db_host(config.get("host", "localhost"))
     if driver == "mysql":
-        engine_url = f"mysql+pymysql://{quote_plus(str(config.get('user', '')))}:{quote_plus(str(config.get('password', '')))}@{config.get('host', 'localhost')}:{config.get('port', 3306)}/{config.get('db', '')}"
+        engine_url = f"mysql+pymysql://{quote_plus(str(config.get('user', '')))}:{quote_plus(str(config.get('password', '')))}@{host}:{config.get('port', 3306)}/{config.get('db', '')}"
     else:
-        engine_url = f"postgresql+psycopg2://{quote_plus(str(config.get('user', '')))}:{quote_plus(str(config.get('password', '')))}@{config.get('host', 'localhost')}:{config.get('port', 5432)}/{config.get('db', '')}"
+        engine_url = f"postgresql+psycopg2://{quote_plus(str(config.get('user', '')))}:{quote_plus(str(config.get('password', '')))}@{host}:{config.get('port', 5432)}/{config.get('db', '')}"
     return config, db_type, engine_url
 
 
-def _get_schema_mapping(session, user_id):
-    """Load the current schema mapping from disk."""
+def _make_engine(engine_url, connect_timeout: int = 5):
+    """Build a SQLAlchemy engine with a bounded connect timeout.
+
+    ``connect_timeout`` is a libpq/PyMySQL connect_arg (not valid for
+    SQLite), so it is only applied to server-backed URLs. Callers must
+    ``dispose()`` the returned engine (see the ``finally`` blocks at each
+    call site) so pooled connections are released deterministically.
+    """
+    kwargs = {"pool_pre_ping": True}
+    try:
+        if engine_url and not str(engine_url).startswith("sqlite"):
+            kwargs["connect_args"] = {"connect_timeout": int(connect_timeout)}
+    except Exception:
+        pass
+    return create_engine(engine_url, **kwargs)
+
+
+def _get_schema_mapping(session):
+    """Load the current schema mapping from the session's schema_path."""
     path = session.get("schema_path")
-    if path and path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
+    if path:
+        # Session values round-trip through JSON as str; normalize to Path.
+        path = Path(str(path))
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
     return None
 
 
@@ -91,7 +128,7 @@ def _resolve_table_param(table, tables):
 
     Accepts the qualified key (sales.employee) or the bare segment
     (employee) when it is unambiguous; raises HTTPException 400 otherwise.
-    Generic — no schema or table names.
+    Generic â€” no schema or table names.
     """
     keys = list((tables or {}).keys())
     if table in keys:
@@ -131,22 +168,26 @@ def get_connection_health(request: Request, user: dict = Depends(get_current_use
 
     config, dtype, engine_url = _get_db_config(session)
     if engine_url:
+        engine = None
         try:
-            engine = create_engine(engine_url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+            engine = _make_engine(engine_url, 5)
             with engine.connect() as conn:
-                if dtype == "mysql":
-                    result = conn.execute(text("SELECT 1"))
-                else:
-                    result = conn.execute(text("SELECT 1"))
+                conn.execute(text("SELECT 1"))
             status = "connected"
         except Exception as e:
             status = f"error: {sanitize_error(e, 200)}"
+        finally:
+            if engine is not None:
+                try:
+                    engine.dispose()
+                except Exception:
+                    pass
     elif source_type in ("semi-structured", "document"):
         status = "connected"
     else:
         status = "unknown"
 
-    mapping = _get_schema_mapping(session, user["user_id"])
+    mapping = _get_schema_mapping(session)
     table_count = len(mapping.get("tables", {})) if mapping else 0
     declared_fk = len(mapping.get("declared_relationships", [])) if mapping else 0
     inferred_fk = len(mapping.get("inferred_relationships", [])) if mapping else 0
@@ -156,8 +197,20 @@ def get_connection_health(request: Request, user: dict = Depends(get_current_use
     generated_at = mapping.get("generated_at", "") if mapping else ""
 
     host_info = ""
-    if config and isinstance(config, dict):
-        host_info = f"{config.get('host', '')}:{config.get('port', '')}"
+    if config and isinstance(config, dict) and config.get("host"):
+        # File uploads have no server: never render an empty "host:port".
+        # Loopback addresses (connect may pin 'localhost' to '::1') read as
+        # "localhost"; other IPv6 hosts are bracketed ("[fe80::1]:5432").
+        _host = str(config["host"]).strip()
+        if _host in ("::1", "127.0.0.1", "[::1]"):
+            _host = "localhost"
+        elif ":" in _host and not _host.startswith("["):
+            _host = f"[{_host}]"
+        _port = config.get("port")
+        host_info = f"{_host}:{_port}" if _port else _host
+    # The schemas actually in use (connect may discover populated schemas
+    # when the requested one is empty), not just the one typed in the form.
+    _schemas = [str(s) for s in (session.get("schemas") or []) if str(s or "").strip()]
 
     return {
         "ok": True,
@@ -166,7 +219,8 @@ def get_connection_health(request: Request, user: dict = Depends(get_current_use
         "db_type": db_type,
         "database": db_name,
         "host": host_info,
-        "schema": config.get("db_schema", "") if config and isinstance(config, dict) else "",
+        "schema": ", ".join(_schemas) if _schemas else (
+            config.get("db_schema", "") if config and isinstance(config, dict) else ""),
         "table_count": table_count,
         "column_count": total_columns,
         "declared_relationships": declared_fk,
@@ -182,20 +236,29 @@ def get_connection_health(request: Request, user: dict = Depends(get_current_use
 def refresh_connection(request: Request, user: dict = Depends(require_writable)):
     """Refresh the database connection and re-validate."""
     session = get_session(user["user_id"])
-    require_data(request)
+    # Reuse the already-resolved authenticated user (require_writable);
+    # passing it avoids a second token verification inside require_data.
+    require_data(request, user=user)
     config, dtype, engine_url = _get_db_config(session)
     if not engine_url:
         if session.get("source_type") in ("semi-structured", "document"):
             return {"ok": True, "status": "connected", "message": "File source is active."}
         return {"ok": False, "detail": "No database connection to refresh."}
 
+    engine = None
     try:
-        engine = create_engine(engine_url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
+        engine = _make_engine(engine_url, 10)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         return {"ok": True, "status": "connected", "message": "Connection validated successfully."}
     except Exception as e:
         return {"ok": False, "detail": f"Connection refresh failed: {sanitize_error(e)}"}
+    finally:
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
 
 
 # =============================================================
@@ -206,7 +269,7 @@ def refresh_connection(request: Request, user: dict = Depends(require_writable))
 def get_data_summary(request: Request, user: dict = Depends(get_current_user)):
     """Return a lightweight summary of all tables with REAL row counts from the database."""
     session = get_session(user["user_id"])
-    mapping = _get_schema_mapping(session, user["user_id"])
+    mapping = _get_schema_mapping(session)
     if not mapping:
         return {"ok": True, "tables": [], "total_tables": 0}
 
@@ -215,13 +278,23 @@ def get_data_summary(request: Request, user: dict = Depends(get_current_user)):
     # Get real row counts from the database
     row_counts: dict = {}
     config, db_type, engine_url = _get_db_config(session)
-    if engine_url:
+    count_engine = None
+    count_dialect = db_type or "postgresql"
+    if not engine_url:
+        # SQLite-backed uploads have a live SQLAlchemy engine even though
+        # they do not have a server connection URL from _get_db_config.
         try:
-            engine = create_engine(engine_url, pool_pre_ping=True, connect_args={"connect_timeout": 5})
+            from api.kpi_routes import _build_engine
+            count_engine, count_dialect, _ = _build_engine(session)
+        except Exception:
+            count_engine = None
+    if engine_url or count_engine is not None:
+        try:
+            engine = count_engine or _make_engine(engine_url, 5)
             with engine.connect() as conn:
                 for name in mapping.get("tables", {}):
                     try:
-                        result = conn.execute(text(f"SELECT COUNT(*) FROM {_quote(name, db_type)}"))
+                        result = conn.execute(text(f"SELECT COUNT(*) FROM {_quote(name, count_dialect)}"))
                         row_counts[name] = result.scalar() or 0
                     except Exception:
                         row_counts[name] = 0
@@ -263,6 +336,7 @@ MAX_PREVIEW_SEARCH = 200
 
 
 class PreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     table: str
     limit: int = 50
     offset: int = 0
@@ -324,7 +398,7 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
     """Return paginated rows from a table in the connected database."""
     session = get_session(user["user_id"])
     reject_document_sql(session)
-    mapping = _get_schema_mapping(session, user["user_id"])
+    mapping = _get_schema_mapping(session)
     if not mapping:
         raise HTTPException(status_code=400, detail="No schema extracted. Run schema extraction first.")
 
@@ -359,8 +433,9 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
         else:
             return {"ok": True, "rows": [], "columns": columns, "total": 0}
 
+    engine = None
     try:
-        engine = create_engine(engine_url, pool_pre_ping=True)
+        engine = _make_engine(engine_url)
         q_t = _quote(_tkey, dialect)
         # ILIKE is PostgreSQL-only; use portable LOWER(...) LIKE on others.
         like_op = "ILIKE" if dialect == "postgresql" else "LIKE"
@@ -439,6 +514,12 @@ def preview_table(req: PreviewRequest, request: Request, user: dict = Depends(ge
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preview failed: {sanitize_error(e)}")
+    finally:
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
 
 
 # =============================================================
@@ -450,7 +531,7 @@ def get_column_profile(request: Request, table: str = "", user: dict = Depends(g
     """Return detailed column metadata and profiling for a table."""
     session = get_session(user["user_id"])
     reject_document_sql(session)
-    mapping = _get_schema_mapping(session, user["user_id"])
+    mapping = _get_schema_mapping(session)
     if not mapping:
         raise HTTPException(status_code=400, detail="No schema extracted.")
 
@@ -520,17 +601,32 @@ def get_column_profile(request: Request, table: str = "", user: dict = Depends(g
             "sample_values": col.get("sample_values", []),
         })
 
-    # Run column profiling if connected to a real DB
+    # Run live column profiling for server databases and SQLite uploads.
     config, db_type, engine_url = _get_db_config(session)
-    if engine_url:
+    profile_engine = None
+    profiled_row_count = table_info.get("row_count")
+    profile_dialect = session.get("dialect", db_type or "postgresql")
+    if not engine_url:
         try:
-            engine = create_engine(engine_url, pool_pre_ping=True)
-            dialect = session.get("dialect", "postgresql")
+            from api.kpi_routes import _build_engine
+            profile_engine, profile_dialect, _ = _build_engine(session)
+        except Exception:
+            profile_engine = None
+    if engine_url or profile_engine is not None:
+        try:
+            engine = profile_engine or _make_engine(engine_url, 5)
+            dialect = profile_dialect
             q_t = _quote(table, dialect)
             with engine.connect() as conn:
+                live_rows = int(conn.execute(text(f"SELECT COUNT(*) FROM {q_t}")).scalar() or 0)
+                profiled_row_count = live_rows
                 for cd in column_details:
                     cn = _quote(cd["name"], dialect)
                     try:
+                        nulls = int(conn.execute(text(f"SELECT COUNT(*) FROM {q_t} WHERE {cn} IS NULL")).scalar() or 0)
+                        cd["null_count"] = nulls
+                        cd["null_percentage"] = round(nulls / live_rows * 100, 2) if live_rows else 0
+                        cd["total_rows"] = live_rows
                         # Distinct count
                         r = conn.execute(text(f"SELECT COUNT(DISTINCT {cn}) FROM {q_t}")).scalar()
                         cd["distinct_count"] = r or 0
@@ -544,7 +640,7 @@ def get_column_profile(request: Request, table: str = "", user: dict = Depends(g
                             cd["min"] = str(mn) if mn is not None else None
                             cd["max"] = str(mx) if mx is not None else None
                             cd["avg"] = str(round(float(avg), 2)) if avg is not None else None
-                        elif any(t in dt for t in ["DATE", "TIME", "TIMESTAMP"]):
+                        elif any(t in dt for t in ["DATE", "TIME", "TIMESTAMP"]) or "date" in cd["name"].lower():
                             mn = conn.execute(text(f"SELECT MIN({cn}) FROM {q_t}")).scalar()
                             mx = conn.execute(text(f"SELECT MAX({cn}) FROM {q_t}")).scalar()
                             cd["min"] = str(mn) if mn is not None else None
@@ -553,6 +649,12 @@ def get_column_profile(request: Request, table: str = "", user: dict = Depends(g
                         pass
         except Exception:
             pass
+        finally:
+            if profile_engine is not None:
+                try:
+                    profile_engine.dispose()
+                except Exception:
+                    pass
 
     return {
         "ok": True,
@@ -561,7 +663,7 @@ def get_column_profile(request: Request, table: str = "", user: dict = Depends(g
         "primary_key": user_pk or pk or [],
         "declared_fks": declared_fks,
         "inferred_fks": inferred_fks,
-        "row_count": table_info.get("row_count"),
+        "row_count": profiled_row_count,
     }
 
 
@@ -574,29 +676,102 @@ def get_data_quality(request: Request, user: dict = Depends(get_current_user)):
     """Return data quality analysis for the connected database."""
     session = get_session(user["user_id"])
     reject_document_sql(session)
-    mapping = _get_schema_mapping(session, user["user_id"])
+    # CSV files have no declared primary-key constraints. Do not report the
+    # inferred/absent key as a quality issue or lower the score for it.
+    primary_keys_applicable = str(session.get("file_type") or "").lower() != "csv"
+    mapping = _get_schema_mapping(session)
     if not mapping:
-        return {"ok": True, "quality": {"overall": 0, "issues": [], "metrics": {}}}
+        return {
+            "ok": True,
+            "quality": {
+                "overall": 0,
+                "issues": [],
+                "metrics": {"primary_key_applicable": primary_keys_applicable},
+            },
+        }
 
     tables = mapping.get("tables", {})
     issues = []
     total_tables = len(tables)
 
     if total_tables == 0:
-        return {"ok": True, "quality": {"overall": 100, "issues": [], "metrics": {}}}
+        return {
+            "ok": True,
+            "quality": {
+                "overall": 100,
+                "issues": [],
+                "metrics": {"primary_key_applicable": primary_keys_applicable},
+            },
+        }
+
+    # Prefer a live scan over schema-extraction statistics, which can be
+    # missing or stale after the source changes. The same dashboard engine
+    # builder handles SQLite uploads and relational database connections.
+    live_engine = None
+    dialect = "postgresql"
+    try:
+        from api.kpi_routes import _build_engine
+        live_engine, dialect, _ = _build_engine(session)
+    except Exception:
+        live_engine = None
 
     # Analyze each table
-    total_null_pct = 0
+    total_null_pct_fallback = 0.0
+    total_fallback_columns = 0
+    total_null_cells = 0
+    total_profiled_cells = 0
+    all_tables_profiled = True
     total_tables_with_pk = 0
     total_empty = 0
     total_duplicate_suspect = 0
+
+    try:
+        live_conn = live_engine.connect() if live_engine is not None else None
+    except Exception:
+        live_conn = None
 
     for tname, tinfo in tables.items():
         cols = tinfo.get("columns", [])
         null_stats = tinfo.get("null_stats", {})
         pk = tinfo.get("primary_key", tinfo.get("inferred_primary_key", []))
 
-        if tinfo.get("empty", False):
+        row_count = None
+        if live_conn is not None:
+            try:
+                null_exprs = [
+                    f"SUM(CASE WHEN {_quote(col_info['column'], dialect)} IS NULL "
+                    f"THEN 1 ELSE 0 END) AS q{index}"
+                    for index, col_info in enumerate(cols)
+                ]
+                profile = live_conn.execute(text(
+                    f"SELECT COUNT(*) AS row_count"
+                    f"{', ' + ', '.join(null_exprs) if null_exprs else ''} "
+                    f"FROM {_quote(tname, dialect)}"
+                )).fetchone()
+                row_count = int(profile[0] or 0)
+                null_stats = dict(null_stats)
+                for index, col_info in enumerate(cols):
+                    cname = col_info["column"]
+                    null_count = int(profile[index + 1] or 0)
+                    total_null_cells += null_count
+                    null_stats[cname] = {
+                        "nulls": null_count,
+                        "null_pct": (null_count / row_count * 100) if row_count else 0,
+                    }
+                total_profiled_cells += row_count * len(cols)
+            except Exception:
+                # Fall back to extraction-time stats for this table only.
+                try:
+                    live_conn.rollback()
+                except Exception:
+                    pass
+                null_stats = tinfo.get("null_stats", {})
+                row_count = None
+                all_tables_profiled = False
+        elif live_conn is None:
+            all_tables_profiled = False
+
+        if row_count == 0 or (row_count is None and tinfo.get("empty", False)):
             total_empty += 1
             issues.append({
                 "table": tname,
@@ -617,7 +792,8 @@ def get_data_quality(request: Request, user: dict = Depends(get_current_user)):
             cname = col_info["column"]
             ns = null_stats.get(cname, {})
             null_pct = ns.get("null_pct", 0)
-            total_null_pct += null_pct
+            total_null_pct_fallback += float(null_pct or 0)
+            total_fallback_columns += 1
 
             # Null check
             if null_pct > 50:
@@ -642,9 +818,21 @@ def get_data_quality(request: Request, user: dict = Depends(get_current_user)):
                     "affected_rows": ns.get("nulls", 0),
                     "percentage": null_pct,
                 })
+            elif null_pct > 0:
+                issues.append({
+                    "table": tname,
+                    "column": cname,
+                    "check": "null_check",
+                    "status": "info",
+                    "severity": "low",
+                    "message": f"{tname}.{cname} has {ns.get('nulls', 0)} missing value(s) ({null_pct:.1f}%).",
+                    "affected_rows": ns.get("nulls", 0),
+                    "percentage": null_pct,
+                })
 
-        # Missing PK
-        if not pk:
+        # Missing PK is meaningful for relational tables, but not for CSVs:
+        # CSV imports do not carry database constraint metadata.
+        if primary_keys_applicable and not pk:
             issues.append({
                 "table": tname,
                 "column": None,
@@ -655,22 +843,44 @@ def get_data_quality(request: Request, user: dict = Depends(get_current_user)):
                 "affected_rows": 0,
                 "percentage": 0,
             })
+    if live_conn is not None:
+        live_conn.close()
+    if live_engine is not None:
+        live_engine.dispose()
 
     # Calculate metrics
-    avg_null_pct = total_null_pct / max(1, sum(len(t.get("columns", [])) for t in tables.values()))
+    if total_profiled_cells and all_tables_profiled:
+        avg_null_pct = total_null_cells / total_profiled_cells * 100
+    else:
+        # Extraction-time profiles may not include row counts. In that case,
+        # retain the mean of the available per-column null percentages.
+        avg_null_pct = total_null_pct_fallback / max(1, total_fallback_columns)
     pk_coverage = (total_tables_with_pk / max(1, total_tables)) * 100
     completeness = max(0, 100 - avg_null_pct)
     empty_ratio = (total_empty / max(1, total_tables)) * 100
-    overall = max(0, round((completeness * 0.4 + pk_coverage * 0.3 + max(0, 100 - empty_ratio * 2) * 0.3)))
+    non_empty_score = max(0, 100 - empty_ratio * 2)
+    if primary_keys_applicable:
+        overall = max(0, round((completeness * 0.4 + pk_coverage * 0.3 + non_empty_score * 0.3), 1))
+    else:
+        # Redistribute the key-coverage weight over the checks that apply.
+        overall = max(0, round((completeness * 0.4 + non_empty_score * 0.3) / 0.7, 1))
 
     # Referential integrity check
     declared = mapping.get("declared_relationships", [])
     if declared:
         config, db_type, engine_url = _get_db_config(session)
-        if engine_url:
+        integrity_engine = None
+        integrity_dialect = session.get("dialect", db_type or "postgresql")
+        if not engine_url:
             try:
-                engine = create_engine(engine_url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
-                dialect = session.get("dialect", "postgresql")
+                from api.kpi_routes import _build_engine
+                integrity_engine, integrity_dialect, _ = _build_engine(session)
+            except Exception:
+                integrity_engine = None
+        if engine_url or integrity_engine is not None:
+            try:
+                engine = integrity_engine or _make_engine(engine_url, 10)
+                dialect = integrity_dialect
                 with engine.connect() as conn:
                     for rel in declared[:10]:
                         try:
@@ -703,20 +913,25 @@ def get_data_quality(request: Request, user: dict = Depends(get_current_user)):
                                 })
                         except Exception:
                             pass
+                engine.dispose()
             except Exception:
                 pass
+
+    metrics = {
+        "completeness": round(completeness, 2),
+        "empty_tables": total_empty,
+        "total_tables": total_tables,
+        "avg_null_percentage": round(avg_null_pct, 2),
+        "primary_key_applicable": primary_keys_applicable,
+    }
+    if primary_keys_applicable:
+        metrics["pk_coverage"] = round(pk_coverage, 1)
 
     return {
         "ok": True,
         "quality": {
             "overall": overall,
-            "metrics": {
-                "completeness": round(completeness, 1),
-                "pk_coverage": round(pk_coverage, 1),
-                "empty_tables": total_empty,
-                "total_tables": total_tables,
-                "avg_null_percentage": round(avg_null_pct, 1),
-            },
+            "metrics": metrics,
             "issues": sorted(issues, key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(x.get("severity", "low"), 3)),
             "last_scan": mapping.get("generated_at", ""),
         },
@@ -728,6 +943,7 @@ def get_data_quality(request: Request, user: dict = Depends(get_current_user)):
 # =============================================================
 
 class OverrideRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     action: str  # "set_pk" | "remove_pk" | "set_fk" | "remove_fk" | "confirm_relationship" | "reject_relationship"
     table: str
     column: str = ""
@@ -741,7 +957,7 @@ def apply_override(req: OverrideRequest, request: Request, user: dict = Depends(
     from core.semantic import is_valid_identifier
 
     session = get_session(user["user_id"])
-    mapping = _get_schema_mapping(session, user["user_id"])
+    mapping = _get_schema_mapping(session)
     if not mapping:
         raise HTTPException(status_code=400, detail="No schema extracted.")
 
@@ -794,8 +1010,9 @@ def apply_override(req: OverrideRequest, request: Request, user: dict = Depends(
         # Validate: check uniqueness
         config, db_type, engine_url = _get_db_config(session)
         if engine_url:
+            engine = None
             try:
-                engine = create_engine(engine_url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
+                engine = _make_engine(engine_url, 10)
                 dialect = session.get("dialect", "postgresql")
                 with engine.connect() as conn:
                     q_t = _quote(req.table, dialect)
@@ -809,14 +1026,20 @@ def apply_override(req: OverrideRequest, request: Request, user: dict = Depends(
                         return {"ok": False, "detail": f"Column '{req.column}' contains {nulls} NULL values.", "warning": True}
             except Exception:
                 pass
+            finally:
+                if engine is not None:
+                    try:
+                        engine.dispose()
+                    except Exception:
+                        pass
         overrides["pk"][req.table] = [req.column]
         _save_user_overrides(user["user_id"], db_name, overrides)
         # Also update the mapping
         if req.table in mapping.get("tables", {}):
             mapping["tables"][req.table]["primary_key"] = [req.column]
-            path = session.get("schema_path")
-            if path:
-                path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+            _sp = session.get("schema_path")
+            if _sp:
+                Path(str(_sp)).write_text(json.dumps(mapping, indent=2), encoding="utf-8")
         return {"ok": True, "message": f"Primary key set to {req.table}.{req.column}"}
 
     elif req.action == "remove_pk":
@@ -825,9 +1048,9 @@ def apply_override(req: OverrideRequest, request: Request, user: dict = Depends(
         _save_user_overrides(user["user_id"], db_name, overrides)
         if req.table in mapping.get("tables", {}):
             mapping["tables"][req.table]["primary_key"] = []
-            path = session.get("schema_path")
-            if path:
-                path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+            _sp = session.get("schema_path")
+            if _sp:
+                Path(str(_sp)).write_text(json.dumps(mapping, indent=2), encoding="utf-8")
         return {"ok": True, "message": f"Primary key removed from {req.table}"}
 
     elif req.action == "set_fk":

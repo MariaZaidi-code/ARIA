@@ -335,5 +335,123 @@ class IntegrityGuardsCase(unittest.TestCase):
             "<script>alert(1)</script> hello", 500))
 
 
+class MirrorPairDedupeCase(unittest.TestCase):
+    """A measure pair and its mirror are one relationship — emitted once."""
+
+    def test_mirror_pair_emitted_once(self):
+        rows = [(float(i + 1), float((i * 7) % 13 + 1)) for i in range(30)]
+        engine, _ = _sqlite({"sales_facts": ("promo_spend REAL, gross_revenue REAL", rows)})
+        intel = SchemaIntelligence(_mapping({
+            "sales_facts": {"columns": [_col("promo_spend", "REAL"),
+                                        _col("gross_revenue", "REAL")],
+                            "primary_key": []}}))
+        from api.prescription_routes import _enrich_context
+        try:
+            out = _enrich_context(engine, "sqlite", intel, ["sales_facts"], {})
+        finally:
+            engine.dispose()
+        opps = out["opportunities"]
+        # Both directions are valid candidates; the pair is one relationship.
+        self.assertEqual(len(opps), 1)
+        self.assertEqual({opps[0]["metric"], opps[0]["driver"]},
+                         {"promo_spend", "gross_revenue"})
+
+
+class ConstantMeasureSkipCase(unittest.TestCase):
+    """A measure that holds one value is not an actionable opportunity."""
+
+    def test_constant_measure_excluded_with_plain_reason(self):
+        rows = [(9.99, float(100 + i * 3)) for i in range(30)]
+        engine, _ = _sqlite({"order_facts": ("list_price REAL, gross_revenue REAL", rows)})
+        intel = SchemaIntelligence(_mapping({
+            "order_facts": {"columns": [_col("list_price", "REAL"),
+                                        _col("gross_revenue", "REAL")],
+                            "primary_key": []}}))
+        from api.prescription_routes import _enrich_context
+        try:
+            out = _enrich_context(engine, "sqlite", intel, ["order_facts"], {})
+        finally:
+            engine.dispose()
+        # The constant never becomes a metric or a driver…
+        for o in out["opportunities"]:
+            self.assertNotEqual(o["metric"], "list_price")
+            self.assertNotEqual(o["driver"], "list_price")
+        # …and the reason reads in plain words, not raw SQL jargon.
+        joined = " ".join(out["table_limitations"])
+        self.assertIn("list_price", joined)
+        self.assertIn("single value", joined)
+
+
+class VariationRankingCase(unittest.TestCase):
+    """Tables whose numbers move outrank big tables full of constants."""
+
+    def test_varying_table_ranked_above_big_constant_table(self):
+        # A 400-row table where every number is fixed must not eat the
+        # modeling budget that a small, actually-varying table deserves.
+        big = [(3.0, 7.0)] * 400
+        small = [(float(i + 1), float((i * 5) % 17 + 2)) for i in range(30)]
+        engine, _ = _sqlite({
+            "big_static": ("fixed_fee REAL, flat_amount REAL", big),
+            "small_active": ("promo_spend REAL, gross_revenue REAL", small),
+        })
+        intel = SchemaIntelligence(_mapping({
+            "big_static": {"columns": [_col("fixed_fee", "REAL"),
+                                       _col("flat_amount", "REAL")],
+                           "primary_key": []},
+            "small_active": {"columns": [_col("promo_spend", "REAL"),
+                                         _col("gross_revenue", "REAL")],
+                             "primary_key": []},
+        }))
+        from api.prescription_routes import _enrich_context
+        try:
+            out = _enrich_context(engine, "sqlite", intel,
+                                  ["big_static", "small_active"], {})
+        finally:
+            engine.dispose()
+        self.assertTrue(out["opportunities"])
+        for o in out["opportunities"]:
+            self.assertEqual(o["table"], "small_active")
+
+
+class OutcomeNeverDriverCase(unittest.TestCase):
+    """Business outcomes (revenue/signups/visits) invert causality as drivers
+    and must never become auto-opportunity drivers — only levers can."""
+
+    def test_classify_driver_outcome_vocabulary(self):
+        from prescription_engine.engine import classify_driver
+        for outcome in ("gross_revenue", "signups", "visits", "conversions"):
+            lvl, _ = classify_driver(outcome, "numeric")
+            self.assertEqual(lvl, "not_controllable", outcome)
+        for lever in ("unit_price", "promo_spend", "budget"):
+            lvl, _ = classify_driver(lever, "numeric")
+            self.assertEqual(lvl, "controllable", lever)
+
+    def test_outcomes_never_paired_as_drivers(self):
+        rows = [
+            (float(10 + i % 5), float(50 + i * 2),
+             float(300 + i * 3), float(120 + i))
+            for i in range(40)
+        ]
+        engine, _ = _sqlite({"web_stats": (
+            "ad_spend REAL, signups REAL, gross_revenue REAL, visits REAL",
+            rows)})
+        intel = SchemaIntelligence(_mapping({
+            "web_stats": {"columns": [_col("ad_spend", "REAL"),
+                                      _col("signups", "REAL"),
+                                      _col("gross_revenue", "REAL"),
+                                      _col("visits", "REAL")],
+                          "primary_key": []}}))
+        from api.prescription_routes import _enrich_context
+        try:
+            out = _enrich_context(engine, "sqlite", intel, ["web_stats"], {})
+        finally:
+            engine.dispose()
+        self.assertTrue(out["opportunities"])
+        for o in out["opportunities"]:
+            self.assertNotIn(o["driver"], ("signups", "gross_revenue", "visits"))
+            # and the money input stays available as the lever
+            self.assertEqual(o["driver"], "ad_spend")
+
+
 if __name__ == "__main__":
     unittest.main()
