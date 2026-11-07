@@ -201,6 +201,8 @@ jobs:
           token = auth.create_email_verification_token(email)
           if not token or auth.verify_email_token(token) != email:
               raise RuntimeError("E2E verification setup failed")
+          print(f"::add-mask::{password}")
+          print(f"::add-mask::{email}")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
               env_file.write(f"ARIA_E2E_EMAIL={email}\n")
               env_file.write(f"ARIA_E2E_PASSWORD={password}\n")

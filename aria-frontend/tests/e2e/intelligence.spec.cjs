@@ -186,10 +186,14 @@ test.describe('Intelligence module', () => {
     // button) — target the form button by its exact accessible name.
     const gen = page.getByRole('button', { name: 'Generate PDF', exact: true });
     await expect(gen).toBeVisible();
+    // The new flow returns a real PDF download, not a print popup.
+    const downloadPromise = page.waitForEvent('download', { timeout: 30000 });
     await gen.click();
-    await expect(
-      page.getByText(/report generated|opening print|isn't available|couldn't reach the server|couldn't complete|couldn't generate/i).first()
-    ).toBeVisible({ timeout: 30000 });
+    const pdf = await downloadPromise;
+    expect(pdf.suggestedFilename()).toMatch(/\.pdf$/i);
+    await expect(page.getByRole('status').filter({
+      hasText: /PDF report downloaded and saved to report history\./i,
+    })).toBeVisible({ timeout: 30000 });
     await expect(page.getByText(BARE_FETCH)).toHaveCount(0);
   });
 

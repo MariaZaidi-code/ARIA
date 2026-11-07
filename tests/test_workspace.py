@@ -285,7 +285,7 @@ class TestWorkspaceRoutes(unittest.TestCase):
                                 json={"url": "not-a-url"}).status_code, (400, 422))
         r = c.post("/api/workspace/webhooks",
                    json={"name": "Slack", "url": "http://127.0.0.1:9/hook"})
-        self.assertEqual(r.status_code, 422, r.text[:200])
+        self.assertEqual(r.status_code, 400, r.text[:200])
         # Old stored hooks are revalidated at delivery time too.
         from services import workspace_service as ws
         legacy = {"id": "legacy-private", "url": "http://127.0.0.1:9/hook",

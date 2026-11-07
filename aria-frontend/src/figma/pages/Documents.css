@@ -2071,7 +2071,22 @@
   }
 
   .documents-header {
+    /* On phone widths, the heading and upload button must not compete
+       for one row (previously overflowed a 390px screen by 137px). */
+    flex-direction: column;
     align-items: flex-start;
+    gap: 12px;
+    min-width: 0;
+  }
+
+  .documents-header > div:first-child {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .documents-header p {
+    max-width: 100%;
+    overflow-wrap: anywhere;
   }
 
   .documents-header h1 {
@@ -2085,7 +2100,7 @@
 
   .documents-upload {
     min-height: 39px;
-    align-self: center;
+    align-self: flex-start;
     padding: 0 11px;
   }
 
