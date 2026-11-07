@@ -1,136 +1,49 @@
-// QA: real connected-source flow. Signs in with Local AI, connects a real
-// small CSV through the API, then checks pages and handles unavailable inference.
-const { test, expect } = require("@playwright/test");
-const { seedAuth } = require("./auth-helper");
+// Real cookie-authenticated CSV upload and navigation with no hosted API key.
+// Inference is tested separately by credential-gated LLM suites.
+const { test, expect } = require('@playwright/test');
+const { seedAuth } = require('./auth-helper');
+const BASE = process.env.ARIA_BASE || 'http://localhost:8000';
+const CSV = [
+  'order_id,product_category,sales,quantity',
+  '1,Home,120,2',
+  '2,Electronics,280,1',
+  '3,Home,75,1',
+  '4,Grocery,42,5',
+  '5,Electronics,160,1',
+  '6,Home,95,3',
+].join('\n') + '\n';
 
-const BASE = process.env.ARIA_BASE || "http://localhost:8000";
-const CSV_FIXTURE = ["order_id,product_category,sales,quantity", "1,Home,120,2", "2,Electronics,280,1", "3,Home,75,1", "4,Grocery,42,5"].join("\n") + "\n";
-
-const BENIGN = [/favicon/i, /React DevTools/i];
-
-function attach(page, sink) {
-  page.on("console", (m) => {
-    if (m.type() !== "error") return;
-    const t = m.text();
-    if (BENIGN.some((re) => re.test(t))) return;
-    sink.consoleErrors.push(t);
+test('Real CSV ingestion survives navigation across ARIA analytics pages', async ({ page }) => {
+  const { username } = await seedAuth(page, BASE);
+  const upload = await page.request.post(BASE + '/api/connect_file', {
+    multipart: {
+      provider: 'local',
+      file: { name: 'e2e_retail.csv', mimeType: 'text/csv', buffer: Buffer.from(CSV, 'utf8') },
+    },
+    timeout: 120000,
   });
-  page.on("pageerror", (e) => sink.pageErrors.push(e.message));
-  page.on("response", (r) => {
-    if (r.status() >= 400 && !BENIGN.some((re) => re.test(r.url())))
-      sink.failedResponses.push(`${r.status()} ${r.request().method()} ${r.url()}`);
-  });
-}
+  expect(upload.ok(), 'CSV upload must succeed: ' + (await upload.text()).slice(0, 250)).toBeTruthy();
+  const data = await upload.json();
+  expect(data.ok).toBe(true);
+  expect(Number(data.rows)).toBeGreaterThan(0);
+  const status = await page.request.get(BASE + '/api/session/status');
+  expect(status.ok(), 'Session must remain authenticated after CSV connect').toBeTruthy();
+  const session = await status.json();
+  expect(session.connection_status).toBe('connected');
 
-test.describe("ARIA QA - connected flow", () => {
-  test("connect CSV then every AI page works", async ({ page }) => {
-    test.setTimeout(300000);
-    const sink = { consoleErrors: [], pageErrors: [], failedResponses: [] };
-    attach(page, sink);
-
-    await seedAuth(page, BASE);
-
-    // ---- Connect a real CSV through the API ----
-    // APIRequestContext shares the authenticated browser session cookie.
-    const res = await page.request.post(`${BASE}/api/connect_file`, {
-      multipart: {
-        provider: "local",
-        file: { name: "aria_e2e_retail.csv", mimeType: "text/csv", buffer: Buffer.from(CSV_FIXTURE, "utf8") },
-      },
-      timeout: 120000,
-    });
-    const conn = await res.json();
-    expect(res.ok(), `connect_file failed: ${JSON.stringify(conn)}`).toBeTruthy();
-    expect(conn.ok).toBeTruthy();
-    console.log("CONNECTED_TABLE=" + conn.table + " ROWS=" + conn.rows);
-
-    // ---- Analytics: run a real question ----
-    sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /ai analytics/i }).first().click();
-    await page.waitForTimeout(500);
-    const box = page.getByLabel("Ask ARIA a business question");
-    await box.fill("What is the total sales by product category?");
-    await page.getByRole("button", { name: /^analyze$/i }).click();
-    // Wait for a terminal state: Answer block, error block, or clarification.
-    await page.waitForTimeout(30000);
-    const analyticsHtml = await page.locator("#root").innerHTML();
-    console.log("ANALYTICS_HAS_ANSWER=" + /Answer/i.test(analyticsHtml));
-    expect(analyticsHtml.length).toBeGreaterThan(500);
-    const analyticsProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
-    if (analyticsProblems.ce.length || analyticsProblems.pe.length || analyticsProblems.fr.length)
-      console.log("ANALYTICS_PROBLEMS=" + JSON.stringify(analyticsProblems));
-
-    // ---- Copilot: real question ----
-    sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /^copilot$/i }).first().click();
-    await page.waitForTimeout(400);
-    const chat = page.locator('input[placeholder*="Ask ARIA"]').first();
-    await chat.fill("How many records are in the data?");
-    await chat.press("Enter");
-    await page.waitForTimeout(30000);
-    const copilotHtml = await page.locator("#root").innerHTML();
-    console.log("COPILOT_HAS_MESSAGE=" + /records|total|couldn|error/i.test(copilotHtml));
-    const copilotProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
-    if (copilotProblems.ce.length || copilotProblems.pe.length || copilotProblems.fr.length)
-      console.log("COPILOT_PROBLEMS=" + JSON.stringify(copilotProblems));
-
-    // ---- Insights (auto-fetch now that a source is connected) ----
-    sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /^insights$/i }).first().click();
-    await page.waitForTimeout(15000);
-    const insightsProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
-    if (insightsProblems.ce.length || insightsProblems.pe.length || insightsProblems.fr.length)
-      console.log("INSIGHTS_PROBLEMS=" + JSON.stringify(insightsProblems));
-
-    // ---- Forecast (Predictive) ----
-    sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /forecast/i }).first().click();
-    await page.waitForTimeout(40000);
-    const predictiveProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
-    if (predictiveProblems.ce.length || predictiveProblems.pe.length || predictiveProblems.fr.length)
-      console.log("PREDICTIVE_PROBLEMS=" + JSON.stringify(predictiveProblems));
-
-    // ---- Decision Center: recommendations integration (prescription contract) ----
-    sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /^intelligence$/i }).first().click();
-    await page.waitForTimeout(40000);
-    const dcHtml = await page.locator("#root").innerHTML();
-    console.log("DECISION_HAS_CONTENT=" + /ARIA Intelligence|Explore|Hypotheses|Reports|Analyzing|Insufficient evidence|recommendation/i.test(dcHtml));
-    const decisionProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
-    if (decisionProblems.ce.length || decisionProblems.pe.length || decisionProblems.fr.length)
-      console.log("DECISION_PROBLEMS=" + JSON.stringify(decisionProblems));
-
-    // ---- Hypothesis (embedded): Insights -> select -> "Investigate why" ->
-    // contextual hypothesis in AI Analytics (Possible drivers) ----
-    sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /^insights$/i }).first().click();
-    await page.waitForTimeout(15000);
-    const whyBtn = page.getByRole("button", { name: /investigate why/i }).first();
-    if (await whyBtn.count()) {
-      await whyBtn.click();
-      await page.waitForTimeout(3000);
-      const analyticsHtml = await page.locator("#root").innerHTML();
-      console.log("HYPOTHESIS_CONTEXT=" + /Possible drivers|Investigate why|AI Analytics/i.test(analyticsHtml));
-      // Close/return: navigate back to Insights to verify context survived.
-      await page.getByRole("button", { name: /^insights$/i }).first().click();
-      await page.waitForTimeout(2000);
-      const backHtml = await page.locator("#root").innerHTML();
-      console.log("HYPOTHESIS_BACK=" + /Insights|Investigate why|Evidence/i.test(backHtml));
-    } else {
-      console.log("HYPOTHESIS_CONTEXT=no-insight-available (empty state, valid)");
-    }
-    const hypothesisProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
-    if (hypothesisProblems.ce.length || hypothesisProblems.pe.length || hypothesisProblems.fr.length)
-      console.log("HYPOTHESIS_PROBLEMS=" + JSON.stringify(hypothesisProblems));
-
-    // ---- History: should now list the analysis ----
-    sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
-    await page.getByRole("button", { name: /^history$/i }).first().click();
-    await page.waitForTimeout(3000);
-    const historyProblems = { ce: [...sink.consoleErrors], pe: [...sink.pageErrors], fr: [...sink.failedResponses] };
-    if (historyProblems.ce.length || historyProblems.pe.length || historyProblems.fr.length)
-      console.log("HISTORY_PROBLEMS=" + JSON.stringify(historyProblems));
-
-    expect(sink.pageErrors, `uncaught errors: ${sink.pageErrors.join(" | ")}`).toEqual([]);
-  });
+  for (const { label, id } of [
+    { label: 'Data', id: 'data' },
+    { label: 'AI Analytics', id: 'analytics' },
+    { label: 'Insights', id: 'insights' },
+    { label: 'Forecast', id: 'predictive' },
+    { label: 'Intelligence', id: 'intelligence' },
+    { label: 'Copilot', id: 'copilot' },
+    { label: 'History', id: 'history' },
+  ]) {
+    await page.locator('nav').getByRole('button', { name: label, exact: true }).click();
+    await expect(page).toHaveURL(new RegExp('#/' + id + '$'));
+    await expect(page.locator('header h1')).toContainText(label);
+    await expect(page.locator('main')).not.toBeEmpty({ timeout: 15000 });
+  }
+  expect(username).toMatch(/_at_aria\.test$/);
 });
