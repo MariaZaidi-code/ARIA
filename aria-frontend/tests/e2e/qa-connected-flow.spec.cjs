@@ -93,7 +93,7 @@ test.describe("ARIA QA - connected flow", () => {
     sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
     await page.getByRole("button", { name: /^copilot$/i }).first().click();
     await page.waitForTimeout(400);
-    const chat = page.locator('input[placeholder*="Ask ARIA"]').first();
+    const chat = page.locator('[placeholder*="Ask ARIA"]').first();
     await chat.fill("How many records are in the data?");
     await chat.press("Enter");
     await expect

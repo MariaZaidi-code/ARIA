@@ -2509,6 +2509,13 @@ def generate_hypotheses(session: dict, request: dict) -> dict:
     """Generate hypothesis candidates — supports search/sort/page (server-side)."""
     request = request or {}
     items = _hypothesis_items(session)
+    # These are suggested investigations, not tested claims. Never present
+    # schema-derived templates as already-verified evidence.
+    for item in items:
+        item["evidence_grade"] = "Insufficient evidence"
+        item["evidence_reason"] = (
+            "Suggested hypothesis — open the detail to check measured evidence."
+        )
     if not items and not _load_schema_mapping(session):
         return {"ok": False, "detail": "No data connected.", "code": "NO_DATA",
                 "candidates": [], "items": [], "data": [],
@@ -2655,8 +2662,8 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                                 "kind": "Dimension",
                                 "association": f"{'Higher' if v >= total / len(pairs) else 'Lower'} total ({sh:.0f}% share)",
                                 "relationship": "Segment difference",
-                                "evidence_strength": "Strong" if sh >= 25 else "Moderate",
-                                "strength": "Strong" if sh >= 25 else "Moderate",
+                                "evidence_strength": "Limited evidence",
+                                "strength": "Limited evidence",
                                 "explore": {"metric": m, "breakdown": d},
                                 "whatif": {"variable": m},
                             })
@@ -2740,14 +2747,18 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                         half = max(1, len(pts) // 2)
                         before = sum(v for _, v in pts[:half]) or 0
                         after = sum(v for _, v in pts[half:]) or 0
-                        pct = ((after - before) / before * 100) if before else 0
-                        direction = "declined" if pct < 0 else "increased" if pct > 0 else "held steady"
+                        pct = ((after - before) / abs(before) * 100) if before else None
+                        direction = ("declined" if pct < 0 else "increased" if pct > 0
+                                     else "held steady") if pct is not None else "cannot be compared"
                         ml = found.get("metric_label") or display_name(str(m), str(m))
                         series = [{"label": p, "value": v} for p, v in pts]
+                        headline = (f"{ml} {direction} by {abs(pct):.1f}%"
+                                    if pct is not None else
+                                    f"{ml} change cannot be expressed as a percentage (zero baseline)")
                         found["observed_pattern"] = {
-                            "headline": f"{ml} {direction} by {abs(pct):.1f}%",
+                            "headline": headline,
                             "detail": f"{_human_total(before)} → {_human_total(after)} across the window.",
-                            "change_pct": round(pct, 1),
+                            "change_pct": round(pct, 1) if pct is not None else None,
                             "direction": direction,
                             "before": before,
                             "after": after,
@@ -2757,11 +2768,22 @@ def get_hypothesis_detail(session: dict, hypothesis_id: str) -> dict | None:
                             "points": series,
                         }
                         found["key_takeaways"] = [
-                            f"{ml} {direction} by about {abs(pct):.0f} percent ({_human_total(before)} → {_human_total(after)}).",
+                            (f"{ml} {direction} by about {abs(pct):.0f} percent"
+                             if pct is not None else
+                             f"{ml} has no comparable percentage change because the earlier total is zero")
+                            + f" ({_human_total(before)} → {_human_total(after)}).",
                             *found.get("key_takeaways", [])[:2],
                         ]
     except Exception:
         pass
+    from hypothesis_engine.evidence_ladder import assess_observed_pattern
+    assessment = assess_observed_pattern(
+        str(found.get("type") or ""), found.get("observed_pattern"))
+    found.update(assessment)
+    # The detail card's previous strength was a schema-only placeholder;
+    # replace it with the grade derived from live observations.
+    found["evidence_strength"] = assessment["evidence_grade"]
+    found["strength"] = assessment["evidence_grade"]
     return found
 
 

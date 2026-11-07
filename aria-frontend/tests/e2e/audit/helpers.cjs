@@ -114,15 +114,20 @@ async function registerAndLogin(page) {
 /** Connect a dataset through the real API using the page's own session. */
 async function connectDataset(page, key, creds) {
   const ds = SETS[key];
+  // The server rejects cookie-authenticated writes without a same-site
+  // Origin (cross-site request protection), exactly as a browser sends it.
+  const headers = { Origin: BASE };
   let res;
   if (ds.kind === "csv") {
     const file = path.join(DATASETS, ds.file);
     res = await page.request.post(BASE + "/api/connect_file", {
+      headers,
       multipart: { file: { name: ds.file, mimeType: "text/csv", buffer: fs.readFileSync(file) } },
       timeout: 180000,
     });
   } else {
     res = await page.request.post(BASE + "/api/connect", {
+      headers,
       data: { source_type: "relational", db_type: "postgresql", host: "localhost",
               port: ds.port, db: ds.db, user: "postgres", password: "audit-trust-auth",
               db_schema: "public" },
