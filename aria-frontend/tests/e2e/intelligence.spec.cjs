@@ -119,7 +119,7 @@ test.describe('Intelligence module', () => {
     await openTab('Hypotheses');
     const questionBox = page.getByRole('textbox', { name: 'Question to investigate' });
     await expect(
-      questionBox.or(page.getByText(/no hypotheses found yet|couldn't load/i).first())
+      questionBox.or(page.getByText(/no hypotheses found yet|couldn't load/i).first()).first()
     ).toBeVisible({ timeout: 30000 });
     await expect(page.getByText(BARE_FETCH)).toHaveCount(0);
     const viewBtn = page.getByRole('button', { name: /^view$/i }).first();
@@ -162,7 +162,7 @@ test.describe('Intelligence module', () => {
     await openIntelligence();
     await openTab('What-If');
     await expect(
-      page.getByLabel('Scenario variable').or(page.getByText(/no scenario variables available|couldn't load/i).first())
+      page.getByLabel('Scenario variable').or(page.getByText(/no scenario variables available|couldn't load/i).first()).first()
     ).toBeVisible({ timeout: 30000 });
     await expect(page.getByText(BARE_FETCH)).toHaveCount(0);
     if (await page.getByLabel('Scenario variable').count()) {
@@ -186,10 +186,14 @@ test.describe('Intelligence module', () => {
     // button) — target the form button by its exact accessible name.
     const gen = page.getByRole('button', { name: 'Generate PDF', exact: true });
     await expect(gen).toBeVisible();
+    // The new flow returns a real PDF download, not a print popup.
+    const downloadPromise = page.waitForEvent('download', { timeout: 30000 });
     await gen.click();
-    await expect(
-      page.getByText(/report generated|opening print|isn't available|couldn't reach the server|couldn't complete|couldn't generate/i).first()
-    ).toBeVisible({ timeout: 30000 });
+    const pdf = await downloadPromise;
+    expect(pdf.suggestedFilename()).toMatch(/\.pdf$/i);
+    await expect(page.getByRole('status').filter({
+      hasText: /PDF report downloaded and saved to report history\./i,
+    })).toBeVisible({ timeout: 30000 });
     await expect(page.getByText(BARE_FETCH)).toHaveCount(0);
   });
 

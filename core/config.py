@@ -81,23 +81,6 @@ def default_provider_name() -> str:
     except Exception:
         pass
     return "local"
-    """Encrypt per-provider API keys for at-rest storage.
-
-    Plaintext values get the current DPAPI envelope; already-encrypted
-    values pass through unchanged. Non-string values are left as-is.
-    """
-    if not isinstance(api_keys, dict):
-        return api_keys
-    out = {}
-    for k, v in api_keys.items():
-        if isinstance(v, str) and v and not is_encrypted(v):
-            try:
-                out[k] = encrypt(v)
-            except Exception:
-                out[k] = v
-        else:
-            out[k] = v
-    return out
 
 
 def _encrypt_api_keys(api_keys):

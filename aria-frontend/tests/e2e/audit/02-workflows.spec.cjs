@@ -111,7 +111,7 @@ test("documents: upload a PDF, find it, search it and ask about it", async ({ pa
     expect(await textProblems(page, [])).toEqual([]);
   });
   await test.step("search finds the refund policy", async () => {
-    const box = page.getByPlaceholder(/search across all documents/i);
+    const box = page.getByRole("textbox", { name: "Search documents" });
     await box.fill("refund");
     await box.press("Enter");
     await expect(page.getByText(/45 days/i).first()).toBeVisible({ timeout: 60000 });

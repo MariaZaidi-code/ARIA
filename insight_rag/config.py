@@ -17,6 +17,11 @@ RAG_DATABASE_URL = (
     or ""
 ).strip()
 
+# Where document metadata lives: "postgres" (table in the RAG database, next to
+# the pgvector index), "file" (per-user manifest.json), or "auto" (postgres
+# whenever ARIA_RAG_DATABASE_URL is set). Chunk JSON and PDF bytes stay on disk.
+RAG_METADATA_BACKEND = os.getenv("ARIA_RAG_METADATA_BACKEND", "auto").strip().lower() or "auto"
+
 EMBEDDING_MODEL = os.getenv("ARIA_RAG_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 
 # During the Groq -> DeepSeek migration an existing local .env may still contain
@@ -166,6 +171,10 @@ def validate_rag_config() -> None:
         errors.append("ARIA_RAG_BM25_PAGE_SIZE must be >= 100")
     if RAG_LEXICAL_CORPUS_MAX_CHUNKS < 100:
         errors.append("ARIA_RAG_LEXICAL_CORPUS_MAX_CHUNKS must be >= 100")
+    if RAG_METADATA_BACKEND not in {"auto", "file", "postgres"}:
+        errors.append("ARIA_RAG_METADATA_BACKEND must be auto, file or postgres")
+    elif RAG_METADATA_BACKEND == "postgres" and not RAG_DATABASE_URL:
+        errors.append("ARIA_RAG_METADATA_BACKEND=postgres requires ARIA_RAG_DATABASE_URL")
     if errors:
         raise RuntimeError("Invalid ARIA RAG configuration: " + "; ".join(errors))
 

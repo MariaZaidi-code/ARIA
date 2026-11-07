@@ -7,6 +7,7 @@ Router prefix: /api/intelligence
 """
 
 import logging
+import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -471,11 +472,22 @@ def save_report_template(req: TemplateRequest, request: Request, user: dict = De
 
 @router.post("/reports/schedule")
 def schedule_report(req: ReportRequest, request: Request, user: dict = Depends(require_writable)):
+    """Create a real daily/weekly digest, not a one-time report."""
     session = get_session(user["user_id"])
-    did = _dataset_id(session)
-    payload = req.model_dump(); payload["scheduled"] = True
-    item = intel.generate_report(user["user_id"], did, payload)
-    return {"ok": True, "item": item, "data": item, "message": "Report scheduled."}
+    data = req.model_dump()
+    freq = str(data.get("frequency") or "daily").strip().lower()
+    if freq not in ("daily", "weekly"):
+        raise HTTPException(status_code=422, detail="Frequency must be daily or weekly.")
+    digest = _digests().create_digest(user["user_id"], {
+        "name": data.get("name") or "ARIA Report",
+        "description": data.get("description") or "",
+        "sections": data.get("sections") or [],
+        "template": data.get("template") or "professional",
+        "frequency": freq,
+        "dataset_id": _dataset_id(session),
+        "enabled": True,
+    })
+    return {"ok": True, "item": digest, "data": digest, "message": "Digest schedule created."}
 
 
 @router.post("/reports/share")
@@ -534,9 +546,19 @@ def delete_scenario(scenario_id: str, request: Request, user: dict = Depends(req
     return {"ok": True}
 
 
+def _validate_report_id(report_id: str) -> None:
+    """Reject malformed report identifiers before using saved history."""
+    if not re.fullmatch(r"[0-9a-fA-F]{12}", report_id):
+        raise HTTPException(status_code=404, detail="Report not found.")
+
+
 @router.delete("/reports/{report_id}")
 def delete_report(report_id: str, request: Request, user: dict = Depends(require_writable)):
     """Delete a generated report."""
+    _validate_report_id(report_id)
+    session = get_session(user["user_id"])
+    if not intel.get_report(user["user_id"], _dataset_id(session), report_id):
+        raise HTTPException(status_code=404, detail="Report not found.")
     if not intel.delete_report(user["user_id"], report_id):
         raise HTTPException(status_code=404, detail="Report not found.")
     return {"ok": True}
@@ -545,6 +567,7 @@ def delete_report(report_id: str, request: Request, user: dict = Depends(require
 @router.get("/reports/{report_id}")
 def get_report(report_id: str, request: Request, user: dict = Depends(get_current_user)):
     """Single report for preview."""
+    _validate_report_id(report_id)
     session = get_session(user["user_id"])
     did = _dataset_id(session)
     item = intel.get_report(user["user_id"], did, report_id)
@@ -561,6 +584,7 @@ def get_report(report_id: str, request: Request, user: dict = Depends(get_curren
 @router.get("/reports/{report_id}/html")
 def get_report_html(report_id: str, request: Request, user: dict = Depends(get_current_user)):
     """Render a stored report as styled, printable HTML (Reporting Agent)."""
+    _validate_report_id(report_id)
     from fastapi.responses import HTMLResponse
 
     from reporting.agent import build_report, intel_report_to_payload
@@ -572,12 +596,37 @@ def get_report_html(report_id: str, request: Request, user: dict = Depends(get_c
         raise HTTPException(status_code=404, detail="Report not found.")
     payload = intel_report_to_payload(item)
     built = build_report("intelligence", payload)
-    return HTMLResponse(content=built["html"], media_type="text/html")
+    return HTMLResponse(
+        content=built["html"], media_type="text/html",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                 "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'"},
+    )
+
+
+@router.get("/reports/{report_id}/pdf")
+def get_report_pdf(report_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Download a real PDF of the authenticated user's stored report."""
+    from fastapi.responses import Response
+    from reporting.agent import intel_report_to_payload
+    from reporting.pdf_export import render_intelligence_report_pdf
+
+    _validate_report_id(report_id)
+    session = get_session(user["user_id"])
+    item = intel.get_report(user["user_id"], _dataset_id(session), report_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Report not found.")
+    pdf_bytes = render_intelligence_report_pdf(intel_report_to_payload(item))
+    return Response(
+        content=pdf_bytes, media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="aria-intelligence-report.pdf"',
+                 "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @router.post("/reports/{report_id}/rerun")
 def rerun_report(report_id: str, request: Request, user: dict = Depends(require_writable)):
     """Re-run a stored report definition with fresh numbers (new history entry)."""
+    _validate_report_id(report_id)
     session = get_session(user["user_id"])
     did = _dataset_id(session)
     stored = intel.get_report(user["user_id"], did, report_id)

@@ -99,7 +99,24 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      # The action's PR range calculation fails on a root commit (ROOT^).
+      # Scan the actual PR commit range directly instead; keep the push scanner.
+      - uses: actions/setup-go@v5
+        if: github.event_name == 'pull_request'
+        with:
+          go-version: "1.24"
+      - name: Scan pull request commits for secrets
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          go install github.com/zricethezav/gitleaks/v8@v8.24.3
+          git cat-file -e "${BASE_SHA}^{commit}"
+          "$(go env GOPATH)/bin/gitleaks" git --redact -v --exit-code 1 --log-opts="${BASE_SHA}..HEAD"
+      - uses: gitleaks/gitleaks-action@v3
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   frontend:
     runs-on: ubuntu-latest
@@ -156,6 +173,11 @@ jobs:
         working-directory: aria-frontend
         run: npm run typecheck && npm run build
       - name: Start backend on :8000 and probe health
+        # The E2E suite deliberately exercises many pages rapidly from one CI IP.
+        # Disable dev-only throttling for this isolated functional-flow server;
+        # separate unit tests still enforce real production rate-limit behaviour.
+        env:
+          ARIA_RATE_LIMIT: "off"
         run: |
           python app.py > /tmp/aria_e2e.log 2>&1 &
           echo $! > /tmp/aria_e2e.pid
@@ -164,6 +186,28 @@ jobs:
             sleep 5
           done
           curl -sf http://127.0.0.1:8000/api/health | head -c 300
+      - name: Create a verified temporary test user (isolated CI database)
+        # Use the app's normal account registration and token verification;
+        # no static credentials, authentication bypasses or production accounts.
+        run: |
+          python - <<'PY'
+          import os
+          import secrets
+          import auth
+
+          email = f"aria-ci-{secrets.token_hex(8)}@example.test"
+          password = secrets.token_urlsafe(26) + "Aa9!"
+          auth.register_email(email, password)
+          token = auth.create_email_verification_token(email)
+          if not token or auth.verify_email_token(token) != email:
+              raise RuntimeError("E2E verification setup failed")
+          print(f"::add-mask::{password}")
+          print(f"::add-mask::{email}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"ARIA_E2E_EMAIL={email}\n")
+              env_file.write(f"ARIA_E2E_PASSWORD={password}\n")
+          print("Created a verified temporary non-admin test user.")
+          PY
       - name: List Playwright specs (must discover the converted suite)
         working-directory: aria-frontend
         env:
