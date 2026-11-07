@@ -55,7 +55,14 @@ def _provider(session):
     name = session.get("provider_name")
     if not name:
         raise CsvAnalysisError("Select an AI provider before analyzing the CSV.")
-    return create_provider(provider=name, api_key=resolve_provider_key(name, session.get("api_keys")), models=session.get("provider_models", {}).get(name))
+    models = session.get("provider_models", {}).get(name)
+    # Drop stale cloud model overrides from before the provider default changed.
+    if name == "cloud" and isinstance(models, dict) and any(
+        isinstance(v, str) and "qwen/qwen3.8-27b" in v for v in models.values()
+    ):
+        models = None
+        session.get("provider_models", {}).pop(name, None)
+    return create_provider(provider=name, api_key=resolve_provider_key(name, session.get("api_keys")), models=models)
 
 
 class _Run:
@@ -90,7 +97,7 @@ class _Run:
             self.trace["provider_invocation_count"] += 1
             raw = ""
             try:
-                raw = self.llm.chat(role, messages, temperature=0.0, num_predict=4000,
+                raw = self.llm.chat(role, messages, temperature=0.0, num_predict=1500,
                                     timeout=min(40, remaining), user_id=self.user_id)
                 raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
                 obj = json.loads(raw, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Non-finite JSON")))
@@ -423,8 +430,14 @@ def dashboard(session, user_id):
     plan = _plan(run, session, context, "Build a useful overview of this CSV using its actual schema.", dashboard=True)
     if plan["status"] != "ready":
         raise CsvAnalysisError(plan["clarification"], run.trace)
-    plan = investigate(run, plan, lambda previous: _plan(run, session, context, "Build a useful overview of this CSV using its actual schema.", dashboard=True, previous=previous))
-    plan = _review_and_repair(run, session, context, "Build a useful overview of this CSV using its actual schema.", plan, dashboard=True)
+    try:
+        plan = investigate(run, plan, lambda previous: _plan(run, session, context, "Build a useful overview of this CSV using its actual schema.", dashboard=True, previous=previous))
+    except CsvAnalysisError:
+        log.warning("csv_dashboard investigation skipped (provider/rate limit) request=%s", run.trace.get("request_id"))
+    try:
+        plan = _review_and_repair(run, session, context, "Build a useful overview of this CSV using its actual schema.", plan, dashboard=True)
+    except CsvAnalysisError:
+        log.warning("csv_dashboard semantic review skipped (provider/rate limit) request=%s", run.trace.get("request_id"))
     session["csv_dataset_understanding"] = plan.get("understanding", {})
     narrative = _narrate_or_preserve(run, plan, "Summarize the dataset", context)
     metrics, charts, discoveries = [], [], []

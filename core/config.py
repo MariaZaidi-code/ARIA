@@ -71,6 +71,35 @@ def resolve_provider_key(provider_name, api_keys=None):
     return None
 
 
+def default_provider_name() -> str:
+    """Prefer cloud (Groq) when a key is available, otherwise local."""
+    try:
+        if resolve_provider_key("cloud", {}):
+            return "cloud"
+        if resolve_provider_key("deepseek", {}):
+            return "deepseek"
+    except Exception:
+        pass
+    return "local"
+    """Encrypt per-provider API keys for at-rest storage.
+
+    Plaintext values get the current DPAPI envelope; already-encrypted
+    values pass through unchanged. Non-string values are left as-is.
+    """
+    if not isinstance(api_keys, dict):
+        return api_keys
+    out = {}
+    for k, v in api_keys.items():
+        if isinstance(v, str) and v and not is_encrypted(v):
+            try:
+                out[k] = encrypt(v)
+            except Exception:
+                out[k] = v
+        else:
+            out[k] = v
+    return out
+
+
 def _encrypt_api_keys(api_keys):
     """Encrypt per-provider API keys for at-rest storage.
 
@@ -920,11 +949,20 @@ def _ensure_provider(session):
     name = session.get("provider_name")
     if not name:
         return
+    # Prefer cloud when a Groq key is available and local has no usable model.
+    if name == "local" and default_provider_name() != "local":
+        name = default_provider_name()
+        session["provider_name"] = name
     try:
         from llm_provider import create_provider
 
         api_key = resolve_provider_key(name, session.get("api_keys", {}))
         models = (session.get("provider_models") or {}).get(name)
+        if name == "cloud" and isinstance(models, dict) and any(
+            isinstance(v, str) and "qwen/qwen3.8-27b" in v for v in models.values()
+        ):
+            models = None
+            (session.get("provider_models") or {}).pop(name, None)
         session["provider"] = create_provider(
             provider=name, api_key=api_key, models=models,
         )

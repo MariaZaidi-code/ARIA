@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart3,
   Check,
@@ -12,29 +12,46 @@ import {
   FileText,
   MoreHorizontal,
   Plus,
+  RefreshCw,
   Search,
   Send,
   Sparkles,
   Tag,
   Trash2,
-  Upload,
   X,
 } from "lucide-react";
 import {
   askDocuments,
   deleteDocument,
+  deleteDocumentConversation,
+  documentSourcesView,
   getDocument,
+  getDocumentConversation,
   getDocumentDashboard,
   getDocumentOverview,
+  listDocumentConversations,
   listDocuments,
   retryDocument,
   searchDocuments,
-  uploadDocument,
 } from "../../services/api";
 import { useToast } from "../../components/Toast";
+import { ChatSessions, type ChatSummary } from "../components/documents/ChatSessions";
+import { ConfirmDialog } from "../components/documents/ConfirmDialog";
+import { DocumentAnswer } from "../components/documents/DocumentAnswer";
+import { DocumentAnswerChart } from "../components/documents/DocumentAnswerChart";
+import { DropOverlay, UploadButton, UploadQueue, useFileDrop } from "../components/documents/UploadQueue";
+import { useDocumentUploads } from "../components/documents/useDocumentUploads";
 import "./Documents.css";
+import "../components/documents/documents-ui.css";
 
 type LibraryFilter = "all" | "pdf" | "spreadsheets" | "word" | "7days" | "30days" | `tag:${string}`;
+
+interface PendingConfirm {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  action: () => Promise<void>;
+}
 
 const SPREADSHEET_EXTENSIONS = new Set(["csv", "xls", "xlsx"]);
 const WORD_EXTENSIONS = new Set(["doc", "docx", "rtf"]);
@@ -63,6 +80,12 @@ function shortNumber(value?: number) {
   return number >= 1000 ? `${(number / 1000).toFixed(1)}k` : number.toLocaleString();
 }
 
+/** "1 page", "3 pages", "1.2k sections" — count with the right singular/plural word. */
+function countLabel(value: number | undefined, singular: string, plural = `${singular}s`) {
+  const number = Number(value) || 0;
+  return `${shortNumber(number)} ${number === 1 ? singular : plural}`;
+}
+
 function fileIcon(extension: string) {
   if (SPREADSHEET_EXTENSIONS.has(extension)) return FileSpreadsheet;
   if (WORD_EXTENSIONS.has(extension) || extension === "pdf") return FileText;
@@ -77,92 +100,40 @@ function documentKind(document: any) {
   return extension ? extension.toUpperCase() : "Document";
 }
 
-function cleanDocumentAnswer(answer: string) {
-  return String(answer || "")
-    .replace(/\*\*(.*?)\*\*/g, "$1")
-    .replace(/(^|\s)\*(?=\S)/g, "$1")
-    .replace(/\*/g, "")
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/`([^`]+)`/g, "$1");
-}
-
-function parseChartNumber(value: string): number | null {
-  const normalized = value.trim();
-  if (!normalized || !/[0-9]/.test(normalized)) return null;
-  const negative = /^\s*\(.*\)\s*$/.test(normalized);
-  const parsed = Number(normalized.replace(/[,$£€₹%()\s]/g, ""));
-  return Number.isFinite(parsed) ? (negative ? -parsed : parsed) : null;
-}
-
-function chartFromEvidence(question: string, answer: string, sources: any[]) {
-  const wantsOverview = /\b(summary|summari[sz]e|overview|key takeaways|compare|comparison|trend|breakdown|visuali[sz]e|chart|graph|performance|highest|lowest|top)\b/i.test(question);
-  if (!wantsOverview) return null;
-
-  const citedIds = new Set(
-    Array.from(answer.matchAll(/\[(S?\d+)\]/gi), (match) => match[1].toUpperCase().startsWith("S")
-      ? match[1].toUpperCase()
-      : `S${match[1]}`),
-  );
-  const citedTables = sources.filter((source) =>
-    source?.content_type === "table" && citedIds.has(String(source.source_id || "").toUpperCase()),
-  );
-
-  for (const source of citedTables) {
-    const snippet = String(source.snippet || "");
-    const tableStart = snippet.indexOf("|");
-    if (tableStart < 0) continue;
-    const cells = snippet.slice(tableStart).split("|").map((cell) => cell.trim()).filter(Boolean);
-    const separatorStart = cells.findIndex((cell) => /^:?-{3,}:?$/.test(cell));
-    if (separatorStart < 2 || separatorStart + 2 > cells.length) continue;
-    const headers = cells.slice(0, separatorStart);
-    const dataRows: string[][] = [];
-    for (let index = separatorStart + headers.length; index + headers.length <= cells.length; index += headers.length) {
-      const row = cells.slice(index, index + headers.length);
-      if (!row.every((cell) => /^:?-{3,}:?$/.test(cell))) dataRows.push(row);
-    }
-    if (!dataRows.length) continue;
-    const numericColumns = headers
-      .map((header, index) => ({
-        header,
-        index,
-        values: dataRows.map((row) => parseChartNumber(row[index] || "")),
-      }))
-      .filter((column) => column.values.filter((value) => value !== null).length >= 2);
-    if (!numericColumns.length) continue;
-
-    numericColumns.sort((a, b) =>
-      Number(/\b(sales|revenue|profit|amount|total|value|score|quantity|units|price|rate|percent)\b/i.test(b.header)) -
-      Number(/\b(sales|revenue|profit|amount|total|value|score|quantity|units|price|rate|percent)\b/i.test(a.header)),
-    );
-    const metric = numericColumns[0];
-    const points = dataRows
-      .map((row, index) => {
-        const labelColumn = headers.findIndex((_, columnIndex) =>
-          columnIndex !== metric.index && row[columnIndex] && parseChartNumber(row[columnIndex]) === null,
-        );
-        const value = metric.values[index];
-        return {
-          label: row[labelColumn >= 0 ? labelColumn : 0] || `Row ${index + 1}`,
-          value,
-        };
-      })
-      .filter((point): point is { label: string; value: number } => point.value !== null)
-      .slice(0, 8);
-
-    if (points.length >= 2 && new Set(points.map((point) => point.label)).size >= 2) {
-      return {
-        title: metric.header || "Values",
-        points,
-        source,
-      };
-    }
-  }
-  return null;
+/** "p. 3", "rows 1–25", … — falls back to the page number for older payloads. */
+function locationText(item: any) {
+  if (item?.location_label) return String(item.location_label);
+  return item?.page_number ? `p. ${item.page_number}` : "";
 }
 
 function StatusBadge({ status }: { status?: string }) {
   const value = status || "ready";
   return <span className={`doc-status doc-status-${value}`}>{value}</span>;
+}
+
+function LibrarySkeleton() {
+  return (
+    <div className="documents-file-list" aria-label="Loading documents" aria-busy="true">
+      {Array.from({ length: 4 }, (_, index) => (
+        <div className="doc-skeleton-row" key={index}>
+          <span className="doc-skeleton" />
+          <div><span className="doc-skeleton" /><span className="doc-skeleton" /></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function turnFromResponse(question: string, data: any) {
+  return {
+    question,
+    answer: data?.answer || "I couldn't find a clear answer in the available document text.",
+    passages: data?.passages || [],
+    citations: data?.citations || [],
+    sources: data?.sources || [],
+    visualization: data?.visualization || null,
+    answerMode: data?.answer_mode || "ai",
+  };
 }
 
 export default function Documents() {
@@ -172,7 +143,6 @@ export default function Documents() {
   const [overview, setOverview] = useState<any>({});
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
-  const [uploading, setUploading] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [retrying, setRetrying] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -192,6 +162,13 @@ export default function Documents() {
   const [chatLoading, setChatLoading] = useState(false);
   const [chatMessages, setChatMessages] = useState<any[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  const [chats, setChats] = useState<ChatSummary[]>([]);
+  const [chatsLoading, setChatsLoading] = useState(false);
+  const [chatsError, setChatsError] = useState("");
+  const [openingChat, setOpeningChat] = useState(false);
+  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const chatInputRef = useRef<HTMLInputElement>(null);
   const [recentQueries, setRecentQueries] = useState<string[]>(() => {
     try {
       const stored = JSON.parse(localStorage.getItem("aria_doc_recent_queries") || "[]");
@@ -214,6 +191,7 @@ export default function Documents() {
       const docs: any[] = response.success ? response.data || [] : [];
       setDocuments(docs);
       setActiveDocId((current) => current && docs.some((doc) => doc.id === current) ? current : null);
+      setSelected((current) => new Set([...current].filter((id) => docs.some((doc) => doc.id === id))));
 
       try {
         const stats: any = await getDocumentOverview();
@@ -254,8 +232,29 @@ export default function Documents() {
     }
   };
 
+  const uploads = useDocumentUploads((readyIds) => {
+    void fetchAll();
+    if (readyIds.length === 1) setActiveDocId(readyIds[0]);
+    if (readyIds.length) toastSuccess(`${readyIds.length} document${readyIds.length === 1 ? "" : "s"} ready`);
+  });
+  const drop = useFileDrop(uploads.addFiles);
+
+  const loadChats = useCallback(async () => {
+    setChatsLoading(true);
+    setChatsError("");
+    try {
+      const response: any = await listDocumentConversations(30);
+      setChats(response?.data || []);
+    } catch (error: any) {
+      setChatsError(error?.message || "Saved chats couldn't be loaded.");
+    } finally {
+      setChatsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void fetchAll();
+    void loadChats();
   }, []);
 
   useEffect(() => {
@@ -315,42 +314,14 @@ export default function Documents() {
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setActiveDocId(null);
+      if (event.key === "Escape" && !pendingConfirm) setActiveDocId(null);
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => {
       document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [activeDocId]);
-
-  const onUpload = async (event: any) => {
-    const file = event?.target?.files?.[0];
-    if (!file) return;
-    const extension = file.name.toLowerCase().split(".").pop();
-    if (!["pdf", "csv", "xlsx", "docx"].includes(extension || "") || file.size > 50 * 1024 * 1024) {
-      toastError("Choose a PDF, CSV, XLSX, or DOCX file smaller than 50 MB");
-      event.target.value = "";
-      return;
-    }
-    setUploading(true);
-    try {
-      const response: any = await uploadDocument(file);
-      if (!response.success) {
-        toastError(response.message || "Upload failed");
-        return;
-      }
-      const id = response.data?.document?.document_id || response.data?.document_id;
-      await fetchAll();
-      if (id) setActiveDocId(id);
-      toastSuccess("Document uploaded and indexed");
-    } catch (error: any) {
-      toastError(error?.message || "Upload failed");
-    } finally {
-      setUploading(false);
-      event.target.value = "";
-    }
-  };
+  }, [activeDocId, pendingConfirm]);
 
   const toggleSelected = (id: string) => {
     setSelected((current) => {
@@ -400,24 +371,18 @@ export default function Documents() {
     if (!prompt || chatLoading) return;
     setChatLoading(true);
     try {
-      const ids = selected.size > 0 ? Array.from(selected) : undefined;
+      // Always explicit: selected documents, or [] for "all documents". The
+      // backend saves this scope on the chat so reopening it restores it.
+      const ids = selected.size > 0 ? Array.from(selected) : [];
       const response: any = await askDocuments(prompt, ids, conversationId);
       if (!response?.success) throw new Error(response?.message || "The document assistant could not answer");
+      const isNewChat = !conversationId;
       if (response?.data?.conversation_id) setConversationId(response.data.conversation_id);
-      const answer = cleanDocumentAnswer(response?.data?.answer || "I couldn't find a clear answer in the available document text.");
-      const passages = response?.data?.passages || [];
-      const citations = response?.data?.citations || [];
-      const chart = chartFromEvidence(prompt, answer, response?.data?.sources || []);
+      const turn = turnFromResponse(prompt, response?.data);
       setChatInput("");
-      setChatMessages((current) => [...current, {
-        question: prompt,
-        answer,
-        passages,
-        citations,
-        chart,
-        answerMode: response?.data?.answer_mode || "ai",
-      }]);
-      if (!passages.length) toastInfo("No matching passages found. Try a different question.");
+      setChatMessages((current) => [...current, turn]);
+      if (!turn.passages.length) toastInfo("No matching passages found. Try a different question.");
+      if (isNewChat) void loadChats();
     } catch (error: any) {
       const errorMessage = error?.message || "The document assistant couldn't reach the document service. Try again.";
       setChatMessages((current) => [...current, {
@@ -433,31 +398,112 @@ export default function Documents() {
     }
   };
 
-  const onDelete = async (id: string) => {
-    if (!window.confirm("Delete this document? This cannot be undone.")) return;
-    setDeleting(id);
+  const onNewChat = () => {
+    setConversationId(null);
+    setChatMessages([]);
+    setChatInput("");
+    chatInputRef.current?.focus();
+  };
+
+  const onOpenChat = async (id: string) => {
+    if (id === conversationId) return;
+    setOpeningChat(true);
     try {
-      await deleteDocument(id);
-      setSelected((current) => {
-        const next = new Set(current);
-        next.delete(id);
-        return next;
-      });
-      setMenuDocId(null);
-      toastSuccess("Document deleted");
-      await fetchAll();
+      const response: any = await getDocumentConversation(id);
+      const conversation = response?.data;
+      if (!conversation) throw new Error("This chat is no longer available.");
+      const turns: any[] = [];
+      let question = "";
+      for (const message of conversation.messages || []) {
+        if (message.role === "user") {
+          question = message.content;
+        } else if (message.role === "assistant") {
+          turns.push(turnFromResponse(question, { answer: message.content, ...documentSourcesView(message.sources), sources: message.sources }));
+          question = "";
+        }
+      }
+      setConversationId(id);
+      setChatMessages(turns);
+      const scope: string[] = (conversation.scope_document_ids || [])
+        .filter((docId: string) => documentsRef.current.some((doc) => doc.id === docId));
+      setSelected(new Set(scope));
     } catch (error: any) {
-      toastError(error?.message || "Delete failed");
+      toastError(error?.message || "Could not open that chat");
     } finally {
-      setDeleting(null);
+      setOpeningChat(false);
     }
   };
 
-  const onRetry = async (doc: any) => {
+  const onDeleteChat = (chat: ChatSummary) => {
+    setPendingConfirm({
+      title: "Delete this chat?",
+      message: `“${chat.title || "Untitled chat"}” and its answers will be removed. Your documents are not affected.`,
+      action: async () => {
+        await deleteDocumentConversation(chat.conversation_id);
+        if (chat.conversation_id === conversationId) onNewChat();
+        setChats((current) => current.filter((item) => item.conversation_id !== chat.conversation_id));
+        toastSuccess("Chat deleted");
+      },
+    });
+  };
+
+  const runConfirm = async () => {
+    if (!pendingConfirm) return;
+    setConfirmBusy(true);
+    try {
+      await pendingConfirm.action();
+      setPendingConfirm(null);
+    } catch (error: any) {
+      toastError(error?.message || "That action failed. Please try again.");
+    } finally {
+      setConfirmBusy(false);
+    }
+  };
+
+  const onDelete = (doc: any) => {
+    setMenuDocId(null);
+    setPendingConfirm({
+      title: "Delete this document?",
+      message: `“${doc.name || "This document"}” will be removed from search and chat. This cannot be undone.`,
+      action: async () => {
+        setDeleting(doc.id);
+        try {
+          await deleteDocument(doc.id);
+          setSelected((current) => {
+            const next = new Set(current);
+            next.delete(doc.id);
+            return next;
+          });
+          toastSuccess("Document deleted");
+          await fetchAll();
+        } finally {
+          setDeleting(null);
+        }
+      },
+    });
+  };
+
+  const onDeleteSelected = () => {
+    const ids = Array.from(selected);
+    setPendingConfirm({
+      title: `Delete ${ids.length} document${ids.length === 1 ? "" : "s"}?`,
+      message: "The selected documents will be removed from search and chat. This cannot be undone.",
+      action: async () => {
+        const outcomes = await Promise.allSettled(ids.map((id) => deleteDocument(id)));
+        const failed = outcomes.filter((outcome) => outcome.status === "rejected").length;
+        setSelected(new Set());
+        if (failed) toastError(`${failed} document${failed === 1 ? "" : "s"} couldn't be deleted. Try again.`);
+        else toastSuccess("Selected documents deleted");
+        await fetchAll();
+      },
+    });
+  };
+
+  const onRetry = async (doc: any, rechunk = false) => {
     setRetrying(doc.id);
     try {
-      await retryDocument(doc.id);
-      toastSuccess("Document re-indexing started");
+      await retryDocument(doc.id, { rechunk });
+      toastSuccess(rechunk ? "Tables re-extracted" : "Document re-indexed");
       await fetchAll();
     } catch (error: any) {
       toastError(error?.message || "Retry failed");
@@ -468,22 +514,21 @@ export default function Documents() {
 
   const onRetrySelected = async () => {
     const retryable = documents.filter((doc) => selected.has(doc.id) && ["failed", "partial"].includes(doc.status));
-    for (const doc of retryable) {
-      try {
-        await retryDocument(doc.id);
-      } catch {
-        toastError(`Could not retry ${doc.name || "a selected document"}`);
-      }
-    }
+    const outcomes = await Promise.allSettled(retryable.map((doc) => retryDocument(doc.id)));
+    outcomes.forEach((outcome, index) => {
+      if (outcome.status === "rejected") toastError(`Could not retry ${retryable[index].name || "a selected document"}`);
+    });
     if (retryable.length) {
-      toastSuccess("Re-indexing started for selected documents");
+      toastSuccess("Selected documents were refreshed and are ready to search");
       await fetchAll();
     }
   };
 
   const onAskDocuments = (documentIds: string[]) => {
-    window.location.hash = `#/copilot?docs=${encodeURIComponent(documentIds.join(","))}`;
-    toastInfo("Opening Copilot with selected documents…");
+    setMenuDocId(null);
+    setSelected(new Set(documentIds));
+    chatInputRef.current?.focus();
+    toastInfo(`Ask the assistant about ${documentIds.length} selected document${documentIds.length === 1 ? "" : "s"}.`);
   };
 
   const onCompare = async () => {
@@ -538,6 +583,12 @@ export default function Documents() {
     }
   };
 
+  const openCitedSource = (message: any, sourceId: string) => {
+    const source = (message.sources || []).find((item: any) => String(item.source_id) === sourceId);
+    const doc = source && documents.find((item) => item.id === source.document_id);
+    if (doc) openPreview(doc, source.page);
+  };
+
   const tags = useMemo(() => {
     const counts = new Map<string, number>();
     for (const doc of documents) {
@@ -577,22 +628,23 @@ export default function Documents() {
   const selectedAll = filteredDocuments.length > 0 && filteredDocuments.every((doc) => selected.has(doc.id));
   const prompts = activeDocument
     ? [`What are the key takeaways from ${activeDocument.name || "this document"}?`, `Summarize ${activeDocument.name || "this document"}.`, "What actions are recommended?"]
-    : ["What are the key takeaways in my documents?", "Summarize the latest report.", "What actions should I prioritize?"];
+    : selected.size >= 2
+      ? ["Compare the selected documents.", "What do these documents agree and disagree on?", "Which figures differ between them?"]
+      : ["What are the key takeaways in my documents?", "Summarize the latest report.", "What actions should I prioritize?"];
 
   return (
-    <div className="documents-page">
+    <div className={`documents-page ${drop.dragging ? "is-dragging" : ""}`} {...drop.handlers}>
+      {drop.dragging && <DropOverlay />}
       <header className="documents-header">
         <div>
           <div className="documents-eyebrow"><FileText size={14} /> Document workspace</div>
           <h1>Documents</h1>
-          <p>Upload PDF, CSV, XLSX spreadsheet, and DOCX Word documents to search and explore their contents.</p>
+          <p>Upload PDF, CSV, XLSX spreadsheet, and DOCX Word documents to search and explore their contents. Drop several files at once.</p>
         </div>
-        <label className={`documents-upload ${uploading ? "is-uploading" : ""}`}>
-          <Upload size={15} />
-          {uploading ? "Uploading…" : "Upload document"}
-          <input type="file" accept=".pdf,.csv,.xlsx,.docx,application/pdf,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={onUpload} disabled={uploading} />
-        </label>
+        <UploadButton onFiles={uploads.addFiles} busy={uploads.busy} />
       </header>
+
+      <UploadQueue items={uploads.items} onRetry={uploads.retry} onDismiss={uploads.dismiss} onClear={uploads.clearFinished} />
 
       <label className="documents-global-search">
         <Search size={16} />
@@ -621,7 +673,7 @@ export default function Documents() {
         </article>
         <article className="documents-stat">
           <span className="documents-stat-icon stat-green"><Sparkles size={16} /></span>
-          <span><small>Elements extracted</small><strong>{shortNumber(overview.elements_extracted)}</strong></span>
+          <span><small>Sections read</small><strong>{shortNumber(overview.elements_extracted)}</strong></span>
         </article>
         <article className="documents-stat">
           <span className="documents-stat-icon stat-amber"><Clock3 size={16} /></span>
@@ -664,12 +716,11 @@ export default function Documents() {
           <button className="documents-add-tag" onClick={() => toastInfo("Add tags from a document's details.")}><Plus size={13} /> Add a tag</button>
           <div className="documents-storage-meter">
             <div><strong>Storage</strong><span>{formatSize(overview.storage_bytes)}</span></div>
-            <div className="documents-storage-track"><span style={{ width: overview.storage_bytes ? "48%" : "0%" }} /></div>
-            <small>Indexed document files</small>
+            <small>Files ready to search</small>
           </div>
         </aside>
 
-        <section className="documents-library" aria-label="Documents">
+        <section className="documents-library" aria-label="Documents" aria-busy={loading}>
           <div className="documents-library-heading">
             <div>
               <h2>{results ? "Search results" : "All documents"}</h2>
@@ -680,24 +731,15 @@ export default function Documents() {
                 <button onClick={() => onAskDocuments(Array.from(selected))}>Ask</button>
                 {selected.size >= 2 && <button onClick={() => void onCompare()}>Compare</button>}
                 {documents.some((doc) => selected.has(doc.id) && ["failed", "partial"].includes(doc.status)) && <button onClick={() => void onRetrySelected()}>Retry</button>}
-                <button className="danger-action" onClick={async () => {
-                  if (!window.confirm(`Delete ${selected.size} selected document(s)? This cannot be undone.`)) return;
-                  for (const id of selected) {
-                    try { await deleteDocument(id); }
-                    catch { toastError(`Could not delete document ${id}`); }
-                  }
-                  setSelected(new Set());
-                  toastSuccess("Selected documents deleted");
-                  await fetchAll();
-                }}>Delete</button>
+                <button className="danger-action" onClick={onDeleteSelected}>Delete</button>
               </div>
             )}
           </div>
 
           {loading && !documents.length ? (
-            <div className="documents-empty">Loading documents…</div>
+            <LibrarySkeleton />
           ) : loadError && !documents.length ? (
-            <div className="documents-empty">
+            <div className="documents-empty" role="alert">
               <FileText size={24} /><strong>Documents couldn't be loaded</strong><span>{loadError}</span>
               <button onClick={() => void fetchAll()}>Try again</button>
             </div>
@@ -705,9 +747,10 @@ export default function Documents() {
             <div className="documents-result-list">
               {results.map((result: any, index: number) => {
                 const doc = documents.find((item) => item.id === result.document_id);
+                const where = locationText(result);
                 return (
                   <button className="documents-result" key={`${result.document_id}:${result.chunk_id || index}`} onClick={() => doc && openPreview(doc, result.page_number)}>
-                    <span className="documents-result-title">{result.filename || doc?.name || "Document"}{result.page_number ? ` · page ${result.page_number}` : ""}</span>
+                    <span className="documents-result-title">{result.filename || doc?.name || "Document"}{where ? ` · ${where}` : ""}</span>
                     <span>{result.content || "No excerpt available."}</span>
                   </button>
                 );
@@ -738,7 +781,7 @@ export default function Documents() {
                         <span className="documents-file-name">
                           <strong title={doc.name || "Untitled"}>{doc.name || "Untitled"}</strong>
                           <span className="documents-file-details">
-                            <small>{documentKind(doc)} · {shortNumber(doc.element_count)} elements · {doc.page_count || 0} pages · {formatSize(doc.file_size)} · {formatDate(doc.created_at)}</small>
+                            <small>{documentKind(doc)} · {countLabel(doc.element_count, "section")} · {countLabel(doc.page_count, "page")} · {formatSize(doc.file_size)} · {formatDate(doc.created_at)}</small>
                             <StatusBadge status={doc.status} />
                           </span>
                         </span>
@@ -755,7 +798,7 @@ export default function Documents() {
                             <button onClick={() => void onDataset(doc)}>Create dataset</button>
                             <button onClick={() => void onExport(doc)}>Export</button>
                             {(doc.status === "failed" || doc.status === "partial") && <button onClick={() => void onRetry(doc)}>{retrying === doc.id ? "Retrying…" : "Retry"}</button>}
-                            <button className="danger-action" disabled={deleting === doc.id} onClick={() => void onDelete(doc.id)}><Trash2 size={13} /> Delete</button>
+                            <button className="danger-action" disabled={deleting === doc.id} onClick={() => onDelete(doc)}><Trash2 size={13} /> Delete</button>
                           </div>
                         )}
                       </div>
@@ -765,7 +808,7 @@ export default function Documents() {
                 {!filteredDocuments.length && (
                   <div className="documents-empty">
                     <FileText size={24} /><strong>{documents.length ? "No documents in this view" : "No documents yet"}</strong>
-                    <span>{documents.length ? "Try a different filter or search." : "Upload a PDF, CSV, XLSX spreadsheet, or DOCX Word document to get started."}</span>
+                    <span>{documents.length ? "Try a different filter or search." : "Upload or drop PDF, CSV, XLSX spreadsheet, or DOCX Word documents to get started."}</span>
                   </div>
                 )}
               </div>
@@ -787,57 +830,50 @@ export default function Documents() {
             <div><h2>Document Assistant</h2><small>Grounded in your uploaded files</small></div>
             <span className="documents-assistant-live" title="Assistant ready" />
           </div>
-          <div className="documents-assistant-messages" aria-live="polite">
-            {!chatMessages.length && (
+          <ChatSessions
+            chats={chats}
+            activeId={conversationId}
+            loading={chatsLoading}
+            error={chatsError}
+            onOpen={(id) => void onOpenChat(id)}
+            onNew={onNewChat}
+            onDelete={onDeleteChat}
+            onReload={() => void loadChats()}
+          />
+          <div className="documents-assistant-messages" aria-live="polite" aria-busy={openingChat || chatLoading}>
+            {openingChat && (
+              <div className="doc-skeleton-list" aria-label="Opening chat">
+                <span className="doc-skeleton" /><span className="doc-skeleton" /><span className="doc-skeleton" />
+              </div>
+            )}
+            {!openingChat && !chatMessages.length && (
               <div className="documents-assistant-welcome">
                 <span><Sparkles size={17} /></span>
                 <strong>Ask questions about your documents</strong>
-                <p>I’ll find relevant passages and cite the source for every answer.</p>
+                <p>I’ll find relevant passages across your files and cite the page or rows for every answer.</p>
               </div>
             )}
-            {chatMessages.map((message, index) => (
+            {!openingChat && chatMessages.map((message, index) => (
               <div className="documents-chat-turn" key={`${message.question}-${index}`}>
-                <div className="documents-chat-question">{message.question}</div>
+                {message.question && <div className="documents-chat-question">{message.question}</div>}
                 <div className="documents-chat-answer">
                   <span className="documents-chat-sparkle"><Sparkles size={13} /></span>
                   {message.answerMode === "evidence" && <small className="documents-answer-mode">Grounded response · AI unavailable</small>}
-                  {message.answerMode === "deterministic" && <small className="documents-answer-mode">Computed from indexed table data</small>}
-                  <p>{message.answer}</p>
-                  {message.chart && (
-                    <figure className="documents-answer-chart" aria-label={`Chart of ${message.chart.title}`}>
-                      <figcaption>{message.chart.title} · from cited document data</figcaption>
-                      <div className="documents-answer-chart-bars">
-                        {message.chart.points.map((point: { label: string; value: number }) => {
-                          const maximum = Math.max(...message.chart.points.map((item: { value: number }) => Math.abs(item.value)), 1);
-                          const width = Math.max(2, Math.abs(point.value) / maximum * 100);
-                          return (
-                            <div className="documents-answer-chart-row" key={point.label}>
-                              <span className="documents-answer-chart-label" title={point.label}>{point.label}</span>
-                              <span className="documents-answer-chart-track" role="img" aria-label={`${point.label}: ${point.value}`}>
-                                <span className="documents-answer-chart-bar" style={{ width: `${width}%` }} />
-                              </span>
-                              <span className="documents-answer-chart-value">{point.value.toLocaleString()}</span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                      <button
-                        className="documents-answer-chart-source"
-                        onClick={() => {
-                          const source = documents.find((doc) => doc.id === message.chart.source.document_id);
-                          if (source) openPreview(source, message.chart.source.page);
-                        }}
-                      >
-                        View cited data · [{message.chart.source.source_id}]
-                      </button>
-                    </figure>
+                  {message.answerMode === "deterministic" && <small className="documents-answer-mode">Calculated from the tables in your documents</small>}
+                  {message.error ? <p role="alert">{message.answer}</p> : <DocumentAnswer text={message.answer} />}
+                  {message.visualization && (
+                    <DocumentAnswerChart
+                      visualization={message.visualization}
+                      onViewSource={(sourceId) => openCitedSource(message, sourceId)}
+                    />
                   )}
                   {message.error && <button className="documents-chat-retry" onClick={() => void onChat(message.question)}>Try again</button>}
                   {message.passages?.length > 0 && <div className="documents-chat-citations">
                     {(message.citations?.length ? message.citations : message.passages).slice(0, 4).map((citation: any, citationIndex: number) => {
                       const source = documents.find((doc) => doc.id === citation.document_id);
+                      const where = locationText(citation);
                       return <button key={`${citation.document_id}:${citationIndex}`} onClick={() => source && openPreview(source, citation.page_number)}>
-                        [{citation.index || citationIndex + 1}] {citation.filename || source?.name || "Document"}{citation.page_number ? ` · p. ${citation.page_number}` : ""}
+                        [{citation.index || citationIndex + 1}] {citation.filename || source?.name || "Document"}{where ? <span className="doc-citation-location"> · {where}</span> : null}
                       </button>;
                     })}
                   </div>}
@@ -852,7 +888,7 @@ export default function Documents() {
           </div>
           {selected.size > 0 && <div className="documents-chat-scope"><Check size={12} /> Answers scoped to {selected.size} selected document{selected.size === 1 ? "" : "s"}</div>}
           <form className="documents-chat-input" onSubmit={(event) => { event.preventDefault(); void onChat(); }}>
-            <input value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder="Ask a question about your documents…" aria-label="Ask the document assistant" />
+            <input ref={chatInputRef} value={chatInput} onChange={(event) => setChatInput(event.target.value)} placeholder="Ask a question about your documents…" aria-label="Ask the document assistant" />
             <button disabled={chatLoading || !chatInput.trim()} aria-label="Send question"><Send size={15} /></button>
           </form>
           <p className="documents-assistant-footnote"><Check size={12} /> Answers are based on your uploaded documents.</p>
@@ -876,7 +912,20 @@ export default function Documents() {
               <div className="documents-paper">
                 <div className="documents-paper-top"><span>ARIA DOCUMENT INSIGHTS</span><StatusBadge status={activeDocument.status} /></div>
                 <h3>{activeDocument.name || "Untitled document"}</h3>
-                <div className="documents-paper-meta">{activeDocument.page_count || 0} pages <span /> {formatSize(activeDocument.file_size)} <span /> {formatDate(activeDocument.created_at)}</div>
+                <div className="documents-paper-meta">{countLabel(activeDocument.page_count, "page")} <span /> {formatSize(activeDocument.file_size)} <span /> {formatDate(activeDocument.created_at)}</div>
+                {activeDocument.needs_reextract && (
+                  <div className="doc-reextract-hint">
+                    <span>This PDF was read by an older version of ARIA. Reading its tables again gives better table answers and page citations.</span>
+                    <button
+                      type="button"
+                      className="doc-link-button"
+                      disabled={retrying === activeDocument.id}
+                      onClick={() => void onRetry(activeDocument, true)}
+                    >
+                      <RefreshCw size={12} /> {retrying === activeDocument.id ? "Reading tables…" : "Read tables again"}
+                    </button>
+                  </div>
+                )}
                 <section className="documents-summary" aria-label="Document summary">
                   <h4>Summary</h4>
                   {activeDocument.summary
@@ -898,20 +947,20 @@ export default function Documents() {
                   <div className="documents-no-chart"><BarChart3 size={16} />No numeric metrics were extracted from this document.</div>
                 )}
                 <div className="documents-paper-stats">
-                  <span><small>Elements</small><strong>{Number(activeDocument.element_count || 0).toLocaleString()}</strong></span>
-                  <span><small>Chunks</small><strong>{Number(activeDocument.chunk_count || 0).toLocaleString()}</strong></span>
+                  <span><small>Sections</small><strong>{Number(activeDocument.element_count || 0).toLocaleString()}</strong></span>
+                  <span><small>Search passages</small><strong>{Number(activeDocument.chunk_count || 0).toLocaleString()}</strong></span>
                   <span><small>Tables</small><strong>{Number(activeDocument.table_count || 0).toLocaleString()}</strong></span>
                 </div>
               </div>
               <div className="documents-extracted">
-                <div className="documents-extracted-heading"><strong>Extracted text</strong><span>{previewChunks.length} chunks</span></div>
-                {previewLoading && <p className="documents-preview-hint">Loading document details…</p>}
-                {previewError && <p className="documents-preview-error">{previewError}</p>}
+                <div className="documents-extracted-heading"><strong>Extracted text</strong><span>{countLabel(previewChunks.length, "passage")}</span></div>
+                {previewLoading && <div className="doc-skeleton-list" aria-label="Loading document details"><span className="doc-skeleton" /><span className="doc-skeleton" /><span className="doc-skeleton" /></div>}
+                {previewError && <p className="documents-preview-error" role="alert">{previewError}</p>}
                 {!previewLoading && previewChunks.slice(0, 5).map((chunk: any, index: number) => {
                   const cited = previewPage != null && Number(chunk?.metadata?.page) === previewPage;
                   return <article className={cited ? "is-cited" : ""} key={`${chunk?.metadata?.page || "chunk"}:${index}`}>
                     <small>{chunk?.metadata?.page ? `Page ${chunk.metadata.page}` : `Section ${index + 1}`}{cited ? " · citation" : ""}</small>
-                    <p>{chunk?.text || ""}</p>
+                    <DocumentAnswer text={chunk?.text || ""} />
                   </article>;
                 })}
                 {!previewLoading && !previewChunks.length && !previewError && <p className="documents-preview-hint">No extracted text is available.</p>}
@@ -927,12 +976,25 @@ export default function Documents() {
             <header><h2>Compare documents</h2><button aria-label="Close comparison" onClick={() => setCompareDocs(null)}><X size={17} /></button></header>
             <div className="documents-compare-columns">
               {compareDocs.map((doc, index) => <article key={doc.id}>
-                <h3>{doc.name || "Untitled"}</h3><small>{doc.page_count || 0} pages · {compareChunks[index]?.length || 0} chunks</small>
-                {compareLoading ? <p>Loading…</p> : (compareChunks[index] || []).slice(0, 8).map((chunk: any, chunkIndex: number) => <p key={chunkIndex}>{chunk?.text || ""}</p>)}
+                <h3>{doc.name || "Untitled"}</h3><small>{countLabel(doc.page_count, "page")} · {countLabel(compareChunks[index]?.length, "passage")}</small>
+                {compareLoading
+                  ? <div className="doc-skeleton-list" aria-label="Loading comparison"><span className="doc-skeleton" /><span className="doc-skeleton" /></div>
+                  : (compareChunks[index] || []).slice(0, 8).map((chunk: any, chunkIndex: number) => <DocumentAnswer key={chunkIndex} text={chunk?.text || ""} />)}
               </article>)}
             </div>
           </div>
         </div>
+      )}
+
+      {pendingConfirm && (
+        <ConfirmDialog
+          title={pendingConfirm.title}
+          message={pendingConfirm.message}
+          confirmLabel={pendingConfirm.confirmLabel}
+          busy={confirmBusy}
+          onConfirm={() => void runConfirm()}
+          onCancel={() => { if (!confirmBusy) setPendingConfirm(null); }}
+        />
       )}
     </div>
   );

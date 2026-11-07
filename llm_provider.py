@@ -432,11 +432,11 @@ PROVIDERS = {
         "label": "Cloud LLM (Groq API)",
         "privacy": "Fast inference on Groq's LPU hardware, but your schema, queries and data samples are sent to the Groq API.",
         "models": {
-            "sql": "qwen/qwen3.8-27b",
-            "story": "qwen/qwen3.8-27b",
-            "suggest": "qwen/qwen3.8-27b",
-            "semi": "qwen/qwen3.8-27b",
-            "schema": "qwen/qwen3.8-27b",
+            "sql": "openai/gpt-oss-120b",
+            "story": "openai/gpt-oss-120b",
+            "suggest": "openai/gpt-oss-120b",
+            "semi": "openai/gpt-oss-120b",
+            "schema": "openai/gpt-oss-120b",
             "vision": "qwen/qwen3.8-27b",
         },
     },
@@ -827,6 +827,8 @@ class LLMProvider:
                 "max_tokens": num_predict,
                 "timeout": timeout,
             }
+            if model.startswith("openai/gpt-oss"):
+                kwargs["response_format"] = {"type": "json_object"}
             if extra_body:
                 kwargs["extra_body"] = extra_body
             return self._cloud_client.chat.completions.create(**kwargs)
@@ -844,6 +846,8 @@ class LLMProvider:
                     "max_tokens": num_predict,
                     "timeout": timeout,
                 }
+                if model.startswith("openai/gpt-oss"):
+                    retry_kwargs["response_format"] = {"type": "json_object"}
                 if extra_body:
                     retry_kwargs["extra_body"] = extra_body
                 return self._cloud_client.chat.completions.create(**retry_kwargs)

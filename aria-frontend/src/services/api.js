@@ -647,8 +647,9 @@ export const deleteDocument = async (documentId) => {
   return { success: true, data };
 };
 
-export const retryDocument = async (documentId) => {
-  const data = await request(`/documents/${documentId}/retry`, {
+export const retryDocument = async (documentId, options = {}) => {
+  const suffix = options?.rechunk ? "?rechunk=true" : "";
+  const data = await request(`/documents/${documentId}/retry${suffix}`, {
     method: "POST",
   });
   return { success: true, data: data?.document };
@@ -1941,4 +1942,94 @@ export const downloadStoryExport = async (envelope = {}, format = "pptx") => {
     throw new Error("The export was generated but the download could not start.");
   }
   return { success: true, filename };
+};
+
+export const listDocumentConversations = async (limit = 30) => {
+  const data = await request(`/insight/pdf/conversations?limit=${encodeURIComponent(limit)}`);
+  return { success: true, data: data?.conversations || [] };
+};
+
+export const getDocumentConversation = async (conversationId) => {
+  const data = await request(`/insight/pdf/conversations/${encodeURIComponent(conversationId)}`);
+  return { success: true, data: data?.conversation || null };
+};
+
+export const deleteDocumentConversation = async (conversationId) => {
+  const data = await request(`/insight/pdf/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "DELETE",
+  });
+  return { success: true, data };
+};
+
+/** Map backend PDF-RAG sources to the passage/citation shape the UI renders. */
+export const documentSourcesView = (sources) => {
+  const list = Array.isArray(sources) ? sources : [];
+  return {
+    passages: list.map((source) => ({
+      ...source,
+      page_number: source.page,
+      content: source.excerpt || source.snippet,
+    })),
+    citations: list.map((source, index) => ({
+      index: source.source_id || index + 1,
+      document_id: source.document_id,
+      filename: source.filename,
+      page_number: source.page,
+      chunk_id: source.chunk_id,
+      location_label: source.location_label || (source.page ? `p. ${source.page}` : ""),
+    })),
+  };
+};
+
+export const uploadDocumentsBatch = (files, options = {}) => new Promise((resolve, reject) => {
+  const { onUploadProgress, signal } = options || {};
+  const formData = new FormData();
+  for (const file of files || []) formData.append("files", file);
+  const xhr = new XMLHttpRequest();
+  const requestId = newRequestId();
+  xhr.open("POST", resolvePath("/insight/pdf/upload-batch"));
+  xhr.withCredentials = true;
+  xhr.setRequestHeader("X-Request-ID", requestId);
+  xhr.timeout = AI_ANSWER_TIMEOUT_MS;
+  xhr.upload.onprogress = (event) => {
+    if (event.lengthComputable && onUploadProgress) onUploadProgress(event.loaded / event.total);
+  };
+  const fail = (message, status = 0, code = "NETWORK_ERROR") => {
+    const error = new Error(message);
+    error.status = status;
+    error.code = code;
+    error.requestId = requestId;
+    reject(error);
+  };
+  xhr.onerror = () => fail("Network error: backend unreachable.");
+  xhr.ontimeout = () => fail("The upload timed out. Try fewer or smaller files.", 0, "TIMEOUT");
+  xhr.onabort = () => {
+    const aborted = new Error("The operation was aborted.");
+    aborted.name = "AbortError";
+    reject(aborted);
+  };
+  xhr.onload = () => {
+    let data;
+    try { data = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch { data = {}; }
+    if (xhr.status >= 200 && xhr.status < 300) {
+      resolve({ success: true, data });
+      return;
+    }
+    if (xhr.status === 401) handleUnauthorized();
+    const norm = normalizeApiError(data, xhr.status, null);
+    fail(norm.message, xhr.status, norm.code);
+  };
+  if (signal) {
+    if (signal.aborted) { xhr.abort(); return; }
+    signal.addEventListener("abort", () => xhr.abort(), { once: true });
+  }
+  xhr.send(formData);
+});
+
+/** Per-file progress for a batch (served under /documents so polling never
+ *  spends the AI chat rate budget). @param {string | null} [batchId] */
+export const listUploadJobs = async (batchId = null, options = {}) => {
+  const query = batchId ? `?batch_id=${encodeURIComponent(batchId)}` : "";
+  const data = await request(`/documents/upload-jobs${query}`, options);
+  return { success: true, data: data?.jobs || [] };
 };

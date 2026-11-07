@@ -42,12 +42,12 @@ def test_summary_upgrades_legacy_raw_excerpt_to_natural_sentence(monkeypatch):
 
     response = document_routes.summarize_document("document-1", None, {"user_id": "test-user"})
 
-    assert response["summary_version"] == 3
+    assert response["summary_version"] == document_routes.DOCUMENT_SUMMARY_VERSION
     assert response["cached"] is False
     assert "Revenue increased by 12 percent." in response["summary"]
     assert "southern operations." in response["summary"]
     assert "|" not in response["summary"]
-    assert metadata.document["summary_version"] == 3
+    assert metadata.document["summary_version"] == document_routes.DOCUMENT_SUMMARY_VERSION
 
 
 def test_extractive_summary_reads_sentence_text_from_docx_table_chunks():

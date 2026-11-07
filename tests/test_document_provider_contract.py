@@ -27,10 +27,20 @@ def test_missing_model_fails_actionably():
         providers.configure_rag_models(SimpleNamespace(models={}))
 
 def test_upload_routes_share_ingestion_and_do_not_call_ocr():
-    for path, function in [('api/connect_routes.py', 'connect_pdf'), ('api/insight_rag_routes.py', 'upload_pdf')]:
+    def calls_in(path, function):
         tree = ast.parse((ROOT/path).read_text())
         node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == function)
-        calls = [ast.unparse(n.func) for n in ast.walk(node) if isinstance(n, ast.Call)]
+        return [ast.unparse(n.func) for n in ast.walk(node) if isinstance(n, ast.Call)]
+
+    for path, function in [('api/connect_routes.py', 'connect_pdf'), ('api/insight_rag_routes.py', '_ingest_spooled')]:
+        calls = calls_in(path, function)
         assert any('PDFIngestion' in c for c in calls)
         assert 'create_document_processor' not in calls
         assert not any(c.endswith('process_document') for c in calls)
+    # Single and batch uploads both funnel through the shared ingestion helper.
+    for function in ('upload_pdf', 'upload_documents_batch'):
+        source = ast.get_source_segment(
+            (ROOT/'api/insight_rag_routes.py').read_text(),
+            next(n for n in ast.parse((ROOT/'api/insight_rag_routes.py').read_text()).body
+                 if isinstance(n, ast.FunctionDef) and n.name == function))
+        assert '_ingest_spooled' in source
