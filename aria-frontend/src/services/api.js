@@ -1374,6 +1374,26 @@ export const intelligenceApi = {
     return { success: true, data: await res.text() };
   },
 
+  // GET /api/intelligence/reports/:id/pdf -> PDF bytes of a saved report.
+  getReportPdf: async (id) => {
+    const res = await fetch(
+      `${API_BASE}/intelligence/reports/${encodeURIComponent(id)}/pdf`,
+      { credentials: "include", cache: "no-store", headers: { "X-Request-ID": newRequestId() } },
+    );
+    if (res.status === 401) handleUnauthorized();
+    if (!res.ok) {
+      let data = {};
+      try { data = await res.json(); } catch { /* unavailable body */ }
+      const norm = normalizeApiError(data, res.status, res.headers);
+      const error = new Error(norm.message || "Could not download PDF.");
+      error.status = res.status;
+      error.code = norm.code;
+      error.requestId = norm.requestId;
+      throw error;
+    }
+    return { success: true, data: await res.blob() };
+  },
+
   // POST /api/intelligence/reports/:id/rerun -> same definition, fresh numbers.
   rerunReport: async (id) => {
     const data = await request(`/intelligence/reports/${encodeURIComponent(id)}/rerun`, {
