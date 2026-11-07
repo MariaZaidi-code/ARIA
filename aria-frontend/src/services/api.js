@@ -581,111 +581,7 @@ export const uploadDocument = async (file) => {
   }
 };
 
-/**
- * Upload several documents in one request. Byte-level upload progress is
- * reported through `onUploadProgress(fraction)` (fetch cannot report upload
- * progress, so this uses XMLHttpRequest with the same cookie/credential,
- * request-id and error-normalisation behaviour as `request`). Each file
- * becomes a server-side job; poll `listUploadJobs(batchId)` for its stage.
- * @param {File[]} files
- * @param {{ onUploadProgress?: (fraction: number) => void, signal?: AbortSignal }} [options]
- */
-export const uploadDocumentsBatch = (files, options = {}) => new Promise((resolve, reject) => {
-  const { onUploadProgress, signal } = options || {};
-  const formData = new FormData();
-  for (const file of files || []) formData.append("files", file);
-  const xhr = new XMLHttpRequest();
-  const requestId = newRequestId();
-  xhr.open("POST", resolvePath("/insight/pdf/upload-batch"));
-  xhr.withCredentials = true;
-  xhr.setRequestHeader("X-Request-ID", requestId);
-  xhr.timeout = AI_ANSWER_TIMEOUT_MS;
-  xhr.upload.onprogress = (event) => {
-    if (event.lengthComputable && onUploadProgress) onUploadProgress(event.loaded / event.total);
-  };
-  const fail = (message, status = 0, code = "NETWORK_ERROR") => {
-    const error = new Error(message);
-    error.status = status;
-    error.code = code;
-    error.requestId = requestId;
-    reject(error);
-  };
-  xhr.onerror = () => fail("Network error: backend unreachable.");
-  xhr.ontimeout = () => fail("The upload timed out. Try fewer or smaller files.", 0, "TIMEOUT");
-  xhr.onabort = () => {
-    const aborted = new Error("The operation was aborted.");
-    aborted.name = "AbortError";
-    reject(aborted);
-  };
-  xhr.onload = () => {
-    let data;
-    try { data = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch { data = {}; }
-    if (xhr.status >= 200 && xhr.status < 300) {
-      resolve({ success: true, data });
-      return;
-    }
-    if (xhr.status === 401) handleUnauthorized();
-    const norm = normalizeApiError(data, xhr.status, null);
-    fail(norm.message, xhr.status, norm.code);
-  };
-  if (signal) {
-    if (signal.aborted) { xhr.abort(); return; }
-    signal.addEventListener("abort", () => xhr.abort(), { once: true });
-  }
-  xhr.send(formData);
-});
-
-/** Per-file progress for a batch (served under /documents so polling never
- *  spends the AI chat rate budget). @param {string | null} [batchId] */
-export const listUploadJobs = async (batchId = null, options = {}) => {
-  const query = batchId ? `?batch_id=${encodeURIComponent(batchId)}` : "";
-  const data = await request(`/documents/upload-jobs${query}`, options);
-  return { success: true, data: data?.jobs || [] };
-};
-
-export const listDocumentConversations = async (limit = 30) => {
-  const data = await request(`/insight/pdf/conversations?limit=${encodeURIComponent(limit)}`);
-  return { success: true, data: data?.conversations || [] };
-};
-
-export const getDocumentConversation = async (conversationId) => {
-  const data = await request(`/insight/pdf/conversations/${encodeURIComponent(conversationId)}`);
-  return { success: true, data: data?.conversation || null };
-};
-
-export const deleteDocumentConversation = async (conversationId) => {
-  const data = await request(`/insight/pdf/conversations/${encodeURIComponent(conversationId)}`, {
-    method: "DELETE",
-  });
-  return { success: true, data };
-};
-
-/** Map backend PDF-RAG sources to the passage/citation shape the UI renders. */
-export const documentSourcesView = (sources) => {
-  const list = Array.isArray(sources) ? sources : [];
-  return {
-    passages: list.map((source) => ({
-      ...source,
-      page_number: source.page,
-      content: source.excerpt || source.snippet,
-    })),
-    citations: list.map((source, index) => ({
-      index: source.source_id || index + 1,
-      document_id: source.document_id,
-      filename: source.filename,
-      page_number: source.page,
-      chunk_id: source.chunk_id,
-      location_label: source.location_label || (source.page ? `p. ${source.page}` : ""),
-    })),
-  };
-};
-
-/**
- * Ask across documents. `documentIds`: a non-empty list scopes the chat to
- * those documents (saved on the conversation); `[]` means all documents;
- * `null` reuses the conversation's saved selection.
- * @param {string} question @param {string[] | null} [documentIds] @param {string | null} [conversationId]
- */
+/** @param {string} question @param {string[] | null} [documentIds] @param {string | null} [conversationId] */
 export const askDocuments = async (question, documentIds = null, conversationId = null) => {
   const response = await request("/insight/pdf/chat", {
     method: "POST",
@@ -696,12 +592,24 @@ export const askDocuments = async (question, documentIds = null, conversationId 
       document_only: true,
     }),
   });
+  const sources = Array.isArray(response?.sources) ? response.sources : [];
   return {
     success: true,
     data: {
       ...response,
       answer_mode: response?.answer_mode || "ai",
-      ...documentSourcesView(response?.sources),
+      passages: sources.map((source) => ({
+        ...source,
+        page_number: source.page,
+        content: source.snippet,
+      })),
+      citations: sources.map((source, index) => ({
+        index: source.source_id || index + 1,
+        document_id: source.document_id,
+        filename: source.filename,
+        page_number: source.page,
+        chunk_id: source.chunk_id,
+      })),
     },
   };
 };
@@ -739,7 +647,6 @@ export const deleteDocument = async (documentId) => {
   return { success: true, data };
 };
 
-/** @param {string} documentId @param {{ rechunk?: boolean }} [options] */
 export const retryDocument = async (documentId, options = {}) => {
   const suffix = options?.rechunk ? "?rechunk=true" : "";
   const data = await request(`/documents/${documentId}/retry${suffix}`, {
@@ -1572,20 +1479,6 @@ export const intelligenceApi = {
   },
 
   // POST /api/intelligence/reports/:id/rerun -> same definition, fresh numbers.
-  getReportPdf: async (id) => {
-    const res = await fetch(`${API_BASE}/intelligence/reports/${encodeURIComponent(id)}/pdf`, {
-      credentials: "include", cache: "no-store", headers: { "X-Request-ID": newRequestId() },
-    });
-    if (res.status === 401) handleUnauthorized();
-    if (!res.ok) {
-      let data = {};
-      try { data = await res.json(); } catch { /* non-JSON error response */ }
-      const error = normalizeApiError(data, res.status, res.headers);
-      throw new Error(error.message || "Could not download PDF.");
-    }
-    return { success: true, data: await res.blob() };
-  },
-
   rerunReport: async (id) => {
     const data = await request(`/intelligence/reports/${encodeURIComponent(id)}/rerun`, {
       method: "POST",
@@ -2051,22 +1944,92 @@ export const downloadStoryExport = async (envelope = {}, format = "pptx") => {
   return { success: true, filename };
 };
 
+export const listDocumentConversations = async (limit = 30) => {
+  const data = await request(`/insight/pdf/conversations?limit=${encodeURIComponent(limit)}`);
+  return { success: true, data: data?.conversations || [] };
+};
 
-// Authenticated HTML summary and bounded CSV table exports.
-export const fetchDataExport = async (format, table = "") => {
-  if (format !== "html" && format !== "csv") throw new Error("Unsupported export format.");
-  if (format === "csv" && !table) throw new Error("Select a table to export.");
-  const params = new URLSearchParams({ format });
-  if (format === "csv") params.set("table", table);
-  const response = await fetch(resolvePath(`/data/export?${params.toString()}`), {
-    method: "GET", credentials: "include", cache: "no-store",
-    headers: { "X-Request-ID": newRequestId() },
+export const getDocumentConversation = async (conversationId) => {
+  const data = await request(`/insight/pdf/conversations/${encodeURIComponent(conversationId)}`);
+  return { success: true, data: data?.conversation || null };
+};
+
+export const deleteDocumentConversation = async (conversationId) => {
+  const data = await request(`/insight/pdf/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "DELETE",
   });
-  if (response.status === 401) handleUnauthorized();
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    const error = normalizeApiError(data, response.status, response.headers);
-    throw new Error(error.message || "Could not download the report.");
+  return { success: true, data };
+};
+
+/** Map backend PDF-RAG sources to the passage/citation shape the UI renders. */
+export const documentSourcesView = (sources) => {
+  const list = Array.isArray(sources) ? sources : [];
+  return {
+    passages: list.map((source) => ({
+      ...source,
+      page_number: source.page,
+      content: source.excerpt || source.snippet,
+    })),
+    citations: list.map((source, index) => ({
+      index: source.source_id || index + 1,
+      document_id: source.document_id,
+      filename: source.filename,
+      page_number: source.page,
+      chunk_id: source.chunk_id,
+      location_label: source.location_label || (source.page ? `p. ${source.page}` : ""),
+    })),
+  };
+};
+
+export const uploadDocumentsBatch = (files, options = {}) => new Promise((resolve, reject) => {
+  const { onUploadProgress, signal } = options || {};
+  const formData = new FormData();
+  for (const file of files || []) formData.append("files", file);
+  const xhr = new XMLHttpRequest();
+  const requestId = newRequestId();
+  xhr.open("POST", resolvePath("/insight/pdf/upload-batch"));
+  xhr.withCredentials = true;
+  xhr.setRequestHeader("X-Request-ID", requestId);
+  xhr.timeout = AI_ANSWER_TIMEOUT_MS;
+  xhr.upload.onprogress = (event) => {
+    if (event.lengthComputable && onUploadProgress) onUploadProgress(event.loaded / event.total);
+  };
+  const fail = (message, status = 0, code = "NETWORK_ERROR") => {
+    const error = new Error(message);
+    error.status = status;
+    error.code = code;
+    error.requestId = requestId;
+    reject(error);
+  };
+  xhr.onerror = () => fail("Network error: backend unreachable.");
+  xhr.ontimeout = () => fail("The upload timed out. Try fewer or smaller files.", 0, "TIMEOUT");
+  xhr.onabort = () => {
+    const aborted = new Error("The operation was aborted.");
+    aborted.name = "AbortError";
+    reject(aborted);
+  };
+  xhr.onload = () => {
+    let data;
+    try { data = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch { data = {}; }
+    if (xhr.status >= 200 && xhr.status < 300) {
+      resolve({ success: true, data });
+      return;
+    }
+    if (xhr.status === 401) handleUnauthorized();
+    const norm = normalizeApiError(data, xhr.status, null);
+    fail(norm.message, xhr.status, norm.code);
+  };
+  if (signal) {
+    if (signal.aborted) { xhr.abort(); return; }
+    signal.addEventListener("abort", () => xhr.abort(), { once: true });
   }
-  return response.blob();
+  xhr.send(formData);
+});
+
+/** Per-file progress for a batch (served under /documents so polling never
+ *  spends the AI chat rate budget). @param {string | null} [batchId] */
+export const listUploadJobs = async (batchId = null, options = {}) => {
+  const query = batchId ? `?batch_id=${encodeURIComponent(batchId)}` : "";
+  const data = await request(`/documents/upload-jobs${query}`, options);
+  return { success: true, data: data?.jobs || [] };
 };

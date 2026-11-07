@@ -9,7 +9,7 @@ module.exports = defineConfig({
   retries: 0,
   workers: 1,
   use: {
-    baseURL: process.env.ARIA_E2E_BASE_URL || "http://localhost:8000",
+    baseURL: "http://localhost:8000",
     headless: true,
     screenshot: "only-on-failure",
     trace: "on-first-retry",

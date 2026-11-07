@@ -10,7 +10,7 @@
 const { test, expect } = require('@playwright/test');
 const { seedAuth } = require('./auth-helper');
 
-const BASE = process.env.ARIA_E2E_BASE_URL || 'http://localhost:8000';
+const BASE = 'http://localhost:8000';
 
 test.describe('Figma pages - all load', () => {
   // One login per file (serial worker): the auth rate limiter is 30/5min.

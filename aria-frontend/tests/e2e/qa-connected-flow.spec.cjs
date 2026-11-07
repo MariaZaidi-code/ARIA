@@ -6,18 +6,8 @@ const path = require("path");
 const { signInVerified } = require("./auth-helper");
 
 const BASE = process.env.ARIA_BASE || "http://localhost:8000";
-const CSV = process.env.ARIA_CSV || null;
-const SYNTH_CSV = [
-  "order_date,product_category,region,units,unit_price,sales",
-  "2024-01-01,Furniture,North,8,150,1200",
-  "2024-01-16,Accessories,South,12,40,480",
-  "2024-02-01,Furniture,East,5,220,1100",
-  "2024-02-16,Accessories,West,14,35,490",
-  "2024-03-01,Furniture,North,9,160,1440",
-  "2024-03-16,Accessories,East,10,55,550",
-  "2024-04-01,Furniture,South,7,180,1260",
-  "2024-04-16,Accessories,West,11,50,550",
-].join("\n");
+const CSV = process.env.ARIA_CSV ||
+  "C:\\Users\\Go\\Desktop\\ARIA\\data\\kaggle_retail_sales\\abbas829__ecommerce-sales-dataset\\ecommerce_sales_analytics_5000.csv";
 
 const BENIGN = [/favicon/i, /React DevTools/i];
 
@@ -58,7 +48,7 @@ test.describe("ARIA QA - connected flow", () => {
       headers: { Origin: new URL(BASE).origin },
       multipart: {
         provider: "local",
-        file: { name: CSV ? path.basename(CSV) : "qa_connected_sales.csv", mimeType: "text/csv", buffer: CSV ? fs.readFileSync(CSV) : Buffer.from(SYNTH_CSV) },
+        file: { name: path.basename(CSV), mimeType: "text/csv", buffer: fs.readFileSync(CSV) },
       },
       timeout: 120000,
     });
@@ -103,7 +93,7 @@ test.describe("ARIA QA - connected flow", () => {
     sink.consoleErrors.length = 0; sink.pageErrors.length = 0; sink.failedResponses.length = 0;
     await page.getByRole("button", { name: /^copilot$/i }).first().click();
     await page.waitForTimeout(400);
-    const chat = page.locator('[placeholder*="Ask ARIA"]').first();
+    const chat = page.locator('input[placeholder*="Ask ARIA"]').first();
     await chat.fill("How many records are in the data?");
     await chat.press("Enter");
     await expect

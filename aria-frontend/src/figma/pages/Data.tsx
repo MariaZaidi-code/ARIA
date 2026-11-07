@@ -10,7 +10,7 @@ import {
   ChevronUp, Download, MoreHorizontal, Copy, Trash2,
 } from "lucide-react";
 
-import { apiFetch, fetchDataExport } from "../../services/api";
+import { apiFetch } from "../../services/api";
 import { useReadOnly, READ_ONLY_HINT } from "../lib/readonly";
 import { datasetLabel } from "../lib/labels";
 
@@ -112,12 +112,6 @@ export default function Data({
   const [overrideMsg, setOverrideMsg] = useState("");
   const [reconnectRequested, setReconnectRequested] = useState(false);
 
-  const [exportTable, setExportTable] = useState("");
-  const [exportPending, setExportPending] = useState<"html" | "csv" | null>(null);
-  const [exportError, setExportError] = useState("");
-  const [exportSuccess, setExportSuccess] = useState("");
-
-
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const sourceType = reconnectRequested ? localSourceType : selectedSourceType || localSourceType;
@@ -129,43 +123,6 @@ export default function Data({
   const tableNames = Object.keys(tables);
   const sourceMeta = SOURCES.find((s) => s.id === sourceType);
   const SourceIcon = sourceMeta?.icon || Plug;
-
-  const exportTableName = tableNames.includes(exportTable) ? exportTable : (tableNames[0] || "");
-
-  const handleDataExport = async (format: "html" | "csv") => {
-    if (!isConnected || schemaStatus !== "success" || sourceType === "pdf") return;
-    if (format === "csv" && !exportTableName) {
-      setExportError("Select a table to export.");
-      return;
-    }
-    setExportPending(format);
-    setExportError("");
-    setExportSuccess("");
-    try {
-      const file = await fetchDataExport(format, exportTableName);
-      const safeSource = (dbName || "data").replace(/[^a-z0-9_-]/gi, "-").slice(0, 40);
-      const safeTable = exportTableName.replace(/[^a-z0-9_-]/gi, "-").slice(0, 40);
-      const filename = format === "html"
-        ? `aria-${safeSource}-report.html`
-        : `aria-${safeSource}-${safeTable}.csv`;
-      const url = URL.createObjectURL(file);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-      setExportSuccess(format === "html"
-        ? "HTML report downloaded. Open in your browser or print it as PDF."
-        : "Table CSV downloaded (up to the first 5,000 rows).");
-    } catch (e: any) {
-      setExportError(e?.message || "Could not download the export.");
-    } finally {
-      setExportPending(null);
-    }
-  };
-
 
   useEffect(() => { setLPass(propDbPassword || ""); }, [propDbPassword]);
 
@@ -317,10 +274,10 @@ export default function Data({
         // Reload schema
         onSchemaRetry?.();
       } else {
-        setOverrideMsg(r.detail || r.message || "Couldn't save your change. Please try again.");
+        setOverrideMsg(r.detail || r.message || "Failed");
       }
     } catch (e: any) {
-      setOverrideMsg(e.message || "Couldn't save your change. Please try again.");
+      setOverrideMsg(e.message || "Override failed");
     }
   };
 
@@ -355,14 +312,14 @@ export default function Data({
                   {[
                     connHealth.source_type === "relational" ? connHealth.db_type?.toUpperCase() : "Uploaded file",
                     connHealth.source_type === "relational" ? (String(connHealth.host || "").trim() || null) : null,
-                    connHealth.schema ? `${String(connHealth.schema).includes(",") ? "Database sections" : "Database section"}: ${connHealth.schema}` : null,
+                    connHealth.schema ? `${String(connHealth.schema).includes(",") ? "Schemas" : "Schema"}: ${connHealth.schema}` : null,
                     `${connHealth.table_count ?? 0} ${connHealth.table_count === 1 ? "table" : "tables"}`,
                     `${connHealth.column_count ?? 0} ${connHealth.column_count === 1 ? "column" : "columns"}`,
                   ].filter(Boolean).join(" · ")}
                 </p>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  Last scan: {connHealth.last_schema_scan ? new Date(connHealth.last_schema_scan).toLocaleString() : "Never"} · Changed your tables? Use Rescan tables.
-                  {connHealth.provider ? ` · AI: ${connHealth.provider === "local" ? "Local (on this computer)" : connHealth.provider === "cloud" ? "Cloud AI service" : connHealth.provider}` : ""}
+                  Last scan: {connHealth.last_schema_scan ? new Date(connHealth.last_schema_scan).toLocaleString() : "Never"}
+                  {connHealth.provider ? ` · AI: ${connHealth.provider === "local" ? "Local (on this computer)" : connHealth.provider === "cloud" ? "Cloud (Groq)" : connHealth.provider}` : ""}
                 </p>
               </div>
             </div>
@@ -372,9 +329,8 @@ export default function Data({
                 <RefreshCw size={11} /> Refresh
               </button>
               <button onClick={handleRefreshSchema}
-                title="Run this after you add, rename or remove tables or columns in your database, so ARIA sees the change."
                 className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground px-3 py-1.5 rounded-lg hover:bg-secondary transition-all">
-                <Columns3 size={11} /> Rescan tables
+                <Columns3 size={11} /> Rescan Schema
               </button>
               <button onClick={handleDisconnect} disabled={readOnly} title={readOnly ? READ_ONLY_HINT : undefined}
                 className="flex items-center gap-1.5 text-[11px] text-negative hover:text-negative/80 px-3 py-1.5 rounded-lg hover:bg-negative/5 transition-all disabled:opacity-50">
@@ -454,7 +410,7 @@ export default function Data({
                 <Field label="Database Name" id="db-name" value={lDbName} onChange={setLDbName} placeholder="my_database" disabled={connecting} />
                 <Field label="Username" id="db-user" value={lUser} onChange={setLUser} placeholder={sourceType === "mysql" ? "root" : "postgres"} disabled={connecting} />
               </div>
-               <Field label="Password" id="db-pass" type={showPassword ? "text" : "password"} value={lPass} onChange={setLPass} placeholder="Enter password" disabled={connecting}>
+              <Field label="Password" id="db-pass" type="password-show" value={lPass} onChange={setLPass} placeholder="Enter password" disabled={connecting}>
                 <button type="button" onClick={() => setShowPassword((s) => !s)}
                   className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground text-[10px]">
                   {showPassword ? "Hide" : "Show"}
@@ -1240,7 +1196,7 @@ export default function Data({
           <div className="bg-card border border-border rounded-xl p-8 text-center">
             <Loader2 size={24} className="mx-auto animate-spin text-primary mb-3" />
             <p className="text-xs text-muted-foreground">Scanning tables...</p>
-            <p className="text-[10px] text-muted-foreground mt-1">Checking for missing values, duplicates and links between tables…</p>
+            <p className="text-[10px] text-muted-foreground mt-1">Checking null values, duplicates, relationships...</p>
           </div>
         ) : error ? (
           <div className="bg-card border border-border rounded-xl p-8 text-center">
@@ -1360,44 +1316,6 @@ export default function Data({
           Inspect your database structure, preview data, and monitor quality.
         </p>
       </div>
-
-      {isConnected && sourceType !== "pdf" && (
-        <div className="bg-card border border-border rounded-xl px-4 py-4 space-y-3" aria-label="Export my data">
-          <div className="flex items-start gap-2.5">
-            <Download size={16} className="text-primary mt-0.5" />
-            <div>
-              <p className="text-sm font-semibold text-foreground">Export My Data</p>
-              <p className="text-[11px] text-muted-foreground">
-                Download a printable HTML report with table summaries and quality findings,
-                or save selected table records as CSV (first 5,000 rows).
-              </p>
-            </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <button type="button" disabled={schemaStatus !== "success" || !!exportPending}
-              onClick={() => handleDataExport("html")}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-primary text-primary-foreground px-3 py-2 text-xs font-semibold disabled:opacity-50">
-              {exportPending === "html" ? <Loader2 size={13} className="animate-spin" /> : <FileText size={13} />}
-              Download HTML Report
-            </button>
-            <select aria-label="Select a table for CSV export" value={exportTableName}
-              onChange={(e) => setExportTable(e.target.value)}
-              disabled={schemaStatus !== "success" || !!exportPending || !tableNames.length}
-              className="bg-secondary border border-border rounded-lg px-3 py-2 text-xs text-foreground outline-none focus:border-primary min-w-[160px]">
-              {tableNames.length === 0 && <option value="">No tables available</option>}
-              {tableNames.map((name) => <option key={name} value={name}>{name}</option>)}
-            </select>
-            <button type="button" disabled={schemaStatus !== "success" || !!exportPending || !exportTableName}
-              onClick={() => handleDataExport("csv")}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-secondary text-foreground border border-border px-3 py-2 text-xs font-semibold hover:bg-secondary/80 disabled:opacity-50">
-              {exportPending === "csv" ? <Loader2 size={13} className="animate-spin" /> : <FileSpreadsheet size={13} />}
-              Export Table CSV
-            </button>
-          </div>
-          {exportError && <p className="text-xs text-negative" role="alert">{exportError}</p>}
-          {exportSuccess && <p className="text-xs text-positive" role="status">{exportSuccess}</p>}
-        </div>
-      )}
 
       <div className="flex gap-1 bg-secondary rounded-lg p-0.5 w-fit">
         {TABS.map((t) => {
